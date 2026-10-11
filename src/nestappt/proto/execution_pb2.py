@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1enestappt/proto/execution.proto\x12\x08nestappt\";\n\x0e\x45xecuteRequest\x12\x0f\n\x07payload\x18\x01 \x01(\x0c\x12\x0b\n\x03gpu\x18\x02 \x01(\x05\x12\x0b\n\x03\x63pu\x18\x03 \x01(\x05\"!\n\x0f\x45xecuteResponse\x12\x0e\n\x06result\x18\x01 \x01(\x0c\x32R\n\x10\x45xecutionService\x12>\n\x07\x45xecute\x12\x18.nestappt.ExecuteRequest\x1a\x19.nestappt.ExecuteResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1enestappt/proto/execution.proto\x12\x08nestappt\";\n\x0e\x45xecuteRequest\x12\x0f\n\x07payload\x18\x01 \x01(\x0c\x12\x0b\n\x03gpu\x18\x02 \x01(\x05\x12\x0b\n\x03\x63pu\x18\x03 \x01(\x05\"!\n\x0f\x45xecuteResponse\x12\x0e\n\x06result\x18\x01 \x01(\x0c\"\"\n\x10JobStatusRequest\x12\x0e\n\x06job_id\x18\x01 \x01(\x03\"\"\n\x11JobStatusResponse\x12\r\n\x05state\x18\x01 \x01(\t2\x9b\x01\n\x10\x45xecutionService\x12>\n\x07\x45xecute\x12\x18.nestappt.ExecuteRequest\x1a\x19.nestappt.ExecuteResponse\x12G\n\x0cGetJobStatus\x12\x1a.nestappt.JobStatusRequest\x1a\x1b.nestappt.JobStatusResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -35,6 +35,10 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_EXECUTEREQUEST']._serialized_end=103
   _globals['_EXECUTERESPONSE']._serialized_start=105
   _globals['_EXECUTERESPONSE']._serialized_end=138
-  _globals['_EXECUTIONSERVICE']._serialized_start=140
-  _globals['_EXECUTIONSERVICE']._serialized_end=222
+  _globals['_JOBSTATUSREQUEST']._serialized_start=140
+  _globals['_JOBSTATUSREQUEST']._serialized_end=174
+  _globals['_JOBSTATUSRESPONSE']._serialized_start=176
+  _globals['_JOBSTATUSRESPONSE']._serialized_end=210
+  _globals['_EXECUTIONSERVICE']._serialized_start=213
+  _globals['_EXECUTIONSERVICE']._serialized_end=368
 # @@protoc_insertion_point(module_scope)

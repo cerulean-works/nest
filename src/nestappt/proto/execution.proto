@@ -4,6 +4,8 @@ package nestappt;
 
 service ExecutionService {
     rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+
+    rpc GetJobStatus(JobStatusRequest) returns (JobStatusResponse);
 }
 
 message ExecuteRequest {
@@ -14,4 +16,12 @@ message ExecuteRequest {
 
 message ExecuteResponse {
     bytes result = 1;
+}
+
+message JobStatusRequest {
+    int64 job_id = 1;
+}
+
+message JobStatusResponse {
+    string state = 1;
 }
