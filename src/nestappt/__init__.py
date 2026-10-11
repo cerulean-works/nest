@@ -1,2 +1,3 @@
-def hello() -> str:
-    return "Hello from nestappt!"
+from .remote import remote
+
+__all__ = ["remote"]
