@@ -52,3 +52,33 @@ class SlurmBackend:
             raise RuntimeError(f"Unexpected sbatch output: {output}")
         
         return int(job_id)
+    
+    def status(self, job_id: int) -> str:
+        job_id = int(job_id)
+        
+        # Check active jobs
+        try:            
+            output = self._run_remote(
+                f"squeue --noheader --jobs={job_id} --format=%T"
+            )
+        except RuntimeError as exc:
+            if "Invalid job id specified" not in str(exc):
+                raise
+            output = ""
+        
+        if output:
+            return output.splitlines()[0].strip()
+        
+        # Check job accouting histroy
+        output = self._run_remote(
+            f"sacct -X -n -P --jobs={job_id} --format=State"
+        )
+        
+        if output:
+            return output.splitlines()[0].strip()
+        
+        return "UNKNOWN"
+
+    def cancel(self, job_id: int) -> None:
+        job_id = int(job_id)
+        self._run_remote(f"scancel {job_id}")
