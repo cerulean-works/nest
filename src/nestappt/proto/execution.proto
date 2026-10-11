@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package nestappt;
+
+service ExecutionService {
+    rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+}
+
+message ExecuteRequest {
+    bytes payload = 1;
+    int32 gpu = 2;
+    int32 cpu = 3;
+}
+
+message ExecuteResponse {
+    bytes result = 1;
+}

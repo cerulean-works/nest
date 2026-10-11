@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from functools import update_wrapper
 from typing import Any, Callable
 
-from .executor import execute
+from .client import execute_remote
 
 @dataclass(frozen=True)
 class Resources:
@@ -19,7 +19,7 @@ class RemoteFunction:
         return self.func(*args, **kwargs)
     
     def remote(self, *args: Any, **kwargs: Any) -> Any:
-        return execute(self.func, *args, **kwargs)
+        return execute_remote(self.func, self.resources, *args, **kwargs)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self.local(*args, **kwargs)
