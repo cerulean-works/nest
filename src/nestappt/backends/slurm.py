@@ -7,6 +7,7 @@ class SlurmConfig:
     ssh_host: str
     account: str
     partition: str = "dev"
+    time: str | None = None
     
 class SlurmBackend:
     def __init__(self, config: SlurmConfig):
@@ -33,16 +34,39 @@ class SlurmBackend:
         
         return result.stdout.strip()
     
-    def submit(self, workdir: str, script: str = "hello.sbatch", gpu: int = 1) -> int:
-        gpu_option = f"--gpus-per-node={gpu}" if gpu > 0 else ""
+    def submit(
+        self, 
+        workdir: str,
+        script: str = "hello.sbatch", 
+        gpu: int = 1,
+        *,
+        account: str | None = None,
+        partition: str | None = None,
+        time: str | None = None,
+    ) -> int:
+        if gpu < 0:
+            raise ValueError("GPU count cannot be negative")
+        
+        args = [
+            "sbatch",
+            "--parsable",
+            f"--account={account or self.config.account}",
+            f"--partition={partition or self.config.partition}",
+        ]
+        
+        if gpu > 0:
+            args.append(f"--gpus-per-node={gpu}")
+            
+        time_limit = time or self.config.time
+        
+        if time_limit:
+            args.append(f"--time={time_limit}")
+        
+        args.append(script)
         
         command = (
             f"cd {shlex.quote(workdir)} && "
-            f"sbatch --parsable "
-            f"--account={shlex.quote(self.config.account)} "
-            f"--partition={shlex.quote(self.config.partition)} "
-            f"{gpu_option} "
-            f"{shlex.quote(script)}"
+            f"{shlex.join(args)}"
         )
         
         output = self._run_remote(command)

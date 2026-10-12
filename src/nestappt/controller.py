@@ -57,6 +57,9 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 workdir=request.workdir,
                 script=request.script,
                 gpu=request.gpu,
+                account=request.account or None,
+                partition=request.partition or None,
+                time=request.time or None,
             )
         except RuntimeError as exc:
             context.abort(

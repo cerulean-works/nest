@@ -34,6 +34,10 @@ message SubmitJobRequest {
     string workdir = 1;
     string script = 2;
     int32 gpu = 3;
+
+    string account = 4;
+    string partition = 5;
+    string time = 6;
 }
 
 message SubmitJobResponse {
