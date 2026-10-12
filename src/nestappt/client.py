@@ -26,7 +26,7 @@ def execute_remote(func: Callable, resources: Any, *args: Any, **kwargs: Any) ->
     # Connect to Controller
     with grpc.insecure_channel(address) as channel:
         stub = execution_pb2_grpc.ExecutionServiceStub(channel)
-        response = stub.Execute(request, timeout=120)
+        response = stub.Execute(request, timeout=900)
 
     # Deserialze result
     return cloudpickle.loads(response.result)

@@ -12,14 +12,42 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
         self.slurm_backend = slurm_backend
         
     def Execute(self, request, context):
-        # Deserialize function and arguments
+        mode = os.getenv("NESTAPPT_EXECUTOR", "local")
+        
+        if mode == "slurm":
+            if self.slurm_backend is None:
+                context.abort(
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                    "Slurm backend is not configured",
+                )
+                
+            try:
+                # Upload payload and submit Slurm job
+                job_id, job_dir = self.slurm_backend.submit_payload(
+                    request.payload,
+                    gpu=request.gpu,
+                )
+                
+                print(f"Submitted Slurm job: {job_id}", flush=True)
+                
+                # Wait for the result
+                result_bytes = self.slurm_backend.wait_result(
+                    job_id,
+                    job_dir,
+                    timeout=600,
+                )
+                
+                return execution_pb2.ExecuteResponse(result=result_bytes)
+            
+            except (RuntimeError, TimeoutError, ValueError) as exc:
+                context.abort(
+                    grpc.StatusCode.INTERNAL,
+                    str(exc),
+                )
+        
+        # Original local executor
         func, args, kwargs = cloudpickle.loads(request.payload)
-        print(f"Received job: GPU={request.gpu}, CPU={request.cpu}", flush=True)
-        
-        # Execute using exeisting subprocess executor
         result = execute(func, *args, **kwargs)
-        
-        # Serialize result
         return execution_pb2.ExecuteResponse(result=cloudpickle.dumps(result))
     
     def GetJobStatus(self, request, context):
@@ -91,13 +119,16 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
             )
             
         return execution_pb2.CancelJobResponse()
-
+    
 def main():
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
     
     slurm_backend = None
     ssh_host = os.getenv("NESTAPPT_SLURM_HOST")
     account = os.getenv("NESTAPPT_SLURM_ACCOUNT")
+    workdir = os.getenv("NESTAPPT_SLURM_WORKDIR")
+    
+    slurm_backend = None
     
     if ssh_host and account:
         slurm_backend = SlurmBackend(
@@ -105,6 +136,9 @@ def main():
                 ssh_host=ssh_host,
                 account=account,
                 partition="dev",
+                time="00:05:00",
+                work_root=f"{workdir.rstrip('/')}/jobs" if workdir else None,
+                worker_workdir=workdir,
             )
         )
         
