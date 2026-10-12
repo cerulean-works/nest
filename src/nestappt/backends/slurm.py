@@ -1,3 +1,4 @@
+import uuid
 import shlex
 import subprocess
 from dataclasses import dataclass
@@ -8,6 +9,7 @@ class SlurmConfig:
     account: str
     partition: str = "dev"
     time: str | None = None
+    work_root: str | None = None
     
 class SlurmBackend:
     def __init__(self, config: SlurmConfig):
@@ -106,3 +108,40 @@ class SlurmBackend:
     def cancel(self, job_id: int) -> None:
         job_id = int(job_id)
         self._run_remote(f"scancel {job_id}")
+
+    def stage_payload(self, payload: bytes) -> str:
+        if not self.config.work_root:
+            raise ValueError("Slurm work_root is not configured")
+        
+        work_root = self.config.work_root
+        
+        if not work_root.startswith("/"):
+            raise ValueError("Slurm work_root must be an absolute path")
+        
+        job_dir = f"{work_root.rstrip('/')}/{uuid.uuid4().hex}"
+        input_path = f"{job_dir}/input.pkl"
+        
+        command = (
+            f"mkdir -p {shlex.quote(job_dir)} && "
+            f"cat > {shlex.quote(input_path)}"
+        )
+        
+        result = subprocess.run(
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                self.config.ssh_host,
+                command,
+            ],
+            input=payload,
+            capture_output=True,
+            timeout=60,
+        )
+        
+        if result.returncode != 0:
+            raise RuntimeError(
+                result.stderr.decode(errors="replace").strip()
+            )
+        
+        return job_dir
