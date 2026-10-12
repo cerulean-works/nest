@@ -6,6 +6,10 @@ service ExecutionService {
     rpc Execute(ExecuteRequest) returns (ExecuteResponse);
 
     rpc GetJobStatus(JobStatusRequest) returns (JobStatusResponse);
+
+    rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);
+
+    rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
 }
 
 message ExecuteRequest {
@@ -25,3 +29,19 @@ message JobStatusRequest {
 message JobStatusResponse {
     string state = 1;
 }
+
+message SubmitJobRequest {
+    string workdir = 1;
+    string script = 2;
+    int32 gpu = 3;
+}
+
+message SubmitJobResponse {
+    int64 job_id = 1;
+}
+
+message CancelJobRequest {
+    int64 job_id = 1;
+}
+
+message CancelJobResponse {}

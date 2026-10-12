@@ -44,6 +44,16 @@ class ExecutionServiceStub:
                 request_serializer=nestappt_dot_proto_dot_execution__pb2.JobStatusRequest.SerializeToString,
                 response_deserializer=nestappt_dot_proto_dot_execution__pb2.JobStatusResponse.FromString,
                 _registered_method=True)
+        self.SubmitJob = channel.unary_unary(
+                '/nestappt.ExecutionService/SubmitJob',
+                request_serializer=nestappt_dot_proto_dot_execution__pb2.SubmitJobRequest.SerializeToString,
+                response_deserializer=nestappt_dot_proto_dot_execution__pb2.SubmitJobResponse.FromString,
+                _registered_method=True)
+        self.CancelJob = channel.unary_unary(
+                '/nestappt.ExecutionService/CancelJob',
+                request_serializer=nestappt_dot_proto_dot_execution__pb2.CancelJobRequest.SerializeToString,
+                response_deserializer=nestappt_dot_proto_dot_execution__pb2.CancelJobResponse.FromString,
+                _registered_method=True)
 
 
 class ExecutionServiceServicer:
@@ -61,6 +71,18 @@ class ExecutionServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def SubmitJob(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def CancelJob(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_ExecutionServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -73,6 +95,16 @@ def add_ExecutionServiceServicer_to_server(servicer, server):
                     servicer.GetJobStatus,
                     request_deserializer=nestappt_dot_proto_dot_execution__pb2.JobStatusRequest.FromString,
                     response_serializer=nestappt_dot_proto_dot_execution__pb2.JobStatusResponse.SerializeToString,
+            ),
+            'SubmitJob': grpc.unary_unary_rpc_method_handler(
+                    servicer.SubmitJob,
+                    request_deserializer=nestappt_dot_proto_dot_execution__pb2.SubmitJobRequest.FromString,
+                    response_serializer=nestappt_dot_proto_dot_execution__pb2.SubmitJobResponse.SerializeToString,
+            ),
+            'CancelJob': grpc.unary_unary_rpc_method_handler(
+                    servicer.CancelJob,
+                    request_deserializer=nestappt_dot_proto_dot_execution__pb2.CancelJobRequest.FromString,
+                    response_serializer=nestappt_dot_proto_dot_execution__pb2.CancelJobResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -129,6 +161,60 @@ class ExecutionService:
             '/nestappt.ExecutionService/GetJobStatus',
             nestappt_dot_proto_dot_execution__pb2.JobStatusRequest.SerializeToString,
             nestappt_dot_proto_dot_execution__pb2.JobStatusResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SubmitJob(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/nestappt.ExecutionService/SubmitJob',
+            nestappt_dot_proto_dot_execution__pb2.SubmitJobRequest.SerializeToString,
+            nestappt_dot_proto_dot_execution__pb2.SubmitJobResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CancelJob(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/nestappt.ExecutionService/CancelJob',
+            nestappt_dot_proto_dot_execution__pb2.CancelJobRequest.SerializeToString,
+            nestappt_dot_proto_dot_execution__pb2.CancelJobResponse.FromString,
             options,
             channel_credentials,
             insecure,
