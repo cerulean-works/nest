@@ -1,6 +1,6 @@
-import nestappt
+import nest
 
-@nestappt.remote(gpu=1)
+@nest.remote(gpu=1)
 def compute(x):
     import socket
     return {"result": x * 2, "hostname": socket.gethostname()}

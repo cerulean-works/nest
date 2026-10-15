@@ -1,11 +1,11 @@
 import os
 import grpc
 
-from nestappt.proto import execution_pb2, execution_pb2_grpc
+from nest.proto import execution_pb2, execution_pb2_grpc
 
 def main():
     address = os.getenv(
-        "NESTAPPT_CONTROLLER_ADDRESS",
+        "NEST_CONTROLLER_ADDRESS",
         "127.0.0.1:50051",
     )
     
@@ -15,7 +15,7 @@ def main():
         # Submit
         response = stub.SubmitJob(
             execution_pb2.SubmitJobRequest(
-                workdir=os.environ["NESTAPPT_SLURM_WORKDIR"],
+                workdir=os.environ["NEST_SLURM_WORKDIR"],
                 script="cancel-test.sbatch",
                 gpu=1,
                 account="ACD115198",

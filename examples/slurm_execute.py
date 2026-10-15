@@ -1,18 +1,18 @@
 import os
 import cloudpickle
 
-from nestappt.backends.slurm import SlurmBackend, SlurmConfig
+from nest.backends.slurm import SlurmBackend, SlurmConfig
 
 def compute(x):
     return x * 2
 
 def main():
-    workdir = os.environ["NESTAPPT_SLURM_WORKDIR"]
+    workdir = os.environ["NEST_SLURM_WORKDIR"]
 
     backend = SlurmBackend(
         SlurmConfig(
-            ssh_host=os.environ["NESTAPPT_SLURM_HOST"],
-            account=os.environ["NESTAPPT_SLURM_ACCOUNT"],
+            ssh_host=os.environ["NEST_SLURM_HOST"],
+            account=os.environ["NEST_SLURM_ACCOUNT"],
             partition="dev",
             time="00:05:00",
             work_root=f"{workdir}/jobs",

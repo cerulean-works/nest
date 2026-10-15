@@ -1,13 +1,13 @@
 import os
 import sys
 
-from nestappt.backends.slurm import SlurmBackend, SlurmConfig
+from nest.backends.slurm import SlurmBackend, SlurmConfig
 
 def main():
     backend = SlurmBackend(
         SlurmConfig(
-            ssh_host=os.environ["NESTAPPT_SLURM_HOST"],
-            account=os.environ["NESTAPPT_SLURM_ACCOUNT"],
+            ssh_host=os.environ["NEST_SLURM_HOST"],
+            account=os.environ["NEST_SLURM_ACCOUNT"],
             partition="dev",
         )
     )

@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-from nestappt.proto import execution_pb2 as nestappt_dot_proto_dot_execution__pb2
+from nest.proto import execution_pb2 as nest_dot_proto_dot_execution__pb2
 
 GRPC_GENERATED_VERSION = '1.84.0'
 GRPC_VERSION = grpc.__version__
@@ -18,7 +18,7 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + ' but the generated code in nestappt/proto/execution_pb2_grpc.py depends on'
+        + ' but the generated code in nest/proto/execution_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
@@ -35,24 +35,24 @@ class ExecutionServiceStub:
             channel: A grpc.Channel.
         """
         self.Execute = channel.unary_unary(
-                '/nestappt.ExecutionService/Execute',
-                request_serializer=nestappt_dot_proto_dot_execution__pb2.ExecuteRequest.SerializeToString,
-                response_deserializer=nestappt_dot_proto_dot_execution__pb2.ExecuteResponse.FromString,
+                '/nest.ExecutionService/Execute',
+                request_serializer=nest_dot_proto_dot_execution__pb2.ExecuteRequest.SerializeToString,
+                response_deserializer=nest_dot_proto_dot_execution__pb2.ExecuteResponse.FromString,
                 _registered_method=True)
         self.GetJobStatus = channel.unary_unary(
-                '/nestappt.ExecutionService/GetJobStatus',
-                request_serializer=nestappt_dot_proto_dot_execution__pb2.JobStatusRequest.SerializeToString,
-                response_deserializer=nestappt_dot_proto_dot_execution__pb2.JobStatusResponse.FromString,
+                '/nest.ExecutionService/GetJobStatus',
+                request_serializer=nest_dot_proto_dot_execution__pb2.JobStatusRequest.SerializeToString,
+                response_deserializer=nest_dot_proto_dot_execution__pb2.JobStatusResponse.FromString,
                 _registered_method=True)
         self.SubmitJob = channel.unary_unary(
-                '/nestappt.ExecutionService/SubmitJob',
-                request_serializer=nestappt_dot_proto_dot_execution__pb2.SubmitJobRequest.SerializeToString,
-                response_deserializer=nestappt_dot_proto_dot_execution__pb2.SubmitJobResponse.FromString,
+                '/nest.ExecutionService/SubmitJob',
+                request_serializer=nest_dot_proto_dot_execution__pb2.SubmitJobRequest.SerializeToString,
+                response_deserializer=nest_dot_proto_dot_execution__pb2.SubmitJobResponse.FromString,
                 _registered_method=True)
         self.CancelJob = channel.unary_unary(
-                '/nestappt.ExecutionService/CancelJob',
-                request_serializer=nestappt_dot_proto_dot_execution__pb2.CancelJobRequest.SerializeToString,
-                response_deserializer=nestappt_dot_proto_dot_execution__pb2.CancelJobResponse.FromString,
+                '/nest.ExecutionService/CancelJob',
+                request_serializer=nest_dot_proto_dot_execution__pb2.CancelJobRequest.SerializeToString,
+                response_deserializer=nest_dot_proto_dot_execution__pb2.CancelJobResponse.FromString,
                 _registered_method=True)
 
 
@@ -88,29 +88,29 @@ def add_ExecutionServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
             'Execute': grpc.unary_unary_rpc_method_handler(
                     servicer.Execute,
-                    request_deserializer=nestappt_dot_proto_dot_execution__pb2.ExecuteRequest.FromString,
-                    response_serializer=nestappt_dot_proto_dot_execution__pb2.ExecuteResponse.SerializeToString,
+                    request_deserializer=nest_dot_proto_dot_execution__pb2.ExecuteRequest.FromString,
+                    response_serializer=nest_dot_proto_dot_execution__pb2.ExecuteResponse.SerializeToString,
             ),
             'GetJobStatus': grpc.unary_unary_rpc_method_handler(
                     servicer.GetJobStatus,
-                    request_deserializer=nestappt_dot_proto_dot_execution__pb2.JobStatusRequest.FromString,
-                    response_serializer=nestappt_dot_proto_dot_execution__pb2.JobStatusResponse.SerializeToString,
+                    request_deserializer=nest_dot_proto_dot_execution__pb2.JobStatusRequest.FromString,
+                    response_serializer=nest_dot_proto_dot_execution__pb2.JobStatusResponse.SerializeToString,
             ),
             'SubmitJob': grpc.unary_unary_rpc_method_handler(
                     servicer.SubmitJob,
-                    request_deserializer=nestappt_dot_proto_dot_execution__pb2.SubmitJobRequest.FromString,
-                    response_serializer=nestappt_dot_proto_dot_execution__pb2.SubmitJobResponse.SerializeToString,
+                    request_deserializer=nest_dot_proto_dot_execution__pb2.SubmitJobRequest.FromString,
+                    response_serializer=nest_dot_proto_dot_execution__pb2.SubmitJobResponse.SerializeToString,
             ),
             'CancelJob': grpc.unary_unary_rpc_method_handler(
                     servicer.CancelJob,
-                    request_deserializer=nestappt_dot_proto_dot_execution__pb2.CancelJobRequest.FromString,
-                    response_serializer=nestappt_dot_proto_dot_execution__pb2.CancelJobResponse.SerializeToString,
+                    request_deserializer=nest_dot_proto_dot_execution__pb2.CancelJobRequest.FromString,
+                    response_serializer=nest_dot_proto_dot_execution__pb2.CancelJobResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
-            'nestappt.ExecutionService', rpc_method_handlers)
+            'nest.ExecutionService', rpc_method_handlers)
     server.add_generic_rpc_handlers((generic_handler,))
-    server.add_registered_method_handlers('nestappt.ExecutionService', rpc_method_handlers)
+    server.add_registered_method_handlers('nest.ExecutionService', rpc_method_handlers)
 
 
  # This class is part of an EXPERIMENTAL API.
@@ -131,9 +131,9 @@ class ExecutionService:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/nestappt.ExecutionService/Execute',
-            nestappt_dot_proto_dot_execution__pb2.ExecuteRequest.SerializeToString,
-            nestappt_dot_proto_dot_execution__pb2.ExecuteResponse.FromString,
+            '/nest.ExecutionService/Execute',
+            nest_dot_proto_dot_execution__pb2.ExecuteRequest.SerializeToString,
+            nest_dot_proto_dot_execution__pb2.ExecuteResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -158,9 +158,9 @@ class ExecutionService:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/nestappt.ExecutionService/GetJobStatus',
-            nestappt_dot_proto_dot_execution__pb2.JobStatusRequest.SerializeToString,
-            nestappt_dot_proto_dot_execution__pb2.JobStatusResponse.FromString,
+            '/nest.ExecutionService/GetJobStatus',
+            nest_dot_proto_dot_execution__pb2.JobStatusRequest.SerializeToString,
+            nest_dot_proto_dot_execution__pb2.JobStatusResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -185,9 +185,9 @@ class ExecutionService:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/nestappt.ExecutionService/SubmitJob',
-            nestappt_dot_proto_dot_execution__pb2.SubmitJobRequest.SerializeToString,
-            nestappt_dot_proto_dot_execution__pb2.SubmitJobResponse.FromString,
+            '/nest.ExecutionService/SubmitJob',
+            nest_dot_proto_dot_execution__pb2.SubmitJobRequest.SerializeToString,
+            nest_dot_proto_dot_execution__pb2.SubmitJobResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -212,9 +212,9 @@ class ExecutionService:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/nestappt.ExecutionService/CancelJob',
-            nestappt_dot_proto_dot_execution__pb2.CancelJobRequest.SerializeToString,
-            nestappt_dot_proto_dot_execution__pb2.CancelJobResponse.FromString,
+            '/nest.ExecutionService/CancelJob',
+            nest_dot_proto_dot_execution__pb2.CancelJobRequest.SerializeToString,
+            nest_dot_proto_dot_execution__pb2.CancelJobResponse.FromString,
             options,
             channel_credentials,
             insecure,

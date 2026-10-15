@@ -20,7 +20,7 @@ def execute(func: Callable, *args: Any, **kwargs: Any) -> Any:
             [
                 sys.executable,
                 "-m",
-                "nestappt.worker",
+                "nest.worker",
                 str(input_path),
                 str(output_path),
             ],

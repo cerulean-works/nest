@@ -4,9 +4,9 @@ import tempfile
 from pathlib import Path
 
 import cloudpickle
-import nestappt
+import nest
 
-@nestappt.remote(gpu=1, cpu=4)
+@nest.remote(gpu=1, cpu=4)
 def compute(x):
     return x * 2
 
@@ -27,7 +27,7 @@ def main():
             [
                 sys.executable,
                 "-m",
-                "nestappt.worker",
+                "nest.worker",
                 str(input_path),
                 str(output_path),
             ],

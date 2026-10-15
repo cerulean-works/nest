@@ -1,7 +1,7 @@
 import sys
 import grpc
 
-from nestappt.proto import execution_pb2, execution_pb2_grpc
+from nest.proto import execution_pb2, execution_pb2_grpc
 
 def main():
     job_id = int(sys.argv[1])

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=nestappt-test
+#SBATCH --job-name=nest-test
 #SBATCH --partition=dev
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=256M

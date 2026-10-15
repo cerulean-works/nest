@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=nestappt-apptainer
+#SBATCH --job-name=nest-apptainer
 #SBATCH --partition=dev
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=1
@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-IMAGE="$HOME/nestappt-smoke/images/uv-python312.sif"
+IMAGE="$HOME/nest-smoke/images/uv-python312.sif"
 
 echo "=== Host ==="
 hostname

@@ -2,7 +2,7 @@ import os
 import hashlib
 import cloudpickle
 
-from nestappt.backends.slurm import SlurmBackend, SlurmConfig
+from nest.backends.slurm import SlurmBackend, SlurmConfig
 
 def compute(x):
     return x * 2
@@ -10,10 +10,10 @@ def compute(x):
 def main():
     backend = SlurmBackend(
         SlurmConfig(
-            ssh_host=os.environ["NESTAPPT_SLURM_HOST"],
-            account=os.environ["NESTAPPT_SLURM_ACCOUNT"],
+            ssh_host=os.environ["NEST_SLURM_HOST"],
+            account=os.environ["NEST_SLURM_ACCOUNT"],
             work_root=(
-                os.environ["NESTAPPT_SLURM_WORKDIR"] + "/jobs"
+                os.environ["NEST_SLURM_WORKDIR"] + "/jobs"
             ),
         )
     )

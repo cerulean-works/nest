@@ -1,11 +1,11 @@
 import os
-import nestappt
+import nest
 
-@nestappt.remote(gpu=1, cpu=4)
+@nest.remote(gpu=1, cpu=4)
 def compute(x):
     return x * 2
 
-@nestappt.remote()
+@nest.remote()
 def get_pid():
     return os.getpid()
 

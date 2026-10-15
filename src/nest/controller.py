@@ -12,7 +12,7 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
         self.slurm_backend = slurm_backend
         
     def Execute(self, request, context):
-        mode = os.getenv("NESTAPPT_EXECUTOR", "local")
+        mode = os.getenv("NEST_EXECUTOR", "local")
         
         if mode == "slurm":
             if self.slurm_backend is None:
@@ -124,9 +124,9 @@ def main():
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
     
     slurm_backend = None
-    ssh_host = os.getenv("NESTAPPT_SLURM_HOST")
-    account = os.getenv("NESTAPPT_SLURM_ACCOUNT")
-    workdir = os.getenv("NESTAPPT_SLURM_WORKDIR")
+    ssh_host = os.getenv("NEST_SLURM_HOST")
+    account = os.getenv("NEST_SLURM_ACCOUNT")
+    workdir = os.getenv("NEST_SLURM_WORKDIR")
     
     slurm_backend = None
     
@@ -149,7 +149,7 @@ def main():
     
     server.add_insecure_port("127.0.0.1:50051")
     server.start()
-    print("nestappt Controller listening on 127.0.0.1:50051")
+    print("nest Controller listening on 127.0.0.1:50051")
     
     try:
         server.wait_for_termination()

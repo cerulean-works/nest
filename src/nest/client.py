@@ -19,7 +19,7 @@ def execute_remote(func: Callable, resources: Any, *args: Any, **kwargs: Any) ->
     )
     
     address = os.getenv(
-        "NESTAPPT_CONTROLLER_ADDRESS",
+        "NEST_CONTROLLER_ADDRESS",
         "127.0.0.1:50051",
     )
     

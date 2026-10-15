@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=nestappt-worker
+#SBATCH --job-name=nest-worker
 #SBATCH --partition=dev
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=1
@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-BASE="$HOME/nestappt-smoke"
+BASE="$HOME/nest-smoke"
 
 # Receive unique execution ID
 JOB_ID="${1:?Missing execution ID}"
@@ -31,7 +31,7 @@ apptainer exec \
     sh -c '
         cd /workspace/project
 
-        uv run --frozen --no-dev python -m nestappt.worker \
+        uv run --frozen --no-dev python -m nest.worker \
             "/workspace/jobs/$1/input.pkl" \
             "/workspace/jobs/$1/output.pkl"
     ' sh "$JOB_ID"

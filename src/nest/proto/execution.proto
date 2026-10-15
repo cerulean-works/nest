@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package nestappt;
+package nest;
 
 service ExecutionService {
     rpc Execute(ExecuteRequest) returns (ExecuteResponse);

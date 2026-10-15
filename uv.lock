@@ -116,7 +116,7 @@ wheels = [
 ]
 
 [[package]]
-name = "nestappt"
+name = "nest"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
