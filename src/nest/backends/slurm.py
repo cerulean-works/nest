@@ -3,6 +3,7 @@ import time
 import shlex
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 
 @dataclass(frozen=True)
 class SlurmConfig:
@@ -244,3 +245,47 @@ class SlurmBackend:
             raise RuntimeError("Worker returned an empty result file")
         
         return result.stdout
+
+    def stage_environment_files(self, project_dir: str) -> str:
+        if not self.config.worker_workdir:
+            raise ValueError("worker_workdit is not configured")
+        
+        project = Path(project_dir)
+        files = ("pyproject.toml", "uv.lock")
+        
+        for name in files:
+            if not (project / name).is_file():
+                raise FileNotFoundError(project / name)
+            
+        env_id = uuid.uuid4().hex
+        env_dir = (
+            f"{self.config.worker_workdir.rstrip('/')}"
+            f"/environments/{env_id}"
+        )
+        
+        self._run_remote(
+            f"mkdir -p {shlex.quote(env_dir)}"
+        )
+        
+        for name in files:
+            remote_path = f"{env_dir}/{name}"
+            
+            result = subprocess.run(
+                [
+                    "ssh",
+                    "-o",
+                    "BatchMode=yes",
+                    self.config.ssh_host,
+                    f"cat > {shlex.quote(remote_path)}",
+                ],
+                input=(project / name).read_bytes(),
+                capture_output=True,
+                timeout=60,
+            )
+            
+            if result.returncode != 0:
+                raise RuntimeError(
+                    result.stderr.decode(errors="replace")
+                )
+                
+        return env_dir
