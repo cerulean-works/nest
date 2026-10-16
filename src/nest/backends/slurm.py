@@ -1,6 +1,7 @@
 import uuid
 import time
 import shlex
+import hashlib
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -248,27 +249,81 @@ class SlurmBackend:
 
     def stage_environment_files(self, project_dir: str) -> str:
         if not self.config.worker_workdir:
-            raise ValueError("worker_workdit is not configured")
+            raise ValueError("worker_workdir is not configured")
         
         project = Path(project_dir)
-        files = ("pyproject.toml", "uv.lock")
+        names = ("pyproject.toml", "uv.lock")
         
-        for name in files:
-            if not (project / name).is_file():
-                raise FileNotFoundError(project / name)
-            
-        env_id = uuid.uuid4().hex
+        files = {
+            name: (project / name).read_bytes() 
+            for name in names
+        }
+        
+        # Calculate environment hash
+        hasher = hashlib.sha256()
+        
+        for name, content in files.items():
+            hasher.update(name.encode())
+            hasher.update(b"\0")
+            hasher.update(len(content).to_bytes(8, "big"))
+            hasher.update(content)
+        
+        env_id = hasher.hexdigest()
+        
         env_dir = (
             f"{self.config.worker_workdir.rstrip('/')}"
             f"/environments/{env_id}"
         )
         
+        paths = {
+            name: f"{env_dir}/{name}" 
+            for name in names
+        }
+        expected = [
+            hashlib.sha256(files[name]).hexdigest()
+            for name in names
+        ]
+        
+        # Check remote cache
+        def remote_hashes() -> list[str]:
+            quoted = [
+                shlex.quote(paths[name])
+                for name in names
+            ]
+            
+            command = (
+                f"if [ -f {quoted[0]} ] && [ -f {quoted[1]} ]; then "
+                f"sha256sum {' '.join(quoted)}; "
+                f"fi"
+            )
+            
+            output = self._run_remote(command)
+            
+            return [
+                line.split()[0]
+                for line in output.splitlines()
+            ]
+        
+        if remote_hashes() == expected:
+            print(f"Environment cache hit: {env_id}")
+            return env_dir
+
+        print(f"Environment cache miss: {env_id}")
+        
         self._run_remote(
             f"mkdir -p {shlex.quote(env_dir)}"
         )
         
-        for name in files:
-            remote_path = f"{env_dir}/{name}"
+        # upload files atomically
+        for name, content in files.items():
+            remote_path = paths[name]
+            temp_path = f"{remote_path}.tmp-{uuid.uuid4().hex}"
+            
+            command = (
+                f"cat > {shlex.quote(temp_path)} && "
+                f"mv -f -- {shlex.quote(temp_path)} "
+                f"{shlex.quote(remote_path)}"
+            )
             
             result = subprocess.run(
                 [
@@ -276,9 +331,9 @@ class SlurmBackend:
                     "-o",
                     "BatchMode=yes",
                     self.config.ssh_host,
-                    f"cat > {shlex.quote(remote_path)}",
+                    command,
                 ],
-                input=(project / name).read_bytes(),
+                input=content,
                 capture_output=True,
                 timeout=60,
             )
@@ -287,5 +342,16 @@ class SlurmBackend:
                 raise RuntimeError(
                     result.stderr.decode(errors="replace")
                 )
-                
+            
+        actual = remote_hashes()
+        if actual != expected:
+            print("Environment direcotry: ", env_dir)
+            print(self._run_remote(f"ls -al {shlex.quote(env_dir)}"))
+            print(f"Expected hashes: {expected}")
+            print(f"Actual hashes: {actual}")
+            
+            raise RuntimeError(
+                "Environment file verification failed"
+            )
+            
         return env_dir
