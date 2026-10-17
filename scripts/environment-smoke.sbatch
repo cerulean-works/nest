@@ -76,6 +76,11 @@ apptainer exec \
     --bind "$BASE:/workspace" \
     "$IMAGE" \
     sh -c '
-        "/workspace/environments/$1/runtimes/$2/.venv/bin/python" \
-            -c "import humanize; print(humanize.intcomma(1234567))"
+        PYTHON="/workspace/environments/$1/runtimes/$2/.venv/bin/python"
+
+        "$PYTHON" -c "
+import sys
+assert sys.prefix != sys.base_prefix
+print(\"Environment Python:\", sys.version.split()[0])
+"
     ' sh "$ENV_ID" "$RUNTIME_ID"
