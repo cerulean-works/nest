@@ -16,6 +16,13 @@ message ExecuteRequest {
     bytes payload = 1;
     int32 gpu = 2;
     int32 cpu = 3;
+
+    EnvironmentFiles environment = 4;
+}
+
+message EnvironmentFiles {
+    bytes pyproject_toml = 1;
+    bytes uv_lock = 2;
 }
 
 message ExecuteResponse {

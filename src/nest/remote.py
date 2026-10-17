@@ -32,7 +32,7 @@ class RemoteFunction:
         return self.func(*args, **kwargs)
     
     def remote(self, *args: Any, **kwargs: Any) -> Any:
-        return execute_remote(self.func, self.resources, *args, **kwargs)
+        return execute_remote(self.func, self.resources, self.project, *args, **kwargs)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self.local(*args, **kwargs)

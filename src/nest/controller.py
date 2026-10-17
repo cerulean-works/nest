@@ -12,6 +12,22 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
         self.slurm_backend = slurm_backend
         
     def Execute(self, request, context):
+        if request.HasField("environment"):
+            env = request.environment
+            
+            if not env.pyproject_toml or not env.uv_lock:
+                context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    "Environment requires pyproject.toml and uv.lock",
+                )
+            
+            print(
+                "Received environment: "
+                f"pyproject.toml={len(env.pyproject_toml)} bytes, "
+                f"uv.lock={len(env.uv_lock)} bytes",
+                flush=True
+            )
+        
         mode = os.getenv("NEST_EXECUTOR", "local")
         
         if mode == "slurm":

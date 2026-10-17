@@ -1,12 +1,18 @@
 import os
-from typing import Any, Callable
-
-import cloudpickle
 import grpc
+import cloudpickle
+from pathlib import Path
+from typing import Any, Callable
 
 from .proto import execution_pb2, execution_pb2_grpc
 
-def execute_remote(func: Callable, resources: Any, *args: Any, **kwargs: Any) -> Any:
+def execute_remote(
+    func: Callable,
+    resources: Any,
+    project: Path | None,
+    *args: Any,
+    **kwargs: Any
+) -> Any:
     # Serialize function and arguments
     payload = cloudpickle.dumps(
         (func, args, kwargs)
@@ -17,6 +23,17 @@ def execute_remote(func: Callable, resources: Any, *args: Any, **kwargs: Any) ->
         gpu=resources.gpu,
         cpu=resources.cpu,
     )
+    
+    if project is not None:
+        pyproject_path = project / "pyproject.toml"
+        lock_path = project / "uv.lock"
+        
+        request.environment.CopyFrom(
+            execution_pb2.EnvironmentFiles(
+                pyproject_toml=pyproject_path.read_bytes(),
+                uv_lock=lock_path.read_bytes(),
+            )
+        )
     
     address = os.getenv(
         "NEST_CONTROLLER_ADDRESS",
