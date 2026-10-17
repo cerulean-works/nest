@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from functools import update_wrapper
 from typing import Any, Callable
+from pathlib import Path
 
 from .client import execute_remote
 
@@ -10,9 +11,21 @@ class Resources:
     cpu: int = 1
     
 class RemoteFunction:
-    def __init__(self, func: Callable, resources: Resources):
+    def __init__(
+        self, 
+        func: Callable, 
+        resources: Resources,
+        project: str | Path | None = None,
+    ):
         self.func = func
         self.resources = resources
+        
+        self.project = (
+            Path(project).expanduser().resolve()
+            if project is not None
+            else None
+        )
+        
         update_wrapper(self, func)
     
     def local(self, *args: Any, **kwargs: Any) -> Any:
@@ -24,10 +37,15 @@ class RemoteFunction:
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self.local(*args, **kwargs)
     
-def remote(*, gpu: int = 0, cpu: int = 1):
+def remote(
+    *,
+    gpu: int = 0,
+    cpu: int = 1,
+    project: str | Path | None = None,
+):
     resources = Resources(gpu=gpu, cpu=cpu)
     
     def decorator(func: Callable) -> RemoteFunction:
-        return RemoteFunction(func, resources)
-    
+        return RemoteFunction(func, resources, project=project)
+
     return decorator
