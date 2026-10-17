@@ -1,3 +1,4 @@
+import re
 import uuid
 import time
 import shlex
@@ -355,3 +356,65 @@ class SlurmBackend:
             )
             
         return env_dir
+
+    def build_environment(self, env_dir: str, gpu: int = 1) -> int:
+        if not self.config.worker_workdir:
+            raise ValueError("worker_workdir is not configured")
+        
+        env_id = Path(env_dir).name
+        
+        if not re.fullmatch(r"[0-9a-f]{64}", env_id):
+            raise ValueError("Invalid environment ID")
+        
+        expected_dir = (
+            Path(self.config.worker_workdir)
+            / "environments"
+            / env_id
+        )
+        
+        if Path(env_dir) != expected_dir:
+            raise ValueError("Invalid environment directory")
+        
+        return self.submit(
+            workdir=self.config.worker_workdir,
+            script="project/scripts/environment-smoke.sbatch",
+            gpu=gpu,
+            script_args=(env_id,),
+        )
+        
+    def wait_environment(self, job_id: int, timeout: int = 1800, poll_interval: int = 5) -> None:
+        if timeout <= 0 or poll_interval <= 0:
+            raise ValueError("Timeout and poll interval must be positive")
+        
+        deadline = time.monotonic() + timeout
+        
+        failed_states = (
+            "FAILED",
+            "CANCELLED",
+            "TIMEOUT",
+            "OUT_OF_MEMORY",
+            "NODE_FAIL",
+            "BOOT_FAIL",
+            "PREEMPTED",
+            "DEADLINE",
+            "REVOKED",
+        )
+        
+        while True:
+            state = self.status(job_id)
+            
+            if state == "COMPLETED":
+                return
+
+            if state.startswith(failed_states):
+                raise RuntimeError(
+                    f"Environment build {job_id} failed: {state}"
+                )
+                
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Timed out waiting for environment build {job_id}. "
+                    f"Last state: {state}"
+                )
+            
+            time.sleep(poll_interval)
