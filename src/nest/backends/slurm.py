@@ -249,15 +249,29 @@ class SlurmBackend:
         return result.stdout
 
     def stage_environment_files(self, project_dir: str) -> str:
+        project = Path(project_dir)
+        
+        return self.stage_environment_bytes(
+            pyproject_toml=(project / "pyproject.toml").read_bytes(),
+            uv_lock=(project / "uv.lock").read_bytes(),
+        )
+        
+    def stage_environment_bytes(
+        self,
+        *,
+        pyproject_toml: bytes,
+        uv_lock: bytes,
+    ) -> str:
         if not self.config.worker_workdir:
             raise ValueError("worker_workdir is not configured")
         
-        project = Path(project_dir)
-        names = ("pyproject.toml", "uv.lock")
+        if not pyproject_toml or not uv_lock:
+            raise ValueError("Environment files cannot be empty")
         
+        names = ("pyproject.toml", "uv.lock")
         files = {
-            name: (project / name).read_bytes() 
-            for name in names
+            "pyproject.toml": pyproject_toml,
+            "uv.lock": uv_lock,
         }
         
         # Calculate environment hash
@@ -489,3 +503,4 @@ class SlurmBackend:
             raise RuntimeError("Environment build completed but cache is not ready")
 
         return env_dir
+
