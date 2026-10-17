@@ -488,7 +488,25 @@ class SlurmBackend:
         return self._run_remote(command) == "ready"
         
     def prepare_environment(self, project_dir: str, gpu: int = 1) -> str:
-        env_dir = self.stage_environment_files(project_dir)
+        project = Path(project_dir)
+        
+        return self.prepare_environment_bytes(
+            pyproject_toml=(project / "pyproject.toml").read_bytes(),
+            uv_lock=(project / "uv.lock").read_bytes(),
+            gpu=gpu,
+        )
+
+    def prepare_environment_bytes(
+        self,
+        *,
+        pyproject_toml: bytes,
+        uv_lock: bytes,
+        gpu: int = 1,
+    ) -> str:
+        env_dir = self.stage_environment_bytes(
+            pyproject_toml=pyproject_toml,
+            uv_lock=uv_lock,
+        )
         
         if self.environment_ready(env_dir):
             print("Runtime cache hit, skipping Slurm job")
@@ -503,4 +521,3 @@ class SlurmBackend:
             raise RuntimeError("Environment build completed but cache is not ready")
 
         return env_dir
-
