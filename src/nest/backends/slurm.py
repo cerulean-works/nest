@@ -418,3 +418,74 @@ class SlurmBackend:
                 )
             
             time.sleep(poll_interval)
+
+    def runtime_id(self) -> str:
+        if not self.config.worker_workdir:
+            raise ValueError("worker_workdir is not configured")
+        
+        image = (
+            f"{self.config.worker_workdir.rstrip('/')}"
+            "/images/uv-python312.sif"
+        )
+        
+        quoted = shlex.quote(image)
+        
+        command = (
+            f"test -r {quoted} && "
+            f"image_hash=$(sha256sum {quoted} | cut -d' ' -f1) && "
+            "arch=$(uname -m) && "
+            """printf '%s:%s' "$image_hash" "$arch" | """
+            "sha256sum | cut -d' ' -f1"
+        )
+        
+        return self._run_remote(command)
+
+    def environment_ready(self, env_dir: str) -> bool:
+        if not self.config.worker_workdir:
+            raise ValueError("worker_workdir is not configured")
+
+        env_id = Path(env_dir).name
+        
+        if not re.fullmatch(r"[0-9a-f]{64}", env_id):
+            raise ValueError("Invalid environment ID")
+
+        expected_dir = (
+            Path(self.config.worker_workdir)
+            / "environments"
+            / env_id
+        )
+        
+        if Path(env_dir) != expected_dir:
+            raise ValueError("Invalid environment directory")
+        
+        runtime_id = self.runtime_id()
+        runtime_dir = f"{env_dir}/runtimes/{runtime_id}"
+        ready = f"{runtime_dir}/.ready"
+        python = f"{runtime_dir}/.venv/bin/python"
+        
+        command = (
+            f"if test -f {shlex.quote(ready)} && "
+            f"( test -L {shlex.quote(python)} || "
+            f"test -f {shlex.quote(python)} ); then "
+            "printf ready; "
+            "else printf missing; fi"
+        )
+        
+        return self._run_remote(command) == "ready"
+        
+    def prepare_environment(self, project_dir: str, gpu: int = 1) -> str:
+        env_dir = self.stage_environment_files(project_dir)
+        
+        if self.environment_ready(env_dir):
+            print("Runtime cache hit, skipping Slurm job")
+            return env_dir
+        
+        print("Runtime cache miss, building environment")
+        job_id = self.build_environment(env_dir, gpu=gpu)
+        print(f"Submitted environment job: {job_id}")
+        self.wait_environment(job_id)
+        
+        if not self.environment_ready(env_dir):
+            raise RuntimeError("Environment build completed but cache is not ready")
+
+        return env_dir

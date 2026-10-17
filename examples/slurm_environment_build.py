@@ -14,17 +14,8 @@ def main():
         )
     )
     
-    # Stage environment files
-    env_dir = backend.stage_environment_files("examples/uv_demo")
-    print(f"Environment: {env_dir}", flush=True)
-    
-    # Submit environment build
-    job_id = backend.build_environment(env_dir, gpu=1)
-    print(f"Submitted job: {job_id}", flush=True)
-    
-    # Wait for completion
-    backend.wait_environment(job_id)
-    print("Environment ready!")
+    env_dir = backend.prepare_environment("examples/uv_demo", gpu=1)
+    print(f"Environment ready: {env_dir}")
     
 if __name__ == "__main__":
     main()
