@@ -76,17 +76,27 @@ if [[ -n "$ENV_ID" ]]; then
     echo "Environment verified"
 fi
 
+# Resolve Python path inside Apptainer
+USER_PYTHON_CONTAINER=""
+
+if [[ -n "$ENV_ID" ]]; then
+    USER_PYTHON_CONTAINER="/workspace/environments/$ENV_ID/runtimes/$RUNTIME_ID/.venv/bin/python"
+
+    echo "User Python (container): [$USER_PYTHON_CONTAINER]"
+fi
+
 apptainer exec \
     --cleanenv \
     --bind "$BASE:/workspace" \
-    "$BASE/images/uv-python312.sif" \
+    "$IMAGE" \
     sh -c '
         cd /workspace/project
 
         uv run --frozen --no-dev python -m nest.worker \
             "/workspace/jobs/$1/input.pkl" \
-            "/workspace/jobs/$1/output.pkl"
-    ' sh "$JOB_ID"
+            "/workspace/jobs/$1/output.pkl" \
+            "$2"
+    ' sh "$JOB_ID" "$USER_PYTHON_CONTAINER"
 
 test -s "$BASE/jobs/$JOB_ID/output.pkl"
 
