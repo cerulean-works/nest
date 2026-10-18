@@ -167,6 +167,7 @@ def main():
     ssh_host = os.getenv("NEST_SLURM_HOST")
     account = os.getenv("NEST_SLURM_ACCOUNT")
     workdir = os.getenv("NEST_SLURM_WORKDIR")
+    bind_address = os.getenv("NEST_CONTROLLER_BIND", "127.0.0.1:50051")
     
     slurm_backend = None
     
@@ -187,15 +188,9 @@ def main():
         server,
     )
     
-    port = server.add_insecure_port("127.0.0.1:50051")
-    
-    if port != 50051:
-        raise RuntimeError(
-            "Failed to bind nest Controller to port 50051"
-        )
-
+    server.add_insecure_port(bind_address)
     server.start()
-    print("nest Controller listening on 127.0.0.1:50051")
+    print(f"nest Controller listening on {bind_address}")
     
     try:
         server.wait_for_termination()
