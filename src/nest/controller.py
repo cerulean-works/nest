@@ -38,6 +38,19 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 )
                 
             try:
+                # Prepare Python environment
+                if request.HasField("environment"):
+                    env = request.environment
+                    print("Preparing Python environment...", flush=True)
+                    
+                    env_dir = self.slurm_backend.prepare_environment_bytes(
+                        pyproject_toml=env.pyproject_toml,
+                        uv_lock=env.uv_lock,
+                        gpu=request.gpu,
+                    )
+                    
+                    print(f"Environment ready: {env_dir}", flush=True)
+                
                 # Upload payload and submit Slurm job
                 job_id, job_dir = self.slurm_backend.submit_payload(
                     request.payload,
@@ -50,17 +63,17 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 result_bytes = self.slurm_backend.wait_result(
                     job_id,
                     job_dir,
-                    timeout=600,
+                    timeout=600
                 )
                 
                 return execution_pb2.ExecuteResponse(result=result_bytes)
-            
+                    
             except (RuntimeError, TimeoutError, ValueError) as exc:
                 context.abort(
                     grpc.StatusCode.INTERNAL,
                     str(exc),
                 )
-        
+
         # Original local executor
         func, args, kwargs = cloudpickle.loads(request.payload)
         result = execute(func, *args, **kwargs)
