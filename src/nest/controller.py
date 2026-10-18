@@ -38,6 +38,8 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 )
                 
             try:
+                environment_id = None
+                
                 # Prepare Python environment
                 if request.HasField("environment"):
                     env = request.environment
@@ -49,12 +51,16 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                         gpu=request.gpu,
                     )
                     
+                    environment_id = env_dir.rsplit("/", 1)[-1]
+                    
                     print(f"Environment ready: {env_dir}", flush=True)
+                    print(f"Environment ID: {environment_id}", flush=True)
                 
-                # Upload payload and submit Slurm job
+                # Submit worker with environment ID
                 job_id, job_dir = self.slurm_backend.submit_payload(
                     request.payload,
                     gpu=request.gpu,
+                    environment_id=environment_id,
                 )
                 
                 print(f"Submitted Slurm job: {job_id}", flush=True)

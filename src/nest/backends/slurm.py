@@ -163,9 +163,19 @@ class SlurmBackend:
         
         return job_dir
 
-    def submit_payload(self, payload: bytes, gpu: int = 1) -> tuple[int, str]:
+    def submit_payload(
+        self,
+        payload: bytes,
+        gpu: int = 1,
+        *,
+        environment_id: str | None = None,
+    ) -> tuple[int, str]:
         if not self.config.worker_workdir:
             raise ValueError("worker_workdir is not configured")
+        
+        if environment_id is not None:
+            if not re.fullmatch(r"[0-9a-f]{64}", environment_id):
+                raise ValueError("Invalid environment ID")
 
         # Upload payload
         job_dir = self.stage_payload(payload)
@@ -173,12 +183,18 @@ class SlurmBackend:
         # Extract execution UUID
         execution_id = job_dir.rsplit("/", 1)[-1]
         
+        # Prepare script arguments
+        script_args = (execution_id,)
+        
+        if environment_id is not None:
+            script_args += (environment_id,)
+        
         # Submit Slurm job
         job_id = self.submit(
             workdir=self.config.worker_workdir,
             script="project/scripts/worker.sbatch",
             gpu=gpu,
-            script_args=(execution_id,),
+            script_args=script_args,
         )
         
         return job_id, job_dir

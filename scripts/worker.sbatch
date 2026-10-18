@@ -24,6 +24,20 @@ if [[ ! "$JOB_ID" =~ ^[0-9a-f]{32}$ ]]; then
     exit 1
 fi
 
+# Receive optional environment ID
+ENV_ID="${2:-}"
+
+if [[ -n "$ENV_ID" ]]; then
+    if [[ ! "$ENV_ID" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "Invalid environment ID"
+        exit 1
+    fi
+
+    echo "Environment ID: [$ENV_ID]"
+else
+    echo "Environment ID: none"
+fi
+
 apptainer exec \
     --cleanenv \
     --bind "$BASE:/workspace" \
