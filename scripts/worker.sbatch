@@ -38,6 +38,44 @@ else
     echo "Environment ID: none"
 fi
 
+# Resolve user Python environment
+IMAGE="$BASE/images/uv-python312.sif"
+
+if [[ -n "$ENV_ID" ]]; then
+
+    # Calculate runtime identity
+    IMAGE_HASH=$(sha256sum "$IMAGE" | cut -d' ' -f1)
+    ARCH=$(uname -m)
+
+    RUNTIME_ID=$(
+        printf '%s:%s' "$IMAGE_HASH" "$ARCH" |
+        sha256sum |
+        cut -d' ' -f1
+    )
+
+    # Resolve environment directory
+    RUNTIME_DIR="$BASE/environments/$ENV_ID/runtimes/$RUNTIME_ID"
+
+    READY="$RUNTIME_DIR/.ready"
+    USER_PYTHON="$RUNTIME_DIR/.venv/bin/python"
+
+    # Verify environment is ready
+    if [[ ! -f "$READY" ]]; then
+        echo "Environment is not ready: $RUNTIME_DIR"
+        exit 1
+    fi
+
+    # Python may be a symlink into the Apptainer image
+    if [[ ! -L "$USER_PYTHON" && ! -f "$USER_PYTHON" ]]; then
+        echo "Environment Python not found: $USER_PYTHON"
+        exit 1
+    fi
+
+    echo "Runtime ID: [$RUNTIME_ID]"
+    echo "User Python: [$USER_PYTHON]"
+    echo "Environment verified"
+fi
+
 apptainer exec \
     --cleanenv \
     --bind "$BASE:/workspace" \
