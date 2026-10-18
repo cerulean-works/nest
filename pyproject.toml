@@ -1,7 +1,7 @@
 [project]
 name = "nest"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.1.0a1"
+description = "A Python SDK for remote function execution on HPC clusters"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
