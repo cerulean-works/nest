@@ -34,7 +34,7 @@ def main():
         env = os.environ.copy()
         env.pop("PYTHONPATH", None)
         env.pop("PYTHONHOME", None)
-        env["VIRTUA:_ENV"] = str(Path(user_python).parent.parent)
+        env["VIRTUA_ENV"] = str(Path(user_python).parent.parent)
         
         subprocess.run(
             [
@@ -49,7 +49,7 @@ def main():
         )
         
         if not output_path.is_file() or output_path.stat().st_size == 0:
-            raise RuntimeError("User process did not product a result")
+            raise RuntimeError("User process did not produce a result")
         
         return
 
