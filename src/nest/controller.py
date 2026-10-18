@@ -156,7 +156,12 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
         return execution_pb2.CancelJobResponse()
     
 def main():
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=4),
+        options=[
+            ("grpc.so_reuseport", 0),
+        ],
+    )
     
     slurm_backend = None
     ssh_host = os.getenv("NEST_SLURM_HOST")
@@ -182,7 +187,13 @@ def main():
         server,
     )
     
-    server.add_insecure_port("127.0.0.1:50051")
+    port = server.add_insecure_port("127.0.0.1:50051")
+    
+    if port != 50051:
+        raise RuntimeError(
+            "Failed to bind nest Controller to port 50051"
+        )
+
     server.start()
     print("nest Controller listening on 127.0.0.1:50051")
     

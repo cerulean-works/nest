@@ -1,6 +1,7 @@
 import os
 import sys
 import shutil
+import traceback
 import subprocess
 import cloudpickle
 
@@ -53,16 +54,32 @@ def main():
         
         return
 
-    # Deserializing function and arguments
-    with input_path.open("rb") as f:
-        func, args, kwargs = cloudpickle.load(f)
+    # Execute in Nest Runtime when no user environment is specified
+    try:        
+        # Deserializing function and arguments
+        with input_path.open("rb") as f:
+            func, args, kwargs = cloudpickle.load(f)
     
-    # Execute function
-    result = func(*args, **kwargs)
+        # Execute function
+        result = func(*args, **kwargs)
     
-    # Serializing return value
-    with output_path.open("wb") as f:
-        cloudpickle.dump(result, f)
+        # Serializing return value
+        with output_path.open("wb") as f:
+            cloudpickle.dump(result, f)
+
+    except Exception as exc:
+        error = {
+            "__nest_remote_error_v1__": True,
+            "type": (
+                f"{type(exc).__module__}."
+                f"{type(exc).__qualname__}"
+            ),
+            "message": str(exc),
+            "traceback": traceback.format_exc(),
+        }
         
+        with output_path.open("wb") as f:
+            cloudpickle.dump(error, f)
+            
 if __name__ == "__main__":
     main()

@@ -4,6 +4,7 @@ import cloudpickle
 from pathlib import Path
 from typing import Any, Callable
 
+from .errors import RemoteExecutionError
 from .proto import execution_pb2, execution_pb2_grpc
 
 def execute_remote(
@@ -45,5 +46,24 @@ def execute_remote(
         stub = execution_pb2_grpc.ExecutionServiceStub(channel)
         response = stub.Execute(request, timeout=900)
 
-    # Deserialze result
-    return cloudpickle.loads(response.result)
+    # Deserialze result or raise a remote exception
+    return _decode_remote_result(response.result)
+
+def _decode_remote_result(data: bytes) -> Any:
+    result = cloudpickle.loads(data)
+    
+    if (
+        isinstance(result, dict)
+        and result.get("__nest_remote_error_v1__") is True
+        and all(
+            isinstance(result.get(key), str)
+            for key in ("type", "message", "traceback")
+        )
+    ):
+        raise RemoteExecutionError(
+            remote_type=result["type"],
+            remote_message=result["message"],
+            remote_traceback=result["traceback"],
+        )
+    
+    return result

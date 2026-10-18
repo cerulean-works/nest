@@ -1,4 +1,5 @@
 import sys
+import traceback
 from pathlib import Path
 
 def main():
@@ -14,13 +15,28 @@ def main():
     
     import cloudpickle
     
-    with input_path.open("rb") as f:
-        func, args, kwargs = cloudpickle.load(f)
+    try:
+        with input_path.open("rb") as f:
+            func, args, kwargs = cloudpickle.load(f)
+            
+        result = func(*args, **kwargs)
         
-    result = func(*args, **kwargs)
-    
-    with output_path.open("wb") as f:
-        cloudpickle.dump(result, f)
+        with output_path.open("wb") as f:
+            cloudpickle.dump(result, f)
+
+    except Exception as exc:
+        error = {
+            "__nest_remote_error_v1__": True,
+            "type": (
+                f"{type(exc).__module__}."
+                f"{type(exc).__qualname__}"
+            ),
+            "message": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+        
+        with output_path.open("wb") as f:
+            cloudpickle.dump(error, f)
         
 if __name__ == "__main__":
     main()
