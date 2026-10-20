@@ -4,6 +4,12 @@ import sys
 from nest.backends.slurm import SlurmBackend, SlurmConfig
 
 def main():
+    """
+    Prints the Slurm state of the job ID supplied on the command line.
+
+    Reads the SSH host and account from `NEST_SLURM_HOST` and
+    `NEST_SLURM_ACCOUNT`.
+    """
     backend = SlurmBackend(
         SlurmConfig(
             ssh_host=os.environ["NEST_SLURM_HOST"],

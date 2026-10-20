@@ -2,13 +2,18 @@ syntax = "proto3";
 
 package nest;
 
+// Executes trusted Python calls and manages Slurm jobs through the controller.
 service ExecutionService {
+    // Executes a serialized Python call and returns its serialized result.
     rpc Execute(ExecuteRequest) returns (ExecuteResponse);
 
+    // Returns a Slurm job state from the queue or accounting history.
     rpc GetJobStatus(JobStatusRequest) returns (JobStatusResponse);
 
+    // Submits a batch script and returns its Slurm job ID.
     rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);
 
+    // Requests cancellation of a Slurm job without waiting for it to stop.
     rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
 }
 

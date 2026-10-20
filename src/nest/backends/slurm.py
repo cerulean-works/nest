@@ -9,6 +9,18 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class SlurmConfig:
+    """
+    Stores SSH connection details, Slurm defaults, and remote working paths.
+
+    Attributes:
+        ssh_host (`str`): SSH host name or configured SSH alias.
+        account (`str`): Default Slurm account.
+        partition (`str`, *optional*, defaults to `"dev"`): Default Slurm partition.
+        time (`str`, *optional*): Default `sbatch --time` value. Omits the flag if unset.
+        work_root (`str`, *optional*): Absolute directory for staged execution payloads.
+        worker_workdir (`str`, *optional*): Remote Nest directory containing the
+            deployed `project`, `images`, and `environments` directories.
+    """
     ssh_host: str
     account: str
     partition: str = "dev"
@@ -17,10 +29,31 @@ class SlurmConfig:
     worker_workdir: str | None = None
     
 class SlurmBackend:
+    """Stages files and manages Slurm jobs through noninteractive SSH commands."""
     def __init__(self, config: SlurmConfig):
+        """
+        Stores the backend configuration without connecting to the cluster.
+
+        Args:
+            config ([`backends.slurm.SlurmConfig`]): SSH host, Slurm defaults, and paths.
+        """
         self.config = config
         
     def _run_remote(self, command: str) -> str:
+        """
+        Runs a text command over SSH with batch mode enabled.
+
+        Args:
+            command (`str`): Shell command to execute on the configured host.
+
+        Returns:
+            `str`: Standard output with leading and trailing whitespace removed.
+
+        Raises:
+            `TimeoutError`: If SSH exceeds 60 seconds. The remote operation's status
+                remains unknown.
+            `RuntimeError`: If SSH exits with a nonzero status.
+        """
         try:
             result = subprocess.run(
                 [
@@ -59,6 +92,33 @@ class SlurmBackend:
         time: str | None = None,
         script_args: tuple[str, ...] = (),
     ) -> int:
+        """
+        Submits a batch script from a remote working directory.
+
+        Args:
+            workdir (`str`): Remote directory in which to run `sbatch`.
+            script (`str`, *optional*, defaults to `"hello.sbatch"`): Script path,
+                resolved from `workdir` when relative.
+            gpu (`int`, *optional*, defaults to `1`): GPUs per node. Omits the GPU
+                flag when `0`; script directives can still request GPUs.
+            account (`str`, *optional*): Account override. Uses the configured account
+                when unset or empty.
+            partition (`str`, *optional*): Partition override. Uses the configured
+                partition when unset or empty.
+            time (`str`, *optional*): Time limit override. Uses the configured limit
+                when unset or empty. Omits the flag if neither has a value.
+            script_args (`tuple[str, ...]`, *optional*, defaults to `()`): Arguments
+                appended after the script path.
+
+        Returns:
+            `int`: Job ID parsed from `sbatch --parsable` output.
+
+        Raises:
+            `TypeError`: If `script_args` is a string.
+            `ValueError`: If the GPU count is negative.
+            `RuntimeError`: If submission fails or its output has no decimal job ID.
+            `TimeoutError`: If the SSH command exceeds 60 seconds.
+        """
         if isinstance(script_args, str):
             raise TypeError("script_args must be a tuple of strings")
             
@@ -97,6 +157,20 @@ class SlurmBackend:
         return int(job_id)
     
     def status(self, job_id: int) -> str:
+        """
+        Looks up a job's state in the active queue, then in accounting history.
+
+        Args:
+            job_id (`int`): Slurm job ID.
+
+        Returns:
+            `str`: First state reported by `squeue` or `sacct`, or `"UNKNOWN"` when
+                neither returns a state.
+
+        Raises:
+            `RuntimeError`: If a remote query fails, except an invalid job ID from `squeue`.
+            `TimeoutError`: If an SSH command exceeds 60 seconds.
+        """
         job_id = int(job_id)
         
         # Check active jobs
@@ -123,10 +197,34 @@ class SlurmBackend:
         return "UNKNOWN"
 
     def cancel(self, job_id: int) -> None:
+        """
+        Requests job cancellation with `scancel` without waiting for a state change.
+
+        Args:
+            job_id (`int`): Slurm job ID.
+
+        Raises:
+            `RuntimeError`: If the remote cancellation command fails.
+            `TimeoutError`: If the SSH command exceeds 60 seconds.
+        """
         job_id = int(job_id)
         self._run_remote(f"scancel {job_id}")
 
     def stage_payload(self, payload: bytes) -> str:
+        """
+        Uploads a payload as `input.pkl` in a new remote execution directory.
+
+        Args:
+            payload (`bytes`): Serialized function and arguments.
+
+        Returns:
+            `str`: Remote directory under `work_root`, named with a random UUID.
+
+        Raises:
+            `ValueError`: If `work_root` is missing or is not an absolute path.
+            `RuntimeError`: If the upload fails.
+            `subprocess.TimeoutExpired`: If the upload exceeds 60 seconds.
+        """
         if not self.config.work_root:
             raise ValueError("Slurm work_root is not configured")
         
@@ -170,6 +268,26 @@ class SlurmBackend:
         *,
         environment_id: str | None = None,
     ) -> tuple[int, str]:
+        """
+        Stages a serialized call and submits the deployed worker batch script.
+
+        Args:
+            payload (`bytes`): Serialized function and arguments.
+            gpu (`int`, *optional*, defaults to `1`): GPU count passed to
+                [`backends.slurm.SlurmBackend.submit`].
+            environment_id (`str`, *optional*): Prepared environment's 64-character
+                lowercase hexadecimal ID. Omitting it selects the Nest runtime.
+
+        Returns:
+            `tuple[int, str]`: Submitted job ID and remote execution directory.
+
+        Raises:
+            `ValueError`: If required working paths are missing or invalid, the
+                environment ID is invalid, or the GPU count is negative.
+            `RuntimeError`: If payload staging or submission fails.
+            `TimeoutError`: If the submission SSH command exceeds 60 seconds.
+            `subprocess.TimeoutExpired`: If payload upload exceeds 60 seconds.
+        """
         if not self.config.worker_workdir:
             raise ValueError("worker_workdir is not configured")
         
@@ -207,6 +325,26 @@ class SlurmBackend:
         timeout: int = 600,
         poll_interval: int = 5,
     ) -> bytes:
+        """
+        Waits for a job to complete and downloads its serialized result over SSH.
+
+        Args:
+            job_id (`int`): Slurm job ID to poll.
+            job_dir (`str`): Remote execution directory containing `output.pkl`.
+            timeout (`int`, *optional*, defaults to `600`): Seconds allowed for polling.
+                Remote queries and the final download can extend the total duration.
+            poll_interval (`int`, *optional*, defaults to `5`): Seconds between queries.
+
+        Returns:
+            `bytes`: Nonempty contents of the completed job's `output.pkl`.
+
+        Raises:
+            `RuntimeError`: If the job enters a failure state, a remote command fails,
+                or the result file is empty.
+            `TimeoutError`: If polling reaches its deadline or a status query times out.
+                The job is not cancelled and may still be running.
+            `subprocess.TimeoutExpired`: If the download exceeds 60 seconds.
+        """
         deadline = time.monotonic() + timeout
         
         failed_states = (
@@ -266,6 +404,23 @@ class SlurmBackend:
         return result.stdout
 
     def stage_environment_files(self, project_dir: str) -> str:
+        """
+        Reads a local project's environment files and stages them on the cluster.
+
+        Args:
+            project_dir (`str`): Local directory containing `pyproject.toml` and `uv.lock`.
+
+        Returns:
+            `str`: Remote directory returned by
+                [`backends.slurm.SlurmBackend.stage_environment_bytes`].
+
+        Raises:
+            `OSError`: If either local environment file cannot be read.
+            `ValueError`: If environment files are empty or `worker_workdir` is missing.
+            `RuntimeError`: If staging or remote hash verification fails.
+            `TimeoutError`: If a remote text command exceeds 60 seconds.
+            `subprocess.TimeoutExpired`: If a file upload exceeds 60 seconds.
+        """
         project = Path(project_dir)
         
         return self.stage_environment_bytes(
@@ -279,6 +434,28 @@ class SlurmBackend:
         pyproject_toml: bytes,
         uv_lock: bytes,
     ) -> str:
+        """
+        Caches environment files in a remote directory identified by their contents.
+
+        Hashes each file's name, byte length, and contents to identify the environment.
+        Reuses files when their remote SHA-256 hashes match. Otherwise, uploads each
+        file through a temporary path and verifies both hashes after replacement.
+        This stages dependency files without building a Python environment.
+
+        Args:
+            pyproject_toml (`bytes`): Contents of the project's `pyproject.toml`.
+            uv_lock (`bytes`): Contents of the project's `uv.lock`.
+
+        Returns:
+            `str`: Directory under `worker_workdir/environments` named with the
+                environment's SHA-256 ID.
+
+        Raises:
+            `ValueError`: If `worker_workdir` is missing or either file is empty.
+            `RuntimeError`: If a remote command, upload, or hash verification fails.
+            `TimeoutError`: If a remote text command exceeds 60 seconds.
+            `subprocess.TimeoutExpired`: If a file upload exceeds 60 seconds.
+        """
         if not self.config.worker_workdir:
             raise ValueError("worker_workdir is not configured")
         
@@ -318,6 +495,17 @@ class SlurmBackend:
         
         # Check remote cache
         def remote_hashes() -> list[str]:
+            """
+            Reads remote checksums for the two cached environment files.
+
+            Returns:
+                `list[str]`: SHA-256 checksums in `names` order, or an empty list if
+                    either remote file is absent.
+
+            Raises:
+                `RuntimeError`: If the remote checksum command fails.
+                `TimeoutError`: If the SSH command exceeds 60 seconds.
+            """
             quoted = [
                 shlex.quote(paths[name])
                 for name in names
@@ -389,6 +577,24 @@ class SlurmBackend:
         return env_dir
 
     def build_environment(self, env_dir: str, gpu: int = 1) -> int:
+        """
+        Submits the environment build script for a staged environment directory.
+
+        Args:
+            env_dir (`str`): Directory under `worker_workdir/environments` whose name
+                is a 64-character lowercase hexadecimal environment ID.
+            gpu (`int`, *optional*, defaults to `1`): GPU count passed to
+                [`backends.slurm.SlurmBackend.submit`].
+
+        Returns:
+            `int`: Environment build job ID. Does not wait for completion.
+
+        Raises:
+            `ValueError`: If `worker_workdir` is missing, the directory or its ID is
+                invalid, or the GPU count is negative.
+            `RuntimeError`: If submission fails or returns an invalid job ID.
+            `TimeoutError`: If the SSH command exceeds 60 seconds.
+        """
         if not self.config.worker_workdir:
             raise ValueError("worker_workdir is not configured")
         
@@ -414,6 +620,22 @@ class SlurmBackend:
         )
         
     def wait_environment(self, job_id: int, timeout: int = 1800, poll_interval: int = 5) -> None:
+        """
+        Polls an environment build job until it completes or fails.
+
+        Args:
+            job_id (`int`): Environment build job ID.
+            timeout (`int`, *optional*, defaults to `1800`): Positive polling deadline
+                in seconds. Remote queries can extend the total duration.
+            poll_interval (`int`, *optional*, defaults to `5`): Positive interval
+                between status queries, in seconds.
+
+        Raises:
+            `ValueError`: If `timeout` or `poll_interval` is not positive.
+            `RuntimeError`: If the build enters a failure state or a status query fails.
+            `TimeoutError`: If polling reaches its deadline or a status query times out.
+                The build job is not cancelled.
+        """
         if timeout <= 0 or poll_interval <= 0:
             raise ValueError("Timeout and poll interval must be positive")
         
@@ -451,6 +673,17 @@ class SlurmBackend:
             time.sleep(poll_interval)
 
     def runtime_id(self) -> str:
+        """
+        Hashes the remote container image checksum and host architecture.
+
+        Returns:
+            `str`: SHA-256 runtime ID for `images/uv-python312.sif` and `uname -m`.
+
+        Raises:
+            `ValueError`: If `worker_workdir` is missing.
+            `RuntimeError`: If the remote runtime identity command fails.
+            `TimeoutError`: If the SSH command exceeds 60 seconds.
+        """
         if not self.config.worker_workdir:
             raise ValueError("worker_workdir is not configured")
         
@@ -472,6 +705,23 @@ class SlurmBackend:
         return self._run_remote(command)
 
     def environment_ready(self, env_dir: str) -> bool:
+        """
+        Checks the readiness marker and Python path for the current runtime.
+
+        Args:
+            env_dir (`str`): Staged environment directory under
+                `worker_workdir/environments`, named with its 64-character hash.
+
+        Returns:
+            `bool`: Whether `.ready` exists and `.venv/bin/python` is a file or symlink
+                under the environment's current runtime directory. A symlink can
+                resolve only inside the container.
+
+        Raises:
+            `ValueError`: If `worker_workdir` is missing or the directory or ID is invalid.
+            `RuntimeError`: If a remote runtime or readiness command fails.
+            `TimeoutError`: If an SSH command exceeds 60 seconds.
+        """
         if not self.config.worker_workdir:
             raise ValueError("worker_workdir is not configured")
 
@@ -505,6 +755,24 @@ class SlurmBackend:
         return self._run_remote(command) == "ready"
         
     def prepare_environment(self, project_dir: str, gpu: int = 1) -> str:
+        """
+        Stages a local project's dependency files and prepares its cached runtime.
+
+        Args:
+            project_dir (`str`): Local directory containing `pyproject.toml` and `uv.lock`.
+            gpu (`int`, *optional*, defaults to `1`): GPU count for a required build job.
+
+        Returns:
+            `str`: Remote environment directory after its runtime is ready.
+
+        Raises:
+            `OSError`: If either local environment file cannot be read.
+            `ValueError`: If configuration or environment files are invalid, or a
+                required build receives a negative GPU count.
+            `RuntimeError`: If staging, building, or readiness verification fails.
+            `TimeoutError`: If a remote text command or the build wait times out.
+            `subprocess.TimeoutExpired`: If an environment file upload exceeds 60 seconds.
+        """
         project = Path(project_dir)
         
         return self.prepare_environment_bytes(
@@ -520,6 +788,29 @@ class SlurmBackend:
         uv_lock: bytes,
         gpu: int = 1,
     ) -> str:
+        """
+        Stages dependency files and reuses or builds their runtime environment.
+
+        Skips submission when the current runtime is ready. Otherwise, submits a
+        build, waits with [`backends.slurm.SlurmBackend.wait_environment`], and checks
+        readiness again before returning.
+
+        Args:
+            pyproject_toml (`bytes`): Contents of the project's `pyproject.toml`.
+            uv_lock (`bytes`): Contents of the project's `uv.lock`.
+            gpu (`int`, *optional*, defaults to `1`): GPU count for a required build job.
+
+        Returns:
+            `str`: Remote environment directory after its runtime is ready.
+
+        Raises:
+            `ValueError`: If configuration or files are invalid, or a required build
+                receives a negative GPU count.
+            `RuntimeError`: If staging or building fails, or a completed build does
+                not leave a ready runtime.
+            `TimeoutError`: If a remote text command or the build wait times out.
+            `subprocess.TimeoutExpired`: If an environment file upload exceeds 60 seconds.
+        """
         env_dir = self.stage_environment_bytes(
             pyproject_toml=pyproject_toml,
             uv_lock=uv_lock,

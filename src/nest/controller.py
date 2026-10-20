@@ -8,10 +8,36 @@ from .proto import execution_pb2, execution_pb2_grpc
 from .backends.slurm import SlurmBackend, SlurmConfig
 
 class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
+    """Handles execution requests and Slurm job operations for the controller."""
     def __init__(self, slurm_backend=None):
+        """
+        Stores the optional Slurm backend used by the RPC handlers.
+
+        Args:
+            slurm_backend ([`backends.slurm.SlurmBackend`], *optional*): Backend for
+                Slurm execution and job operations. Local execution needs no backend.
+        """
         self.slurm_backend = slurm_backend
         
     def Execute(self, request, context):
+        """
+        Executes a serialized call locally or through the configured Slurm backend.
+
+        Selects Slurm only when `NEST_EXECUTOR` is `slurm`; all other values use a
+        local subprocess. Slurm execution prepares any supplied environment before
+        submitting the worker and waits up to 600 seconds for its result. The request's
+        CPU count is not passed to the Slurm backend.
+
+        Args:
+            request (`execution_pb2.ExecuteRequest`): Serialized call, resource counts,
+                and optional environment files.
+            context (`grpc.ServicerContext`): RPC context used to abort with
+                `INVALID_ARGUMENT` for empty environment files, `FAILED_PRECONDITION`
+                for an absent Slurm backend, or `INTERNAL` for handled Slurm failures.
+
+        Returns:
+            `execution_pb2.ExecuteResponse`: Serialized return value or worker error record.
+        """
         if request.HasField("environment"):
             env = request.environment
             
@@ -86,6 +112,18 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
         return execution_pb2.ExecuteResponse(result=cloudpickle.dumps(result))
     
     def GetJobStatus(self, request, context):
+        """
+        Returns the current or recorded Slurm state of a job.
+
+        Args:
+            request (`execution_pb2.JobStatusRequest`): Job operation parameters.
+            context (`grpc.ServicerContext`): RPC context for reporting failures.
+                Uses `FAILED_PRECONDITION` when the backend is absent and `INTERNAL`
+                when a backend status query fails.
+
+        Returns:
+            `execution_pb2.JobStatusResponse`: The job operation response.
+        """
         if self.slurm_backend is None:
             context.abort(
                 grpc.StatusCode.FAILED_PRECONDITION,
@@ -103,6 +141,18 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
         return execution_pb2.JobStatusResponse(state=state)
     
     def SubmitJob(self, request, context):
+        """
+        Submits a batch script through the Slurm backend.
+
+        Args:
+            request (`execution_pb2.SubmitJobRequest`): Job operation parameters.
+            context (`grpc.ServicerContext`): RPC context for reporting failures.
+                Uses `INVALID_ARGUMENT` for a negative GPU count and
+                `FAILED_PRECONDITION` for an absent backend or a submission runtime error.
+
+        Returns:
+            `execution_pb2.SubmitJobResponse`: The job operation response.
+        """
         if self.slurm_backend is None:
             context.abort(
                 grpc.StatusCode.FAILED_PRECONDITION,
@@ -133,6 +183,18 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
         return execution_pb2.SubmitJobResponse(job_id=job_id)
     
     def CancelJob(self, request, context):
+        """
+        Requests cancellation of a Slurm job.
+
+        Args:
+            request (`execution_pb2.CancelJobRequest`): Job operation parameters.
+            context (`grpc.ServicerContext`): RPC context for reporting failures.
+                Uses `INVALID_ARGUMENT` for a nonpositive job ID and
+                `FAILED_PRECONDITION` for an absent backend or a cancellation runtime error.
+
+        Returns:
+            `execution_pb2.CancelJobResponse`: The job operation response.
+        """
         if self.slurm_backend is None:
             context.abort(
                 grpc.StatusCode.FAILED_PRECONDITION,
@@ -156,6 +218,15 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
         return execution_pb2.CancelJobResponse()
     
 def main():
+    """
+    Starts the controller and waits until it stops.
+
+    Binds to `NEST_CONTROLLER_BIND`, which defaults to `127.0.0.1:50051`, with
+    four RPC worker threads and port reuse disabled. Configures a Slurm backend
+    when both `NEST_SLURM_HOST` and `NEST_SLURM_ACCOUNT` are nonempty. Uses
+    `NEST_SLURM_WORKDIR` for worker files and its `jobs` subdirectory for payloads.
+    Stops the server immediately if waiting for termination raises an exception.
+    """
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=4),
         options=[

@@ -4,6 +4,13 @@ import grpc
 from nest.proto import execution_pb2, execution_pb2_grpc
 
 def main():
+    """
+    Submits, queries, and requests cancellation of a Slurm job over gRPC.
+
+    Uses `NEST_CONTROLLER_ADDRESS`, defaulting to `127.0.0.1:50051`, and
+    reads the remote work directory from `NEST_SLURM_WORKDIR`. Requests
+    cancellation in a `finally` block after querying the submitted job.
+    """
     address = os.getenv(
         "NEST_CONTROLLER_ADDRESS",
         "127.0.0.1:50051",

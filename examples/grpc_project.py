@@ -2,6 +2,15 @@ import nest
 
 @nest.remote(gpu=1, project="examples/uv_demo")
 def compute():
+    """
+    Formats a number with a project dependency and reports the Python prefix.
+
+    Returns:
+        `dict`: Formatted number in `result` and `sys.prefix` in `python_prefix`.
+
+    Raises:
+        ImportError: If the executing environment does not provide `humanize`.
+    """
     import sys
     import humanize
     return {

@@ -4,6 +4,12 @@ from pathlib import Path
 from nest.backends.slurm import SlurmBackend, SlurmConfig
 
 def main():
+    """
+    Prepares the demo environment through the file and byte APIs.
+
+    Reads `NEST_SLURM_HOST`, `NEST_SLURM_ACCOUNT`, and `NEST_SLURM_WORKDIR`.
+    Asserts that both APIs return the same directory for `examples/uv_demo`.
+    """
     workdir = os.environ["NEST_SLURM_WORKDIR"]
     
     backend = SlurmBackend(

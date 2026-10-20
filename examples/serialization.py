@@ -8,9 +8,23 @@ import nest
 
 @nest.remote(gpu=1, cpu=4)
 def compute(x):
+    """
+    Returns twice the input value.
+
+    Args:
+        x (`int`): Value to double in this example.
+
+    Returns:
+        `int`: Twice `x`.
+    """
     return x * 2
 
 def main():
+    """
+    Serializes a call, runs the Nest worker, and prints its decoded result.
+
+    Uses temporary input and output files and the current Python interpreter.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         input_path = Path(tmpdir) / "input.pkl"
         output_path = Path(tmpdir) / "output.pkl"
