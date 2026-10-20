@@ -190,9 +190,6 @@ class SlurmBackend:
             self.config.worker_workdir,
         )
         
-        if environment_id is not None:
-            script_args += (environment_id,)
-        
         # Submit Slurm job
         job_id = self.submit(
             workdir=self.config.worker_workdir,
