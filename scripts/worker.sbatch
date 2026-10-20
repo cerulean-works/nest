@@ -9,8 +9,6 @@
 
 set -euo pipefail
 
-BASE="$HOME/nest-smoke"
-
 # Receive unique execution ID
 JOB_ID="${1:?Missing execution ID}"
 
@@ -36,6 +34,20 @@ if [[ -n "$ENV_ID" ]]; then
     echo "Environment ID: [$ENV_ID]"
 else
     echo "Environment ID: none"
+fi
+
+# Receive work directory from Controller
+BASE="${3:?Missing Nest work directory}"
+
+# Validate work directory
+if [[ "$BASE" != /* ]]; then
+    echo "Nest work directory must be an absolute path: $BASE"
+    exit 1
+fi
+
+if [[ ! -d "$BASE" ]]; then
+    echo "Nest work directory does not exist: $BASE"
+    exit 1
 fi
 
 # Resolve user Python environment

@@ -11,13 +11,23 @@
 set -euo pipefail
 
 ENV_ID="${1:?Missing environment ID}"
+BASE="${2:?Missing Nest work directory}"
 
 if [[ ! "$ENV_ID" =~ ^[0-9a-f]{64}$ ]]; then
     echo "Invalid environment ID"
     exit 1
 fi
 
-BASE="$HOME/nest-smoke"
+if [[ "$BASE" != /* ]]; then
+    echo "Nest work directory must be an absolute path: $BASE"
+    exit 1
+fi
+
+if [[ ! -d "$BASE" ]]; then
+    echo "Nest work directory does not exist: $BASE"
+    exit 1
+fi
+
 IMAGE="$BASE/images/uv-python312.sif"
 ENV_DIR="$BASE/environments/$ENV_ID"
 

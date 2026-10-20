@@ -184,7 +184,11 @@ class SlurmBackend:
         execution_id = job_dir.rsplit("/", 1)[-1]
         
         # Prepare script arguments
-        script_args = (execution_id,)
+        script_args = (
+            execution_id,
+            environment_id or "",
+            self.config.worker_workdir,
+        )
         
         if environment_id is not None:
             script_args += (environment_id,)
@@ -409,7 +413,7 @@ class SlurmBackend:
             workdir=self.config.worker_workdir,
             script="project/scripts/environment-smoke.sbatch",
             gpu=gpu,
-            script_args=(env_id,),
+            script_args=(env_id,self.config.worker_workdir),
         )
         
     def wait_environment(self, job_id: int, timeout: int = 1800, poll_interval: int = 5) -> None:

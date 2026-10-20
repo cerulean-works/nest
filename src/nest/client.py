@@ -36,15 +36,28 @@ def execute_remote(
             )
         )
     
-    address = os.getenv(
-        "NEST_CONTROLLER_ADDRESS",
-        "127.0.0.1:50051",
-    )
+    DEFAULT_CONTROLLER_ADDRESS = "services.tail8e5ba1.ts.net:50051"
+    
+    address = os.getenv("NEST_CONTROLLER_ADDRESS") or DEFAULT_CONTROLLER_ADDRESS
     
     # Connect to Controller
-    with grpc.insecure_channel(address) as channel:
-        stub = execution_pb2_grpc.ExecutionServiceStub(channel)
-        response = stub.Execute(request, timeout=900)
+    try:        
+        with grpc.insecure_channel(address) as channel:
+            stub = execution_pb2_grpc.ExecutionServiceStub(channel)
+            response = stub.Execute(request, timeout=900)
+    
+    except grpc.RpcError as exc:
+        if exc.code() == grpc.StatusCode.UNAVAILABLE:
+            raise ConnectionError(
+                f"Cannot connect to Nest Controller at {address}.\n\n"
+                "Please check:\n"
+                "  - Tailscale is connected to the required Tailnet.\n"
+                "  - You have permission to access the Controller.\n"
+                "  - The Controller is running.\n\n"
+                "To use another Controller, set NEST_CONTROLLER_ADDRESS."
+            ) from exc
+        
+        raise
 
     # Deserialze result or raise a remote exception
     return _decode_remote_result(response.result)

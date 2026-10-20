@@ -9,7 +9,14 @@
 
 set -euo pipefail
 
-IMAGE="$HOME/nest-smoke/images/uv-python312.sif"
+BASE="${1:?Missing Nest work directory}"
+
+if [[ "$BASE" != /* ]]; then
+    echo "Nest work directory must be an absolute path: $BASE"
+    exit 1
+fi
+
+IMAGE="$BASE/images/uv-python312.sif"
 
 echo "=== Host ==="
 hostname
