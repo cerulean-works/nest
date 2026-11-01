@@ -1,5 +1,50 @@
+# Complete workflows in Guide; API contracts and settings in Reference.
+# Every Markdown page must appear exactly once, without its file extension.
 guide:
   - title: Get started
     sections:
       - local: index
-        title: Introduction
+        title: Nest
+      - local: installation
+        title: Install Nest
+      - local: quickstart
+        title: Run your first remote function
+  - title: Run functions
+    sections:
+      - local: project-dependencies
+        title: Use project dependencies
+      - local: remote-errors
+        title: Handle remote errors
+  - title: Hosting
+    sections:
+      - local: deploy
+        title: Deploy a Slurm Controller
+      - local: local-controller
+        title: Run a local Controller
+  - title: Contributing
+    sections:
+      - local: developing
+        title: Develop Nest and its docs
+reference:
+  - title: Python SDK
+    sections:
+      - local: api/remote
+        title: Remote functions and resources
+      - local: api/client
+        title: Client execution
+      - local: api/errors
+        title: RemoteExecutionError
+  - title: Controller and runtime
+    sections:
+      - local: api/controller
+        title: Execution service and RPCs
+      - local: api/slurm
+        title: Slurm backend
+      - local: api/runtime
+        title: Executor and workers
+  - title: Operations
+    sections:
+      - local: configuration
+        title: Environment variables and defaults
+      - local: security
+        title: Security and limitations

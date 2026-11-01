@@ -19,7 +19,6 @@ jobs:
       contents: read
     with:
       project: nest
-      not_python_module: true
 
   publish:
     needs: build
