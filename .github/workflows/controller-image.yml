@@ -1,0 +1,32 @@
+name: Controller container
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: controller-container-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build the Controller image with Compose
+        env:
+          NEST_CONTROLLER_IMAGE: nest-controller:test
+        run: docker compose build --pull controller
+      - name: Test Controller RPCs and shutdown
+        run: |
+          docker run --rm --volume "$PWD/tests:/tests:ro" \
+            --entrypoint python nest-controller:test \
+            -m unittest discover -s /tests -v
+      - name: Test Compose deployment and SSH credentials
+        run: bash tests/smoke_compose.sh

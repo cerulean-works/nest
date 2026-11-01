@@ -13,6 +13,23 @@ uv run python examples/hello.py
 uv run python examples/serialization.py
 ```
 
+Run the Controller integration tests:
+
+```bash
+uv run python -m unittest discover -s tests -v
+```
+
+To build and test the Compose deployment, with Docker Engine running:
+
+```bash
+docker build -t nest-controller:test .
+bash tests/smoke_compose.sh
+```
+
+The smoke test uses local execution and temporary SSH fixtures. It checks the
+health check, non-root execution, credential copying, remote calls and errors,
+and clean container shutdown. It does not submit real Slurm jobs.
+
 ## Regenerate Protobuf Code
 
 ```bash

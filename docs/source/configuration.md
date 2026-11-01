@@ -24,6 +24,24 @@ The Controller creates its backend with partition `dev` and a Slurm time limit o
 overrides. Direct backend users can set [`backends.slurm.SlurmConfig`]. Review
 the deployed batch scripts for CPU, memory, and cluster-specific settings.
 
+Slurm execution requires nonempty host, account, and work-directory values.
+The Controller rejects missing settings and a nonabsolute work directory before
+starting the listener.
+
+## Docker Compose
+
+The Compose deployment sets the container listener to `0.0.0.0:50051` and defaults
+to Slurm mode. These additional variables configure Compose itself:
+
+| Variable | Default | Behavior |
+| --- | --- | --- |
+| `NEST_CONTROLLER_IMAGE` | `nest-controller:local` | Local tag assigned to the image built from this checkout. |
+| `NEST_CONTROLLER_HOST_IP` | `127.0.0.1` | Host interface for the published gRPC port. Use the host's Tailscale IPv4 address for Tailnet clients. |
+| `NEST_CONTROLLER_PORT` | `50051` | Published host port; the container always listens on port 50051. |
+| `NEST_SSH_DIR` | `./ssh` | Existing host directory containing the deployment's SSH configuration, key, and verified host keys. |
+
+See [Deploy with Docker Compose](docker-compose) for setup and operating commands.
+
 ## Deadlines and resources
 
 | Operation | Current value | Notes |

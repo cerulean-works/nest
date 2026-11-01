@@ -18,7 +18,8 @@ before version 1.0.0.
 ## Host a Controller
 
 Hosts manage the Controller, SSH connection, Slurm scripts, and Apptainer runtime.
-See [Deploy a Slurm Controller](deploy), or [Run a local Controller](local-controller)
+Start with [Deploy with Docker Compose](docker-compose) for the Controller service.
+See [Deploy a Slurm Controller](deploy) for the HPC runtime, or [Run a local Controller](local-controller)
 to develop without an HPC cluster.
 
 ## Reference

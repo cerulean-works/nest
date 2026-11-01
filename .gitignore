@@ -8,3 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Controller deployment configuration and credentials
+.env
+.env.*
+!.env.example
+ssh/

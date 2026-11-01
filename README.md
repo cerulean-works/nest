@@ -133,6 +133,19 @@ The original exception type, message, and remote traceback are preserved.
 
 This section is intended for hosts who operate a Nest Controller.
 
+### Docker Compose
+
+Clone this repository and deploy the Controller using [compose.yaml](compose.yaml).
+Follow [Deploy with Docker Compose](docs/source/docker-compose.md) to configure
+the Slurm connection, SSH credentials, and host address, then start the service:
+
+```bash
+docker compose up -d --build --wait
+```
+
+Docker handles the Controller's Python environment, health checks, logs, and
+restart policy. The HPC runtime and work directory below must already exist.
+
 ### Requirements
 
 - Python 3.12+
