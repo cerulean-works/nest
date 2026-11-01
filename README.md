@@ -8,6 +8,8 @@
 
 Nest is a Python SDK for executing Python functions on remote Slurm clusters.
 
+**Documentation:** [Guides and API reference](https://docs.cerulean.works/nest/main/guide/)
+
 ## Early Access
 
 Nest is currently in Early Access (`0.1.0a1`).
