@@ -3,6 +3,18 @@ import traceback
 from pathlib import Path
 
 def main():
+    """
+    Runs a serialized call inside the user's Python environment.
+
+    Reads input and output paths from `sys.argv`. Loads cloudpickle from the
+    `.nest-bootstrap` directory beside the input file. Writes the return value
+    or a remote error record to the output file.
+
+    Raises:
+        `ValueError`: If the command line does not contain exactly two arguments.
+        `ImportError`: If the bootstrapped cloudpickle package cannot be imported.
+        `OSError`: If the output file cannot be written.
+    """
     if len(sys.argv) != 3:
         raise ValueError("Usage: user_runner.py <input_path> <output_path>")
     

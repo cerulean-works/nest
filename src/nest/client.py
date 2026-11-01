@@ -14,6 +14,31 @@ def execute_remote(
     *args: Any,
     **kwargs: Any
 ) -> Any:
+    """
+    Serializes a function call and executes it through the controller.
+
+    Uses `NEST_CONTROLLER_ADDRESS` when it is nonempty. Otherwise, connects to
+    `services.tail8e5ba1.ts.net:50051`. The insecure gRPC call has a 900-second
+    deadline. Only send trusted functions and accept results from trusted hosts:
+    deserializing Python objects can execute code.
+
+    Args:
+        func (`Callable`): Function to serialize with cloudpickle.
+        resources (`Any`): Object with `gpu` and `cpu` resource counts.
+        project (`Path | None`): Directory whose `pyproject.toml` and `uv.lock`
+            are sent with the request. `None` omits environment files.
+        *args (`Any`): Positional arguments for the function.
+        **kwargs (`Any`): Keyword arguments for the function.
+
+    Returns:
+        `Any`: The decoded worker result.
+
+    Raises:
+        `OSError`: If project environment files cannot be read.
+        `ConnectionError`: If gRPC reports that the controller is unavailable.
+        `grpc.RpcError`: If another RPC error occurs.
+        [`errors.RemoteExecutionError`]: If the result contains a remote error record.
+    """
     # Serialize function and arguments
     payload = cloudpickle.dumps(
         (func, args, kwargs)
@@ -63,6 +88,19 @@ def execute_remote(
     return _decode_remote_result(response.result)
 
 def _decode_remote_result(data: bytes) -> Any:
+    """
+    Deserializes a trusted worker result and recognizes remote error records.
+
+    Args:
+        data (`bytes`): Cloudpickle-serialized return value or error record.
+
+    Returns:
+        `Any`: The deserialized value when it is not a complete error record.
+
+    Raises:
+        [`errors.RemoteExecutionError`]: If the value has the remote error marker and
+            string values for its type, message, and traceback.
+    """
     result = cloudpickle.loads(data)
     
     if (

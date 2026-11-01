@@ -3,6 +3,13 @@ import os
 from nest.backends.slurm import SlurmBackend, SlurmConfig
 
 def main():
+    """
+    Submits a Slurm job and prints its state before and after requesting cancellation.
+
+    Reads the SSH host, account, and work directory from `NEST_SLURM_HOST`,
+    `NEST_SLURM_ACCOUNT`, and `NEST_SLURM_WORKDIR`. Requests cancellation in a
+    `finally` block after the initial status query.
+    """
     backend = SlurmBackend(
         SlurmConfig(
             ssh_host=os.environ["NEST_SLURM_HOST"],

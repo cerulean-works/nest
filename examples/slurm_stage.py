@@ -5,9 +5,24 @@ import cloudpickle
 from nest.backends.slurm import SlurmBackend, SlurmConfig
 
 def compute(x):
+    """
+    Returns twice the input value.
+
+    Args:
+        x (`int`): Value to double in this example.
+
+    Returns:
+        `int`: Twice `x`.
+    """
     return x * 2
 
 def main():
+    """
+    Uploads a serialized call and prints its directory and payload checksum.
+
+    Reads `NEST_SLURM_HOST`, `NEST_SLURM_ACCOUNT`, and `NEST_SLURM_WORKDIR`.
+    Stages the payload without submitting a worker job.
+    """
     backend = SlurmBackend(
         SlurmConfig(
             ssh_host=os.environ["NEST_SLURM_HOST"],

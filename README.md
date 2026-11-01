@@ -39,6 +39,7 @@ import nest
 
 @nest.remote(gpu=1)
 def compute(x):
+    """Returns twice the input value."""
     return x * 2
 
 print(compute.local(21))   # 42
@@ -90,6 +91,7 @@ import nest
 
 @nest.remote(gpu=1, project=".")
 def compute():
+    """Formats a number with the project's humanize dependency."""
     import humanize
     return humanize.intcomma(1234567)
 
@@ -112,6 +114,7 @@ from nest.errors import RemoteExecutionError
 
 @nest.remote(gpu=1)
 def compute():
+    """Raises an error to demonstrate remote exception handling."""
     raise ValueError("Something went wrong")
 
 try:

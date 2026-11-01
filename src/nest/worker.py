@@ -8,6 +8,21 @@ import cloudpickle
 from pathlib import Path
 
 def main():
+    """
+    Executes a serialized call from the worker's command-line paths.
+
+    Reads `input_path` and `output_path` from `sys.argv`, followed by an optional
+    `user_python` executable. With a user interpreter, copies cloudpickle beside
+    the input and runs `user_runner.py` in isolated mode. Otherwise, executes the
+    call in this process. Writes the return value or a remote error record to the
+    output file with cloudpickle.
+
+    Raises:
+        `ValueError`: If the command line does not contain two or three arguments.
+        `subprocess.CalledProcessError`: If the user interpreter exits unsuccessfully.
+        `RuntimeError`: If the user process does not produce a nonempty result file.
+        `OSError`: If bootstrap files or the result file cannot be written.
+    """
     if len(sys.argv) not in (3, 4):
         raise ValueError(
             "Usage: python -m nest.worker "

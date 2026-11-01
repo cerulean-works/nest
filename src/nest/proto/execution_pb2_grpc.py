@@ -26,7 +26,8 @@ if _version_not_supported:
 
 
 class ExecutionServiceStub:
-    """Missing associated documentation comment in .proto file."""
+    """Executes trusted Python calls and manages Slurm jobs through the controller.
+    """
 
     def __init__(self, channel):
         """Constructor.
@@ -57,28 +58,33 @@ class ExecutionServiceStub:
 
 
 class ExecutionServiceServicer:
-    """Missing associated documentation comment in .proto file."""
+    """Executes trusted Python calls and manages Slurm jobs through the controller.
+    """
 
     def Execute(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Executes a serialized Python call and returns its serialized result.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def GetJobStatus(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Returns a Slurm job state from the queue or accounting history.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def SubmitJob(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Submits a batch script and returns its Slurm job ID.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def CancelJob(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Requests cancellation of a Slurm job without waiting for it to stop.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -115,7 +121,8 @@ def add_ExecutionServiceServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class ExecutionService:
-    """Missing associated documentation comment in .proto file."""
+    """Executes trusted Python calls and manages Slurm jobs through the controller.
+    """
 
     @staticmethod
     def Execute(request,

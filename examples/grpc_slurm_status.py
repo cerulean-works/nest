@@ -4,6 +4,11 @@ import grpc
 from nest.proto import execution_pb2, execution_pb2_grpc
 
 def main():
+    """
+    Prints the state of the job ID supplied on the command line.
+
+    Queries the controller at `127.0.0.1:50051` through the job status RPC.
+    """
     job_id = int(sys.argv[1])
     
     with grpc.insecure_channel("127.0.0.1:50051") as channel:
