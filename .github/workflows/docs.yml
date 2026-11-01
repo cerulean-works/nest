@@ -1,0 +1,36 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: cerulean-works/doc-builder/.github/workflows/build_docs.yml@main
+    permissions:
+      contents: read
+    with:
+      project: nest
+      not_python_module: true
+
+  publish:
+    needs: build
+    uses: cerulean-works/doc-builder/.github/workflows/publish_docs.yml@main
+    permissions:
+      actions: read
+      pull-requests: write
+    with:
+      project: nest
+      environment: production
+    secrets:
+      r2_access_key_id: ${{ secrets.DOC_BUILDER_R2_ACCESS_KEY_ID }}
+      r2_secret_access_key: ${{ secrets.DOC_BUILDER_R2_SECRET_ACCESS_KEY }}
+      cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
