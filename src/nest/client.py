@@ -1,12 +1,28 @@
 import os
+from functools import wraps
+
 import grpc
 import cloudpickle
 from pathlib import Path
 from typing import Any, Callable
 
+from ._logging import current_request_id, get_logger, operation, request_context
 from .errors import RemoteExecutionError
 from .proto import execution_pb2, execution_pb2_grpc
 
+logger = get_logger(__name__)
+
+
+def _logged_execution(method):
+    @wraps(method)
+    def wrapper(*args, **kwargs):
+        with request_context():
+            with operation(logger, "Remote execution"):
+                return method(*args, **kwargs)
+    return wrapper
+
+
+@_logged_execution
 def execute_remote(
     func: Callable,
     resources: Any,
@@ -65,13 +81,22 @@ def execute_remote(
     
     address = os.getenv("NEST_CONTROLLER_ADDRESS") or DEFAULT_CONTROLLER_ADDRESS
     
+    logger.info(
+        "Calling controller address=%s gpu=%s cpu=%s payload_bytes=%s",
+        address, resources.gpu, resources.cpu, len(payload),
+    )
+
     # Connect to Controller
     try:        
         with grpc.insecure_channel(address) as channel:
             stub = execution_pb2_grpc.ExecutionServiceStub(channel)
-            response = stub.Execute(request, timeout=900)
+            response = stub.Execute(
+                request, timeout=900,
+                metadata=(("x-nest-request-id", current_request_id()),),
+            )
     
     except grpc.RpcError as exc:
+        logger.error("Controller RPC failed address=%s status=%s", address, exc.code().name)
         if exc.code() == grpc.StatusCode.UNAVAILABLE:
             raise ConnectionError(
                 f"Cannot connect to Nest Controller at {address}.\n\n"
@@ -83,6 +108,8 @@ def execute_remote(
             ) from exc
         
         raise
+
+    logger.debug("Result received result_bytes=%s", len(response.result))
 
     # Deserialze result or raise a remote exception
     return _decode_remote_result(response.result)
