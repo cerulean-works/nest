@@ -1,0 +1,34 @@
+name: nest
+
+services:
+  controller:
+    image: ${NEST_CONTROLLER_IMAGE:-nest-controller:local}
+    build: .
+    pull_policy: build
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 20s
+    environment:
+      NEST_CONTROLLER_BIND: 0.0.0.0:50051
+      NEST_EXECUTOR: ${NEST_EXECUTOR:-slurm}
+      NEST_SLURM_HOST: ${NEST_SLURM_HOST:-}
+      NEST_SLURM_ACCOUNT: ${NEST_SLURM_ACCOUNT:-}
+      NEST_SLURM_WORKDIR: ${NEST_SLURM_WORKDIR:-}
+    volumes:
+      - type: bind
+        source: ${NEST_SSH_DIR:-./ssh}
+        target: /run/nest-ssh
+        read_only: true
+        bind:
+          create_host_path: false
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /home/nest/.ssh:mode=0700
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
