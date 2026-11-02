@@ -1,4 +1,6 @@
 import re
+import os
+
 import uuid
 import time
 import shlex
@@ -6,6 +8,11 @@ import hashlib
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+from .._logging import current_request_id, get_logger, operation
+
+logger = get_logger(__name__)
+
 
 @dataclass(frozen=True)
 class SlurmConfig:
@@ -54,6 +61,8 @@ class SlurmBackend:
                 remains unknown.
             `RuntimeError`: If SSH exits with a nonzero status.
         """
+        started = time.monotonic()
+        logger.debug("SSH command started host=%s", self.config.ssh_host)
         try:
             result = subprocess.run(
                 [
@@ -79,8 +88,13 @@ class SlurmBackend:
                 f"{result.stderr.strip() or result.stdout.strip()}"
             )
         
+        logger.debug(
+            "SSH command completed host=%s elapsed_ms=%.1f",
+            self.config.ssh_host, (time.monotonic() - started) * 1000,
+        )
         return result.stdout.strip()
     
+    @operation(logger, "Slurm submit")
     def submit(
         self, 
         workdir: str,
@@ -154,6 +168,10 @@ class SlurmBackend:
         if not job_id.isdecimal():
             raise RuntimeError(f"Unexpected sbatch output: {output}")
         
+        logger.info(
+            "Slurm job submitted job_id=%s script=%s gpu=%s partition=%s",
+            job_id, script, gpu, partition or self.config.partition,
+        )
         return int(job_id)
     
     def status(self, job_id: int) -> str:
@@ -196,6 +214,7 @@ class SlurmBackend:
         
         return "UNKNOWN"
 
+    @operation(logger, "Slurm cancel")
     def cancel(self, job_id: int) -> None:
         """
         Requests job cancellation with `scancel` without waiting for a state change.
@@ -208,8 +227,10 @@ class SlurmBackend:
             `TimeoutError`: If the SSH command exceeds 60 seconds.
         """
         job_id = int(job_id)
+        logger.info("Cancelling Slurm job job_id=%s", job_id)
         self._run_remote(f"scancel {job_id}")
 
+    @operation(logger, "Slurm stage_payload")
     def stage_payload(self, payload: bytes) -> str:
         """
         Uploads a payload as `input.pkl` in a new remote execution directory.
@@ -235,6 +256,10 @@ class SlurmBackend:
         
         job_dir = f"{work_root.rstrip('/')}/{uuid.uuid4().hex}"
         input_path = f"{job_dir}/input.pkl"
+        logger.info(
+            "Staging payload host=%s job_dir=%s payload_bytes=%s",
+            self.config.ssh_host, job_dir, len(payload),
+        )
         
         command = (
             f"mkdir -p {shlex.quote(job_dir)} && "
@@ -306,6 +331,8 @@ class SlurmBackend:
             execution_id,
             environment_id or "",
             self.config.worker_workdir,
+            current_request_id(),
+            os.getenv("NEST_LOG_LEVEL", "INFO"),
         )
         
         # Submit Slurm job
@@ -316,8 +343,13 @@ class SlurmBackend:
             script_args=script_args,
         )
         
+        logger.info(
+            "Execution scheduled execution_id=%s job_id=%s environment_id=%s job_dir=%s",
+            execution_id, job_id, environment_id or "none", job_dir,
+        )
         return job_id, job_dir
 
+    @operation(logger, "Slurm wait_result")
     def wait_result(
         self,
         job_id: int,
@@ -346,6 +378,8 @@ class SlurmBackend:
             `subprocess.TimeoutExpired`: If the download exceeds 60 seconds.
         """
         deadline = time.monotonic() + timeout
+        previous_state = None
+        logger.info("Waiting for Slurm job job_id=%s timeout_s=%s", job_id, timeout)
         
         failed_states = (
             "FAILED",
@@ -361,6 +395,9 @@ class SlurmBackend:
         
         while True:
             state = self.status(job_id)
+            if state != previous_state:
+                logger.info("Slurm state changed job_id=%s state=%s", job_id, state)
+                previous_state = state
             
             if state == "COMPLETED":
                 break
@@ -380,6 +417,7 @@ class SlurmBackend:
             
         # Download binary result through SSH stdout
         output_path = f"{job_dir}/output.pkl"
+        logger.info("Downloading result job_id=%s job_dir=%s", job_id, job_dir)
         
         result = subprocess.run(
             [
@@ -401,6 +439,7 @@ class SlurmBackend:
         if not result.stdout:
             raise RuntimeError("Worker returned an empty result file")
         
+        logger.debug("Result downloaded job_id=%s result_bytes=%s", job_id, len(result.stdout))
         return result.stdout
 
     def stage_environment_files(self, project_dir: str) -> str:
@@ -428,6 +467,7 @@ class SlurmBackend:
             uv_lock=(project / "uv.lock").read_bytes(),
         )
         
+    @operation(logger, "Slurm stage_environment_bytes")
     def stage_environment_bytes(
         self,
         *,
@@ -525,10 +565,10 @@ class SlurmBackend:
             ]
         
         if remote_hashes() == expected:
-            print(f"Environment cache hit: {env_id}")
+            logger.info("Environment files cache hit environment_id=%s", env_id)
             return env_dir
 
-        print(f"Environment cache miss: {env_id}")
+        logger.info("Environment files cache miss environment_id=%s", env_id)
         
         self._run_remote(
             f"mkdir -p {shlex.quote(env_dir)}"
@@ -565,10 +605,10 @@ class SlurmBackend:
             
         actual = remote_hashes()
         if actual != expected:
-            print("Environment direcotry: ", env_dir)
-            print(self._run_remote(f"ls -al {shlex.quote(env_dir)}"))
-            print(f"Expected hashes: {expected}")
-            print(f"Actual hashes: {actual}")
+            logger.error(
+                "Environment verification failed environment_id=%s env_dir=%s expected_hashes=%s actual_hashes=%s",
+                env_id, env_dir, expected, actual,
+            )
             
             raise RuntimeError(
                 "Environment file verification failed"
@@ -619,6 +659,7 @@ class SlurmBackend:
             script_args=(env_id,self.config.worker_workdir),
         )
         
+    @operation(logger, "Slurm wait_environment")
     def wait_environment(self, job_id: int, timeout: int = 1800, poll_interval: int = 5) -> None:
         """
         Polls an environment build job until it completes or fails.
@@ -640,6 +681,8 @@ class SlurmBackend:
             raise ValueError("Timeout and poll interval must be positive")
         
         deadline = time.monotonic() + timeout
+        previous_state = None
+        logger.info("Waiting for Slurm job job_id=%s timeout_s=%s", job_id, timeout)
         
         failed_states = (
             "FAILED",
@@ -655,6 +698,9 @@ class SlurmBackend:
         
         while True:
             state = self.status(job_id)
+            if state != previous_state:
+                logger.info("Slurm state changed job_id=%s state=%s", job_id, state)
+                previous_state = state
             
             if state == "COMPLETED":
                 return
@@ -752,7 +798,12 @@ class SlurmBackend:
             "else printf missing; fi"
         )
         
-        return self._run_remote(command) == "ready"
+        ready = self._run_remote(command) == "ready"
+        logger.debug(
+            "Runtime readiness environment_id=%s runtime_id=%s ready=%s",
+            env_id, runtime_id, ready,
+        )
+        return ready
         
     def prepare_environment(self, project_dir: str, gpu: int = 1) -> str:
         """
@@ -781,6 +832,7 @@ class SlurmBackend:
             gpu=gpu,
         )
 
+    @operation(logger, "Slurm prepare_environment_bytes")
     def prepare_environment_bytes(
         self,
         *,
@@ -817,12 +869,12 @@ class SlurmBackend:
         )
         
         if self.environment_ready(env_dir):
-            print("Runtime cache hit, skipping Slurm job")
+            logger.info("Runtime cache hit environment_id=%s", Path(env_dir).name)
             return env_dir
         
-        print("Runtime cache miss, building environment")
+        logger.info("Runtime cache miss environment_id=%s", Path(env_dir).name)
         job_id = self.build_environment(env_dir, gpu=gpu)
-        print(f"Submitted environment job: {job_id}")
+        logger.info("Environment build submitted job_id=%s environment_id=%s", job_id, Path(env_dir).name)
         self.wait_environment(job_id)
         
         if not self.environment_ready(env_dir):

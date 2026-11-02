@@ -1,10 +1,17 @@
+import os
 import subprocess
+import time
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
 import cloudpickle
+
+from ._logging import current_request_id, get_logger
+
+logger = get_logger(__name__)
+
 
 def execute(func: Callable, *args: Any, **kwargs: Any) -> Any:
     """
@@ -35,17 +42,21 @@ def execute(func: Callable, *args: Any, **kwargs: Any) -> Any:
             cloudpickle.dump((func, args, kwargs), f)
             
         # Execute in another Python process
-        subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "nest.worker",
-                str(input_path),
-                str(output_path),
-            ],
-            check=True,
-        )
-        
+        started = time.monotonic()
+        logger.info("Local worker starting job_dir=%s", tmpdir)
+        env = os.environ.copy()
+        env["NEST_REQUEST_ID"] = current_request_id()
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "nest.worker", str(input_path), str(output_path)],
+                check=True,
+                env=env,
+            )
+        except Exception:
+            logger.exception("Local worker process failed job_dir=%s", tmpdir)
+            raise
+        logger.info("Local worker exited elapsed_ms=%.1f", (time.monotonic() - started) * 1000)
+
         # Deserialize resutl
         with open(output_path, "rb") as f:
             return cloudpickle.load(f)

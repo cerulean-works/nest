@@ -1,3 +1,4 @@
+import os
 import sys
 import traceback
 from pathlib import Path
@@ -26,7 +27,16 @@ def main():
     sys.path.insert(0, str(bootstrap_dir))
     
     import cloudpickle
-    
+    from nest_logging import configure_logging, get_logger, operation, request_context
+
+    configure_logging()
+    logger = get_logger("nest.user_runner")
+    with request_context(os.getenv("NEST_REQUEST_ID")):
+        with operation(logger, "User environment execution"):
+            _execute(input_path, output_path, cloudpickle, logger)
+
+
+def _execute(input_path, output_path, cloudpickle, logger):
     try:
         with input_path.open("rb") as f:
             func, args, kwargs = cloudpickle.load(f)
@@ -37,6 +47,7 @@ def main():
             cloudpickle.dump(result, f)
 
     except Exception as exc:
+        logger.exception("User function failed job_dir=%s", input_path.parent)
         error = {
             "__nest_remote_error_v1__": True,
             "type": (
