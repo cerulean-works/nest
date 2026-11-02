@@ -42,6 +42,19 @@ to Slurm mode. These additional variables configure Compose itself:
 
 See [Deploy with Docker Compose](docker-compose) for setup and operating commands.
 
+The optional `compose.tailscale.yaml` also accepts:
+
+| Variable | Default | Behavior |
+| --- | --- | --- |
+| `NEST_TAILSCALE_AUTHKEY_FILE` | `./secrets/tailscale-authkey` | Private host file containing an official Tailscale Auth Key; mounted only into the sidecar as a Compose Secret. Dokploy: `../files/tailscale/authkey`. |
+| `NEST_TAILSCALE_HOSTNAME` | `nest-controller` | Sidecar's name in your personal Tailnet. |
+| `NEST_TAILSCALE_IMAGE` | `tailscale/tailscale:v1.104.4` | Official sidecar image, pinned to a version; may be overridden with a reviewed version or digest. |
+
+The sidecar uses userspace SOCKS5 on `tailscale:1055`, a persistent state volume,
+and `tag:nest-controller`. Configure the SSH alias using the supplied template
+and restrict that tag to the Login Node's SSH port in your Tailnet policy.
+These settings do not affect the default Compose or local Python development.
+
 ## Deadlines and resources
 
 | Operation | Current value | Notes |

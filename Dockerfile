@@ -12,7 +12,7 @@ LABEL org.opencontainers.image.source="https://github.com/cerulean-works/nest"
 LABEL org.opencontainers.image.description="Nest gRPC Controller for Slurm clusters"
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates gosu openssh-client \
+    && apt-get install -y --no-install-recommends ca-certificates gosu netcat-openbsd openssh-client \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 10001 --create-home --shell /usr/sbin/nologin nest
 
