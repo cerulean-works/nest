@@ -270,3 +270,7 @@ uv run python -m grpc_tools.protoc \
     --grpc_python_out=src \
     src/nest/proto/execution.proto
 ```
+
+## License
+
+Nest is licensed under the [Apache License 2.0](LICENSE).
