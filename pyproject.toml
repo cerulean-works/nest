@@ -9,6 +9,7 @@ dependencies = [
     "grpcio>=1.84.0",
     "protobuf>=7.36.2",
     "pytest>=9.2.0",
+    "pytest-cov>=7.1.0",
 ]
 
 [build-system]
