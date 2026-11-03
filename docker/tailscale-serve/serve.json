@@ -1,0 +1,8 @@
+{
+  "TCP": {
+    "50051": {
+      "TCPForward": "controller:50051"
+    }
+  },
+  "AllowFunnel": {}
+}

@@ -12,6 +12,11 @@ For the current team deployment, restrict network access using Tailscale Grants 
 
 Do not expose the Controller directly to the public Internet.
 
+The [shared Tailscale deployment](tailscale-shared) exposes only TCP 50051 to
+accepted, policy-authorized recipients. All callers still submit work as the
+Controller's single HPC SSH user. Node Sharing and Grants restrict network
+reachability; they do not authenticate callers inside Nest or isolate jobs.
+
 ## Known limitations
 
 - Experimental API with potential breaking changes.

@@ -1,0 +1,105 @@
+# Shared-team deployment: use this file alone, not as an override.
+# Self-contained because Dokploy v0.30.10 rewrites YAML before Compose resolves it.
+# In particular, do not inherit compose.yaml's published Controller port.
+name: nest
+
+services:
+  controller:
+    image: ${NEST_CONTROLLER_IMAGE:-nest-controller:local}
+    build: .
+    pull_policy: build
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 20s
+    environment:
+      NEST_CONTROLLER_BIND: 0.0.0.0:50051
+      NEST_EXECUTOR: ${NEST_EXECUTOR:-slurm}
+      NEST_SLURM_HOST: ${NEST_SLURM_HOST:-}
+      NEST_SLURM_ACCOUNT: ${NEST_SLURM_ACCOUNT:-}
+      NEST_SLURM_WORKDIR: ${NEST_SLURM_WORKDIR:-}
+    depends_on:
+      tailscale:
+        condition: service_healthy
+    volumes:
+      - type: bind
+        source: ${NEST_SSH_DIR:-./ssh}
+        target: /run/nest-ssh
+        read_only: true
+        bind:
+          create_host_path: false
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /home/nest/.ssh:mode=0700
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      tailnet:
+        # Keep Serve's backend name stable if Dokploy renames services.
+        aliases: [controller]
+    labels:
+      traefik.enable: "false"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  tailscale:
+    image: ${NEST_TAILSCALE_IMAGE:-tailscale/tailscale:v1.104.4}
+    restart: unless-stopped
+    environment:
+      TS_AUTHKEY: file:/run/secrets/tailscale_authkey
+      TS_AUTH_ONCE: "true"
+      TS_HOSTNAME: ${NEST_TAILSCALE_HOSTNAME:-nest-controller}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_USERSPACE: "true"
+      TS_ACCEPT_DNS: "false"
+      TS_SOCKS5_SERVER: ":1055"
+      # Existing state needs a one-time `tailscale set`; see the deployment guide.
+      TS_EXTRA_ARGS: --advertise-tags=tag:nest-controller --accept-routes=false --shields-up=false --ssh=false
+      TS_SERVE_CONFIG: /etc/tailscale/serve/serve.json
+      TS_ENABLE_HEALTH_CHECK: "true"
+      TS_LOCAL_ADDR_PORT: 127.0.0.1:9002
+    secrets:
+      - tailscale_authkey
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      # Mount the directory so atomic file replacements remain visible.
+      - type: bind
+        source: ${NEST_TAILSCALE_SERVE_DIR:-./docker/tailscale-serve}
+        target: /etc/tailscale/serve
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      tailnet:
+        aliases: [tailscale]
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      traefik.enable: "false"
+    healthcheck:
+      test: [CMD, wget, -q, --spider, http://127.0.0.1:9002/healthz]
+      interval: 10s
+      timeout: 3s
+      start_period: 30s
+      retries: 6
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  tailnet:
+    driver: bridge
+
+volumes:
+  tailscale-state:
+
+secrets:
+  tailscale_authkey:
+    file: ${NEST_TAILSCALE_AUTHKEY_FILE:-./secrets/tailscale-authkey}

@@ -135,6 +135,9 @@ This section is intended for hosts who operate a Nest Controller.
 
 ### Docker Compose
 
+For a Dokploy Controller shared with members on separate Tailscale Tailnets,
+see [Share a Controller over Tailscale](docs/source/tailscale-shared.md).
+
 Clone this repository and deploy the Controller using [compose.yaml](compose.yaml).
 Follow [Deploy with Docker Compose](docs/source/docker-compose.md) to configure
 the Slurm connection, SSH credentials, and host address, then start the service:

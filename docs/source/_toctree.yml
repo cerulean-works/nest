@@ -19,6 +19,8 @@ guide:
     sections:
       - local: docker-compose
         title: Deploy with Docker Compose
+      - local: tailscale-shared
+        title: Share a Controller over Tailscale
       - local: deploy
         title: Deploy a Slurm Controller
       - local: local-controller

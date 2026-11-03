@@ -4,6 +4,9 @@ Clone Nest and run the Controller with Docker Engine and Docker Compose v2.20
 or newer. The Controller needs network access to the HPC login node and a working
 noninteractive SSH identity. For a Login Node on your personal Tailscale Tailnet,
 use the [optional outbound Tailscale sidecar](#personal-tailnet-access-with-a-sidecar).
+For members using separate Tailnets, use the
+[shared Controller deployment](tailscale-shared), including private inbound
+TCP forwarding, minimal grants, and Dokploy File Mount instructions.
 Python, uv, Slurm, and Apptainer do not need to be
 installed on the Controller host.
 
@@ -380,7 +383,7 @@ pushes to `main`. Run the same checks locally with:
 
 ```bash
 docker build -t nest-controller:test .
-docker run --rm --volume "$PWD/tests:/tests:ro" --volume "$PWD/docker:/docker:ro" --entrypoint python nest-controller:test -m unittest discover -s /tests -v
+docker run --rm --volume "$PWD/tests:/tests:ro" --volume "$PWD/docker:/docker:ro" --volume "$PWD/scripts:/scripts:ro" --entrypoint python nest-controller:test -m unittest discover -s /tests -v
 bash tests/smoke_compose.sh
 ```
 
