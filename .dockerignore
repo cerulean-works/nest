@@ -1,0 +1,13 @@
+# Only application and packaging files belong in the image build context.
+**
+!Dockerfile
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!src/
+!src/**
+!docker/
+!docker/controller-entrypoint.sh
+**/__pycache__/
+**/*.pyc

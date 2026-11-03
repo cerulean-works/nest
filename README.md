@@ -60,10 +60,10 @@ python main.py
 The default Controller endpoint is:
 
 ```text
-services.tail8e5ba1.ts.net:50051
+nest-controller.tail8e5ba1.ts.net:50051
 ```
 
-If you are a member of the authorized Tailnet, you do not need to configure this address manually.
+With Tailscale connected and access granted through the team Tailnet or an accepted Controller node share, you do not need to configure this address manually.
 
 ### Using a Different Controller
 
@@ -132,6 +132,22 @@ The original exception type, message, and remote traceback are preserved.
 ## Controller Deployment
 
 This section is intended for hosts who operate a Nest Controller.
+
+### Docker Compose
+
+For a Dokploy Controller shared with members on separate Tailscale Tailnets,
+see [Share a Controller over Tailscale](docs/source/tailscale-shared.md).
+
+Clone this repository and deploy the Controller using [compose.yaml](compose.yaml).
+Follow [Deploy with Docker Compose](docs/source/docker-compose.md) to configure
+the Slurm connection, SSH credentials, and host address, then start the service:
+
+```bash
+docker compose up -d --build --wait
+```
+
+Docker handles the Controller's Python environment, health checks, logs, and
+restart policy. The HPC runtime and work directory below must already exist.
 
 ### Requirements
 

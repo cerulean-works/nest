@@ -1,4 +1,5 @@
 import os
+import signal
 import time
 from functools import wraps
 
@@ -279,21 +280,32 @@ def main():
     four RPC worker threads and port reuse disabled. Configures a Slurm backend
     when both `NEST_SLURM_HOST` and `NEST_SLURM_ACCOUNT` are nonempty. Uses
     `NEST_SLURM_WORKDIR` for worker files and its `jobs` subdirectory for payloads.
-    Stops the server immediately if waiting for termination raises an exception.
+    Slurm mode requires a host, account, and absolute work directory. Handles
+    SIGTERM and SIGINT by allowing active RPCs up to ten seconds to finish.
     """
     configure_logging()
-    server = grpc.server(
-        futures.ThreadPoolExecutor(max_workers=4),
-        options=[
-            ("grpc.so_reuseport", 0),
-        ],
-    )
-    
-    slurm_backend = None
     ssh_host = os.getenv("NEST_SLURM_HOST")
     account = os.getenv("NEST_SLURM_ACCOUNT")
     workdir = os.getenv("NEST_SLURM_WORKDIR")
     bind_address = os.getenv("NEST_CONTROLLER_BIND", "127.0.0.1:50051")
+
+    if os.getenv("NEST_EXECUTOR", "local") == "slurm":
+        missing = [
+            name for name, value in (
+                ("NEST_SLURM_HOST", ssh_host),
+                ("NEST_SLURM_ACCOUNT", account),
+                ("NEST_SLURM_WORKDIR", workdir),
+            ) if not value or not value.strip()
+        ]
+        if missing:
+            raise ValueError("Slurm execution requires: " + ", ".join(missing))
+        if not workdir.startswith("/"):
+            raise ValueError("NEST_SLURM_WORKDIR must be an absolute HPC path")
+
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=4),
+        options=[("grpc.so_reuseport", 0)],
+    )
     
     slurm_backend = None
     
@@ -314,22 +326,30 @@ def main():
         server,
     )
     
-    server.add_insecure_port(bind_address)
-    server.start()
-    logger.info(
-        "Controller listening address=%s executor=%s slurm_configured=%s",
-        bind_address, os.getenv("NEST_EXECUTOR", "local"), slurm_backend is not None,
-    )
-    
+    def stop_server(signum, frame):
+        """Stops accepting RPCs and gives active calls ten seconds to finish."""
+        logger.info("Controller stopping signal=%s", signum)
+        server.stop(grace=10)
+
+    signal.signal(signal.SIGTERM, stop_server)
+    signal.signal(signal.SIGINT, stop_server)
+
     try:
+        if not server.add_insecure_port(bind_address):
+            raise RuntimeError(f"Cannot bind Controller to {bind_address}")
+        server.start()
+        logger.info(
+            "Controller listening address=%s executor=%s slurm_configured=%s",
+            bind_address, os.getenv("NEST_EXECUTOR", "local"), slurm_backend is not None,
+        )
         server.wait_for_termination()
     except KeyboardInterrupt:
         logger.info("Controller interrupted")
-        server.stop(grace=0)
     except BaseException:
         logger.exception("Controller stopped unexpectedly")
-        server.stop(grace=0)
+        raise
     finally:
+        server.stop(grace=0)
         logger.info("Controller stopped")
 
 if __name__ == "__main__":

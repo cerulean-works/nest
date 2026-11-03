@@ -1,0 +1,63 @@
+# Optional deployment: docker compose -f compose.tailscale.yaml up -d --build --wait
+# Reuse the existing Controller definition; compose.yaml remains the local default.
+name: nest
+
+services:
+  controller:
+    extends:
+      file: compose.yaml
+      service: controller
+    depends_on:
+      tailscale:
+        condition: service_healthy
+    networks:
+      - tailnet
+
+  tailscale:
+    image: ${NEST_TAILSCALE_IMAGE:-tailscale/tailscale:v1.104.4}
+    restart: unless-stopped
+    environment:
+      TS_AUTHKEY: file:/run/secrets/tailscale_authkey
+      TS_AUTH_ONCE: "true"
+      TS_HOSTNAME: ${NEST_TAILSCALE_HOSTNAME:-nest-controller}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_USERSPACE: "true"
+      TS_ACCEPT_DNS: "false"
+      TS_SOCKS5_SERVER: ":1055"
+      TS_EXTRA_ARGS: --advertise-tags=tag:nest-controller --accept-routes=false --shields-up
+      TS_ENABLE_HEALTH_CHECK: "true"
+      TS_LOCAL_ADDR_PORT: 127.0.0.1:9002
+    secrets:
+      - tailscale_authkey
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+    networks:
+      - tailnet
+    # Neither the unauthenticated SOCKS5 proxy nor health endpoint is published.
+    # Userspace mode needs no TUN device, NET_ADMIN, or NET_RAW.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: [CMD, wget, -q, --spider, http://127.0.0.1:9002/healthz]
+      interval: 10s
+      timeout: 3s
+      start_period: 30s
+      retries: 6
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  tailnet:
+    driver: bridge
+
+volumes:
+  tailscale-state:
+
+secrets:
+  tailscale_authkey:
+    file: ${NEST_TAILSCALE_AUTHKEY_FILE:-./secrets/tailscale-authkey}

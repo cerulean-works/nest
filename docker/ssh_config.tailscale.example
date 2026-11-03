@@ -1,0 +1,14 @@
+# Copy to the deployment's NEST_SSH_DIR/config and replace HostName/User/Port.
+# Use the Login Node's personal Tailscale IP or full MagicDNS name.
+Host hpc
+    HostName login.YOUR-TAILNET.ts.net
+    User YOUR-HPC-USER
+    Port 22
+    IdentityFile ~/.ssh/id_ed25519
+    IdentitiesOnly yes
+    BatchMode yes
+    StrictHostKeyChecking yes
+    UserKnownHostsFile ~/.ssh/known_hosts
+    ConnectTimeout 15
+    # SOCKS5 resolves the destination inside Tailscale, not Docker's DNS.
+    ProxyCommand /usr/bin/nc -X 5 -x tailscale:1055 %h %p

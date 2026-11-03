@@ -30,10 +30,10 @@ python main.py
 The default Controller endpoint is:
 
 ```text
-services.tail8e5ba1.ts.net:50051
+nest-controller.tail8e5ba1.ts.net:50051
 ```
 
-If you are a member of the authorized Tailnet, you do not need to configure this address manually.
+With Tailscale connected and access granted through the team Tailnet or an accepted Controller node share, you do not need to configure this address manually.
 
 ## Use a different Controller
 

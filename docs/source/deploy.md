@@ -2,6 +2,9 @@
 
 This section is intended for hosts who operate a Nest Controller.
 
+For a container deployment, start with [Deploy with Docker Compose](docker-compose).
+The HPC work directory and runtime described below are required for both methods.
+
 ## Requirements
 
 - Python 3.12+
