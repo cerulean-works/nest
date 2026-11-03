@@ -24,6 +24,10 @@ fi
 
 # Receive optional environment ID
 ENV_ID="${2:-}"
+REQUEST_ID="${4:-}"
+LOG_LEVEL="${5:-INFO}"
+
+echo "Nest worker job_id=${SLURM_JOB_ID:-unknown} execution_id=$JOB_ID request_id=${REQUEST_ID:-none} environment_id=${ENV_ID:-none}"
 
 if [[ -n "$ENV_ID" ]]; then
     if [[ ! "$ENV_ID" =~ ^[0-9a-f]{64}$ ]]; then
@@ -99,6 +103,8 @@ fi
 
 apptainer exec \
     --cleanenv \
+    --env "NEST_REQUEST_ID=$REQUEST_ID" \
+    --env "NEST_LOG_LEVEL=$LOG_LEVEL" \
     --bind "$BASE:/workspace" \
     "$IMAGE" \
     sh -c '

@@ -7,6 +7,10 @@ import cloudpickle
 
 from pathlib import Path
 
+from ._logging import configure_logging, get_logger, operation, request_context
+
+logger = get_logger("nest.worker")
+
 def main():
     """
     Executes a serialized call from the worker's command-line paths.
@@ -32,6 +36,7 @@ def main():
     input_path = Path(sys.argv[1])
     output_path = Path(sys.argv[2])
     user_python = sys.argv[3] if len(sys.argv) == 4 else None
+    logger.info("Worker input job_dir=%s user_environment=%s", input_path.parent, bool(user_python))
     
     if user_python:
         # Prepare cloudpickle bootstrap for the user process
@@ -44,7 +49,12 @@ def main():
             dirs_exist_ok=True,
         )
         
+        shutil.copyfile(
+            Path(__file__).with_name("_logging.py"),
+            bootstrap_dir / "nest_logging.py",
+        )
         runner_path = Path(__file__).with_name("user_runner.py")
+        logger.info("User interpreter starting python=%s job_dir=%s", user_python, input_path.parent)
         
         # Avoid leaking the Nest virtual environment into the user process
         env = os.environ.copy()
@@ -67,6 +77,7 @@ def main():
         if not output_path.is_file() or output_path.stat().st_size == 0:
             raise RuntimeError("User process did not produce a result")
         
+        logger.info("User interpreter completed job_dir=%s", input_path.parent)
         return
 
     # Execute in Nest Runtime when no user environment is specified
@@ -83,6 +94,7 @@ def main():
             cloudpickle.dump(result, f)
 
     except Exception as exc:
+        logger.exception("User function failed job_dir=%s", input_path.parent)
         error = {
             "__nest_remote_error_v1__": True,
             "type": (
@@ -97,4 +109,7 @@ def main():
             cloudpickle.dump(error, f)
             
 if __name__ == "__main__":
-    main()
+    configure_logging()
+    with request_context(os.getenv("NEST_REQUEST_ID")):
+        with operation(logger, "Worker execution"):
+            main()

@@ -3,11 +3,15 @@ name = "nest"
 version = "0.1.0a1"
 description = "A Python SDK for remote function execution on HPC clusters"
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     "cloudpickle>=3.1.2",
     "grpcio>=1.84.0",
     "protobuf>=7.36.2",
+    "pytest>=9.2.0",
+    "pytest-cov>=7.1.0",
 ]
 
 [build-system]

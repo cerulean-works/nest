@@ -239,6 +239,16 @@ Clients can connect to this Controller by setting:
 export NEST_CONTROLLER_ADDRESS="127.0.0.1:50051"
 ```
 
+## Logging
+
+Controller and worker commands log to stderr at `INFO` by default. Use
+`NEST_LOG_LEVEL=DEBUG` for more detail. Logs include request IDs, execution timings,
+Slurm job IDs, cache activity and state changes.
+
+Client applications enable the `nest` logger using Python's `logging` module.
+See [logging configuration and troubleshooting](docs/source/configuration.md#logging-and-troubleshooting)
+for client setup and how to follow an execution across the Controller and workers.
+
 ## Security
 
 Nest currently uses Python object serialization for remote function execution.
@@ -286,3 +296,7 @@ uv run python -m grpc_tools.protoc \
     --grpc_python_out=src \
     src/nest/proto/execution.proto
 ```
+
+## License
+
+Nest is licensed under the [Apache License 2.0](LICENSE).
