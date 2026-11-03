@@ -4,7 +4,7 @@
 
 | Variable | Default | Behavior |
 | --- | --- | --- |
-| `NEST_CONTROLLER_ADDRESS` | `nest-controller.tail8e5ba1.ts.net:50051` | Host and port for each remote call. An empty value also uses the default. |
+| `NEST_CONTROLLER_ADDRESS` | `nest-tag.tail8e5ba1.ts.net:50051` | Host and port for each remote call. An empty value also uses the default. |
 
 Set the address in the process running your Nest application. It does not
 configure where the Controller listens.

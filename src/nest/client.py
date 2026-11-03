@@ -34,7 +34,7 @@ def execute_remote(
     Serializes a function call and executes it through the controller.
 
     Uses `NEST_CONTROLLER_ADDRESS` when it is nonempty. Otherwise, connects to
-    `nest-controller.tail8e5ba1.ts.net:50051`. The insecure gRPC call has a 900-second
+    `nest-tag.tail8e5ba1.ts.net:50051`. The insecure gRPC call has a 900-second
     deadline. Only send trusted functions and accept results from trusted hosts:
     deserializing Python objects can execute code.
 
@@ -77,7 +77,7 @@ def execute_remote(
             )
         )
     
-    DEFAULT_CONTROLLER_ADDRESS = "nest-controller.tail8e5ba1.ts.net:50051"
+    DEFAULT_CONTROLLER_ADDRESS = "nest-tag.tail8e5ba1.ts.net:50051"
     
     address = os.getenv("NEST_CONTROLLER_ADDRESS") or DEFAULT_CONTROLLER_ADDRESS
     

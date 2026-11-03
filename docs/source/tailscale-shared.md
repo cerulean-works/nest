@@ -264,7 +264,7 @@ admin console. Confirm the accepting account's identity and the source tag.
 From an accepted recipient's user-owned device with Nest installed, run:
 
 ```bash
-uv run --locked python scripts/verify-grpc.py nest-controller.tail8e5ba1.ts.net:50051
+uv run --locked python scripts/verify-grpc.py nest-tag.tail8e5ba1.ts.net:50051
 ```
 
 This sends an explicitly empty environment to the existing `Execute` RPC and
