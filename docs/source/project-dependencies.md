@@ -16,11 +16,14 @@ Use the `project` parameter:
 ```python
 import nest
 
+
 @nest.remote(gpu=1, project=".")
 def compute():
     """Formats a number with the project's humanize dependency."""
     import humanize
+
     return humanize.intcomma(1234567)
+
 
 print(compute.remote())
 ```

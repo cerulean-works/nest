@@ -1,8 +1,10 @@
-import os
 import hashlib
+import os
+
 import cloudpickle
 
 from nest.backends.slurm import SlurmBackend, SlurmConfig
+
 
 def compute(x):
     """
@@ -16,6 +18,7 @@ def compute(x):
     """
     return x * 2
 
+
 def main():
     """
     Uploads a serialized call and prints its directory and payload checksum.
@@ -27,19 +30,16 @@ def main():
         SlurmConfig(
             ssh_host=os.environ["NEST_SLURM_HOST"],
             account=os.environ["NEST_SLURM_ACCOUNT"],
-            work_root=(
-                os.environ["NEST_SLURM_WORKDIR"] + "/jobs"
-            ),
+            work_root=(os.environ["NEST_SLURM_WORKDIR"] + "/jobs"),
         )
     )
-    
-    payload = cloudpickle.dumps(
-        (compute, (21,), {})
-    )
-    
+
+    payload = cloudpickle.dumps((compute, (21,), {}))
+
     job_dir = backend.stage_payload(payload)
     print("Remote directory: ", job_dir)
     print("Payload SHA256: ", hashlib.sha256(payload).hexdigest())
-    
+
+
 if __name__ == "__main__":
     main()

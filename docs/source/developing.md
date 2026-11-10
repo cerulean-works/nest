@@ -36,6 +36,7 @@ and clean container shutdown. It does not submit real Slurm jobs.
 uv run python -m grpc_tools.protoc \
     -I src \
     --python_out=src \
+    --pyi_out=src \
     --grpc_python_out=src \
     src/nest/proto/execution.proto
 ```

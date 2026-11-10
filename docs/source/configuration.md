@@ -96,10 +96,12 @@ import logging
 import nest
 
 handler = logging.StreamHandler()
-handler.setFormatter(logging.Formatter(
-    "%(asctime)s %(levelname)s %(name)s request_id=%(request_id)s %(message)s",
-    defaults={"request_id": "-"},
-))
+handler.setFormatter(
+    logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s request_id=%(request_id)s %(message)s",
+        defaults={"request_id": "-"},
+    )
+)
 logger = logging.getLogger("nest")
 logger.setLevel(logging.INFO)  # Use DEBUG for additional detail.
 logger.addHandler(handler)

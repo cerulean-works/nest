@@ -1,10 +1,11 @@
 import os
 import subprocess
-import time
 import sys
 import tempfile
+import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import cloudpickle
 
@@ -36,11 +37,11 @@ def execute(func: Callable, *args: Any, **kwargs: Any) -> Any:
     with tempfile.TemporaryDirectory() as tmpdir:
         input_path = Path(tmpdir) / "input.pkl"
         output_path = Path(tmpdir) / "output.pkl"
-        
+
         # Serialize function and arguments
         with open(input_path, "wb") as f:
             cloudpickle.dump((func, args, kwargs), f)
-            
+
         # Execute in another Python process
         started = time.monotonic()
         logger.info("Local worker starting job_dir=%s", tmpdir)

@@ -1,14 +1,13 @@
 """Offline checks for the container's OpenSSH/SOCKS5 path; no Tailnet credentials."""
 
 import concurrent.futures
-from pathlib import Path
 import shutil
 import socket
 import struct
 import subprocess
 import tempfile
 import unittest
-
+from pathlib import Path
 
 TEMPLATE = Path(__file__).resolve().parents[1] / "docker/ssh_config.tailscale.example"
 
@@ -18,7 +17,9 @@ class TailnetProxyTests(unittest.TestCase):
     def test_ssh_template_requires_verified_host_keys(self):
         result = subprocess.run(
             ["ssh", "-F", str(TEMPLATE), "-G", "hpc"],
-            capture_output=True, text=True, check=True,
+            capture_output=True,
+            text=True,
+            check=True,
         )
         config = dict(line.split(" ", 1) for line in result.stdout.splitlines())
         self.assertIn(config["stricthostkeychecking"], ("yes", "true"))
@@ -47,6 +48,7 @@ class TailnetProxyTests(unittest.TestCase):
                 with listener.accept()[0] as connection:
                     connection.settimeout(5)
                     with connection.makefile("rb", buffering=0) as stream:
+
                         def read_exact(size):
                             data = bytearray()
                             while len(data) < size:
@@ -75,7 +77,9 @@ class TailnetProxyTests(unittest.TestCase):
                 request = executor.submit(receive_proxy_request)
                 result = subprocess.run(
                     ["ssh", "-F", str(config), "hpc", "hostname"],
-                    capture_output=True, timeout=8,
+                    check=False,
+                    capture_output=True,
+                    timeout=8,
                 )
                 target, target_port, banner = request.result(timeout=6)
 

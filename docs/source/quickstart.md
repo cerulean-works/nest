@@ -9,12 +9,14 @@ Create `main.py`:
 ```python
 import nest
 
+
 @nest.remote(gpu=1)
 def compute(x):
     """Returns twice the input value."""
     return x * 2
 
-print(compute.local(21))   # 42
+
+print(compute.local(21))  # 42
 print(compute.remote(21))  # 42
 ```
 
