@@ -2,6 +2,7 @@ import os
 
 from nest.backends.slurm import SlurmBackend, SlurmConfig
 
+
 def main():
     """
     Submits a Slurm job and prints its state before and after requesting cancellation.
@@ -17,22 +18,22 @@ def main():
             partition="dev",
         )
     )
-    
+
     job_id = backend.submit(
         workdir=os.environ["NEST_SLURM_WORKDIR"],
         script="cancel-test.sbatch",
         gpu=1,
     )
-    
+
     print(f"Submitted: {job_id}")
-    
+
     try:
         print(f"Before: {backend.status(job_id)}")
     finally:
         backend.cancel(job_id)
-    
+
     print(f"After: {backend.status(job_id)}")
-    
+
+
 if __name__ == "__main__":
     main()
-    

@@ -1,10 +1,11 @@
 import os
+from collections.abc import Callable
 from functools import wraps
-
-import grpc
-import cloudpickle
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, cast
+
+import cloudpickle
+import grpc
 
 from ._logging import current_request_id, get_logger, operation, request_context
 from .errors import RemoteExecutionError
@@ -16,19 +17,15 @@ logger = get_logger(__name__)
 def _logged_execution(method):
     @wraps(method)
     def wrapper(*args, **kwargs):
-        with request_context():
-            with operation(logger, "Remote execution"):
-                return method(*args, **kwargs)
+        with request_context(), operation(logger, "Remote execution"):
+            return method(*args, **kwargs)
+
     return wrapper
 
 
 @_logged_execution
 def execute_remote(
-    func: Callable,
-    resources: Any,
-    project: Path | None,
-    *args: Any,
-    **kwargs: Any
+    func: Callable, resources: Any, project: Path | None, *args: Any, **kwargs: Any
 ) -> Any:
     """
     Serializes a function call and executes it through the controller.
@@ -56,48 +53,52 @@ def execute_remote(
         [`errors.RemoteExecutionError`]: If the result contains a remote error record.
     """
     # Serialize function and arguments
-    payload = cloudpickle.dumps(
-        (func, args, kwargs)
-    )
-    
+    payload = cloudpickle.dumps((func, args, kwargs))
+
     request = execution_pb2.ExecuteRequest(
         payload=payload,
         gpu=resources.gpu,
         cpu=resources.cpu,
     )
-    
+
     if project is not None:
         pyproject_path = project / "pyproject.toml"
         lock_path = project / "uv.lock"
-        
+
         request.environment.CopyFrom(
             execution_pb2.EnvironmentFiles(
                 pyproject_toml=pyproject_path.read_bytes(),
                 uv_lock=lock_path.read_bytes(),
             )
         )
-    
+
     DEFAULT_CONTROLLER_ADDRESS = "nest-tag.tail8e5ba1.ts.net:50051"
-    
+
     address = os.getenv("NEST_CONTROLLER_ADDRESS") or DEFAULT_CONTROLLER_ADDRESS
-    
+
     logger.info(
         "Calling controller address=%s gpu=%s cpu=%s payload_bytes=%s",
-        address, resources.gpu, resources.cpu, len(payload),
+        address,
+        resources.gpu,
+        resources.cpu,
+        len(payload),
     )
 
     # Connect to Controller
-    try:        
+    try:
         with grpc.insecure_channel(address) as channel:
             stub = execution_pb2_grpc.ExecutionServiceStub(channel)
             response = stub.Execute(
-                request, timeout=900,
+                request,
+                timeout=900,
                 metadata=(("x-nest-request-id", current_request_id()),),
             )
-    
+
     except grpc.RpcError as exc:
-        logger.error("Controller RPC failed address=%s status=%s", address, exc.code().name)
-        if exc.code() == grpc.StatusCode.UNAVAILABLE:
+        # Errors raised by stub calls are also `grpc.Call`s, which carry the status.
+        status = cast(grpc.Call, exc).code()
+        logger.error("Controller RPC failed address=%s status=%s", address, status.name)
+        if status == grpc.StatusCode.UNAVAILABLE:
             raise ConnectionError(
                 f"Cannot connect to Nest Controller at {address}.\n\n"
                 "Please check:\n"
@@ -106,13 +107,14 @@ def execute_remote(
                 "  - The Controller is running.\n\n"
                 "To use another Controller, set NEST_CONTROLLER_ADDRESS."
             ) from exc
-        
+
         raise
 
     logger.debug("Result received result_bytes=%s", len(response.result))
 
     # Deserialze result or raise a remote exception
     return _decode_remote_result(response.result)
+
 
 def _decode_remote_result(data: bytes) -> Any:
     """
@@ -129,19 +131,16 @@ def _decode_remote_result(data: bytes) -> Any:
             string values for its type, message, and traceback.
     """
     result = cloudpickle.loads(data)
-    
+
     if (
         isinstance(result, dict)
         and result.get("__nest_remote_error_v1__") is True
-        and all(
-            isinstance(result.get(key), str)
-            for key in ("type", "message", "traceback")
-        )
+        and all(isinstance(result.get(key), str) for key in ("type", "message", "traceback"))
     ):
         raise RemoteExecutionError(
             remote_type=result["type"],
             remote_message=result["message"],
             remote_traceback=result["traceback"],
         )
-    
+
     return result

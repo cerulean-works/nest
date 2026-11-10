@@ -1,0 +1,39 @@
+name: Code Quality
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  lint:
+    name: Lint, Format and Type Check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Setup Python
+        run: uv python install
+
+      - name: Install Dependencies
+        run: uv sync --dev --frozen
+
+      - name: Run ruff's linter
+        run: uv run --no-sync ruff check --output-format=github .
+
+      - name: Run ruff's format checker
+        run: uv run --no-sync ruff format --check .
+
+      - name: Run ty
+        run: uv run --no-sync ty check --output-format=github

@@ -2,6 +2,7 @@
 """Probe Nest's real RPC handler without executing code, SSH, or a Slurm job."""
 
 import argparse
+from typing import cast
 
 import grpc
 
@@ -20,9 +21,10 @@ def verify(address: str, timeout: float = 5) -> None:
         try:
             stub.Execute(request, timeout=timeout)
         except grpc.RpcError as error:
+            call = cast(grpc.Call, error)
             if (
-                error.code() == grpc.StatusCode.INVALID_ARGUMENT
-                and error.details() == "Environment requires pyproject.toml and uv.lock"
+                call.code() == grpc.StatusCode.INVALID_ARGUMENT
+                and call.details() == "Environment requires pyproject.toml and uv.lock"
             ):
                 return
             raise

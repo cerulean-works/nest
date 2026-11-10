@@ -1,7 +1,9 @@
 import os
+
 import grpc
 
 from nest.proto import execution_pb2, execution_pb2_grpc
+
 
 def main():
     """
@@ -15,10 +17,10 @@ def main():
         "NEST_CONTROLLER_ADDRESS",
         "127.0.0.1:50051",
     )
-    
+
     with grpc.insecure_channel(address) as channel:
         stub = execution_pb2_grpc.ExecutionServiceStub(channel)
-        
+
         # Submit
         response = stub.SubmitJob(
             execution_pb2.SubmitJobRequest(
@@ -31,10 +33,10 @@ def main():
             ),
             timeout=30,
         )
-        
+
         job_id = response.job_id
         print(f"Submitted: {job_id}")
-        
+
         # Status
         try:
             status = stub.GetJobStatus(
@@ -48,8 +50,9 @@ def main():
                 execution_pb2.CancelJobRequest(job_id=job_id),
                 timeout=30,
             )
-            
+
         print("Cancellation requested")
-        
+
+
 if __name__ == "__main__":
     main()

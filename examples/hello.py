@@ -1,5 +1,6 @@
 import nest
 
+
 @nest.remote(gpu=1, cpu=4)
 def compute(x):
     """
@@ -12,6 +13,7 @@ def compute(x):
         `int`: Twice `x`.
     """
     return x * 2
+
 
 if __name__ == "__main__":
     print(compute(21))

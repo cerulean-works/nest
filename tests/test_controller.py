@@ -33,7 +33,9 @@ def running_controller(**settings):
     with tempfile.TemporaryFile(mode="w+") as log:
         process = subprocess.Popen(
             [sys.executable, "-m", "nest.controller"],
-            env=env, stdout=log, stderr=subprocess.STDOUT,
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
         )
         try:
             with grpc.insecure_channel(address) as channel:
@@ -117,27 +119,39 @@ class ControllerTests(unittest.TestCase):
                 env[missing] = ""
                 result = subprocess.run(
                     [sys.executable, "-m", "nest.controller"],
-                    env=env, capture_output=True, text=True, timeout=5,
+                    check=False,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
                 )
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(missing, result.stderr)
 
     def test_slurm_rejects_a_relative_workdir(self):
         env = controller_environment(
-            NEST_EXECUTOR="slurm", NEST_SLURM_HOST="hpc",
-            NEST_SLURM_ACCOUNT="test-account", NEST_SLURM_WORKDIR="relative/path",
+            NEST_EXECUTOR="slurm",
+            NEST_SLURM_HOST="hpc",
+            NEST_SLURM_ACCOUNT="test-account",
+            NEST_SLURM_WORKDIR="relative/path",
         )
         result = subprocess.run(
             [sys.executable, "-m", "nest.controller"],
-            env=env, capture_output=True, text=True, timeout=5,
+            check=False,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("must be an absolute HPC path", result.stderr)
 
     def test_complete_slurm_config_starts_without_contacting_hpc(self):
         with running_controller(
-            NEST_EXECUTOR="slurm", NEST_SLURM_HOST="hpc",
-            NEST_SLURM_ACCOUNT="test-account", NEST_SLURM_WORKDIR="/home/test/nest",
+            NEST_EXECUTOR="slurm",
+            NEST_SLURM_HOST="hpc",
+            NEST_SLURM_ACCOUNT="test-account",
+            NEST_SLURM_WORKDIR="/home/test/nest",
         ) as (process, _):
             self.assertIsNone(process.poll())
 

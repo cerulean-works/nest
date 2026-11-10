@@ -3,6 +3,7 @@ import sys
 
 from nest.backends.slurm import SlurmBackend, SlurmConfig
 
+
 def main():
     """
     Prints the Slurm state of the job ID supplied on the command line.
@@ -17,9 +18,10 @@ def main():
             partition="dev",
         )
     )
-    
+
     job_id = int(sys.argv[1])
     print(f"Job {job_id}: {backend.status(job_id)}")
-    
+
+
 if __name__ == "__main__":
     main()

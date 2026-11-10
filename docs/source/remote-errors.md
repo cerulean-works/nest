@@ -6,10 +6,12 @@ Exceptions raised during remote function execution are returned as `RemoteExecut
 import nest
 from nest.errors import RemoteExecutionError
 
+
 @nest.remote(gpu=1)
 def compute():
     """Raises an error to demonstrate remote exception handling."""
     raise ValueError("Something went wrong")
+
 
 try:
     compute.remote()

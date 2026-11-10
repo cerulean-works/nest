@@ -1,16 +1,16 @@
 import os
 import signal
 import time
+from concurrent import futures
 from functools import wraps
 
 import cloudpickle
 import grpc
-from concurrent import futures
 
 from ._logging import configure_logging, get_logger, request_context
+from .backends.slurm import SlurmBackend, SlurmConfig
 from .executor import execute
 from .proto import execution_pb2, execution_pb2_grpc
-from .backends.slurm import SlurmBackend, SlurmConfig
 
 logger = get_logger("nest.controller")
 
@@ -33,25 +33,31 @@ def _logged_rpc(method):
                 if status is not None and status != grpc.StatusCode.OK:
                     logger.warning(
                         "RPC aborted method=%s status=%s details=%s elapsed_ms=%.1f",
-                        method.__name__, status.name, context.details(),
+                        method.__name__,
+                        status.name,
+                        context.details(),
                         (time.monotonic() - started) * 1000,
                     )
                 else:
                     logger.exception(
                         "RPC failed method=%s elapsed_ms=%.1f",
-                        method.__name__, (time.monotonic() - started) * 1000,
+                        method.__name__,
+                        (time.monotonic() - started) * 1000,
                     )
                 raise
             getattr(logger, level)(
                 "RPC completed method=%s elapsed_ms=%.1f",
-                method.__name__, (time.monotonic() - started) * 1000,
+                method.__name__,
+                (time.monotonic() - started) * 1000,
             )
             return response
+
     return wrapper
 
 
 class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
     """Handles execution requests and Slurm job operations for the controller."""
+
     def __init__(self, slurm_backend=None):
         """
         Stores the optional Slurm backend used by the RPC handlers.
@@ -61,7 +67,26 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 Slurm execution and job operations. Local execution needs no backend.
         """
         self.slurm_backend = slurm_backend
-        
+
+    def _require_slurm_backend(self, context) -> SlurmBackend:
+        """
+        Returns the Slurm backend, aborting the RPC when none is configured.
+
+        Args:
+            context (`grpc.ServicerContext`): RPC context, aborted with
+                `FAILED_PRECONDITION` when no backend is configured.
+
+        Returns:
+            [`backends.slurm.SlurmBackend`]: The configured backend.
+        """
+        if self.slurm_backend is None:
+            context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "Slurm backend is not configured",
+            )
+            raise AssertionError("context.abort raises")
+        return self.slurm_backend
+
     @_logged_rpc
     def Execute(self, request, context):
         """
@@ -84,67 +109,63 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
         """
         if request.HasField("environment"):
             env = request.environment
-            
+
             if not env.pyproject_toml or not env.uv_lock:
                 context.abort(
                     grpc.StatusCode.INVALID_ARGUMENT,
                     "Environment requires pyproject.toml and uv.lock",
                 )
-            
+
             logger.debug(
                 "Environment received pyproject_bytes=%s lock_bytes=%s",
-                len(env.pyproject_toml), len(env.uv_lock),
+                len(env.pyproject_toml),
+                len(env.uv_lock),
             )
-        
+
         mode = os.getenv("NEST_EXECUTOR", "local")
         logger.info(
             "Execution received executor=%s gpu=%s cpu=%s payload_bytes=%s",
-            mode, request.gpu, request.cpu, len(request.payload),
+            mode,
+            request.gpu,
+            request.cpu,
+            len(request.payload),
         )
-        
+
         if mode == "slurm":
-            if self.slurm_backend is None:
-                context.abort(
-                    grpc.StatusCode.FAILED_PRECONDITION,
-                    "Slurm backend is not configured",
-                )
-                
+            backend = self._require_slurm_backend(context)
+
             try:
                 environment_id = None
-                
+
                 # Prepare Python environment
                 if request.HasField("environment"):
                     env = request.environment
                     logger.info("Preparing Python environment")
-                    
-                    env_dir = self.slurm_backend.prepare_environment_bytes(
+
+                    env_dir = backend.prepare_environment_bytes(
                         pyproject_toml=env.pyproject_toml,
                         uv_lock=env.uv_lock,
                         gpu=request.gpu,
                     )
-                    
+
                     environment_id = env_dir.rsplit("/", 1)[-1]
-                    
+
                     logger.info("Environment ready environment_id=%s", environment_id)
-                
+
                 # Submit worker with environment ID
-                job_id, job_dir = self.slurm_backend.submit_payload(
+                job_id, job_dir = backend.submit_payload(
                     request.payload,
                     gpu=request.gpu,
                     environment_id=environment_id,
                 )
-                
+
                 logger.info("Worker submitted job_id=%s job_dir=%s", job_id, job_dir)
-                
+
                 # Wait for the result
-                result_bytes = self.slurm_backend.wait_result(
-                    job_id,
-                    job_dir,
-                    timeout=600
-                )
-                
+                result_bytes = backend.wait_result(job_id, job_dir, timeout=600)
+
                 return execution_pb2.ExecuteResponse(result=result_bytes)
-                    
+
             except (RuntimeError, TimeoutError, ValueError) as exc:
                 logger.exception("Slurm execution failed")
                 context.abort(
@@ -156,7 +177,7 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
         func, args, kwargs = cloudpickle.loads(request.payload)
         result = execute(func, *args, **kwargs)
         return execution_pb2.ExecuteResponse(result=cloudpickle.dumps(result))
-    
+
     @_logged_rpc
     def GetJobStatus(self, request, context):
         """
@@ -171,24 +192,20 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
         Returns:
             `execution_pb2.JobStatusResponse`: The job operation response.
         """
-        if self.slurm_backend is None:
-            context.abort(
-                grpc.StatusCode.FAILED_PRECONDITION,
-                "Slurm backend is not configured",
-            )
-            
+        backend = self._require_slurm_backend(context)
+
         try:
-            state = self.slurm_backend.status(request.job_id)
+            state = backend.status(request.job_id)
         except Exception as exc:
             logger.exception("Job status query failed job_id=%s", request.job_id)
             context.abort(
                 grpc.StatusCode.INTERNAL,
                 str(exc),
             )
-        
+
         logger.debug("Job status job_id=%s state=%s", request.job_id, state)
         return execution_pb2.JobStatusResponse(state=state)
-    
+
     @_logged_rpc
     def SubmitJob(self, request, context):
         """
@@ -203,20 +220,16 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
         Returns:
             `execution_pb2.SubmitJobResponse`: The job operation response.
         """
-        if self.slurm_backend is None:
-            context.abort(
-                grpc.StatusCode.FAILED_PRECONDITION,
-                "Slurm backend is not configured",
-            )
-        
+        backend = self._require_slurm_backend(context)
+
         if request.gpu < 0:
             context.abort(
                 grpc.StatusCode.INVALID_ARGUMENT,
                 "GPU count cannot be negative",
             )
-            
+
         try:
-            job_id = self.slurm_backend.submit(
+            job_id = backend.submit(
                 workdir=request.workdir,
                 script=request.script,
                 gpu=request.gpu,
@@ -230,10 +243,10 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 grpc.StatusCode.FAILED_PRECONDITION,
                 str(exc),
             )
-            
+
         logger.info("Batch job submitted job_id=%s", job_id)
         return execution_pb2.SubmitJobResponse(job_id=job_id)
-    
+
     @_logged_rpc
     def CancelJob(self, request, context):
         """
@@ -248,30 +261,27 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
         Returns:
             `execution_pb2.CancelJobResponse`: The job operation response.
         """
-        if self.slurm_backend is None:
-            context.abort(
-                grpc.StatusCode.FAILED_PRECONDITION,
-                "Slurm backend is not configured",
-            )
-            
+        backend = self._require_slurm_backend(context)
+
         if request.job_id <= 0:
             context.abort(
                 grpc.StatusCode.INVALID_ARGUMENT,
                 "Invalid job ID",
             )
-        
+
         try:
-            self.slurm_backend.cancel(request.job_id)
+            backend.cancel(request.job_id)
         except RuntimeError as exc:
             logger.exception("Job cancellation failed job_id=%s", request.job_id)
             context.abort(
                 grpc.StatusCode.FAILED_PRECONDITION,
                 str(exc),
             )
-            
+
         logger.info("Job cancellation requested job_id=%s", request.job_id)
         return execution_pb2.CancelJobResponse()
-    
+
+
 def main():
     """
     Starts the controller and waits until it stops.
@@ -291,24 +301,26 @@ def main():
 
     if os.getenv("NEST_EXECUTOR", "local") == "slurm":
         missing = [
-            name for name, value in (
+            name
+            for name, value in (
                 ("NEST_SLURM_HOST", ssh_host),
                 ("NEST_SLURM_ACCOUNT", account),
                 ("NEST_SLURM_WORKDIR", workdir),
-            ) if not value or not value.strip()
+            )
+            if not value or not value.strip()
         ]
         if missing:
             raise ValueError("Slurm execution requires: " + ", ".join(missing))
-        if not workdir.startswith("/"):
+        if workdir is None or not workdir.startswith("/"):
             raise ValueError("NEST_SLURM_WORKDIR must be an absolute HPC path")
 
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=4),
         options=[("grpc.so_reuseport", 0)],
     )
-    
+
     slurm_backend = None
-    
+
     if ssh_host and account:
         slurm_backend = SlurmBackend(
             SlurmConfig(
@@ -320,12 +332,12 @@ def main():
                 worker_workdir=workdir,
             )
         )
-        
+
     execution_pb2_grpc.add_ExecutionServiceServicer_to_server(
         ExecutionService(slurm_backend),
         server,
     )
-    
+
     def stop_server(signum, frame):
         """Stops accepting RPCs and gives active calls ten seconds to finish."""
         logger.info("Controller stopping signal=%s", signum)
@@ -340,7 +352,9 @@ def main():
         server.start()
         logger.info(
             "Controller listening address=%s executor=%s slurm_configured=%s",
-            bind_address, os.getenv("NEST_EXECUTOR", "local"), slurm_backend is not None,
+            bind_address,
+            os.getenv("NEST_EXECUTOR", "local"),
+            slurm_backend is not None,
         )
         server.wait_for_termination()
     except KeyboardInterrupt:
@@ -351,6 +365,7 @@ def main():
     finally:
         server.stop(grace=0)
         logger.info("Controller stopped")
+
 
 if __name__ == "__main__":
     main()

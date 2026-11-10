@@ -1,9 +1,10 @@
 """The live deployment probe must never reach execution or the Slurm backend."""
 
-from concurrent import futures
 import importlib.util
-from pathlib import Path
 import unittest
+from concurrent import futures
+from pathlib import Path
+from typing import cast
 from unittest.mock import Mock, patch
 
 import grpc
@@ -11,10 +12,11 @@ import grpc
 from nest.controller import ExecutionService
 from nest.proto import execution_pb2_grpc
 
-
 spec = importlib.util.spec_from_file_location(
-    "verify_grpc", Path(__file__).resolve().parents[1] / "scripts/verify-grpc.py",
+    "verify_grpc",
+    Path(__file__).resolve().parents[1] / "scripts/verify-grpc.py",
 )
+assert spec is not None and spec.loader is not None
 probe = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(probe)
 
@@ -26,14 +28,18 @@ class GrpcProbeTests(unittest.TestCase):
                 backend = Mock()
                 server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
                 execution_pb2_grpc.add_ExecutionServiceServicer_to_server(
-                    ExecutionService(backend), server,
+                    ExecutionService(backend),
+                    server,
                 )
                 port = server.add_insecure_port("127.0.0.1:0")
                 server.start()
                 try:
-                    with patch("nest.controller.execute") as execute, patch(
-                        "nest.controller.cloudpickle.loads",
-                    ) as unpickle:
+                    with (
+                        patch("nest.controller.execute") as execute,
+                        patch(
+                            "nest.controller.cloudpickle.loads",
+                        ) as unpickle,
+                    ):
                         probe.verify(f"127.0.0.1:{port}")
                         execute.assert_not_called()
                         unpickle.assert_not_called()
@@ -48,6 +54,8 @@ class GrpcProbeTests(unittest.TestCase):
         try:
             with self.assertRaises(grpc.RpcError) as caught:
                 probe.verify(f"127.0.0.1:{port}")
-            self.assertEqual(caught.exception.code(), grpc.StatusCode.UNIMPLEMENTED)
+            self.assertEqual(
+                cast(grpc.Call, caught.exception).code(), grpc.StatusCode.UNIMPLEMENTED
+            )
         finally:
             server.stop(0).wait()
