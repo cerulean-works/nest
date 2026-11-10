@@ -16,7 +16,7 @@ if [[ "$BASE" != /* ]]; then
     exit 1
 fi
 
-IMAGE="$BASE/images/uv-python312.sif"
+IMAGE="$BASE/images/uv-python314.sif"
 
 echo "=== Host ==="
 hostname

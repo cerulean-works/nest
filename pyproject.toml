@@ -5,7 +5,7 @@ description = "A Python SDK for remote function execution on HPC clusters"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 dependencies = [
     "cloudpickle>=3.1.2",
     "grpcio>=1.84.0",

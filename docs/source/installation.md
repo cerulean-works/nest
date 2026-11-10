@@ -1,6 +1,6 @@
 # Install Nest
 
-Nest requires Python 3.12 or later.
+Nest requires Python 3.14 or later.
 
 Install Nest from GitHub:
 
