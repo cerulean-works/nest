@@ -1,0 +1,13 @@
+# Mode B (managed SSH) override: the Controller gets every SSH setting from ENV,
+# so no host directory is mounted. Use with the default deployment:
+#
+#   docker compose -f compose.yaml -f compose.managed-ssh.yaml up -d
+#
+# Set NEST_SLURM_SSH_MODE=B, NEST_SLURM_LOGIN_NODES, NEST_SLURM_SSH_USER,
+# NEST_SSH_KNOWN_HOSTS_DATA and NEST_SSH_PRIVATE_KEY (see docs/source/configuration.md).
+# No Tailscale setting is read or needed.
+services:
+  controller:
+    environment:
+      NEST_SLURM_SSH_MODE: ${NEST_SLURM_SSH_MODE:-B}
+    volumes: !reset []

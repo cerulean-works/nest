@@ -1,5 +1,4 @@
 import hashlib
-import os
 import re
 import shlex
 import subprocess
@@ -9,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .._logging import current_request_id, get_logger, operation
+from ..config import load_log_level
 from ..errors import (
     ExecutionTimeoutError,
     InfrastructureError,
@@ -70,6 +70,16 @@ class SlurmConfig:
             deadline for an environment build job, in seconds.
         poll_interval (`float`, *optional*, defaults to `5`): Default seconds between
             Slurm status queries.
+        ssh_mode (`str`, *optional*, defaults to `"A"`): `"A"` resolves `ssh_host`
+            through the local user's SSH configuration. `"B"` (managed SSH) ignores
+            every SSH configuration file and requires `ssh_user`, `identity_file`,
+            and `known_hosts_file`; host keys are always strictly checked.
+        ssh_user (`str`, *optional*): Remote user passed with `-l`.
+        ssh_port (`int`, *optional*): Remote port passed with `-p`.
+        identity_file (`str`, *optional*): Private key for Mode B.
+        known_hosts_file (`str`, *optional*): Verified host keys for Mode B.
+        allowed_hosts (`tuple[str, ...]`, *optional*): Approved login nodes. When
+            nonempty, `ssh_host` must be one of them.
     """
 
     ssh_host: str
@@ -82,6 +92,28 @@ class SlurmConfig:
     result_timeout: float = 600
     environment_timeout: float = 1800
     poll_interval: float = 5
+    ssh_mode: str = "A"
+    ssh_user: str | None = None
+    ssh_port: int | None = None
+    identity_file: str | None = None
+    known_hosts_file: str | None = None
+    allowed_hosts: tuple[str, ...] = ()
+
+    def __post_init__(self):
+        if self.ssh_mode not in ("A", "B"):
+            raise ValueError(f"Unknown SSH mode {self.ssh_mode!r}")
+        if self.allowed_hosts and self.ssh_host not in self.allowed_hosts:
+            raise ValueError(f"SSH host {self.ssh_host!r} is not an approved login node")
+        if self.ssh_host.startswith("-"):
+            raise ValueError("SSH host cannot start with '-'")
+        if self.ssh_mode == "B":
+            missing = [
+                name
+                for name in ("ssh_user", "identity_file", "known_hosts_file")
+                if not getattr(self, name)
+            ]
+            if missing:
+                raise ValueError("Managed SSH (mode B) requires " + ", ".join(missing))
 
 
 class SlurmBackend:
@@ -114,12 +146,42 @@ class SlurmBackend:
                 killed, but the remote command may still have run.
         """
         return subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", self.config.ssh_host, command],
+            [*self._ssh_argv(), command],
             check=False,
             input=input,
             capture_output=True,
             timeout=self.config.ssh_timeout,
         )
+
+    def _ssh_argv(self) -> list[str]:
+        """
+        Builds the SSH command line, without the remote command, for the SSH mode.
+
+        Returns:
+            `list[str]`: Mode A: `ssh -o BatchMode=yes [-p port] [-l user] host`.
+                Mode B adds `-F none`, strict host-key checking against
+                `known_hosts_file`, and only `identity_file` as a key, so no SSH
+                configuration file, agent, or proxy setting can change the connection.
+        """
+        config = self.config
+        argv = ["ssh"]
+        if config.ssh_mode == "B":
+            known_hosts = str(config.known_hosts_file)
+            argv += ["-F", "none"]
+            argv += ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes"]
+            argv += ["-o", f"UserKnownHostsFile={known_hosts}"]
+            argv += ["-o", f"GlobalKnownHostsFile={known_hosts}"]
+            argv += ["-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none"]
+            argv += ["-o", "ForwardAgent=no", "-o", "ClearAllForwardings=yes"]
+            argv += ["-i", str(config.identity_file), "-p", str(config.ssh_port or 22)]
+        else:
+            argv += ["-o", "BatchMode=yes"]
+            if config.ssh_port is not None:
+                argv += ["-p", str(config.ssh_port)]
+        if config.ssh_user:
+            argv += ["-l", config.ssh_user]
+        argv.append(config.ssh_host)
+        return argv
 
     def _command_error(self, result: subprocess.CompletedProcess[bytes]) -> InfrastructureError:
         """
@@ -458,7 +520,7 @@ class SlurmBackend:
             environment_id or "",
             self.config.worker_workdir,
             current_request_id(),
-            os.getenv("NEST_LOG_LEVEL", "INFO"),
+            load_log_level()[0],
         )
 
         # Submit Slurm job exactly once; an ambiguous outcome is reported, not retried.

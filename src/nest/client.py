@@ -1,4 +1,3 @@
-import os
 from collections.abc import Callable
 from functools import wraps
 from pathlib import Path
@@ -8,6 +7,7 @@ import cloudpickle
 import grpc
 
 from ._logging import current_request_id, get_logger, operation, request_context
+from .config import ClientConfig, load_client_config
 from .errors import (
     ERROR_KIND_METADATA,
     INFRASTRUCTURE_ERRORS,
@@ -19,30 +19,24 @@ from .proto import execution_pb2, execution_pb2_grpc
 
 logger = get_logger(__name__)
 
-DEFAULT_RPC_TIMEOUT = 900
-"""Seconds allowed for an `Execute` RPC unless `NEST_RPC_TIMEOUT` overrides it."""
 
-
-def _rpc_timeout() -> float:
+def _channel(config: ClientConfig) -> grpc.Channel:
     """
-    Reads the `Execute` RPC deadline from `NEST_RPC_TIMEOUT`.
+    Opens a plaintext or TLS channel to the configured Controller.
+
+    Args:
+        config ([`config.ClientConfig`]): Validated client configuration.
 
     Returns:
-        `float`: Positive deadline in seconds; 900 when the variable is unset or empty.
-
-    Raises:
-        `ValueError`: If the value is not a positive finite number.
+        `grpc.Channel`: The channel; close it after use.
     """
-    raw = os.getenv("NEST_RPC_TIMEOUT", "").strip()
-    if not raw:
-        return DEFAULT_RPC_TIMEOUT
-    try:
-        value = float(raw)
-    except ValueError:
-        value = float("nan")
-    if not 0 < value < float("inf"):
-        raise ValueError(f"NEST_RPC_TIMEOUT must be a positive number of seconds, got {raw!r}")
-    return value
+    if not config.tls:
+        return grpc.insecure_channel(config.address)
+    roots = None
+    if config.tls_ca_file is not None:
+        with open(config.tls_ca_file, "rb") as handle:
+            roots = handle.read()
+    return grpc.secure_channel(config.address, grpc.ssl_channel_credentials(roots))
 
 
 def _controller_error(exc: grpc.RpcError, address: str, timeout: float) -> Exception | None:
@@ -77,10 +71,10 @@ def _controller_error(exc: grpc.RpcError, address: str, timeout: float) -> Excep
         return ConnectionError(
             f"Cannot connect to Nest Controller at {address}.\n\n"
             "Please check:\n"
-            "  - Tailscale is connected to the required Tailnet.\n"
-            "  - You have permission to access the Controller.\n"
-            "  - The Controller is running.\n\n"
-            "To use another Controller, set NEST_CONTROLLER_ADDRESS."
+            "  - NEST_CONTROLLER_ADDRESS names the Controller (default 127.0.0.1:50051).\n"
+            "  - Your network can reach it, for example through a VPN or Tailnet.\n"
+            "  - NEST_CONTROLLER_TLS matches the Controller's TLS setting.\n"
+            "  - The Controller is running."
         )
 
     return None
@@ -102,9 +96,10 @@ def execute_remote(
     """
     Serializes a function call and executes it through the controller.
 
-    Uses `NEST_CONTROLLER_ADDRESS` when it is nonempty. Otherwise, connects to
-    `nest-tag.tail8e5ba1.ts.net:50051`. The insecure gRPC call has a 900-second
-    deadline unless `NEST_RPC_TIMEOUT` sets another positive number of seconds.
+    Reads its settings with [`config.load_client_config`]: the Controller is
+    `NEST_CONTROLLER_ADDRESS` (default `127.0.0.1:50051`), the call has a 900-second
+    deadline unless `NEST_RPC_TIMEOUT` sets another positive number of seconds, and
+    `NEST_CONTROLLER_TLS` or `NEST_CONTROLLER_TLS_CA_FILE` selects a TLS channel.
     The call is never retried. Only send trusted functions and accept results from
     trusted hosts: deserializing Python objects can execute code.
 
@@ -121,7 +116,7 @@ def execute_remote(
 
     Raises:
         `OSError`: If project environment files cannot be read.
-        `ValueError`: If `NEST_RPC_TIMEOUT` is invalid.
+        [`config.ConfigError`]: If a client setting is invalid. It is a `ValueError`.
         `ConnectionError`: If gRPC reports that the controller is unavailable.
         [`errors.RpcTimeoutError`]: If the RPC deadline expires.
         [`errors.InfrastructureError`]: If the Controller reports a classified SSH or
@@ -151,14 +146,13 @@ def execute_remote(
             )
         )
 
-    DEFAULT_CONTROLLER_ADDRESS = "nest-tag.tail8e5ba1.ts.net:50051"
-
-    address = os.getenv("NEST_CONTROLLER_ADDRESS") or DEFAULT_CONTROLLER_ADDRESS
-    timeout = _rpc_timeout()
+    config = load_client_config()
+    address, timeout = config.address, config.rpc_timeout
 
     logger.info(
-        "Calling controller address=%s gpu=%s cpu=%s payload_bytes=%s",
+        "Calling controller address=%s tls=%s gpu=%s cpu=%s payload_bytes=%s",
         address,
+        config.tls,
         resources.gpu,
         resources.cpu,
         len(payload),
@@ -166,7 +160,7 @@ def execute_remote(
 
     # Connect to Controller
     try:
-        with grpc.insecure_channel(address) as channel:
+        with _channel(config) as channel:
             stub = execution_pb2_grpc.ExecutionServiceStub(channel)
             response = stub.Execute(
                 request,
