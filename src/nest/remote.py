@@ -14,12 +14,28 @@ class Resources:
 
     Attributes:
         gpu (`int`, *optional*, defaults to `0`): Number of requested GPUs.
-        cpu (`int`, *optional*, defaults to `1`): Number of requested CPUs.
-            The Slurm controller does not currently pass this count to the backend.
+        cpu (`int`, *optional*, defaults to `1`): Number of requested CPUs. The Slurm
+            controller requests them with `sbatch --cpus-per-task`; `0` keeps the
+            worker script's own setting.
     """
 
     gpu: int = 0
     cpu: int = 1
+
+    def __post_init__(self):
+        """
+        Validates the resource counts.
+
+        Raises:
+            `TypeError`: If a count is not an integer.
+            `ValueError`: If a count is negative.
+        """
+        for name in ("gpu", "cpu"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be an integer")
+            if value < 0:
+                raise ValueError(f"{name} cannot be negative")
 
 
 class RemoteFunction:
@@ -84,8 +100,10 @@ class RemoteFunction:
         Raises:
             `OSError`: If project environment files cannot be read.
             `ConnectionError`: If the controller is unavailable.
-            `grpc.RpcError`: If another RPC error occurs, including the 900-second
-                request deadline expiring.
+            [`errors.RpcTimeoutError`]: If the 900-second request deadline expires.
+            [`errors.InfrastructureError`]: If the Controller reports a classified
+                SSH or Slurm failure, including queue and execution timeouts.
+            `grpc.RpcError`: If another RPC error occurs.
             [`errors.RemoteExecutionError`]: If the worker returns a remote error record.
         """
         return execute_remote(self.func, self.resources, self.project, *args, **kwargs)
@@ -118,8 +136,8 @@ def remote(
 
     Args:
         gpu (`int`, *optional*, defaults to `0`): Number of requested GPUs.
-        cpu (`int`, *optional*, defaults to `1`): Number of requested CPUs.
-            The Slurm controller does not currently pass this count to the backend.
+        cpu (`int`, *optional*, defaults to `1`): Number of requested CPUs. The Slurm
+            controller requests them with `sbatch --cpus-per-task`.
         project (`str | Path`, *optional*): Directory containing `pyproject.toml`
             and `uv.lock`. Remote calls send these files to the controller.
             Project source files and data are not transferred.

@@ -39,7 +39,7 @@ reference:
       - local: api/client
         title: Client execution
       - local: api/errors
-        title: RemoteExecutionError
+        title: Errors
   - title: Controller and runtime
     sections:
       - local: api/controller

@@ -13,6 +13,16 @@ then run unmodified:
 
 Every shim appends its invocation to a JSON-lines log so tests can assert the
 exact commands the Controller sends to the cluster.
+
+Failure injection, for timeout and ambiguity regressions:
+
+- `FakeHpc.hang_ssh(match)` makes SSH commands containing `match` hang, either
+  before running (nothing happens remotely) or after running (the remote command
+  took effect, but the caller never hears back).
+- `FakeHpc.drop_ssh(match)` runs the command, then exits with status 255 as if the
+  connection dropped.
+- `FakeHpc.hold_jobs(state)` makes `sbatch` record `state` (for example `PENDING`,
+  `RUNNING`, or `TIMEOUT`) instead of running the batch script.
 """
 
 import json
@@ -25,7 +35,7 @@ from pathlib import Path
 REPOSITORY = Path(__file__).resolve().parent.parent
 
 _COMMON = """\
-import json, os, subprocess, sys
+import json, os, subprocess, sys, time
 from pathlib import Path
 
 STATE = Path(os.environ["FAKE_HPC_STATE"])
@@ -61,6 +71,18 @@ host, command = args
 if host != os.environ["FAKE_HPC_HOST"]:
     print(f"ssh: Could not resolve hostname {host}", file=sys.stderr)
     sys.exit(255)
+fault_file = STATE / "ssh-fault.json"
+fault = json.loads(fault_file.read_text()) if fault_file.exists() else None
+if fault and fault["match"] in command:
+    log("ssh-fault", mode=fault["mode"], command=command)
+    if fault["mode"] in ("after", "drop"):
+        subprocess.run(["bash", "-c", command], stdin=sys.stdin)
+        sys.stdout.flush()
+    if fault["mode"] == "drop":
+        print(f"Connection to {host} closed by remote host.", file=sys.stderr)
+        sys.exit(255)
+    # The caller's SSH timeout kills this process.
+    time.sleep(3600)
 os.execvp("bash", ["bash", "-c", command])
 """,
     "sbatch": """
@@ -73,7 +95,10 @@ counter = STATE / "next-job-id"
 job_id = int(counter.read_text()) if counter.exists() else 1000
 counter.write_text(str(job_id + 1))
 log("sbatch", cwd=os.getcwd(), flags=flags, script=script, args=script_args, job_id=job_id)
-if Path(script).name.startswith("pending"):
+hold = STATE / "hold-state"
+if hold.exists():
+    state_file(job_id).write_text(hold.read_text())
+elif Path(script).name.startswith("pending"):
     state_file(job_id).write_text("PENDING")
 else:
     with open(STATE / f"job-{job_id}.out", "w") as out:
@@ -90,7 +115,7 @@ print(f"{job_id};fake-cluster" if "--parsable" in flags else f"Submitted batch j
 job_id = job_flag(sys.argv[1:])
 path = state_file(job_id)
 state = path.read_text() if path.exists() else None
-if state in ("PENDING", "RUNNING"):
+if state in ("PENDING", "RUNNING", "CONFIGURING", "COMPLETING"):
     print(state)
 else:
     # Real Slurm forgets finished jobs after MinJobAge.
@@ -208,6 +233,30 @@ class FakeHpc:
             "FAKE_HPC_STATE": str(self.state),
             "FAKE_HPC_PYTHON": sys.executable,
         }
+
+    def hang_ssh(self, match: str, *, after: bool = False) -> None:
+        """Makes SSH commands containing `match` hang until the caller kills SSH.
+
+        Args:
+            match (`str`): Substring of the remote command to intercept.
+            after (`bool`, *optional*, defaults to `False`): Run the command first, so
+                it takes effect remotely before the connection hangs.
+        """
+        fault = {"match": match, "mode": "after" if after else "before"}
+        (self.state / "ssh-fault.json").write_text(json.dumps(fault))
+
+    def drop_ssh(self, match: str) -> None:
+        """Runs SSH commands containing `match`, then fails with SSH's exit status 255."""
+        (self.state / "ssh-fault.json").write_text(json.dumps({"match": match, "mode": "drop"}))
+
+    def hold_jobs(self, state: str) -> None:
+        """Makes later `sbatch` calls record `state` without running their script."""
+        (self.state / "hold-state").write_text(state)
+
+    def job_state(self, job_id: int) -> str | None:
+        """Returns the recorded state of a job, or `None` if it was never submitted."""
+        path = self.state / f"job-{job_id}.state"
+        return path.read_text() if path.exists() else None
 
     def calls(self, tool: str) -> list[dict]:
         """Returns the logged invocations of one shim, oldest first."""

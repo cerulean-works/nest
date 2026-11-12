@@ -7,6 +7,7 @@ environment build, and the worker all run unchanged without a cluster.
 """
 
 import re
+from contextlib import ExitStack
 from pathlib import Path
 from typing import cast
 
@@ -16,7 +17,18 @@ from fake_hpc import FakeHpc
 from test_controller import controller_at_free_port
 
 import nest
-from nest.errors import RemoteExecutionError
+from nest.errors import (
+    ERROR_KIND_METADATA,
+    ExecutionTimeoutError,
+    NestTimeoutError,
+    QueueTimeoutError,
+    RemoteExecutionError,
+    RpcTimeoutError,
+    SlurmJobError,
+    SSHError,
+    SSHTimeoutError,
+    SubmissionUnknownError,
+)
 from nest.proto import execution_pb2
 
 WORKER_SCRIPT = "project/scripts/worker.sbatch"
@@ -49,6 +61,28 @@ def slurm_controller(monkeypatch, hpc):
     with controller_at_free_port(**hpc.controller_settings()) as (_, stub, address):
         monkeypatch.setenv("NEST_CONTROLLER_ADDRESS", address)
         yield stub
+
+
+@pytest.fixture
+def start_slurm_controller(monkeypatch, hpc):
+    """Starts a FakeHpc Controller with extra settings, such as short timeouts."""
+    with ExitStack() as stack:
+
+        def start(**settings):
+            _, stub, address = stack.enter_context(
+                controller_at_free_port(**{**hpc.controller_settings(), **settings})
+            )
+            monkeypatch.setenv("NEST_CONTROLLER_ADDRESS", address)
+            return stub
+
+        yield start
+
+
+FAST_POLLING = {"NEST_POLL_INTERVAL": "0.1"}
+
+
+def _metadata(error: grpc.Call) -> dict:
+    return dict(error.trailing_metadata() or ())
 
 
 def _worker_jobs(hpc):
@@ -170,26 +204,29 @@ def test_slurm_job_failure_surfaces_as_internal_rpc_error(slurm_controller, hpc)
 
     with pytest.raises(grpc.RpcError) as caught:
         crash.remote()
-    error = cast(grpc.Call, caught.value)
-    assert error.code() == grpc.StatusCode.INTERNAL
+    error = caught.value
     job_id = _worker_jobs(hpc)[0]["job_id"]
-    assert error.details() == f"Slurm job {job_id} failed: FAILED"
-
-
-def test_slurm_unreachable_host_surfaces_ssh_error(monkeypatch, hpc):
-    settings = {**hpc.controller_settings(), "NEST_SLURM_HOST": "unknown-hpc"}
-    with controller_at_free_port(**settings) as (_, _stub, address):
-        monkeypatch.setenv("NEST_CONTROLLER_ADDRESS", address)
-
-        @nest.remote()
-        def noop():
-            return None
-
-        with pytest.raises(grpc.RpcError) as caught:
-            noop.remote()
-    error = cast(grpc.Call, caught.value)
+    # Still a grpc.RpcError with the original status and details.
+    assert isinstance(error, SlurmJobError)
     assert error.code() == grpc.StatusCode.INTERNAL
+    assert error.details() == f"Slurm job {job_id} failed: FAILED"
+    assert error.job_id == job_id
+
+
+def test_slurm_unreachable_host_surfaces_ssh_error(start_slurm_controller, hpc):
+    start_slurm_controller(NEST_SLURM_HOST="unknown-hpc")
+
+    @nest.remote()
+    def noop():
+        return None
+
+    with pytest.raises(SSHError) as caught:
+        noop.remote()
+    error = caught.value
+    assert not isinstance(error, TimeoutError)
+    assert error.code() == grpc.StatusCode.UNAVAILABLE
     assert "Could not resolve hostname unknown-hpc" in error.details()
+    assert _worker_jobs(hpc) == []
 
 
 # uv dependency environments
@@ -304,7 +341,7 @@ def test_controller_ssh_and_sbatch_commands_are_stable(slurm_controller, hpc, pr
     def ping():
         return "pong"
 
-    @nest.remote()
+    @nest.remote(cpu=0)
     def ping_cpu():
         return "pong"
 
@@ -321,8 +358,10 @@ def test_controller_ssh_and_sbatch_commands_are_stable(slurm_controller, hpc, pr
     (build,) = _build_jobs(hpc)
     gpu_job, cpu_job = _worker_jobs(hpc)
     common = ["--parsable", "--account=test-account", "--partition=dev"]
-    assert build["flags"] == [*common, "--gpus-per-node=2", "--time=00:05:00"]
-    assert gpu_job["flags"] == [*common, "--gpus-per-node=2", "--time=00:05:00"]
+    resources = ["--gpus-per-node=2", "--cpus-per-task=1"]
+    assert build["flags"] == [*common, *resources, "--time=00:05:00"]
+    assert gpu_job["flags"] == [*common, *resources, "--time=00:05:00"]
+    # cpu=0 and gpu=0 leave both counts to the deployed worker script.
     assert cpu_job["flags"] == [*common, "--time=00:05:00"]
     for job in (build, gpu_job, cpu_job):
         assert job["cwd"] == str(hpc.base)
@@ -393,3 +432,223 @@ def test_batch_job_rpcs_submit_query_and_cancel(slurm_controller, hpc, tmp_path)
     with pytest.raises(grpc.RpcError) as caught:
         stub.CancelJob(execution_pb2.CancelJobRequest(job_id=999999), timeout=30)
     assert cast(grpc.Call, caught.value).code() == grpc.StatusCode.FAILED_PRECONDITION
+
+
+# CPU resource forwarding
+
+
+def test_cpu_request_is_forwarded_to_worker_and_build(slurm_controller, hpc, project):
+    @nest.remote(cpu=8, project=project)
+    def threads():
+        return "ok"
+
+    @nest.remote(cpu=3)
+    def plain():
+        return "ok"
+
+    assert threads.remote() == "ok"
+    assert plain.remote() == "ok"
+    (build,) = _build_jobs(hpc)
+    with_env, without_env = _worker_jobs(hpc)
+    assert "--cpus-per-task=8" in build["flags"]
+    assert "--cpus-per-task=8" in with_env["flags"]
+    assert "--cpus-per-task=3" in without_env["flags"]
+    # GPU defaults to zero, so no GPU flag accompanies a CPU-only request.
+    assert not any(flag.startswith("--gpus") for flag in without_env["flags"])
+
+
+def test_negative_resources_are_rejected_before_submission(slurm_controller, hpc):
+    with pytest.raises(ValueError, match="cpu cannot be negative"):
+        nest.remote(cpu=-1)
+
+    with pytest.raises(grpc.RpcError) as caught:
+        slurm_controller.Execute(
+            execution_pb2.ExecuteRequest(payload=b"unused", cpu=-2), timeout=30
+        )
+    assert cast(grpc.Call, caught.value).code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert hpc.calls("ssh") == []
+
+
+# Timeout classification
+
+
+def test_ssh_timeout_while_staging_is_an_ssh_timeout(start_slurm_controller, hpc):
+    start_slurm_controller(NEST_SSH_TIMEOUT="1")
+    hpc.hang_ssh("input.pkl")
+
+    @nest.remote()
+    def noop():
+        return None
+
+    with pytest.raises(SSHTimeoutError) as caught:
+        noop.remote()
+    error = caught.value
+    assert isinstance(error, TimeoutError)
+    assert error.code() == grpc.StatusCode.DEADLINE_EXCEEDED
+    assert "timed out after 1 seconds" in error.details()
+    assert hpc.calls("sbatch") == []
+
+
+def test_queue_timeout_when_job_never_starts(start_slurm_controller, hpc):
+    start_slurm_controller(NEST_RESULT_TIMEOUT="0.5", **FAST_POLLING)
+    hpc.hold_jobs("PENDING")
+
+    @nest.remote()
+    def noop():
+        return None
+
+    with pytest.raises(QueueTimeoutError) as caught:
+        noop.remote()
+    error = caught.value
+    [job] = _worker_jobs(hpc)
+    assert not isinstance(error, ExecutionTimeoutError)
+    assert error.code() == grpc.StatusCode.DEADLINE_EXCEEDED
+    assert error.job_id == job["job_id"]
+    assert "did not start within 0.5 seconds. Last state: PENDING" in error.details()
+    # A timeout never cancels the job.
+    assert hpc.calls("scancel") == []
+    assert hpc.job_state(job["job_id"]) == "PENDING"
+
+
+def test_execution_timeout_when_running_job_does_not_finish(start_slurm_controller, hpc):
+    start_slurm_controller(NEST_RESULT_TIMEOUT="0.5", **FAST_POLLING)
+    hpc.hold_jobs("RUNNING")
+
+    @nest.remote()
+    def noop():
+        return None
+
+    with pytest.raises(ExecutionTimeoutError) as caught:
+        noop.remote()
+    [job] = _worker_jobs(hpc)
+    assert caught.value.job_id == job["job_id"]
+    assert "did not finish within 0.5 seconds. Last state: RUNNING" in caught.value.details()
+    assert hpc.calls("scancel") == []
+
+
+def test_slurm_time_limit_is_an_execution_timeout(slurm_controller, hpc):
+    hpc.hold_jobs("TIMEOUT")
+
+    @nest.remote()
+    def noop():
+        return None
+
+    with pytest.raises(ExecutionTimeoutError) as caught:
+        noop.remote()
+    job_id = _worker_jobs(hpc)[0]["job_id"]
+    assert caught.value.details() == f"Slurm job {job_id} exceeded its Slurm time limit: TIMEOUT"
+
+
+def test_environment_build_queue_timeout(start_slurm_controller, hpc, project):
+    start_slurm_controller(NEST_ENVIRONMENT_TIMEOUT="0.5", **FAST_POLLING)
+    hpc.hold_jobs("PENDING")
+
+    @nest.remote(project=project)
+    def noop():
+        return None
+
+    with pytest.raises(QueueTimeoutError) as caught:
+        noop.remote()
+    [build] = _build_jobs(hpc)
+    assert caught.value.job_id == build["job_id"]
+    assert caught.value.details().startswith(f"Environment build {build['job_id']} did not start")
+    assert _worker_jobs(hpc) == []
+
+
+def test_client_rpc_deadline_is_an_rpc_timeout(start_slurm_controller, hpc, monkeypatch):
+    start_slurm_controller(NEST_RESULT_TIMEOUT="3", **FAST_POLLING)
+    hpc.hold_jobs("PENDING")
+    monkeypatch.setenv("NEST_RPC_TIMEOUT", "0.5")
+
+    @nest.remote()
+    def noop():
+        return None
+
+    with pytest.raises(RpcTimeoutError) as caught:
+        noop.remote()
+    error = caught.value
+    assert isinstance(error, TimeoutError)
+    assert isinstance(error.__cause__, grpc.RpcError)
+    assert error.code() == grpc.StatusCode.DEADLINE_EXCEEDED
+    assert "did not reply within 0.5 seconds" in str(error)
+
+
+def test_timeout_kinds_are_distinct():
+    kinds = [SSHTimeoutError, QueueTimeoutError, ExecutionTimeoutError, RpcTimeoutError]
+    assert len({kind.kind for kind in kinds}) == len(kinds)
+    for kind in kinds:
+        assert issubclass(kind, NestTimeoutError)
+        assert issubclass(kind, TimeoutError)
+        assert [other for other in kinds if issubclass(kind, other)] == [kind]
+    # An ambiguous submission is not a plain timeout: it must not be retried blindly.
+    assert not issubclass(SubmissionUnknownError, TimeoutError)
+
+
+# Ambiguous submissions
+
+
+def test_ssh_timeout_during_sbatch_is_reported_and_not_resubmitted(start_slurm_controller, hpc):
+    start_slurm_controller(NEST_SSH_TIMEOUT="1", **FAST_POLLING)
+    hpc.hang_ssh("sbatch --parsable", after=True)
+
+    @nest.remote()
+    def noop():
+        return None
+
+    with pytest.raises(SubmissionUnknownError) as caught:
+        noop.remote()
+    error = caught.value
+    # sbatch really submitted the job, but the Controller never received its ID.
+    [job] = _worker_jobs(hpc)
+    assert hpc.job_state(job["job_id"]) == "COMPLETED"
+    assert error.code() == grpc.StatusCode.UNKNOWN
+    assert error.job_id is None
+    execution_id = job["args"][0]
+    assert "status of project/scripts/worker.sbatch is unknown" in error.details()
+    assert f"Execution ID: {execution_id}" in error.details()
+    # Exactly one submission, and no polling or download afterward.
+    assert len(hpc.calls("sbatch")) == 1
+    last_ssh = hpc.calls("ssh")[-1]["argv"][-1]
+    assert "sbatch" in last_ssh
+
+
+def test_ssh_drop_after_sbatch_started_is_ambiguous(slurm_controller, hpc):
+    hpc.drop_ssh("sbatch --parsable")
+
+    @nest.remote()
+    def noop():
+        return None
+
+    with pytest.raises(SubmissionUnknownError) as caught:
+        noop.remote()
+    assert "SSH disconnected during sbatch" in caught.value.details()
+    assert "closed by remote host" in caught.value.details()
+    assert len(hpc.calls("sbatch")) == 1
+
+
+def test_ambiguous_submit_job_rpc_reports_unknown_kind(start_slurm_controller, hpc, tmp_path):
+    stub = start_slurm_controller(NEST_SSH_TIMEOUT="1")
+    (tmp_path / "hello.sbatch").write_text("#!/bin/bash\nexit 0\n")
+    hpc.hang_ssh("sbatch --parsable", after=True)
+
+    with pytest.raises(grpc.RpcError) as caught:
+        stub.SubmitJob(
+            execution_pb2.SubmitJobRequest(workdir=str(tmp_path), script="hello.sbatch"),
+            timeout=30,
+        )
+    error = cast(grpc.Call, caught.value)
+    assert error.code() == grpc.StatusCode.UNKNOWN
+    assert _metadata(error)[ERROR_KIND_METADATA] == "submission_unknown"
+    assert len(hpc.calls("sbatch")) == 1
+
+
+def test_rejected_submit_job_rpc_keeps_failed_precondition(slurm_controller, hpc, tmp_path):
+    with pytest.raises(grpc.RpcError) as caught:
+        slurm_controller.SubmitJob(
+            execution_pb2.SubmitJobRequest(workdir=str(tmp_path / "missing"), script="x.sbatch"),
+            timeout=30,
+        )
+    error = cast(grpc.Call, caught.value)
+    assert error.code() == grpc.StatusCode.FAILED_PRECONDITION
+    assert _metadata(error)[ERROR_KIND_METADATA] == "remote_command_error"
+    assert hpc.calls("sbatch") == []

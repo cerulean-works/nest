@@ -8,10 +8,82 @@ import cloudpickle
 import grpc
 
 from ._logging import current_request_id, get_logger, operation, request_context
-from .errors import RemoteExecutionError
+from .errors import (
+    ERROR_KIND_METADATA,
+    INFRASTRUCTURE_ERRORS,
+    JOB_ID_METADATA,
+    RemoteExecutionError,
+    RpcTimeoutError,
+)
 from .proto import execution_pb2, execution_pb2_grpc
 
 logger = get_logger(__name__)
+
+DEFAULT_RPC_TIMEOUT = 900
+"""Seconds allowed for an `Execute` RPC unless `NEST_RPC_TIMEOUT` overrides it."""
+
+
+def _rpc_timeout() -> float:
+    """
+    Reads the `Execute` RPC deadline from `NEST_RPC_TIMEOUT`.
+
+    Returns:
+        `float`: Positive deadline in seconds; 900 when the variable is unset or empty.
+
+    Raises:
+        `ValueError`: If the value is not a positive finite number.
+    """
+    raw = os.getenv("NEST_RPC_TIMEOUT", "").strip()
+    if not raw:
+        return DEFAULT_RPC_TIMEOUT
+    try:
+        value = float(raw)
+    except ValueError:
+        value = float("nan")
+    if not 0 < value < float("inf"):
+        raise ValueError(f"NEST_RPC_TIMEOUT must be a positive number of seconds, got {raw!r}")
+    return value
+
+
+def _controller_error(exc: grpc.RpcError, address: str, timeout: float) -> Exception | None:
+    """
+    Converts a Controller RPC error into a typed Nest exception when possible.
+
+    Args:
+        exc (`grpc.RpcError`): Error raised by the stub call.
+        address (`str`): Controller address, used in messages.
+        timeout (`float`): RPC deadline in seconds, used in messages.
+
+    Returns:
+        `Exception | None`: The exception to raise, or `None` to re-raise `exc`.
+    """
+    call = cast(grpc.Call, exc)
+    metadata = {key: value for key, value in call.trailing_metadata() or ()}
+    error_class = INFRASTRUCTURE_ERRORS.get(str(metadata.get(ERROR_KIND_METADATA, "")))
+
+    if error_class is not None:
+        job_id = str(metadata.get(JOB_ID_METADATA, ""))
+        return error_class(call.details() or "", job_id=int(job_id) if job_id.isdecimal() else None)
+
+    status = call.code()
+    if status == grpc.StatusCode.DEADLINE_EXCEEDED:
+        return RpcTimeoutError(
+            f"Nest Controller at {address} did not reply within {timeout:g} seconds. "
+            "Any Slurm job it submitted was not cancelled. Set NEST_RPC_TIMEOUT to "
+            "allow longer calls."
+        )
+
+    if status == grpc.StatusCode.UNAVAILABLE:
+        return ConnectionError(
+            f"Cannot connect to Nest Controller at {address}.\n\n"
+            "Please check:\n"
+            "  - Tailscale is connected to the required Tailnet.\n"
+            "  - You have permission to access the Controller.\n"
+            "  - The Controller is running.\n\n"
+            "To use another Controller, set NEST_CONTROLLER_ADDRESS."
+        )
+
+    return None
 
 
 def _logged_execution(method):
@@ -32,8 +104,9 @@ def execute_remote(
 
     Uses `NEST_CONTROLLER_ADDRESS` when it is nonempty. Otherwise, connects to
     `nest-tag.tail8e5ba1.ts.net:50051`. The insecure gRPC call has a 900-second
-    deadline. Only send trusted functions and accept results from trusted hosts:
-    deserializing Python objects can execute code.
+    deadline unless `NEST_RPC_TIMEOUT` sets another positive number of seconds.
+    The call is never retried. Only send trusted functions and accept results from
+    trusted hosts: deserializing Python objects can execute code.
 
     Args:
         func (`Callable`): Function to serialize with cloudpickle.
@@ -48,7 +121,13 @@ def execute_remote(
 
     Raises:
         `OSError`: If project environment files cannot be read.
+        `ValueError`: If `NEST_RPC_TIMEOUT` is invalid.
         `ConnectionError`: If gRPC reports that the controller is unavailable.
+        [`errors.RpcTimeoutError`]: If the RPC deadline expires.
+        [`errors.InfrastructureError`]: If the Controller reports a classified SSH or
+            Slurm failure, such as [`errors.SSHTimeoutError`],
+            [`errors.QueueTimeoutError`], [`errors.ExecutionTimeoutError`], or
+            [`errors.SubmissionUnknownError`]. These are also `grpc.RpcError`s.
         `grpc.RpcError`: If another RPC error occurs.
         [`errors.RemoteExecutionError`]: If the result contains a remote error record.
     """
@@ -75,6 +154,7 @@ def execute_remote(
     DEFAULT_CONTROLLER_ADDRESS = "nest-tag.tail8e5ba1.ts.net:50051"
 
     address = os.getenv("NEST_CONTROLLER_ADDRESS") or DEFAULT_CONTROLLER_ADDRESS
+    timeout = _rpc_timeout()
 
     logger.info(
         "Calling controller address=%s gpu=%s cpu=%s payload_bytes=%s",
@@ -90,7 +170,7 @@ def execute_remote(
             stub = execution_pb2_grpc.ExecutionServiceStub(channel)
             response = stub.Execute(
                 request,
-                timeout=900,
+                timeout=timeout,
                 metadata=(("x-nest-request-id", current_request_id()),),
             )
 
@@ -98,17 +178,10 @@ def execute_remote(
         # Errors raised by stub calls are also `grpc.Call`s, which carry the status.
         status = cast(grpc.Call, exc).code()
         logger.error("Controller RPC failed address=%s status=%s", address, status.name)
-        if status == grpc.StatusCode.UNAVAILABLE:
-            raise ConnectionError(
-                f"Cannot connect to Nest Controller at {address}.\n\n"
-                "Please check:\n"
-                "  - Tailscale is connected to the required Tailnet.\n"
-                "  - You have permission to access the Controller.\n"
-                "  - The Controller is running.\n\n"
-                "To use another Controller, set NEST_CONTROLLER_ADDRESS."
-            ) from exc
-
-        raise
+        error = _controller_error(exc, address, timeout)
+        if error is None:
+            raise
+        raise error from exc
 
     logger.debug("Result received result_bytes=%s", len(response.result))
 
