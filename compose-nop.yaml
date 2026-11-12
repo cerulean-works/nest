@@ -14,6 +14,7 @@ services:
       NEST_SLURM_HOST: ${NEST_SLURM_HOST:-}
       NEST_SLURM_ACCOUNT: ${NEST_SLURM_ACCOUNT:-}
       NEST_SLURM_WORKDIR: ${NEST_SLURM_WORKDIR:-}
+      NEST_LOG_LEVEL: ${NEST_LOG_LEVEL:-INFO}
     volumes:
       - type: bind
         source: ${NEST_SSH_DIR:-./ssh}
