@@ -3,7 +3,7 @@
 # Nest
 
 [![Version](https://img.shields.io/badge/version-0.1.0a1-blue)](https://github.com/cerulean-works/nest/releases)
-![Python](https://img.shields.io/badge/python-3.12%2B-blue)
+![Python](https://img.shields.io/badge/python-3.14%2B-blue)
 ![Status](https://img.shields.io/badge/status-early_access-orange)
 
 Nest is a Python SDK for executing Python functions on remote Slurm clusters.
@@ -18,7 +18,7 @@ The API is experimental and may change before version 1.0.0.
 
 ## Installation
 
-Nest requires Python 3.12 or later.
+Nest requires Python 3.14 or later.
 
 Install Nest from GitHub:
 
@@ -158,7 +158,7 @@ restart policy. The HPC runtime and work directory below must already exist.
 
 ### Requirements
 
-- Python 3.12+
+- Python 3.14+
 - Access to the target HPC Login Node via SSH
 - A configured Slurm backend
 - A working Nest runtime and Apptainer environment on HPC
@@ -202,7 +202,7 @@ Nest expects the following directory structure:
 ```text
 nest/
 ├── images/
-│   └── uv-python312.sif
+│   └── uv-python314.sif
 ├── project/
 │   ├── pyproject.toml
 │   ├── uv.lock

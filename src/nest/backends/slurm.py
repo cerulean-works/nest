@@ -693,7 +693,7 @@ class SlurmBackend:
         Hashes the remote container image checksum and host architecture.
 
         Returns:
-            `str`: SHA-256 runtime ID for `images/uv-python312.sif` and `uname -m`.
+            `str`: SHA-256 runtime ID for `images/uv-python314.sif` and `uname -m`.
 
         Raises:
             `ValueError`: If `worker_workdir` is missing.
@@ -703,7 +703,7 @@ class SlurmBackend:
         if not self.config.worker_workdir:
             raise ValueError("worker_workdir is not configured")
 
-        image = f"{self.config.worker_workdir.rstrip('/')}/images/uv-python312.sif"
+        image = f"{self.config.worker_workdir.rstrip('/')}/images/uv-python314.sif"
 
         quoted = shlex.quote(image)
 

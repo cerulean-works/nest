@@ -55,7 +55,7 @@ if [[ ! -d "$BASE" ]]; then
 fi
 
 # Resolve user Python environment
-IMAGE="$BASE/images/uv-python312.sif"
+IMAGE="$BASE/images/uv-python314.sif"
 
 if [[ -n "$ENV_ID" ]]; then
 

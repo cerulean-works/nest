@@ -9,7 +9,7 @@ before version 1.0.0.
 
 ## Get started
 
-1. [Install Nest](installation) with Python 3.12 or later.
+1. [Install Nest](installation) with Python 3.14 or later.
 2. [Run your first remote function](quickstart) using the team's Controller.
 3. [Use project dependencies](project-dependencies) when your function needs
    packages from a uv project.

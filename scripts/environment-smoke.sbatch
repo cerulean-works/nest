@@ -28,7 +28,7 @@ if [[ ! -d "$BASE" ]]; then
     exit 1
 fi
 
-IMAGE="$BASE/images/uv-python312.sif"
+IMAGE="$BASE/images/uv-python314.sif"
 ENV_DIR="$BASE/environments/$ENV_ID"
 
 # Identify container runtime
