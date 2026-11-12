@@ -60,7 +60,7 @@ def main():
         env = os.environ.copy()
         env.pop("PYTHONPATH", None)
         env.pop("PYTHONHOME", None)
-        env["VIRTUA_ENV"] = str(Path(user_python).parent.parent)
+        env["VIRTUAL_ENV"] = str(Path(user_python).parent.parent)
 
         subprocess.run(
             [
