@@ -13,7 +13,14 @@ uv run python examples/hello.py
 uv run python examples/serialization.py
 ```
 
-Run the Controller integration tests:
+Run the full test suite, as the `Tests` workflow does:
+
+```bash
+uv run pytest
+```
+
+The Controller container job runs only the `unittest` test cases. To run the
+same subset locally:
 
 ```bash
 uv run python -m unittest discover -s tests -v
@@ -29,6 +36,25 @@ bash tests/smoke_compose.sh
 The smoke test uses local execution and temporary SSH fixtures. It checks the
 health check, non-root execution, credential copying, remote calls and errors,
 and clean container shutdown. It does not submit real Slurm jobs.
+
+## End-to-end runtime tests
+
+`tests/test_runtime_e2e.py` sends calls through `nest.remote` to a real
+Controller process over gRPC. Its Slurm tests use a fake cluster defined in
+`tests/fake_hpc.py`. That file puts stand-in `ssh`, `sbatch`, `squeue`, `sacct`,
+`scancel`, `apptainer`, `uv`, and `flock` commands first on `PATH`. The
+Controller's SSH commands, `scripts/worker.sbatch`,
+`scripts/environment-smoke.sbatch`, the worker, and the user's uv environment
+then run unchanged on your machine. Each stand-in logs its calls, so the tests
+can check the exact commands the Controller sends.
+
+The tests cover local and Slurm execution, environment cache hits and misses,
+remote tracebacks, and job and build failures. They need `bash` but no cluster.
+They check the commands Nest sends, not how real Slurm or Apptainer behaves, so
+test on the cluster before a release.
+
+If you change a deployment contract, update `tests/fake_hpc.py` to match.
+Examples are the image name, a batch script's arguments, or the `sbatch` flags.
 
 ## Regenerate Protobuf Code
 
