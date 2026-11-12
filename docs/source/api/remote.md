@@ -27,8 +27,10 @@ instance), and `project` (a resolved `Path`, or `None`). It preserves the origin
 function's metadata with `functools.update_wrapper`.
 
 Remote calls can raise `OSError` while reading dependency files,
-`ConnectionError` when the Controller is unavailable, `grpc.RpcError` for other
-RPC failures, or [`errors.RemoteExecutionError`] for a remote Python exception.
+`ConnectionError` when the Controller is unavailable, an
+[`errors.InfrastructureError`] subclass for classified SSH, Slurm, and timeout
+failures, `grpc.RpcError` for other RPC failures, or
+[`errors.RemoteExecutionError`] for a remote Python exception.
 
 <!-- nest.remote exports the decorator and shadows the module in attribute
      traversal. Keep the wrapper and resources explicit until doc-builder can
@@ -36,14 +38,16 @@ RPC failures, or [`errors.RemoteExecutionError`] for a remote Python exception.
 
 ## Resource requests
 
-The client sends both resource counts. The current Slurm Controller forwards
-`gpu` to the backend but does not forward `cpu`; the deployed worker script
-currently requests one CPU per task. The local Controller does not allocate
-Slurm resources.
+The client sends both resource counts. The Slurm Controller requests `gpu` with
+`sbatch --gpus-per-node` and `cpu` with `--cpus-per-task`, for both the worker
+and any environment build. A count of `0` omits the flag, so the batch script's
+own directive applies. The local Controller does not allocate Slurm resources.
 
 `nest.remote.Resources(gpu=0, cpu=1)` is a frozen dataclass with integer `gpu` and
-`cpu` fields. Nest creates it from the decorator arguments; callers normally do
-not need to construct it directly.
+`cpu` fields. It raises `TypeError` for non-integer counts and `ValueError` for
+negative counts, so `@nest.remote(cpu=-1)` fails when the decorator is created.
+Nest creates it from the decorator arguments; callers normally do not need to
+construct it directly.
 
 Import the types from their defining module when needed:
 

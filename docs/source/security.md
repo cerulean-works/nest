@@ -40,9 +40,8 @@ verification. See [Deployment validation and roadmap](deployment-architecture).
 The client connects through an insecure gRPC channel. The current deployment
 relies on the trusted network and host configuration to restrict access.
 
-The `cpu` decorator argument is sent by the client but is not forwarded by the
-Slurm Controller. Project dependency installation applies to the Slurm backend;
-a local Controller uses its own environment.
+Project dependency installation applies to the Slurm backend; a local Controller
+uses its own environment.
 
 Client RPC and backend polling deadlines do not cancel submitted Slurm jobs.
 See [Environment variables and defaults](configuration) for current values and

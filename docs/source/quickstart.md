@@ -51,8 +51,8 @@ Calling `compute(21)` is equivalent to `compute.local(21)`: both run in the
 current Python process. Only `compute.remote(21)` sends the function to the
 Controller and waits for a result.
 
-The `gpu` argument requests GPUs for Slurm execution. The current Slurm Controller
-does not forward the decorator's `cpu` count to the backend.
+The `gpu` and `cpu` arguments request GPUs per node and CPUs per task for Slurm
+execution.
 
 Continue with [Use project dependencies](project-dependencies) or
 [Handle remote errors](remote-errors). The full API is in

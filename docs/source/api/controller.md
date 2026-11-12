@@ -16,8 +16,27 @@ It starts with four RPC worker threads and an insecure gRPC listener. See
 | `CancelJob` | `job_id` (int64) | Empty response |
 
 `environment` contains `pyproject_toml` and `uv_lock` bytes. When supplied, both
-must be nonempty. Slurm job operations require a configured backend, even when
-`Execute` uses local mode. Cancellation requests do not wait for a job to stop.
+must be nonempty. `gpu` and `cpu` must not be negative. Slurm job operations
+require a configured backend, even when `Execute` uses local mode. Cancellation
+requests do not wait for a job to stop.
+
+## Error statuses
+
+Classified SSH and Slurm failures set the `nest-error-kind` trailing metadata, and
+`nest-job-id` when a job is involved. Clients can tell timeouts apart without
+parsing messages:
+
+| `nest-error-kind` | Status |
+| --- | --- |
+| `ssh_timeout`, `queue_timeout`, `execution_timeout` | `DEADLINE_EXCEEDED` |
+| `submission_unknown` | `UNKNOWN` |
+| `ssh_error` | `UNAVAILABLE` |
+| `remote_command_error` | `INTERNAL` for `Execute` and `GetJobStatus`; `FAILED_PRECONDITION` for `SubmitJob` and `CancelJob` |
+| `slurm_job_failed`, `infrastructure_error` | `INTERNAL` |
+
+A `DEADLINE_EXCEEDED` status without `nest-error-kind` is the caller's own RPC
+deadline. The Controller never retries `sbatch`. See
+[Handle remote errors](../remote-errors).
 
 ## Service handlers
 

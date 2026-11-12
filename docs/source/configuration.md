@@ -5,6 +5,7 @@
 | Variable | Default | Behavior |
 | --- | --- | --- |
 | `NEST_CONTROLLER_ADDRESS` | `nest-tag.tail8e5ba1.ts.net:50051` | Host and port for each remote call. An empty value also uses the default. |
+| `NEST_RPC_TIMEOUT` | `900` | Seconds allowed for each `Execute` RPC. Must be a positive number. When it expires, the call raises `RpcTimeoutError`. |
 
 Set the address in the process running your Nest application. It does not
 configure where the Controller listens.
@@ -18,11 +19,18 @@ configure where the Controller listens.
 | `NEST_SLURM_HOST` | Unset | SSH host or alias used by the Slurm backend. |
 | `NEST_SLURM_ACCOUNT` | Unset | Default Slurm account. Both this and the host must be nonempty to create a backend. |
 | `NEST_SLURM_WORKDIR` | Unset | Absolute shared HPC directory containing `project/`, `images/`, `environments/`, and `jobs/`. Required for Controller-managed Slurm worker execution. |
+| `NEST_SSH_TIMEOUT` | `60` | Seconds allowed for each SSH command or file transfer. When it expires, the call raises `SSHTimeoutError`, or `SubmissionUnknownError` during `sbatch`. |
+| `NEST_RESULT_TIMEOUT` | `600` | Seconds the Controller polls a worker job. When it expires, the call raises `QueueTimeoutError` or `ExecutionTimeoutError`. |
+| `NEST_ENVIRONMENT_TIMEOUT` | `1800` | Seconds the Controller polls an environment build job. When it expires, the same timeout classes are raised. |
+| `NEST_POLL_INTERVAL` | `5` | Seconds between Slurm status queries. |
+
+The four timing settings accept positive numbers, including fractions. Empty
+values use the defaults. The Controller rejects other values at startup.
 
 The Controller creates its backend with partition `dev` and a Slurm time limit of
 `00:05:00`. These are currently code defaults, without environment-variable
 overrides. Direct backend users can set [`backends.slurm.SlurmConfig`]. Review
-the deployed batch scripts for CPU, memory, and cluster-specific settings.
+the deployed batch scripts for memory and cluster-specific settings.
 
 Slurm execution requires nonempty host, account, and work-directory values.
 The Controller rejects missing settings and a nonabsolute work directory before
@@ -31,9 +39,9 @@ starting the listener.
 ## Docker Compose
 
 The Compose deployment sets the container listener to `0.0.0.0:50051` and defaults
-to Slurm mode. It passes `NEST_EXECUTOR`, the three `NEST_SLURM_*` settings, and
-`NEST_LOG_LEVEL` (default `INFO`) into the container; other host variables are not
-passed. These additional variables configure Compose itself:
+to Slurm mode. It passes `NEST_EXECUTOR`, the three `NEST_SLURM_*` settings,
+`NEST_LOG_LEVEL` (default `INFO`), and the four timing settings into the container.
+Other host variables are not passed. These additional variables configure Compose itself:
 
 | Variable | Default | Behavior |
 | --- | --- | --- |
@@ -59,18 +67,37 @@ These settings do not affect the default Compose or local Python development.
 
 ## Deadlines and resources
 
-| Operation | Current value | Notes |
-| --- | --- | --- |
-| Client `Execute` RPC | 900 seconds | Covers the entire RPC, including environment preparation and queueing. |
-| Controller Slurm result polling | 600 seconds | Starts after worker submission; remote queries and download can extend total time. |
-| Environment build polling | 1,800 seconds | Backend default; this can exceed the client's RPC deadline. |
-| SSH commands and file transfer subprocesses | 60 seconds | A timeout does not prove the remote operation stopped. |
-| `@nest.remote` resources | `gpu=0`, `cpu=1` | The Slurm Controller forwards `gpu` but currently ignores `cpu`. |
+| Operation | Default | Setting | Error when exceeded |
+| --- | --- | --- | --- |
+| Client `Execute` RPC | 900 seconds | `NEST_RPC_TIMEOUT` (client) | `RpcTimeoutError` |
+| SSH commands and file transfers | 60 seconds | `NEST_SSH_TIMEOUT` | `SSHTimeoutError`; `SubmissionUnknownError` during `sbatch` |
+| Worker job polling | 600 seconds | `NEST_RESULT_TIMEOUT` | `QueueTimeoutError` if the job never started, otherwise `ExecutionTimeoutError` |
+| Environment build polling | 1,800 seconds | `NEST_ENVIRONMENT_TIMEOUT` | `QueueTimeoutError` or `ExecutionTimeoutError` |
+| Slurm job time limit | `00:05:00` | Code default | `ExecutionTimeoutError` (Slurm state `TIMEOUT`) |
 
-These deadlines are currently set in code. RPC or polling timeouts do not
-automatically cancel submitted Slurm jobs. For deployment steps, see
-[Deploy a Slurm Controller](deploy); for local execution, see
-[Run a local Controller](local-controller).
+The client RPC deadline covers the whole call: environment preparation, queueing,
+execution, and download. The Controller deadlines are counted separately, so the
+default environment build deadline is longer than the client's. A long build can
+end with `RpcTimeoutError` while the Controller keeps waiting. Raise
+`NEST_RPC_TIMEOUT` or lower the Controller deadlines if you need the classified
+Controller error. Status queries and downloads can extend each polling deadline by
+up to one SSH timeout.
+
+No timeout cancels a submitted Slurm job, and Nest never retries a submission.
+[Handle remote errors](remote-errors) describes each error and when it is safe to
+call again.
+
+### Resources
+
+`@nest.remote(gpu=..., cpu=...)` defaults to `gpu=0`, `cpu=1`. The Slurm
+Controller passes both counts to the worker job and to any environment build job:
+`gpu` as `--gpus-per-node` and `cpu` as `--cpus-per-task`. A count of `0` omits
+the flag, so the batch script's `#SBATCH` directive applies (one CPU in
+`scripts/worker.sbatch`). Negative counts are rejected before anything is
+submitted. The local Controller does not allocate resources.
+
+For deployment steps, see [Deploy a Slurm Controller](deploy); for local
+execution, see [Run a local Controller](local-controller).
 
 ## Logging and troubleshooting
 
