@@ -322,6 +322,10 @@ in the sidecar before selecting the old Compose file. Removing
 
 ## Verification record (2026-11-03)
 
+The Docker build, Compose smoke test, and an offline Controller-to-Login-Node
+SSH test have since been run; see
+[Deployment validation and roadmap](deployment-architecture#validation-record-2026-11-12).
+
 Based on PR #7 HEAD `a14c95f7459b7fa5df406bfda8fc4052efcb3246`. No credentials,
 personal policy, HPC node, or Dokploy deployment were changed. No jobs were
 submitted. There is no Docker executable/daemon or enrolled Tailnet in this

@@ -32,6 +32,7 @@ NEST_EXECUTOR=slurm
 NEST_SLURM_HOST=hpc
 NEST_SLURM_ACCOUNT=your-slurm-account
 NEST_SLURM_WORKDIR=/home/your-user/nest
+NEST_LOG_LEVEL=INFO
 NEST_SSH_DIR=./ssh
 NEST_CONTROLLER_HOST_IP=127.0.0.1
 NEST_CONTROLLER_PORT=50051
@@ -385,6 +386,9 @@ pushes to `main`. Run the same checks locally with:
 docker build -t nest-controller:test .
 docker run --rm --volume "$PWD/tests:/tests:ro" --volume "$PWD/docker:/docker:ro" --volume "$PWD/scripts:/scripts:ro" --entrypoint python nest-controller:test -m unittest discover -s /tests -v
 bash tests/smoke_compose.sh
+bash tests/smoke_tailnet_ssh.sh
+python tests/check_shared_compose.py
+uv run pytest tests/test_deployment_hygiene.py
 ```
 
 The build installs the non-development dependencies from `uv.lock`. The image
@@ -396,3 +400,11 @@ the destination hostname and SSH stream through the proxy without local DNS,
 and that the template retains strict host-key verification. They need no Auth
 Key, Login Node, or Slurm access. Actual Tailnet enrollment and SSH authentication
 must still be checked with `scripts/verify-tailnet.sh` on the deployment host.
+
+`tests/smoke_tailnet_ssh.sh` runs the `compose.tailscale.yaml` Controller against
+a disposable OpenSSH Login Node that only a SOCKS5 stand-in for the sidecar can
+reach. It proves the SSH path and that unknown or changed host keys are refused,
+without an Auth Key or Slurm. The repository hygiene test fails if a private key,
+Tailscale key, or token is committed, or if any tracked file disables host-key
+verification. See [Deployment validation and roadmap](deployment-architecture)
+for the full list of checks and what still needs a real deployment.

@@ -31,7 +31,9 @@ starting the listener.
 ## Docker Compose
 
 The Compose deployment sets the container listener to `0.0.0.0:50051` and defaults
-to Slurm mode. These additional variables configure Compose itself:
+to Slurm mode. It passes `NEST_EXECUTOR`, the three `NEST_SLURM_*` settings, and
+`NEST_LOG_LEVEL` (default `INFO`) into the container; other host variables are not
+passed. These additional variables configure Compose itself:
 
 | Variable | Default | Behavior |
 | --- | --- | --- |
