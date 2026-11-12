@@ -168,6 +168,7 @@ class FakeHpc:
     Attributes:
         host (`str`): SSH alias the shim accepts.
         base (`Path`): Nest work directory (`NEST_SLURM_WORKDIR`).
+        image (`Path`): Deployed Apptainer image inside `base`.
         bin (`Path`): Directory containing the shim executables.
         state (`Path`): Job states, job output, and the call log.
     """
@@ -180,7 +181,9 @@ class FakeHpc:
         self.state = root / "state"
         for path in (self.base / "images", self.base / "jobs", self.bin, self.state):
             path.mkdir(parents=True)
-        (self.base / "images" / "uv-python312.sif").write_bytes(b"fake apptainer image")
+        # The deployed Apptainer image that the backend and batch scripts expect.
+        self.image = self.base / "images" / "uv-python314.sif"
+        self.image.write_bytes(b"fake apptainer image")
         # The deployed project contains the worker scripts.
         (self.base / "project").mkdir()
         shutil.copytree(REPOSITORY / "scripts", self.base / "project" / "scripts")

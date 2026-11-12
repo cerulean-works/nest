@@ -337,7 +337,7 @@ def test_controller_ssh_and_sbatch_commands_are_stable(slurm_controller, hpc, pr
 
     # The worker runs in the deployed image with a clean environment.
     for call in hpc.calls("apptainer"):
-        assert call["image"] == str(hpc.base / "images" / "uv-python312.sif")
+        assert call["image"] == str(hpc.image)
         assert call["clean"] is True
 
 
