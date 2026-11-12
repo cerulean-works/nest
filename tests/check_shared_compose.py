@@ -6,11 +6,10 @@ Set NEST_COMPOSE_COMMAND to a standalone Compose binary if needed.
 
 import json
 import os
-from pathlib import Path
 import shlex
 import subprocess
 import tempfile
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 COMMAND = shlex.split(os.environ.get("NEST_COMPOSE_COMMAND", "docker compose"))
@@ -28,9 +27,23 @@ def render(filename, directory=ROOT, **settings):
     )
     env.update(settings)
     result = subprocess.run(
-        COMMAND + ["--env-file", "/dev/null", "--project-directory", str(directory),
-                   "-f", str(ROOT / filename), "config", "--format", "json"],
-        cwd=ROOT, env=env, capture_output=True, text=True, check=True,
+        COMMAND
+        + [
+            "--env-file",
+            "/dev/null",
+            "--project-directory",
+            str(directory),
+            "-f",
+            str(ROOT / filename),
+            "config",
+            "--format",
+            "json",
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
     )
     return json.loads(result.stdout)
 
@@ -62,7 +75,9 @@ def main():
     assert controller["volumes"][0]["read_only"]
     assert not controller.get("secrets"), "Controller must not receive the Auth Key"
     assert sidecar["volumes"][0] == outbound["services"]["tailscale"]["volumes"][0]
-    assert "--shields-up" in outbound["services"]["tailscale"]["environment"]["TS_EXTRA_ARGS"].split()
+    assert (
+        "--shields-up" in outbound["services"]["tailscale"]["environment"]["TS_EXTRA_ARGS"].split()
+    )
     assert outbound["services"]["controller"]["ports"], "Keep original deployment behavior"
     serve = json.loads((ROOT / "docker/tailscale-serve/serve.json").read_text())
     assert serve == {"TCP": {"50051": {"TCPForward": "controller:50051"}}, "AllowFunnel": {}}
@@ -71,7 +86,8 @@ def main():
         checkout = Path(temporary) / "code"
         checkout.mkdir()
         deployed = render(
-            "compose.tailscale-shared.yaml", directory=checkout,
+            "compose.tailscale-shared.yaml",
+            directory=checkout,
             NEST_SSH_DIR="../files/nest-ssh",
             NEST_TAILSCALE_AUTHKEY_FILE="../files/tailscale/authkey",
             NEST_TAILSCALE_SERVE_DIR="../files/tailscale/serve",
@@ -79,7 +95,9 @@ def main():
         files = checkout.parent / "files"
         assert deployed["services"]["controller"]["volumes"][0]["source"] == str(files / "nest-ssh")
         assert deployed["secrets"]["tailscale_authkey"]["file"] == str(files / "tailscale/authkey")
-        assert deployed["services"]["tailscale"]["volumes"][1]["source"] == str(files / "tailscale/serve")
+        assert deployed["services"]["tailscale"]["volumes"][1]["source"] == str(
+            files / "tailscale/serve"
+        )
     print("PASS: rendered shared Compose isolation, state reuse, and Dokploy ../files paths")
 
 

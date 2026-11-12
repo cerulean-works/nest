@@ -24,7 +24,11 @@ def get_logger(name):
 @contextmanager
 def request_context(value=None):
     """Accept only UUID hex IDs, so incoming metadata cannot inject log lines."""
-    value = value if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{32}", value) else uuid.uuid4().hex
+    value = (
+        value
+        if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{32}", value)
+        else uuid.uuid4().hex
+    )
     token = _request_id.set(value)
     try:
         yield value
@@ -45,7 +49,7 @@ def configure_logging():
     logger.setLevel(level if valid else logging.INFO)
     if not any(getattr(handler, "_nest_console", False) for handler in logger.handlers):
         handler = logging.StreamHandler()
-        handler._nest_console = True
+        handler._nest_console = True  # ty: ignore[missing-attribute]  # marks our handler
         formatter = logging.Formatter(
             "%(asctime)s.%(msecs)03dZ %(levelname)s %(name)s "
             "pid=%(process)d request_id=%(request_id)s %(message)s",

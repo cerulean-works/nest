@@ -9,6 +9,7 @@ import sys
 from concurrent import futures
 from threading import Barrier
 from types import SimpleNamespace
+from typing import cast
 
 import cloudpickle
 import grpc
@@ -42,12 +43,17 @@ def controller(monkeypatch):
 
 @pytest.fixture
 def backend():
-    return SlurmBackend(SlurmConfig("cluster", "account", work_root="/nest/jobs", worker_workdir="/nest"))
+    return SlurmBackend(
+        SlurmConfig("cluster", "account", work_root="/nest/jobs", worker_workdir="/nest")
+    )
 
 
 def test_import_does_not_configure_application_logging():
     result = subprocess.run(
-        [sys.executable, "-c", """
+        [
+            sys.executable,
+            "-c",
+            """
 import logging
 root = logging.getLogger()
 handler = logging.StreamHandler()
@@ -60,7 +66,11 @@ nest_logger = logging.getLogger('nest')
 assert nest_logger.level == logging.NOTSET
 assert nest_logger.propagate
 assert all(isinstance(h, logging.NullHandler) for h in nest_logger.handlers)
-"""], capture_output=True, text=True, check=True,
+""",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
     )
     assert result.stdout == result.stderr == ""
 
@@ -157,8 +167,11 @@ def test_controller_generates_id_for_legacy_or_invalid_metadata(controller, capl
     with grpc.insecure_channel(controller) as channel:
         stub = execution_pb2_grpc.ExecutionServiceStub(channel)
         with pytest.raises(grpc.RpcError) as error:
-            stub.Execute(execution_pb2.ExecuteRequest(environment=execution_pb2.EnvironmentFiles()), metadata=metadata)
-    assert error.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+            stub.Execute(
+                execution_pb2.ExecuteRequest(environment=execution_pb2.EnvironmentFiles()),
+                metadata=metadata,
+            )
+    assert cast(grpc.Call, error.value).code() == grpc.StatusCode.INVALID_ARGUMENT
     records = [r for r in caplog.records if r.name == "nest.controller"]
     assert len({r.request_id for r in records}) == 1
     assert re.fullmatch(r"[0-9a-f]{32}", records[0].request_id)
@@ -178,7 +191,10 @@ def test_isolated_user_interpreter_uses_bootstrap_and_request_id(tmp_path, faile
     env = {**os.environ, "NEST_REQUEST_ID": "c" * 32, "NEST_LOG_LEVEL": "DEBUG"}
     result = subprocess.run(
         [sys.executable, "-m", "nest.worker", str(input_path), str(output_path), sys.executable],
-        env=env, capture_output=True, text=True, check=True,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
     )
     value = cloudpickle.loads(output_path.read_bytes())
     if failed:
@@ -190,7 +206,9 @@ def test_isolated_user_interpreter_uses_bootstrap_and_request_id(tmp_path, faile
     assert "nest.user_runner" in result.stderr
     assert "request_id=" + "c" * 32 in result.stderr
     assert "User environment execution completed" in result.stderr
-    assert all("request_id=" + "c" * 32 in line for line in result.stderr.splitlines() if "pid=" in line)
+    assert all(
+        "request_id=" + "c" * 32 in line for line in result.stderr.splitlines() if "pid=" in line
+    )
     assert result.stdout == ""
 
 
@@ -200,7 +218,10 @@ def test_slurm_polls_log_only_state_transitions(backend, monkeypatch, caplog, wa
     states = iter(["PENDING", "PENDING", "RUNNING", "RUNNING", "COMPLETED"])
     monkeypatch.setattr(backend, "status", lambda job_id: next(states))
     monkeypatch.setattr("nest.backends.slurm.time.sleep", lambda _: None)
-    monkeypatch.setattr("nest.backends.slurm.subprocess.run", lambda *a, **k: SimpleNamespace(returncode=0, stdout=b"private-result"))
+    monkeypatch.setattr(
+        "nest.backends.slurm.subprocess.run",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout=b"private-result"),
+    )
     with request_context("d" * 32):
         if wait == "wait_result":
             assert backend.wait_result(123, "/nest/jobs/execution") == b"private-result"
@@ -212,8 +233,12 @@ def test_slurm_polls_log_only_state_transitions(backend, monkeypatch, caplog, wa
     assert "private-result" not in caplog.text
 
 
-@pytest.mark.parametrize("state, timeout, exception", [("FAILED", 600, RuntimeError), ("RUNNING", 0, TimeoutError)])
-def test_slurm_failure_and_timeout_preserve_exception(backend, monkeypatch, caplog, state, timeout, exception):
+@pytest.mark.parametrize(
+    "state, timeout, exception", [("FAILED", 600, RuntimeError), ("RUNNING", 0, TimeoutError)]
+)
+def test_slurm_failure_and_timeout_preserve_exception(
+    backend, monkeypatch, caplog, state, timeout, exception
+):
     caplog.set_level(logging.INFO, logger="nest")
     monkeypatch.setattr(backend, "status", lambda _: state)
     with pytest.raises(exception):
@@ -242,12 +267,16 @@ def test_slurm_forwards_context_without_payload_in_logs(backend, monkeypatch, ca
 
 
 @pytest.mark.parametrize("cache_hit", [False, True])
-def test_environment_cache_logging_omits_dependency_contents(backend, monkeypatch, caplog, cache_hit):
+def test_environment_cache_logging_omits_dependency_contents(
+    backend, monkeypatch, caplog, cache_hit
+):
     caplog.set_level(logging.DEBUG, logger="nest")
     pyproject, lock = b"PRIVATE_DEPENDENCIES", b"PRIVATE_LOCK"
     hashes = "\n".join(hashlib.sha256(data).hexdigest() + " file" for data in (pyproject, lock))
     checks = iter([hashes] if cache_hit else ["", hashes])
-    monkeypatch.setattr(backend, "_run_remote", lambda command: next(checks) if "sha256sum" in command else "")
+    monkeypatch.setattr(
+        backend, "_run_remote", lambda command: next(checks) if "sha256sum" in command else ""
+    )
     uploads = []
 
     def upload(*args, **kwargs):
@@ -256,12 +285,18 @@ def test_environment_cache_logging_omits_dependency_contents(backend, monkeypatc
 
     monkeypatch.setattr("nest.backends.slurm.subprocess.run", upload)
     monkeypatch.setattr(backend, "environment_ready", lambda _: True)
-    monkeypatch.setattr(backend, "build_environment", lambda *a, **k: pytest.fail("ready runtime must not submit a build"))
+    monkeypatch.setattr(
+        backend,
+        "build_environment",
+        lambda *a, **k: pytest.fail("ready runtime must not submit a build"),
+    )
     env_dir = backend.prepare_environment_bytes(pyproject_toml=pyproject, uv_lock=lock)
     assert env_dir.startswith("/nest/environments/")
     assert uploads == ([] if cache_hit else [pyproject, lock])
     assert "Runtime cache hit environment_id=" in caplog.text
-    assert ("Environment files cache hit" if cache_hit else "Environment files cache miss") in caplog.text
+    assert (
+        "Environment files cache hit" if cache_hit else "Environment files cache miss"
+    ) in caplog.text
     assert "PRIVATE_" not in caplog.text
 
 
@@ -284,8 +319,8 @@ def test_controller_logs_original_slurm_error_before_rpc_abort(monkeypatch, capl
             execute_remote(lambda: None, Resources(), None)
     finally:
         server.stop(0).wait()
-    assert error.value.code() == grpc.StatusCode.INTERNAL
-    assert "scheduler failure marker" in error.value.details()
+    assert cast(grpc.Call, error.value).code() == grpc.StatusCode.INTERNAL
+    assert "scheduler failure marker" in cast(grpc.Call, error.value).details()
     assert "status=INTERNAL" in caplog.text
     original = next(r for r in caplog.records if r.message == "Slurm execution failed")
     assert original.exc_info[0] is RuntimeError
@@ -298,7 +333,7 @@ def test_unexpected_controller_failure_logs_original_traceback(controller, caplo
         stub = execution_pb2_grpc.ExecutionServiceStub(channel)
         with pytest.raises(grpc.RpcError) as error:
             stub.Execute(execution_pb2.ExecuteRequest(payload=b"invalid pickle"))
-    assert error.value.code() == grpc.StatusCode.UNKNOWN
+    assert cast(grpc.Call, error.value).code() == grpc.StatusCode.UNKNOWN
     failure = next(r for r in caplog.records if "RPC failed method=Execute" in r.message)
     assert failure.exc_info
     assert "cloudpickle.loads" in caplog.text

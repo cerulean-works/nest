@@ -233,9 +233,7 @@ class TestRemoteCall:
             ran.append(True)
             return "local"
 
-        monkeypatch.setattr(
-            remote_module, "execute_remote", lambda *a, **k: "remote"
-        )
+        monkeypatch.setattr(remote_module, "execute_remote", lambda *a, **k: "remote")
 
         assert fn.remote() == "remote"
         assert ran == []  # wrapped function was never invoked locally
@@ -247,7 +245,6 @@ class TestRemoteCall:
 
         def fake_execute_remote(func, resources, project, *args, **kwargs):
             captured["project"] = project
-            return None
 
         monkeypatch.setattr(remote_module, "execute_remote", fake_execute_remote)
 
