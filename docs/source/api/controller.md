@@ -2,7 +2,8 @@
 
 The Controller implements the `nest.ExecutionService` gRPC service defined in
 [`execution.proto`](https://github.com/cerulean-works/nest/blob/main/src/nest/proto/execution.proto).
-It starts with four RPC worker threads and an insecure gRPC listener. See
+It starts with four RPC worker threads and a plaintext gRPC listener, or a TLS
+listener when `NEST_TLS_CERT_FILE` and `NEST_TLS_KEY_FILE` are set. See
 [Deploy a Slurm Controller](../deploy) for setup and
 [Security and limitations](../security) before granting access.
 
@@ -45,3 +46,5 @@ deadline. The Controller never retries `sbatch`. See
 ## Server entry point
 
 [[autodoc]] controller.main
+
+[[autodoc]] controller.build_backend
