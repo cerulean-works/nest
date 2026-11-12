@@ -25,6 +25,13 @@ def controller_environment(**settings):
 
 @contextmanager
 def running_controller(**settings):
+    with controller_at_free_port(**settings) as (process, stub, _):
+        yield process, stub
+
+
+@contextmanager
+def controller_at_free_port(**settings):
+    """Starts `nest.controller` and yields its process, stub, and address."""
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
@@ -44,7 +51,7 @@ def running_controller(**settings):
                 except grpc.FutureTimeoutError:
                     log.seek(0)
                     raise AssertionError("Controller did not start:\n" + log.read())
-                yield process, execution_pb2_grpc.ExecutionServiceStub(channel)
+                yield process, execution_pb2_grpc.ExecutionServiceStub(channel), address
         finally:
             if process.poll() is None:
                 process.terminate()
