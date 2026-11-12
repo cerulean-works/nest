@@ -2,7 +2,11 @@
 
 For the current team deployment, make sure your device is connected to the authorized Tailscale network.
 
-No additional Controller configuration is required.
+Point the SDK at the team Controller:
+
+```bash
+export NEST_CONTROLLER_ADDRESS="nest-tag.tail8e5ba1.ts.net:50051"
+```
 
 Create `main.py`:
 
@@ -29,17 +33,15 @@ python main.py
 - `.local()` executes the function on your machine.
 - `.remote()` sends the function to the Nest Controller, which schedules execution on the HPC cluster.
 
-The default Controller endpoint is:
-
-```text
-nest-tag.tail8e5ba1.ts.net:50051
-```
-
-With Tailscale connected and access granted through the team Tailnet or an accepted Controller node share, you do not need to configure this address manually.
+Without `NEST_CONTROLLER_ADDRESS`, the SDK connects to `127.0.0.1:50051`, a
+[local Controller](local-controller). Earlier releases defaulted to the team's
+Tailnet address; the SDK no longer depends on any Tailnet. Access to the team
+Controller still needs Tailscale connected and access granted through the team
+Tailnet or an accepted Controller node share.
 
 ## Use a different Controller
 
-You can override the default endpoint:
+Set the address of any other Controller:
 
 ```bash
 export NEST_CONTROLLER_ADDRESS="your-controller:50051"

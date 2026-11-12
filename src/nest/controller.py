@@ -1,4 +1,4 @@
-import os
+import json
 import signal
 import time
 from concurrent import futures
@@ -7,8 +7,15 @@ from functools import wraps
 import cloudpickle
 import grpc
 
-from ._logging import configure_logging, get_logger, request_context
+from ._logging import configure_logging, get_logger, register_secret, request_context
 from .backends.slurm import SlurmBackend, SlurmConfig
+from .config import (
+    ConfigError,
+    ControllerConfig,
+    load_controller_config,
+    load_executor,
+    materialize_ssh_credentials,
+)
 from .errors import ERROR_KIND_METADATA, JOB_ID_METADATA, InfrastructureError, RemoteCommandError
 from .executor import execute
 from .proto import execution_pb2, execution_pb2_grpc
@@ -72,44 +79,21 @@ def _abort_infrastructure(context, exc: InfrastructureError, status=None):
     context.abort(status or exc.status, str(exc))
 
 
-def _positive_seconds(name: str, default: float) -> float:
-    """
-    Reads a positive number of seconds from an environment variable.
-
-    Args:
-        name (`str`): Environment variable name.
-        default (`float`): Value used when the variable is unset or empty.
-
-    Returns:
-        `float`: The configured number of seconds.
-
-    Raises:
-        `ValueError`: If the value is not a positive finite number.
-    """
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return default
-    try:
-        value = float(raw)
-    except ValueError:
-        value = float("nan")
-    if not 0 < value < float("inf"):
-        raise ValueError(f"{name} must be a positive number of seconds, got {raw!r}")
-    return value
-
-
 class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
     """Handles execution requests and Slurm job operations for the controller."""
 
-    def __init__(self, slurm_backend=None):
+    def __init__(self, slurm_backend=None, executor: str | None = None):
         """
         Stores the optional Slurm backend used by the RPC handlers.
 
         Args:
             slurm_backend ([`backends.slurm.SlurmBackend`], *optional*): Backend for
                 Slurm execution and job operations. Local execution needs no backend.
+            executor (`str`, *optional*): `"local"` or `"slurm"`. When omitted, each
+                request reads and validates `NEST_EXECUTOR`.
         """
         self.slurm_backend = slurm_backend
+        self.executor = executor
 
     def _require_slurm_backend(self, context) -> SlurmBackend:
         """
@@ -174,7 +158,7 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 "Resource counts cannot be negative",
             )
 
-        mode = os.getenv("NEST_EXECUTOR", "local")
+        mode = self.executor or load_executor()
         logger.info(
             "Execution received executor=%s gpu=%s cpu=%s payload_bytes=%s",
             mode,
@@ -348,73 +332,89 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
         return execution_pb2.CancelJobResponse()
 
 
+def build_backend(config: ControllerConfig) -> SlurmBackend | None:
+    """
+    Creates the Slurm backend for the default Provider Profile.
+
+    Inline Mode B credentials are written to a private temporary directory, and
+    the private key is registered so Nest's log handler masks it.
+
+    Args:
+        config ([`config.ControllerConfig`]): Validated Controller configuration.
+
+    Returns:
+        [`backends.slurm.SlurmBackend`] or `None`: `None` when no provider is set.
+    """
+    profile = config.provider
+    if profile is None:
+        return None
+    identity = known_hosts = None
+    if profile.ssh_mode == "B":
+        if config.ssh.private_key is not None:
+            register_secret(config.ssh.private_key.reveal())
+        identity, known_hosts = materialize_ssh_credentials(config.ssh)
+    node = profile.login_nodes[0]
+    workdir = profile.workdir
+    return SlurmBackend(
+        SlurmConfig(
+            ssh_host=node.host,
+            ssh_port=node.port,
+            ssh_user=profile.ssh_user,
+            ssh_mode=profile.ssh_mode,
+            identity_file=identity,
+            known_hosts_file=known_hosts,
+            allowed_hosts=tuple(n.host for n in profile.login_nodes),
+            account=profile.account,
+            partition=profile.partition,
+            time=profile.time,
+            work_root=f"{workdir.rstrip('/')}/jobs" if workdir else None,
+            worker_workdir=workdir,
+            ssh_timeout=config.ssh_timeout,
+            result_timeout=config.result_timeout,
+            environment_timeout=config.environment_timeout,
+            poll_interval=config.poll_interval,
+        )
+    )
+
+
+def _add_port(server, config: ControllerConfig) -> int:
+    if config.tls is None:
+        return server.add_insecure_port(config.bind)
+    with open(config.tls.key_file, "rb") as key, open(config.tls.cert_file, "rb") as cert:
+        credentials = grpc.ssl_server_credentials([(key.read(), cert.read())])
+    return server.add_secure_port(config.bind, credentials)
+
+
 def main():
     """
-    Starts the controller and waits until it stops.
+    Validates the configuration, starts the controller, and waits until it stops.
 
-    Binds to `NEST_CONTROLLER_BIND`, which defaults to `127.0.0.1:50051`, with
-    four RPC worker threads and port reuse disabled. Configures a Slurm backend
-    when both `NEST_SLURM_HOST` and `NEST_SLURM_ACCOUNT` are nonempty. Uses
-    `NEST_SLURM_WORKDIR` for worker files and its `jobs` subdirectory for payloads.
-    Slurm mode requires a host, account, and absolute work directory.
-    `NEST_SSH_TIMEOUT`, `NEST_RESULT_TIMEOUT`, `NEST_ENVIRONMENT_TIMEOUT`, and
-    `NEST_POLL_INTERVAL` optionally override the backend's 60, 600, 1,800, and
-    5 second defaults. Handles SIGTERM and SIGINT by allowing active RPCs up to
-    ten seconds to finish.
+    Reads every setting through [`config.load_controller_config`]; see
+    *Environment variables and defaults* for the contract. Invalid settings are
+    all reported at once, before the listener starts, and the process exits with
+    status 2. Uses four RPC worker threads with port reuse disabled, and TLS when
+    `NEST_TLS_CERT_FILE` and `NEST_TLS_KEY_FILE` are set. Handles SIGTERM and SIGINT
+    by allowing active RPCs up to ten seconds to finish.
 
     Raises:
-        `ValueError`: If Slurm settings are missing or invalid, or a timeout
-            override is not a positive number.
+        `SystemExit`: If the configuration is invalid.
     """
     configure_logging()
-    ssh_host = os.getenv("NEST_SLURM_HOST")
-    account = os.getenv("NEST_SLURM_ACCOUNT")
-    workdir = os.getenv("NEST_SLURM_WORKDIR")
-    bind_address = os.getenv("NEST_CONTROLLER_BIND", "127.0.0.1:50051")
-    timeouts = {
-        "ssh_timeout": _positive_seconds("NEST_SSH_TIMEOUT", 60),
-        "result_timeout": _positive_seconds("NEST_RESULT_TIMEOUT", 600),
-        "environment_timeout": _positive_seconds("NEST_ENVIRONMENT_TIMEOUT", 1800),
-        "poll_interval": _positive_seconds("NEST_POLL_INTERVAL", 5),
-    }
-
-    if os.getenv("NEST_EXECUTOR", "local") == "slurm":
-        missing = [
-            name
-            for name, value in (
-                ("NEST_SLURM_HOST", ssh_host),
-                ("NEST_SLURM_ACCOUNT", account),
-                ("NEST_SLURM_WORKDIR", workdir),
-            )
-            if not value or not value.strip()
-        ]
-        if missing:
-            raise ValueError("Slurm execution requires: " + ", ".join(missing))
-        if workdir is None or not workdir.startswith("/"):
-            raise ValueError("NEST_SLURM_WORKDIR must be an absolute HPC path")
+    try:
+        config = load_controller_config()
+    except ConfigError as exc:
+        logger.error("%s", exc)
+        raise SystemExit(2) from None
 
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=4),
         options=[("grpc.so_reuseport", 0)],
     )
 
-    slurm_backend = None
-
-    if ssh_host and account:
-        slurm_backend = SlurmBackend(
-            SlurmConfig(
-                ssh_host=ssh_host,
-                account=account,
-                partition="dev",
-                time="00:05:00",
-                work_root=f"{workdir.rstrip('/')}/jobs" if workdir else None,
-                worker_workdir=workdir,
-                **timeouts,
-            )
-        )
+    slurm_backend = build_backend(config)
 
     execution_pb2_grpc.add_ExecutionServiceServicer_to_server(
-        ExecutionService(slurm_backend),
+        ExecutionService(slurm_backend, executor=config.executor),
         server,
     )
 
@@ -427,14 +427,16 @@ def main():
     signal.signal(signal.SIGINT, stop_server)
 
     try:
-        if not server.add_insecure_port(bind_address):
-            raise RuntimeError(f"Cannot bind Controller to {bind_address}")
+        logger.info("Controller configuration %s", json.dumps(config.summary(), sort_keys=True))
+        if not _add_port(server, config):
+            raise RuntimeError(f"Cannot bind Controller to {config.bind}")
         server.start()
         logger.info(
-            "Controller listening address=%s executor=%s slurm_configured=%s",
-            bind_address,
-            os.getenv("NEST_EXECUTOR", "local"),
+            "Controller listening address=%s executor=%s slurm_configured=%s tls=%s",
+            config.bind,
+            config.executor,
             slurm_backend is not None,
+            config.tls is not None,
         )
         server.wait_for_termination()
     except KeyboardInterrupt:

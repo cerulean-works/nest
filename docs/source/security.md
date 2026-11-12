@@ -26,13 +26,24 @@ YAML. Keep `StrictHostKeyChecking yes` with a verified `known_hosts`; never use
 fails if a tracked file contains a private key or token, or weakens host-key
 verification. See [Deployment validation and roadmap](deployment-architecture).
 
+Mode B (managed SSH, see [configuration](configuration)) can take the key from
+`NEST_SSH_PRIVATE_KEY` for platforms without file mounts. Set it from the
+platform's secret store or the deploying shell, never in `.env` or Git. The
+Controller writes it to a private temporary file, never logs it, and masks it
+in its own log output. It remains visible to anyone who can inspect the
+container's environment, so prefer `NEST_SSH_IDENTITY_FILE` where a secret
+file mount is available. Mode B always uses `StrictHostKeyChecking=yes` and
+ignores every SSH configuration file.
+
 ## Known limitations
 
 - Experimental API with potential breaking changes.
 - No multi-tenant isolation.
 - No per-user HPC accounts.
 - No automatic project source or data synchronization.
-- No application-level authentication.
+- No application-level authentication. `NEST_AUTH_TOKEN_FILE` is reserved and
+  rejected at startup until it is implemented. TLS is available with
+  `NEST_TLS_CERT_FILE` and `NEST_TLS_KEY_FILE`.
 - Controller and backend deployment are managed by the host.
 
 ## Execution behavior

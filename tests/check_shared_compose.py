@@ -23,11 +23,24 @@ CONTROLLER_SETTINGS = {
     "NEST_RESULT_TIMEOUT",
     "NEST_ENVIRONMENT_TIMEOUT",
     "NEST_POLL_INTERVAL",
+    "NEST_SLURM_LOGIN_NODES",
+    "NEST_SLURM_SSH_MODE",
+    "NEST_SLURM_SSH_USER",
+    "NEST_SLURM_PARTITION",
+    "NEST_SLURM_TIME",
+    "NEST_SSH_MODES_ALLOWED",
+    "NEST_SSH_KNOWN_HOSTS",
+    "NEST_SSH_KNOWN_HOSTS_DATA",
+    "NEST_SSH_IDENTITY_FILE",
+    "NEST_SSH_PRIVATE_KEY",
+    "NEST_TLS_CERT_FILE",
+    "NEST_TLS_KEY_FILE",
+    "NEST_PUBLIC_URL",
 }
 COMMAND = shlex.split(os.environ.get("NEST_COMPOSE_COMMAND", "docker compose"))
 
 
-def render(filename, directory=ROOT, **settings):
+def render(filename, directory=ROOT, *, overrides=(), **settings):
     env = os.environ.copy()
     env.update(
         COMPOSE_PROJECT_NAME="nest-shared-check",
@@ -45,8 +58,7 @@ def render(filename, directory=ROOT, **settings):
             "/dev/null",
             "--project-directory",
             str(directory),
-            "-f",
-            str(ROOT / filename),
+            *(arg for name in (filename, *overrides) for arg in ("-f", str(ROOT / name))),
             "config",
             "--format",
             "json",
@@ -105,6 +117,14 @@ def main():
         assert service["volumes"][0]["target"] == "/run/nest-ssh", name
         assert service["volumes"][0]["read_only"], name
     assert not controllers["compose-nop.yaml"].get("ports")
+    # Mode B renders without .env (render uses --env-file /dev/null), without an SSH
+    # directory, and without any Tailscale setting reaching the Controller.
+    managed = render(
+        "compose.yaml", overrides=("compose.managed-ssh.yaml",), NEST_SSH_DIR="/nonexistent"
+    )["services"]["controller"]
+    assert not managed.get("volumes"), "Mode B must not need a host mount"
+    assert set(managed["environment"]) == CONTROLLER_SETTINGS
+    assert managed["environment"]["NEST_SLURM_SSH_MODE"] == "B"
     for deployment in (shared, outbound):
         secrets = deployment["services"]["tailscale"]["secrets"]
         assert [secret["source"] for secret in secrets] == ["tailscale_authkey"]

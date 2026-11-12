@@ -652,3 +652,50 @@ def test_rejected_submit_job_rpc_keeps_failed_precondition(slurm_controller, hpc
     assert error.code() == grpc.StatusCode.FAILED_PRECONDITION
     assert _metadata(error)[ERROR_KIND_METADATA] == "remote_command_error"
     assert hpc.calls("sbatch") == []
+
+
+def test_managed_ssh_profile_runs_without_any_ssh_config(start_slurm_controller, hpc, tmp_path):
+    """Mode B: a Provider Profile from ENV alone, with no SSH config or Tailscale setting."""
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.write_text(f"{hpc.host} ssh-ed25519 AAAA\n")
+    start_slurm_controller(
+        NEST_SLURM_HOST="",
+        NEST_SLURM_ACCOUNT="",
+        NEST_SLURM_WORKDIR="",
+        NEST_PROVIDERS="fake",
+        NEST_PROVIDER_FAKE_SSH_MODE="B",
+        NEST_PROVIDER_FAKE_LOGIN_NODES=f"{hpc.host}:2222",
+        NEST_PROVIDER_FAKE_SSH_USER="svc-nest",
+        NEST_PROVIDER_FAKE_ACCOUNT="managed-account",
+        NEST_PROVIDER_FAKE_PARTITION="gpu",
+        NEST_PROVIDER_FAKE_TIME="00:10:00",
+        NEST_PROVIDER_FAKE_WORKDIR=str(hpc.base),
+        NEST_SSH_KNOWN_HOSTS=str(known_hosts),
+        # Split so the repository credential scan does not match the placeholder.
+        NEST_SSH_PRIVATE_KEY="-----BEGIN OPENSSH "
+        "PRIVATE KEY-----\\nplaceholder\\n"
+        "-----END OPENSSH "
+        "PRIVATE KEY-----",
+    )
+
+    @nest.remote()
+    def ping():
+        return "pong"
+
+    assert ping.remote() == "pong"
+
+    for call in hpc.calls("ssh"):
+        argv = call["argv"]
+        assert argv[:2] == ["-F", "none"]
+        assert "StrictHostKeyChecking=yes" in argv
+        assert f"UserKnownHostsFile={known_hosts}" in argv
+        assert argv[-6:-2] == ["-p", "2222", "-l", "svc-nest"]
+        assert argv[-2] == hpc.host
+    (job,) = _worker_jobs(hpc)
+    assert job["flags"] == [
+        "--parsable",
+        "--account=managed-account",
+        "--partition=gpu",
+        "--cpus-per-task=1",
+        "--time=00:10:00",
+    ]

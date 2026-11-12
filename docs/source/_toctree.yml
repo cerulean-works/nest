@@ -52,5 +52,7 @@ reference:
     sections:
       - local: configuration
         title: Environment variables and defaults
+      - local: api/config
+        title: Configuration loaders
       - local: security
         title: Security and limitations

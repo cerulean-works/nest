@@ -66,13 +66,12 @@ credentials; follow the checks in the deployment guides.
 The Controller reads its configuration only from `NEST_*` environment variables.
 The deployment mostly follows that. These are the remaining gaps, most important first.
 
-### Expose the hardcoded Slurm defaults
+### Expose the hardcoded Slurm defaults (done)
 
-`nest.controller.main` always creates the backend with partition `dev` and time
-limit `00:05:00`, and `scripts/worker.sbatch` repeats `--time=00:05:00`. Every
-cluster that differs needs a code change. Add `NEST_SLURM_PARTITION` and
-`NEST_SLURM_TIME`, defaulting to today's values, validate them at startup with
-the other Slurm settings, and pass them through every Compose file.
+`NEST_SLURM_PARTITION` and `NEST_SLURM_TIME` (and the per-profile
+`NEST_PROVIDER_<ID>_PARTITION` / `_TIME`) default to `dev` and `00:05:00`, are
+validated at startup, and pass through every Compose file. The `--time` option
+overrides the `#SBATCH --time` line still in `scripts/worker.sbatch`.
 
 ### Keep the Controller definitions from drifting
 
@@ -86,7 +85,8 @@ allowlist of `NEST_*` variables, so a new setting must be added to all of them.
 definition is possible:
 
 - Add every new Controller variable to all Compose files and to
-  `CONTROLLER_SETTINGS` in the check.
+  `CONTROLLER_SETTINGS` in the check. The `NEST_PROVIDER_<ID>_*` family cannot be
+  listed in advance, so multi-provider deployments add those in an override file.
 - Decide what `compose-nop.yaml` is for. It is the default deployment without a
   published port, but nothing documents or runs it. Document it as the
   no-host-port variant, or remove it.
@@ -94,20 +94,18 @@ definition is possible:
 Keep the explicit allowlist rather than `env_file:`. It stops unrelated host or
 Dokploy variables from reaching the Controller.
 
-### Make SSH settings explicit
+### Make SSH settings explicit (Mode B done)
 
-`NEST_SLURM_HOST` names an alias in the mounted `ssh/config`. The host, user,
-port, proxy, and host-key database are in that file, not in the environment.
-This fits credentials, which should stay files: keys, `known_hosts`, and the
-Auth Key are mounted read-only or as Compose Secrets, never in environment
-variables. Two changes would make the policy independent of the file:
-
-- Have `SlurmBackend` pass `-o StrictHostKeyChecking=yes` along with
-  `-o BatchMode=yes`. Today a permissive `ssh/config` could weaken verification.
-  The hygiene test only covers files in this repository. This changes behavior
-  for non-container hosts that rely on `accept-new`, so it needs its own release note.
-- Optionally accept `NEST_SSH_CONFIG` and `NEST_SSH_KNOWN_HOSTS` paths, so a
-  deployment can point at mounted files without building an SSH directory.
+`NEST_SLURM_HOST` names an alias in the mounted `ssh/config` (Mode A). The host,
+user, port, proxy, and host-key database are in that file, not in the environment.
+Mode B, managed SSH ([configuration](configuration)), now builds the whole SSH
+command line from the environment with `-F none` and `StrictHostKeyChecking=yes`,
+and accepts `NEST_SSH_KNOWN_HOSTS` and `NEST_SSH_IDENTITY_FILE` paths or inline
+values. Remaining for Mode A: have `SlurmBackend` pass
+`-o StrictHostKeyChecking=yes` too. Today a permissive `ssh/config` could weaken
+verification, and the hygiene test only covers files in this repository. This
+changes behavior for non-container hosts that rely on `accept-new`, so it needs
+its own release note.
 
 ### Report SSH readiness
 
@@ -120,11 +118,10 @@ healthy until the first call fails. Options:
 - A standard `grpc.health.v1` service. `scripts/verify-grpc.py` then would not
   need to rely on rejecting an empty environment.
 
-### Remove the Tailnet-specific client default
+### Remove the Tailnet-specific client default (done)
 
-The SDK's default `NEST_CONTROLLER_ADDRESS` is `nest-tag.tail8e5ba1.ts.net:50051`,
-a single team's Tailnet name. Before wider access, require the variable, or
-default to `127.0.0.1:50051`, and fail with a message that names it.
+The SDK's default `NEST_CONTROLLER_ADDRESS` is now `127.0.0.1:50051`. Team users set
+the Tailnet address explicitly; nothing in the SDK or Mode B depends on Tailscale.
 
 ### Check sidecar preferences in both modes
 
@@ -142,8 +139,11 @@ would make deployments reproducible and remove the build from the host.
 
 ### Authenticate callers
 
-gRPC is plaintext, protected only by Tailscale between client and host. The
-Docker bridge hop is plaintext. Nest has no application-level authentication,
-and every caller uses one HPC SSH identity (see [Security](security)). A
-multi-user deployment needs TLS or Tailscale identity checks at the Controller,
-per-caller authorization, and eventually per-user HPC identities.
+gRPC is plaintext unless `NEST_TLS_CERT_FILE` and `NEST_TLS_KEY_FILE` are set
+(clients then set `NEST_CONTROLLER_TLS` or `NEST_CONTROLLER_TLS_CA_FILE`). Without
+TLS it is protected only by the network, such as Tailscale, between client and host.
+Nest has no application-level authentication, and every caller uses one HPC SSH
+identity (see [Security](security)). `NEST_AUTH_TOKEN_FILE` and `NEST_DATABASE_URL`
+are reserved for this work and rejected at startup until it lands. A multi-user
+deployment needs per-caller authentication and authorization, and eventually
+per-user HPC identities.

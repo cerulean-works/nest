@@ -89,6 +89,13 @@ permissions to `600`, and runs the Controller as UID `10001` (`nest`). It does
 not modify the host's credentials or require matching host and container UIDs.
 Restart the service after updating keys or SSH settings.
 
+### Without an SSH directory (Mode B)
+
+To deploy without any host mount, use managed SSH: set the login nodes, user,
+host keys and key in the environment and add `compose.managed-ssh.yaml`, which
+drops this mount. No SSH config or Tailscale setting is used. See
+[Environment variables and defaults](configuration) for the variables.
+
 ## Select who can connect
 
 The default host binding is `127.0.0.1:50051`. For the team's Tailscale deployment,
