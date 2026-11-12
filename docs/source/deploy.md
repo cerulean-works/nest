@@ -7,7 +7,7 @@ The HPC work directory and runtime described below are required for both methods
 
 ## Requirements
 
-- Python 3.12+
+- Python 3.14+
 - Access to the target HPC Login Node via SSH
 - A configured Slurm backend
 - A working Nest runtime and Apptainer environment on HPC
@@ -51,7 +51,7 @@ Nest expects the following directory structure:
 ```text
 nest/
 ├── images/
-│   └── uv-python312.sif
+│   └── uv-python314.sif
 ├── project/
 │   ├── pyproject.toml
 │   ├── uv.lock
