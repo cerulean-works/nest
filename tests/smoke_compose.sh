@@ -17,6 +17,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Host-side metadata; GNU and BSD stat disagree on flags.
+host_metadata() {
+    python3 -c 'import os, sys; s = os.stat(sys.argv[1]); print(f"{s.st_mode & 0o777:o}:{s.st_uid}:{s.st_gid}")' "$1"
+}
+
 ssh-keygen -q -t ed25519 -N '' -C '' -f "$fixture/id_ed25519"
 cat > "$fixture/config" <<'EOF'
 Host fixture-hpc
@@ -27,7 +32,7 @@ Host fixture-hpc
     StrictHostKeyChecking yes
 EOF
 printf 'fixture.example %s\n' "$(cat "$fixture/id_ed25519.pub")" > "$fixture/known_hosts"
-original_key_permissions=$(stat -c '%a:%u:%g' "$fixture/id_ed25519")
+original_key_permissions=$(host_metadata "$fixture/id_ed25519")
 
 docker compose config --quiet
 docker compose up -d --no-build --pull never --wait --wait-timeout 60
@@ -36,7 +41,7 @@ docker compose exec -T --user nest controller sh -c \
     'test "$(stat -c %a ~/.ssh)" = 700 && test "$(stat -c %a ~/.ssh/id_ed25519)" = 600 && ssh-keygen -y -f ~/.ssh/id_ed25519 >/dev/null'
 docker compose exec -T --user nest controller ssh -G fixture-hpc > "$fixture/resolved-config"
 grep -q '^hostname fixture.example$' "$fixture/resolved-config"
-test "$(stat -c '%a:%u:%g' "$fixture/id_ed25519")" = "$original_key_permissions"
+test "$(host_metadata "$fixture/id_ed25519")" = "$original_key_permissions"
 
 address=$(docker compose port controller 50051)
 docker run --rm -i --network host --env "NEST_CONTROLLER_ADDRESS=$address" "$NEST_CONTROLLER_IMAGE" python - <<'PY'
