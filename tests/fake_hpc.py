@@ -62,8 +62,8 @@ _SHIMS = {
 args = sys.argv[1:]
 log("ssh", argv=args)
 options = []
-while args and args[0] == "-o":
-    options.append(args[1])
+while args and args[0] in ("-o", "-F", "-i", "-p", "-l"):
+    options.append((args[0], args[1]))
     args = args[2:]
 if len(args) != 2:
     sys.exit("fake ssh expects exactly one host and one command")

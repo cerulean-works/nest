@@ -11,8 +11,9 @@ from unittest import mock
 import grpc
 
 from nest.backends.slurm import SlurmBackend, SlurmConfig
-from nest.client import _controller_error, _rpc_timeout
-from nest.controller import ExecutionService, _positive_seconds
+from nest.client import _controller_error
+from nest.config import load_client_config, load_controller_config
+from nest.controller import ExecutionService
 from nest.errors import (
     ERROR_KIND_METADATA,
     INFRASTRUCTURE_ERRORS,
@@ -301,16 +302,14 @@ class ClientClassificationTests(unittest.TestCase):
         self.assertIsNone(_controller_error(FakeCall(grpc.StatusCode.INTERNAL), "addr", 900))
 
     def test_rpc_timeout_setting(self):
-        with mock.patch.dict("os.environ", {"NEST_RPC_TIMEOUT": ""}):
-            self.assertEqual(_rpc_timeout(), 900)
-        with mock.patch.dict("os.environ", {"NEST_RPC_TIMEOUT": "2.5"}):
-            self.assertEqual(_rpc_timeout(), 2.5)
+        def timeout(value):
+            return load_client_config({"NEST_RPC_TIMEOUT": value}).rpc_timeout
+
+        self.assertEqual(timeout(""), 900)
+        self.assertEqual(timeout("2.5"), 2.5)
         for bad in ("0", "-1", "soon", "inf", "nan"):
-            with (
-                mock.patch.dict("os.environ", {"NEST_RPC_TIMEOUT": bad}),
-                self.assertRaises(ValueError),
-            ):
-                _rpc_timeout()
+            with self.assertRaises(ValueError):
+                timeout(bad)
 
 
 class Aborted(Exception):
@@ -402,16 +401,14 @@ class ControllerTests(unittest.TestCase):
                 fake.submit_payload.assert_called_once()
 
     def test_timeout_settings_are_validated(self):
-        with mock.patch.dict("os.environ", {"NEST_SSH_TIMEOUT": ""}):
-            self.assertEqual(_positive_seconds("NEST_SSH_TIMEOUT", 60), 60)
-        with mock.patch.dict("os.environ", {"NEST_SSH_TIMEOUT": "0.25"}):
-            self.assertEqual(_positive_seconds("NEST_SSH_TIMEOUT", 60), 0.25)
+        def timeout(value):
+            return load_controller_config({"NEST_SSH_TIMEOUT": value}).ssh_timeout
+
+        self.assertEqual(timeout(""), 60)
+        self.assertEqual(timeout("0.25"), 0.25)
         for bad in ("0", "-5", "ten", "inf"):
-            with (
-                mock.patch.dict("os.environ", {"NEST_SSH_TIMEOUT": bad}),
-                self.assertRaisesRegex(ValueError, "NEST_SSH_TIMEOUT"),
-            ):
-                _positive_seconds("NEST_SSH_TIMEOUT", 60)
+            with self.assertRaisesRegex(ValueError, "NEST_SSH_TIMEOUT"):
+                timeout(bad)
 
 
 class ResourcesTests(unittest.TestCase):
