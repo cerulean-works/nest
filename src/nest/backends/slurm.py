@@ -702,12 +702,9 @@ class SlurmBackend:
         """
         if not self.config.worker_workdir:
             raise ValueError("worker_workdir is not configured")
-        
-        image = (
-            f"{self.config.worker_workdir.rstrip('/')}"
-            "/images/uv-python314.sif"
-        )
-        
+
+        image = f"{self.config.worker_workdir.rstrip('/')}/images/uv-python314.sif"
+
         quoted = shlex.quote(image)
 
         command = (
