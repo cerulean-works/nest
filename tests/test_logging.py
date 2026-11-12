@@ -24,7 +24,7 @@ from nest._logging import (
 from nest.backends.slurm import SlurmBackend, SlurmConfig
 from nest.client import execute_remote
 from nest.controller import ExecutionService
-from nest.errors import RemoteExecutionError
+from nest.errors import ExecutionTimeoutError, RemoteExecutionError, SlurmJobError
 from nest.proto import execution_pb2, execution_pb2_grpc
 from nest.remote import Resources
 
@@ -234,7 +234,8 @@ def test_slurm_polls_log_only_state_transitions(backend, monkeypatch, caplog, wa
 
 
 @pytest.mark.parametrize(
-    "state, timeout, exception", [("FAILED", 600, RuntimeError), ("RUNNING", 0, TimeoutError)]
+    "state, timeout, exception",
+    [("FAILED", 600, SlurmJobError), ("RUNNING", 0, ExecutionTimeoutError)],
 )
 def test_slurm_failure_and_timeout_preserve_exception(
     backend, monkeypatch, caplog, state, timeout, exception
@@ -281,7 +282,7 @@ def test_environment_cache_logging_omits_dependency_contents(
 
     def upload(*args, **kwargs):
         uploads.append(kwargs["input"])
-        return SimpleNamespace(returncode=0)
+        return SimpleNamespace(returncode=0, stdout=b"")
 
     monkeypatch.setattr("nest.backends.slurm.subprocess.run", upload)
     monkeypatch.setattr(backend, "environment_ready", lambda _: True)
