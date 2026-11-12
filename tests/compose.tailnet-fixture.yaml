@@ -1,0 +1,57 @@
+# Test-only override for compose.tailscale.yaml; see tests/smoke_tailnet_ssh.sh.
+# Replaces the Tailscale sidecar with a local SOCKS5 proxy and adds a disposable
+# OpenSSH "Login Node" reachable only through that proxy. No Slurm is installed.
+# Paths resolve against the repository root (the first Compose file's directory).
+services:
+  tailscale:
+    image: ${NEST_CONTROLLER_IMAGE:-nest-controller:test}
+    pull_policy: never
+    entrypoint: [python, /fixture/socks5_proxy.py, "1055"]
+    volumes:
+      - type: bind
+        source: ./tests/socks5_proxy.py
+        target: /fixture/socks5_proxy.py
+        read_only: true
+    healthcheck:
+      test: [CMD, python, -c, "import socket; socket.create_connection(('127.0.0.1', 1055), 2).close()"]
+      interval: 2s
+      timeout: 3s
+      start_period: 5s
+      retries: 10
+    networks:
+      - hpcnet
+
+  login:
+    build:
+      context: ./tests
+      dockerfile_inline: |
+        FROM debian:bookworm-slim
+        RUN apt-get update \
+            && apt-get install -y --no-install-recommends openssh-server \
+            && rm -rf /var/lib/apt/lists/* \
+            && useradd --create-home --shell /bin/sh hpc-user \
+            && mkdir -p /run/sshd
+    image: nest-login-fixture:test
+    hostname: login-node-fixture
+    command:
+      - sh
+      - -eu
+      - -c
+      - |
+        install -m 600 /fixture/ssh_host_ed25519_key /etc/ssh/ssh_host_ed25519_key
+        install -d -o hpc-user -g hpc-user -m 700 /home/hpc-user/.ssh
+        install -o hpc-user -g hpc-user -m 600 /fixture/authorized_keys /home/hpc-user/.ssh/authorized_keys
+        exec /usr/sbin/sshd -D -e -h /etc/ssh/ssh_host_ed25519_key \
+            -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no
+    volumes:
+      - type: bind
+        source: ${NEST_LOGIN_FIXTURE_DIR:?Set NEST_LOGIN_FIXTURE_DIR}
+        target: /fixture
+        read_only: true
+    networks:
+      - hpcnet
+
+networks:
+  # Only the proxy can reach the Login Node, as only tailscaled reaches the Tailnet.
+  hpcnet:
+    internal: true

@@ -12,6 +12,14 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+CONTROLLER_SETTINGS = {
+    "NEST_CONTROLLER_BIND",
+    "NEST_EXECUTOR",
+    "NEST_SLURM_HOST",
+    "NEST_SLURM_ACCOUNT",
+    "NEST_SLURM_WORKDIR",
+    "NEST_LOG_LEVEL",
+}
 COMMAND = shlex.split(os.environ.get("NEST_COMPOSE_COMMAND", "docker compose"))
 
 
@@ -79,6 +87,23 @@ def main():
         "--shields-up" in outbound["services"]["tailscale"]["environment"]["TS_EXTRA_ARGS"].split()
     )
     assert outbound["services"]["controller"]["ports"], "Keep original deployment behavior"
+    # The four Controller definitions are copies; keep their settings in step.
+    controllers = {
+        name: render(name)["services"]["controller"]
+        for name in ("compose.yaml", "compose-nop.yaml", "compose.tailscale.yaml")
+    }
+    controllers["compose.tailscale-shared.yaml"] = controller
+    for name, service in controllers.items():
+        assert set(service["environment"]) == CONTROLLER_SETTINGS, (name, service["environment"])
+        assert service["environment"]["NEST_CONTROLLER_BIND"] == "0.0.0.0:50051", name
+        assert not service.get("secrets"), f"{name}: Controller must not receive the Auth Key"
+        assert service["read_only"], name
+        assert service["volumes"][0]["target"] == "/run/nest-ssh", name
+        assert service["volumes"][0]["read_only"], name
+    assert not controllers["compose-nop.yaml"].get("ports")
+    for deployment in (shared, outbound):
+        secrets = deployment["services"]["tailscale"]["secrets"]
+        assert [secret["source"] for secret in secrets] == ["tailscale_authkey"]
     serve = json.loads((ROOT / "docker/tailscale-serve/serve.json").read_text())
     assert serve == {"TCP": {"50051": {"TCPForward": "controller:50051"}}, "AllowFunnel": {}}
 
@@ -98,7 +123,7 @@ def main():
         assert deployed["services"]["tailscale"]["volumes"][1]["source"] == str(
             files / "tailscale/serve"
         )
-    print("PASS: rendered shared Compose isolation, state reuse, and Dokploy ../files paths")
+    print("PASS: rendered Compose isolation, Controller settings, state reuse, and Dokploy paths")
 
 
 if __name__ == "__main__":
