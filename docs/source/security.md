@@ -17,6 +17,15 @@ accepted, policy-authorized recipients. All callers still submit work as the
 Controller's single HPC SSH user. Node Sharing and Grants restrict network
 reachability; they do not authenticate callers inside Nest or isolate jobs.
 
+## Deployment credentials
+
+Keep SSH keys, `known_hosts`, and the Tailscale Auth Key in the ignored `ssh/` and
+`secrets/` directories or Dokploy File Mounts, never in Git, `.env`, or Compose
+YAML. Keep `StrictHostKeyChecking yes` with a verified `known_hosts`; never use
+`accept-new`, `no`, or `/dev/null` to work around a host-key error. The test suite
+fails if a tracked file contains a private key or token, or weakens host-key
+verification. See [Deployment validation and roadmap](deployment-architecture).
+
 ## Known limitations
 
 - Experimental API with potential breaking changes.

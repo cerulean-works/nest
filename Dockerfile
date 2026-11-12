@@ -27,7 +27,7 @@ ENV PATH="/opt/nest/.venv/bin:$PATH" \
 
 EXPOSE 50051
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD ["python", "-c", "import grpc; channel = grpc.insecure_channel('127.0.0.1:50051'); grpc.channel_ready_future(channel).result(timeout=3); channel.close()"]
+    CMD ["python", "-c", "import os, grpc; port = os.environ['NEST_CONTROLLER_BIND'].rpartition(':')[2]; channel = grpc.insecure_channel(f'127.0.0.1:{port}'); grpc.channel_ready_future(channel).result(timeout=3); channel.close()"]
 
 ENTRYPOINT ["/usr/local/bin/nest-controller-entrypoint"]
 CMD ["python", "-m", "nest.controller"]

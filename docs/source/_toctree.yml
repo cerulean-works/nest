@@ -25,6 +25,8 @@ guide:
         title: Deploy a Slurm Controller
       - local: local-controller
         title: Run a local Controller
+      - local: deployment-architecture
+        title: Deployment validation and roadmap
   - title: Contributing
     sections:
       - local: developing

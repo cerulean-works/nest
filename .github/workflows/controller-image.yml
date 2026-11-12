@@ -37,3 +37,5 @@ jobs:
             -m unittest discover -s /tests -v
       - name: Test Compose deployment and SSH credentials
         run: bash tests/smoke_compose.sh
+      - name: Test Controller-to-Login-Node SSH through the Tailnet proxy path
+        run: bash tests/smoke_tailnet_ssh.sh
