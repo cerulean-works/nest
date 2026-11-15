@@ -60,6 +60,14 @@ The smoke test uses local execution and temporary SSH fixtures. It checks the
 health check, non-root execution, credential copying, remote calls and errors,
 and clean container shutdown. It does not submit real Slurm jobs.
 
+`bash tests/smoke_compose_postgres.sh` checks the database deployments: the
+default Compose deployment starts no database, the `local-db` profile starts
+PostgreSQL with a file-based password, data survives `down` and `up`, the
+Controller and database run independently, and the documented backup and restore
+commands work. `bash tests/smoke_compose_postgres_upgrade.sh` runs the documented
+PostgreSQL 17 to 18 upgrade and its rollback, and checks that records and the
+schema history survive both.
+
 ## Regenerate Protobuf Code
 
 ```bash

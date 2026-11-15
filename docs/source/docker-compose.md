@@ -157,6 +157,10 @@ To stop and remove the Controller:
 docker compose down
 ```
 
+With the `local-db` profile, `docker compose --profile local-db down` also stops
+the database and keeps its volume; never add `--volumes` unless you mean to delete
+the data.
+
 SIGTERM stops new RPCs and gives active calls ten seconds to finish. Compose
 allows twenty seconds before forcing the container to stop. Stopping or
 replacing the Controller does not cancel existing Slurm jobs or remove files
@@ -173,8 +177,23 @@ docker compose run --rm --no-deps controller nest-db upgrade
 docker compose up -d --wait
 ```
 
-`compose.postgres-dev.yaml` adds a local PostgreSQL for development only. See
-[Store Controller records in PostgreSQL](database).
+TLS and password files for the database go in `NEST_SSH_DIR`, so they appear under
+`/home/nest/.ssh` in the container, for example
+`NEST_DATABASE_SSLROOTCERT=/home/nest/.ssh/db-ca.crt`.
+
+`docker compose up -d` never starts a database. To run PostgreSQL in Docker
+as well, for development or a small self-hosted deployment, select the `local-db`
+profile explicitly:
+
+```bash
+(umask 077; openssl rand -hex 32 > ssh/nest-postgres-password)
+docker compose --profile local-db up -d --wait postgres
+```
+
+The database keeps its data in a named volume and is started, stopped and
+upgraded separately from the Controller. See
+[Run PostgreSQL with Docker Compose](database#run-postgresql-with-docker-compose)
+for connecting the Controller, migrations, PostgreSQL upgrades, and backups.
 
 ## Test without HPC
 
@@ -407,6 +426,8 @@ pushes to `main`. Run the same checks locally with:
 docker build -t nest-controller:test .
 docker run --rm --volume "$PWD/tests:/tests:ro" --volume "$PWD/docker:/docker:ro" --volume "$PWD/scripts:/scripts:ro" --entrypoint python nest-controller:test -m unittest discover -s /tests -v
 bash tests/smoke_compose.sh
+bash tests/smoke_compose_postgres.sh
+bash tests/smoke_compose_postgres_upgrade.sh
 bash tests/smoke_tailnet_ssh.sh
 python tests/check_shared_compose.py
 uv run pytest tests/test_deployment_hygiene.py
