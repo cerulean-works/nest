@@ -253,7 +253,9 @@ def test_slurm_forwards_context_without_payload_in_logs(backend, monkeypatch, ca
     caplog.set_level(logging.DEBUG, logger="nest")
     captured = {}
     monkeypatch.setenv("NEST_LOG_LEVEL", "DEBUG")
-    monkeypatch.setattr(backend, "stage_payload", lambda payload: "/nest/jobs/" + "e" * 32)
+    monkeypatch.setattr(
+        backend, "stage_payload", lambda payload, execution_id=None: "/nest/jobs/" + "e" * 32
+    )
 
     def submit(**kwargs):
         captured.update(kwargs)

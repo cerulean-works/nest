@@ -18,13 +18,24 @@ from urllib.parse import urlsplit
 
 import cloudpickle
 import grpc
-from postgres_fixture import PostgresTestCase, connect
+from postgres_fixture import (
+    PG_BIN,
+    REQUIRED,
+    TLS_CA_FILE,
+    TLS_OTHER_CA_FILE,
+    TLS_URL,
+    PostgresTestCase,
+    PostgresTLSTestCase,
+    connect,
+    temporary_database,
+)
 from test_controller import controller_at_free_port, controller_environment
 
 from nest.config import ConfigError, load_controller_config, load_database_config
 from nest.controller import ExecutionService
 from nest.db import (
     Database,
+    DatabaseError,
     JobStore,
     MigrationError,
     load_migrations,
@@ -104,9 +115,9 @@ class DatabaseConfigTests(unittest.TestCase):
             "NEST_DATABASE_SSLMODE must be one of",
             self.problems({"NEST_DATABASE_URL": url, "NEST_DATABASE_SSLMODE": "on"}),
         )
-        self.assertIn(
-            "sslmode='strict'", self.problems({"NEST_DATABASE_URL": url + "?sslmode=strict"})
-        )
+        text = self.problems({"NEST_DATABASE_URL": url + "?sslmode=strict-marker"})
+        self.assertIn("invalid sslmode in its query string", text)
+        self.assertNotIn("strict-marker", text)
         self.assertIn(
             "sslmode is set in both",
             self.problems(
@@ -340,6 +351,26 @@ class MigrationTests(PostgresTestCase):
             upgrade(self.conn, edited + self.migrations("", "CREATE TABLE b (id int);")[1:])
         self.assertNotIn("b", self.tables())
 
+    def test_renaming_an_applied_migration_is_detected(self):
+        directory = Path(tempfile.mkdtemp())
+        (directory / "0001_original_name.sql").write_text("CREATE TABLE a (id int);")
+        original = load_migrations(directory)
+        upgrade(self.conn, original)
+        (directory / "0001_original_name.sql").rename(directory / "0001_new_name.sql")
+        renamed = load_migrations(directory)
+        # Same version and SQL, so the checksum alone would not notice.
+        self.assertEqual(renamed[0].checksum, original[0].checksum)
+        status = schema_status(self.conn, renamed)
+        self.assertEqual([m.label for m in status.renamed], ["0001_new_name"])
+        self.assertEqual(status.modified, [])
+        message = "0001_original_name was renamed to 0001_new_name after it was applied"
+        with self.assertRaisesRegex(MigrationError, message):
+            verify(self.conn, renamed)
+        (directory / "0002_next.sql").write_text("CREATE TABLE b (id int);")
+        with self.assertRaisesRegex(MigrationError, message):
+            upgrade(self.conn, load_migrations(directory))
+        self.assertNotIn("b", self.tables())
+
     def test_a_newer_database_is_rejected(self):
         upgrade(self.conn, self.migrations("SELECT 1;", "SELECT 2;"))
         older = self.migrations("SELECT 1;")
@@ -448,8 +479,23 @@ class StoreTests(PostgresTestCase):
         )
         sync_providers(self.db, config.providers, config.default_provider)
         jobs = JobStore(self.db, "default")
-        record = jobs.begin("execution", request_id="r1", gpu=1, cpu=4)
-        self.assertEqual(jobs.get(record)["status"], "submitting")  # ty: ignore[not-subscriptable]
+        execution_id = "c" * 32
+        record = jobs.begin(
+            "execution",
+            execution_id,
+            request_id="r1",
+            job_dir="/w/jobs/" + execution_id,
+            gpu=1,
+            cpu=4,
+        )
+        row = jobs.by_execution_id(execution_id)
+        assert row is not None
+        self.assertEqual((row["id"], row["status"]), (record, "submitting"))
+        self.assertEqual(row["job_dir"], "/w/jobs/" + execution_id)
+        # Execution IDs are unique and must be 32 lowercase hexadecimal characters.
+        for bad in (execution_id, "not-an-execution-id"):
+            with self.subTest(execution_id=bad), self.assertRaises(DatabaseUnavailableError):
+                jobs.begin("batch", bad)
         jobs.submitted(record, 42, "/w/jobs/x")
         jobs.observe(42, "RUNNING")
         jobs.finish(record, "succeeded")
@@ -465,7 +511,7 @@ class StoreTests(PostgresTestCase):
         jobs = JobStore(self.db, "default")
         self.db.close()
         with self.assertRaises(DatabaseUnavailableError):
-            jobs.begin("batch")
+            jobs.begin("batch", "b" * 32)
         # Updates after a side effect are logged, never raised.
         jobs.finish(1, "failed")
 
@@ -522,18 +568,97 @@ class ControllerDatabaseTests(PostgresTestCase):
         self.assertEqual(code, 2)
         self.assertIn("NEST_DATABASE_URL is unset", stderr)
 
-    def test_records_survive_a_controller_restart(self):
+    def slurm_controller_settings(self):
+        """Returns a migrated database URL, a FakeHpc, and Controller settings."""
         from fake_hpc import FakeHpc
 
         url = self.database()
         with connect(url) as conn:
             upgrade(conn)
         root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
         hpc = FakeHpc(root)
+        return url, hpc, {**hpc.controller_settings(), "NEST_DATABASE_URL": url}
+
+    @staticmethod
+    def worker_jobs(hpc):
+        return [c for c in hpc.calls("sbatch") if c["script"] == "project/scripts/worker.sbatch"]
+
+    @staticmethod
+    def job_rows(url):
+        from psycopg.rows import dict_row
+
+        with connect(url) as conn, conn.cursor(row_factory=dict_row) as cursor:
+            return cursor.execute("SELECT * FROM jobs ORDER BY id").fetchall()
+
+    def test_execution_id_is_shared_by_record_backend_and_job_directory(self):
+        url, hpc, settings = self.slurm_controller_settings()
+        with controller_at_free_port(**settings) as (_, stub, _address):
+            payload = cloudpickle.dumps((lambda value: value * 2, (21,), {}))
+            response = stub.Execute(execution_pb2.ExecuteRequest(payload=payload), timeout=60)
+            self.assertEqual(cloudpickle.loads(response.result), 42)
+        [job] = self.worker_jobs(hpc)
+        [row] = self.job_rows(url)
+        execution_id = job["args"][0]
+        self.assertRegex(row["execution_id"], r"^[0-9a-f]{32}$")
+        self.assertEqual(row["execution_id"], execution_id)
+        self.assertEqual(row["job_dir"], str(hpc.base / "jobs" / execution_id))
+        self.assertTrue((hpc.base / "jobs" / execution_id / "input.pkl").exists())
+        self.assertEqual((row["status"], row["slurm_job_id"]), ("succeeded", job["job_id"]))
+
+    def test_ambiguous_submission_record_names_its_execution_directory(self):
+        url, hpc, settings = self.slurm_controller_settings()
+        hpc.hang_ssh("sbatch --parsable", after=True)
+        with (
+            controller_at_free_port(**settings, NEST_SSH_TIMEOUT="1") as (_, stub, _a),
+            self.assertRaises(grpc.RpcError) as caught,
+        ):
+            stub.Execute(
+                execution_pb2.ExecuteRequest(payload=cloudpickle.dumps((print, (), {}))),
+                timeout=60,
+            )
+        error = caught.exception
+        self.assertEqual(error.code(), grpc.StatusCode.UNKNOWN)  # ty: ignore[missing-attribute]
+        # sbatch ran once and was never retried; the Controller got no job ID.
+        self.assertEqual(len(hpc.calls("sbatch")), 1)
+        [job] = self.worker_jobs(hpc)
+        [row] = self.job_rows(url)
+        execution_id = job["args"][0]
+        self.assertEqual(row["status"], "unknown")
+        self.assertEqual(row["error_kind"], "submission_unknown")
+        self.assertIsNone(row["slurm_job_id"])
+        # The record alone is enough to find the execution directory and its output.
+        self.assertEqual(row["execution_id"], execution_id)
+        self.assertEqual(row["job_dir"], str(hpc.base / "jobs" / execution_id))
+        self.assertTrue((hpc.base / "jobs" / execution_id / "input.pkl").exists())
+        self.assertIn(f"Execution ID: {execution_id}", error.details())  # ty: ignore[missing-attribute]
+
+    def test_failure_before_submission_is_recorded_without_a_slurm_job(self):
+        url, hpc, settings = self.slurm_controller_settings()
+        with (
+            controller_at_free_port(**{**settings, "NEST_SLURM_HOST": "unknown-hpc"}) as (
+                _,
+                stub,
+                _a,
+            ),
+            self.assertRaises(grpc.RpcError),
+        ):
+            stub.Execute(
+                execution_pb2.ExecuteRequest(payload=cloudpickle.dumps((print, (), {}))),
+                timeout=60,
+            )
+        self.assertEqual(hpc.calls("sbatch"), [])
+        [row] = self.job_rows(url)
+        self.assertEqual((row["status"], row["error_kind"]), ("failed", "ssh_error"))
+        self.assertIsNone(row["slurm_job_id"])
+        self.assertRegex(row["execution_id"], r"^[0-9a-f]{32}$")
+
+    def test_records_survive_a_controller_restart(self):
+        url, hpc, settings = self.slurm_controller_settings()
+        root = hpc.base.parent
         workdir = root / "batch"
         workdir.mkdir()
         (workdir / "hello.sbatch").write_text("#!/bin/bash\necho hello > hello.out\n")
-        settings = {**hpc.controller_settings(), "NEST_DATABASE_URL": url}
 
         with controller_at_free_port(**settings) as (_, stub, _address):
             submitted = stub.SubmitJob(
@@ -575,6 +700,249 @@ class ControllerDatabaseTests(PostgresTestCase):
         self.assertEqual(profile, ("long", True, True))
 
 
+class QueryValueRedactionTests(PostgresTestCase):
+    """URL passwords and query values never reach errors, `nest-db`, or Controller logs."""
+
+    CASES = (
+        # (query string, marker that must never appear, failing stage)
+        ("sslmode=sslmode-marker-1", "sslmode-marker-1", "config"),
+        ("keepalives=keepalive-marker-2", "keepalive-marker-2", "connect"),
+        ("target_session_attrs=tsa-marker-3", "tsa-marker-3", "connect"),
+        ("gssencmode=gss-marker-4", "gss-marker-4", "connect"),
+        ("options=-coptparam-marker-5%3Dvalue-marker-6", "marker-5", "connect"),
+        ("options=-coptparam-marker-5%3Dvalue-marker-6", "marker-6", "connect"),
+        ("host=host-marker-7.invalid", "host-marker-7", "connect"),
+    )
+
+    def setUp(self):
+        super().setUp()
+        self.url = self.database()
+
+    def marker_url(self, query: str) -> str:
+        parts = urlsplit(self.url)
+        return f"postgresql://{parts.username}:{PASSWORD}@{parts.hostname}:{parts.port}{parts.path}?{query}"
+
+    def run_entry_point(self, module, *args, url):
+        env = controller_environment(NEST_CONTROLLER_BIND="127.0.0.1:0")
+        env.update(NEST_DATABASE_URL=url, NEST_DATABASE_CONNECT_TIMEOUT="3")
+        result = subprocess.run(
+            [sys.executable, "-m", module, *args],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        return result.returncode, result.stdout + result.stderr
+
+    def assert_clean(self, text, marker):
+        self.assertNotIn(marker, text)
+        self.assertNotIn(PASSWORD, text)
+        self.assertNotIn("Traceback", text)
+
+    def test_markers_never_appear_in_errors_or_output(self):
+        for query, marker, stage in self.CASES:
+            url = self.marker_url(query)
+            with self.subTest(query=query, marker=marker):
+                if stage == "config":
+                    with self.assertRaises(ConfigError) as caught:
+                        load_controller_config({"NEST_DATABASE_URL": url})
+                    self.assert_clean(str(caught.exception), marker)
+                    self.assertIn("NEST_DATABASE_URL", str(caught.exception))
+                else:
+                    config = _db_config(url, NEST_DATABASE_CONNECT_TIMEOUT="3")
+                    self.assert_clean(str(config.summary()), marker)
+                    with self.assertRaises(DatabaseError) as caught:
+                        Database(config).open()
+                    self.assert_clean(str(caught.exception), marker)
+                    # Still actionable: names the redacted URL and what to check.
+                    self.assertIn(
+                        "Cannot connect to PostgreSQL at postgresql://", str(caught.exception)
+                    )
+                expected = 2 if stage == "config" else 3
+                code, output = self.run_entry_point("nest.db.cli", "verify", url=url)
+                self.assertEqual(code, expected, output)
+                self.assert_clean(output, marker)
+                code, output = self.run_entry_point("nest.controller", url=url)
+                self.assertEqual(code, expected, output)
+                self.assert_clean(output, marker)
+
+    def test_successful_startup_logs_no_query_values(self):
+        with connect(self.url) as conn:
+            upgrade(conn)
+        url = self.marker_url("application_name=app-marker-8&keepalives_idle=30")
+        env = controller_environment(NEST_CONTROLLER_BIND="127.0.0.1:0", NEST_DATABASE_URL=url)
+        process = subprocess.Popen(
+            [sys.executable, "-m", "nest.controller"],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        lines = []
+        try:
+            assert process.stdout is not None
+            for line in process.stdout:
+                lines.append(line)
+                if "Controller listening" in line:
+                    break
+        finally:
+            process.terminate()
+            rest, _ = process.communicate(timeout=15)
+        output = "".join(lines) + rest
+        self.assertIn("Database connected url=postgresql://", output)
+        self.assertIn("?***", output)
+        self.assert_clean(output, "app-marker-8")
+
+
+class TLSTests(PostgresTLSTestCase):
+    """`NEST_DATABASE_SSL*` against a real TLS-enabled PostgreSQL."""
+
+    def tls_url(self, host: str = "localhost") -> str:
+        parts = urlsplit(TLS_URL)
+        auth = parts.netloc.rsplit("@", 1)[0] + "@" if "@" in parts.netloc else ""
+        return f"postgresql://{auth}{host}:{parts.port or 5432}{parts.path}"
+
+    def open(self, url: str, **settings: str) -> Database:
+        database = Database(_db_config(url, NEST_DATABASE_CONNECT_TIMEOUT="5", **settings))
+        database.open()
+        self.addCleanup(database.close)
+        return database
+
+    def test_verify_full_checks_the_certificate_and_encrypts(self):
+        database = self.open(self.tls_url(), NEST_DATABASE_SSLROOTCERT=TLS_CA_FILE)
+        self.assertEqual(database.config.effective_sslmode, "verify-full")
+        with database.connection() as conn:
+            row = conn.execute(
+                "SELECT ssl, version FROM pg_stat_ssl WHERE pid = pg_backend_pid()"
+            ).fetchone()
+        assert row is not None
+        self.assertTrue(row[0])
+        self.assertTrue(row[1].startswith("TLS"))
+
+    def test_verify_full_rejects_an_untrusted_certificate(self):
+        with self.assertRaisesRegex(DatabaseError, "certificate verify failed"):
+            self.open(self.tls_url(), NEST_DATABASE_SSLROOTCERT=TLS_OTHER_CA_FILE)
+
+    def test_verify_full_rejects_a_host_name_mismatch(self):
+        # The certificate names only DNS:localhost, so 127.0.0.1 does not match.
+        url = self.tls_url("127.0.0.1")
+        with self.assertRaisesRegex(DatabaseError, "does not match host name"):
+            self.open(url, NEST_DATABASE_SSLROOTCERT=TLS_CA_FILE)
+        # verify-ca still checks the CA but not the host name.
+        self.open(url, NEST_DATABASE_SSLROOTCERT=TLS_CA_FILE, NEST_DATABASE_SSLMODE="verify-ca")
+
+    def test_controller_and_nest_db_use_the_tls_settings(self):
+        env = controller_environment(
+            NEST_CONTROLLER_BIND="127.0.0.1:0",
+            NEST_DATABASE_URL=self.tls_url(),
+            NEST_DATABASE_SSLROOTCERT=TLS_OTHER_CA_FILE,
+            NEST_DATABASE_CONNECT_TIMEOUT="5",
+        )
+        for module, args in (("nest.controller", ()), ("nest.db.cli", ("verify",))):
+            with self.subTest(module=module):
+                result = subprocess.run(
+                    [sys.executable, "-m", module, *args],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 3, result.stderr)
+                self.assertIn("certificate verify failed", result.stderr)
+
+
+def _pg_tool(name: str) -> str | None:
+    import shutil
+
+    path = os.path.join(PG_BIN, name) if PG_BIN else shutil.which(name)
+    return path if path and os.access(path, os.X_OK) else None
+
+
+class BackupRestoreTests(PostgresTestCase):
+    """The documented pg_dump / pg_restore / nest-db verify workflow."""
+
+    def setUp(self):
+        super().setUp()
+        self.pg_dump, self.pg_restore = _pg_tool("pg_dump"), _pg_tool("pg_restore")
+        if not (self.pg_dump and self.pg_restore):
+            message = "pg_dump and pg_restore are needed (set NEST_TEST_PG_BIN)"
+            if REQUIRED:
+                self.fail(message)
+            self.skipTest(message)
+
+    def test_dump_and_restore_preserve_records_and_schema(self):
+        source = self.database()
+        with connect(source) as conn:
+            upgrade(conn)
+        database = Database(_db_config(source))
+        database.open()
+        self.addCleanup(database.close)
+        config = load_controller_config(
+            {"NEST_SLURM_HOST": "hpc", "NEST_SLURM_ACCOUNT": "acct", "NEST_SLURM_WORKDIR": "/w"}
+        )
+        sync_providers(database, config.providers, config.default_provider)
+        jobs = JobStore(database, "default")
+        record = jobs.begin("execution", "d" * 32, job_dir="/w/jobs/" + "d" * 32, gpu=1)
+        jobs.submitted(record, 77, "/w/jobs/" + "d" * 32)
+        jobs.finish(record, "succeeded")
+        jobs.begin("batch", "e" * 32, script="hello.sbatch")
+        database.close()
+
+        def snapshot(url):
+            with connect(url) as conn:
+                return (
+                    conn.execute(
+                        "SELECT id, execution_id, kind, status, slurm_job_id, job_dir, gpu "
+                        "FROM jobs ORDER BY id"
+                    ).fetchall(),
+                    conn.execute(
+                        "SELECT id, login_nodes, account, is_default FROM provider_profiles"
+                    ).fetchall(),
+                    conn.execute(
+                        "SELECT version, name, checksum FROM schema_migrations ORDER BY version"
+                    ).fetchall(),
+                )
+
+        expected = snapshot(source)
+        dump = Path(tempfile.mkdtemp()) / "nest.dump"
+        self.addCleanup(lambda: __import__("shutil").rmtree(dump.parent))
+        assert self.pg_dump and self.pg_restore
+        subprocess.run(
+            [self.pg_dump, "--format=custom", "--no-owner", f"--file={dump}", source],
+            check=True,
+            capture_output=True,
+        )
+        with temporary_database() as restored:
+            subprocess.run(
+                [self.pg_restore, "--no-owner", "--exit-on-error", f"--dbname={restored}", dump],
+                check=True,
+                capture_output=True,
+            )
+            env = {k: v for k, v in os.environ.items() if not k.startswith("NEST_DATABASE_")}
+            result = subprocess.run(
+                [sys.executable, "-m", "nest.db.cli", "verify"],
+                env={**env, "NEST_DATABASE_URL": restored},
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(snapshot(restored), expected)
+            # New records continue after the restored ones.
+            with connect(restored) as conn:
+                conn.execute(
+                    "INSERT INTO jobs (execution_id, provider_id, kind) "
+                    "VALUES (%s, 'default', 'batch')",
+                    ("f" * 32,),
+                )
+                ids = [row[0] for row in conn.execute("SELECT id FROM jobs ORDER BY id")]
+        self.assertEqual(len(expected[0]), 2)
+        self.assertEqual(ids[-1], max(row[0] for row in expected[0]) + 1)
+
+
 class NestDbCommandTests(PostgresTestCase):
     def nest_db(self, *args, **settings):
         env = {k: v for k, v in os.environ.items() if not k.startswith("NEST_DATABASE_")}
@@ -609,6 +977,18 @@ class NestDbCommandTests(PostgresTestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("checksum mismatch", result.stderr)
         self.assertIn("MODIFIED", self.nest_db("status", NEST_DATABASE_URL=url).stdout)
+
+    def test_verify_and_upgrade_both_reject_a_renamed_migration(self):
+        url = self.database()
+        self.assertEqual(self.nest_db("upgrade", NEST_DATABASE_URL=url).returncode, 0)
+        with connect(url) as conn:
+            conn.execute("UPDATE schema_migrations SET name = 'old_name' WHERE version = 1")
+        for command in ("verify", "upgrade"):
+            with self.subTest(command=command):
+                result = self.nest_db(command, NEST_DATABASE_URL=url)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("0001_old_name was renamed to 0001_providers_and_jobs", result.stderr)
+        self.assertIn("RENAMED", self.nest_db("status", NEST_DATABASE_URL=url).stdout)
 
     def test_configuration_and_connection_errors(self):
         result = self.nest_db("verify")

@@ -31,9 +31,11 @@ psql() {
 "${compose[@]}" up -d --no-build --pull missing --wait --wait-timeout 120
 
 # Migrations ran once, outside the Controller, and the Controller verified them.
-"${compose[@]}" logs --no-color migrate | grep -q 'applied 0001_providers_and_jobs'
-"${compose[@]}" exec -T controller nest-db verify | grep -q 'Schema is current'
-"${compose[@]}" logs --no-color controller | grep -q 'Database connected'
+# Capture output before grepping: with pipefail, grep -q exiting early would
+# kill the producer with SIGPIPE and fail the pipeline.
+grep -q 'applied 0001_providers_and_jobs' <<<"$("${compose[@]}" logs --no-color migrate)"
+grep -q 'Schema is current' <<<"$("${compose[@]}" exec -T controller nest-db verify)"
+grep -q 'Database connected' <<<"$("${compose[@]}" logs --no-color controller)"
 test "$(psql 'SELECT count(*) FROM schema_migrations')" = 1
 
 # A record written before a full restart is still there afterwards. The
@@ -43,7 +45,7 @@ psql "INSERT INTO provider_profiles (id, ssh_mode, login_nodes, account, partiti
 "${compose[@]}" down --timeout 20
 "${compose[@]}" up -d --no-build --pull never --wait --wait-timeout 120
 test "$(psql "SELECT active FROM provider_profiles WHERE id = 'smoke'")" = f
-"${compose[@]}" logs --no-color migrate | grep -q 'already current'
+grep -q 'already current' <<<"$("${compose[@]}" logs --no-color migrate)"
 
 # With the database gone, a Controller start fails fast and never logs the password.
 "${compose[@]}" stop postgres

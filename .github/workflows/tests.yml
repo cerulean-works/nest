@@ -40,5 +40,28 @@ jobs:
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Install PostgreSQL 17 client tools for the backup and restore test
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y postgresql-client-17
+          echo "NEST_TEST_PG_BIN=/usr/lib/postgresql/17/bin" >> "$GITHUB_ENV"
+      - name: Start a TLS-enabled PostgreSQL for the TLS verification tests
+        run: |
+          certs="$RUNNER_TEMP/postgres-tls"
+          bash tests/make_postgres_tls_certs.sh "$certs"
+          docker run -d --name postgres-tls -p 127.0.0.1:5433:5432 \
+            -e POSTGRES_PASSWORD=postgres -v "$certs:/certs:ro" postgres:17 \
+            bash -c 'cp /certs/server.crt /certs/server.key /tmp/ && chown postgres /tmp/server.* && chmod 600 /tmp/server.key && exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/tmp/server.crt -c ssl_key_file=/tmp/server.key'
+          for _ in $(seq 60); do
+            docker exec postgres-tls pg_isready -U postgres -h 127.0.0.1 && break
+            sleep 1
+          done
+          {
+            echo "NEST_TEST_TLS_DATABASE_URL=postgresql://postgres:postgres@localhost:5433/postgres"
+            echo "NEST_TEST_TLS_CA_FILE=$certs/ca.crt"
+            echo "NEST_TEST_TLS_OTHER_CA_FILE=$certs/other-ca.crt"
+          } >> "$GITHUB_ENV"
       - name: Test with python ${{ matrix.python-version }}
         run: uv run --frozen pytest --cov=src/nest
