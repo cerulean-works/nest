@@ -88,5 +88,6 @@ and container requirements before use. From a trusted client, run the
 [quickstart](quickstart) with `NEST_CONTROLLER_ADDRESS` set to this Controller.
 
 The Controller uses partition `dev` and a `00:05:00` time limit unless
-`NEST_SLURM_PARTITION` and `NEST_SLURM_TIME` override them. See [Environment variables and defaults](configuration) for all settings and
+`NEST_SLURM_PARTITION` and `NEST_SLURM_TIME` override them. Environment builds
+keep the `00:10:00` limit in `scripts/environment-smoke.sbatch`. See [Environment variables and defaults](configuration) for all settings and
 [Slurm backend](api/slurm) for direct backend configuration.
