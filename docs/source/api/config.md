@@ -24,6 +24,8 @@ except ConfigError as error:
 
 [[autodoc]] config.load_client_config
 
+[[autodoc]] config.load_database_config
+
 [[autodoc]] config.ConfigError
 
 ## Settings
@@ -35,6 +37,8 @@ except ConfigError as error:
 [[autodoc]] config.LoginNode
 
 [[autodoc]] config.SSHPolicy
+
+[[autodoc]] config.DatabaseConfig
 
 [[autodoc]] config.ClientConfig
 

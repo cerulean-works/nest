@@ -19,6 +19,36 @@ Run the Controller integration tests:
 uv run python -m unittest discover -s tests -v
 ```
 
+The PostgreSQL tests (migrations, `nest-db`, Controller restart persistence) need a
+real server and are skipped without one. Point them at any PostgreSQL 14 or newer
+whose user may create databases; each test creates and drops its own database:
+
+```bash
+docker run -d --name nest-test-postgres -e POSTGRES_PASSWORD=postgres -p 127.0.0.1:5432:5432 postgres:17
+export NEST_TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/postgres
+uv run pytest tests/test_database.py
+```
+
+Two groups need more than one server:
+
+- **TLS tests** need a second, TLS-enabled server whose certificate comes from
+  `tests/make_postgres_tls_certs.sh`. Set `NEST_TEST_TLS_DATABASE_URL` (host
+  `localhost`), `NEST_TEST_TLS_CA_FILE` and `NEST_TEST_TLS_OTHER_CA_FILE`:
+
+  ```bash
+  bash tests/make_postgres_tls_certs.sh /tmp/nest-tls
+  docker run -d --name nest-test-postgres-tls -p 127.0.0.1:5433:5432 -e POSTGRES_PASSWORD=postgres \
+      -v /tmp/nest-tls:/certs:ro postgres:17 bash -c 'cp /certs/server.* /tmp/ && chown postgres /tmp/server.* && exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/tmp/server.crt -c ssl_key_file=/tmp/server.key'
+  export NEST_TEST_TLS_DATABASE_URL=postgresql://postgres:postgres@localhost:5433/postgres
+  export NEST_TEST_TLS_CA_FILE=/tmp/nest-tls/ca.crt NEST_TEST_TLS_OTHER_CA_FILE=/tmp/nest-tls/other-ca.crt
+  ```
+
+- **The backup and restore test** needs `pg_dump` and `pg_restore` at least as new
+  as the server, on `PATH` or in `NEST_TEST_PG_BIN`.
+
+CI sets `NEST_TEST_DATABASE_REQUIRED=1`, which turns all of these skips into
+failures.
+
 To build and test the Compose deployment, with Docker Engine running:
 
 ```bash

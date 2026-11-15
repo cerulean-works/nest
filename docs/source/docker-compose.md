@@ -162,6 +162,20 @@ allows twenty seconds before forcing the container to stop. Stopping or
 replacing the Controller does not cancel existing Slurm jobs or remove files
 from the HPC cluster.
 
+## Store records in PostgreSQL
+
+Every Controller definition passes the `NEST_DATABASE_*` settings through, so set
+`NEST_DATABASE_URL` in `.env` to use an external database. Apply migrations before
+starting or updating the Controller:
+
+```bash
+docker compose run --rm --no-deps controller nest-db upgrade
+docker compose up -d --wait
+```
+
+`compose.postgres-dev.yaml` adds a local PostgreSQL for development only. See
+[Store Controller records in PostgreSQL](database).
+
 ## Test without HPC
 
 Keep the `ssh/` directory present (it can be empty), set `NEST_EXECUTOR=local`,

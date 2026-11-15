@@ -45,6 +45,15 @@ _STARTED_STATES = (
 )
 """Slurm states showing that a job left the queue and started on a node."""
 
+_EXECUTION_ID = re.compile(r"[0-9a-f]{32}")
+"""Execution IDs: a UUID4 as 32 lowercase hexadecimal characters."""
+
+
+def new_execution_id() -> str:
+    """Returns a new Execution ID: a UUID4 as 32 lowercase hexadecimal characters."""
+    return uuid.uuid4().hex
+
+
 _SUBMIT_MARKER = "nest-sbatch-started"
 """Printed before `sbatch` so an SSH failure can show whether submission began."""
 
@@ -432,31 +441,48 @@ class SlurmBackend:
         logger.info("Cancelling Slurm job job_id=%s", job_id)
         self._run_remote(f"scancel {job_id}")
 
+    def execution_dir(self, execution_id: str) -> str:
+        """
+        Returns the remote execution directory for an Execution ID. Runs no command.
+
+        Args:
+            execution_id (`str`): ID from [`backends.slurm.new_execution_id`].
+
+        Returns:
+            `str`: `<work_root>/<execution_id>`.
+
+        Raises:
+            `ValueError`: If the ID is malformed, or `work_root` is missing or relative.
+        """
+        if not _EXECUTION_ID.fullmatch(execution_id):
+            raise ValueError("Invalid execution ID")
+        if not self.config.work_root:
+            raise ValueError("Slurm work_root is not configured")
+        work_root = self.config.work_root
+        if not work_root.startswith("/"):
+            raise ValueError("Slurm work_root must be an absolute path")
+        return f"{work_root.rstrip('/')}/{execution_id}"
+
     @operation(logger, "Slurm stage_payload")
-    def stage_payload(self, payload: bytes) -> str:
+    def stage_payload(self, payload: bytes, execution_id: str | None = None) -> str:
         """
         Uploads a payload as `input.pkl` in a new remote execution directory.
 
         Args:
             payload (`bytes`): Serialized function and arguments.
+            execution_id (`str`, *optional*): Execution ID naming the directory. The
+                Controller passes the ID it already recorded; omitted, a new one is
+                generated.
 
         Returns:
-            `str`: Remote directory under `work_root`, named with a random UUID.
+            `str`: Remote directory under `work_root`, named with the Execution ID.
 
         Raises:
-            `ValueError`: If `work_root` is missing or is not an absolute path.
+            `ValueError`: If the ID is malformed, or `work_root` is missing or relative.
             [`errors.SSHError`] or [`errors.RemoteCommandError`]: If the upload fails.
             [`errors.SSHTimeoutError`]: If the upload exceeds `ssh_timeout`.
         """
-        if not self.config.work_root:
-            raise ValueError("Slurm work_root is not configured")
-
-        work_root = self.config.work_root
-
-        if not work_root.startswith("/"):
-            raise ValueError("Slurm work_root must be an absolute path")
-
-        job_dir = f"{work_root.rstrip('/')}/{uuid.uuid4().hex}"
+        job_dir = self.execution_dir(execution_id or new_execution_id())
         input_path = f"{job_dir}/input.pkl"
         logger.info(
             "Staging payload host=%s job_dir=%s payload_bytes=%s",
@@ -476,9 +502,14 @@ class SlurmBackend:
         *,
         cpu: int = 0,
         environment_id: str | None = None,
+        execution_id: str | None = None,
     ) -> tuple[int, str]:
         """
         Stages a serialized call and submits the deployed worker batch script once.
+
+        The Execution ID names the remote directory and is passed to the worker, so a
+        caller that records it before calling can always find the execution, even
+        when the submission outcome is unknown.
 
         Args:
             payload (`bytes`): Serialized function and arguments.
@@ -488,6 +519,8 @@ class SlurmBackend:
                 [`backends.slurm.SlurmBackend.submit`]; `0` keeps the script's value.
             environment_id (`str`, *optional*): Prepared environment's 64-character
                 lowercase hexadecimal ID. Omitting it selects the Nest runtime.
+            execution_id (`str`, *optional*): Execution ID from
+                [`backends.slurm.new_execution_id`]. Omitted, a new one is generated.
 
         Returns:
             `tuple[int, str]`: Submitted job ID and remote execution directory.
@@ -508,10 +541,11 @@ class SlurmBackend:
         if gpu < 0 or cpu < 0:
             raise ValueError("Resource counts cannot be negative")
 
-        # Upload payload
-        job_dir = self.stage_payload(payload)
+        # Validate before any SSH command.
+        self.execution_dir(execution_id or new_execution_id())
 
-        # Extract execution UUID
+        # Upload payload into the directory named by the Execution ID
+        job_dir = self.stage_payload(payload, execution_id)
         execution_id = job_dir.rsplit("/", 1)[-1]
 
         # Prepare script arguments

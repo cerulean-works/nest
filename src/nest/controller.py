@@ -6,9 +6,16 @@ from functools import wraps
 
 import cloudpickle
 import grpc
+import psycopg
 
-from ._logging import configure_logging, get_logger, register_secret, request_context
-from .backends.slurm import SlurmBackend, SlurmConfig
+from ._logging import (
+    configure_logging,
+    current_request_id,
+    get_logger,
+    register_secret,
+    request_context,
+)
+from .backends.slurm import SlurmBackend, SlurmConfig, new_execution_id
 from .config import (
     ConfigError,
     ControllerConfig,
@@ -16,7 +23,15 @@ from .config import (
     load_executor,
     materialize_ssh_credentials,
 )
-from .errors import ERROR_KIND_METADATA, JOB_ID_METADATA, InfrastructureError, RemoteCommandError
+from .db import Database, DatabaseError, JobStore, sync_providers, verify
+from .errors import (
+    ERROR_KIND_METADATA,
+    JOB_ID_METADATA,
+    DatabaseUnavailableError,
+    InfrastructureError,
+    RemoteCommandError,
+    SubmissionUnknownError,
+)
 from .executor import execute
 from .proto import execution_pb2, execution_pb2_grpc
 
@@ -82,18 +97,48 @@ def _abort_infrastructure(context, exc: InfrastructureError, status=None):
 class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
     """Handles execution requests and Slurm job operations for the controller."""
 
-    def __init__(self, slurm_backend=None, executor: str | None = None):
+    def __init__(
+        self, slurm_backend=None, executor: str | None = None, jobs: JobStore | None = None
+    ):
         """
-        Stores the optional Slurm backend used by the RPC handlers.
+        Stores the optional Slurm backend and job store used by the RPC handlers.
 
         Args:
             slurm_backend ([`backends.slurm.SlurmBackend`], *optional*): Backend for
                 Slurm execution and job operations. Local execution needs no backend.
             executor (`str`, *optional*): `"local"` or `"slurm"`. When omitted, each
                 request reads and validates `NEST_EXECUTOR`.
+            jobs ([`db.JobStore`], *optional*): Records Slurm submissions in
+                PostgreSQL. Without it the Controller is stateless.
         """
         self.slurm_backend = slurm_backend
         self.executor = executor
+        self.jobs = jobs
+
+    def _begin_record(self, context, kind: str, execution_id: str, **fields) -> int | None:
+        """
+        Creates the job record before any side effect, aborting with `UNAVAILABLE`
+        and kind `database_unavailable` when the database cannot store it.
+        """
+        if self.jobs is None:
+            return None
+        try:
+            return self.jobs.begin(kind, execution_id, request_id=current_request_id(), **fields)
+        except DatabaseUnavailableError as exc:
+            _abort_infrastructure(context, exc)
+            raise AssertionError("context.abort raises") from None
+
+    def _fail_record(self, record: int | None, exc: Exception) -> None:
+        if self.jobs is None or record is None:
+            return
+        infrastructure = isinstance(exc, InfrastructureError)
+        self.jobs.finish(
+            record,
+            "unknown" if isinstance(exc, SubmissionUnknownError) else "failed",
+            slurm_job_id=exc.job_id if infrastructure else None,
+            error_kind=exc.kind if infrastructure else "internal",
+            error_message=str(exc),
+        )
 
     def _require_slurm_backend(self, context) -> SlurmBackend:
         """
@@ -169,6 +214,23 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
 
         if mode == "slurm":
             backend = self._require_slurm_backend(context)
+            # The Execution ID is fixed and recorded before any SSH or Slurm side
+            # effect; the backend then uses it for the remote directory and worker.
+            execution_id = new_execution_id()
+            job_dir = None
+            if self.jobs is not None:
+                try:
+                    job_dir = backend.execution_dir(execution_id)
+                except ValueError:
+                    pass  # submit_payload reports it below, before any SSH command
+            record = self._begin_record(
+                context,
+                "execution",
+                execution_id,
+                job_dir=job_dir,
+                gpu=request.gpu,
+                cpu=request.cpu,
+            )
 
             try:
                 environment_id = None
@@ -195,20 +257,27 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                     gpu=request.gpu,
                     cpu=request.cpu,
                     environment_id=environment_id,
+                    execution_id=execution_id,
                 )
 
                 logger.info("Worker submitted job_id=%s job_dir=%s", job_id, job_dir)
+                if self.jobs is not None and record is not None:
+                    self.jobs.submitted(record, job_id, job_dir)
 
                 # Wait for the result
                 result_bytes = backend.wait_result(job_id, job_dir)
+                if self.jobs is not None and record is not None:
+                    self.jobs.finish(record, "succeeded")
 
                 return execution_pb2.ExecuteResponse(result=result_bytes)
 
             except InfrastructureError as exc:
                 logger.exception("Slurm execution failed kind=%s", exc.kind)
+                self._fail_record(record, exc)
                 _abort_infrastructure(context, exc)
             except (RuntimeError, ValueError) as exc:
                 logger.exception("Slurm execution failed")
+                self._fail_record(record, exc)
                 context.abort(
                     grpc.StatusCode.INTERNAL,
                     str(exc),
@@ -248,6 +317,8 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
             )
 
         logger.debug("Job status job_id=%s state=%s", request.job_id, state)
+        if self.jobs is not None:
+            self.jobs.observe(request.job_id, state)
         return execution_pb2.JobStatusResponse(state=state)
 
     @_logged_rpc
@@ -275,6 +346,17 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 "GPU count cannot be negative",
             )
 
+        record = self._begin_record(
+            context,
+            "batch",
+            new_execution_id(),
+            script=request.script,
+            workdir=request.workdir,
+            account=request.account or None,
+            partition=request.partition or None,
+            time_limit=request.time or None,
+            gpu=request.gpu,
+        )
         try:
             job_id = backend.submit(
                 workdir=request.workdir,
@@ -286,14 +368,18 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
             )
         except RemoteCommandError as exc:
             logger.exception("Batch job submission failed script=%s", request.script)
+            self._fail_record(record, exc)
             _abort_infrastructure(context, exc, grpc.StatusCode.FAILED_PRECONDITION)
         except InfrastructureError as exc:
             logger.exception(
                 "Batch job submission failed script=%s kind=%s", request.script, exc.kind
             )
+            self._fail_record(record, exc)
             _abort_infrastructure(context, exc)
 
         logger.info("Batch job submitted job_id=%s", job_id)
+        if self.jobs is not None and record is not None:
+            self.jobs.submitted(record, job_id)
         return execution_pb2.SubmitJobResponse(job_id=job_id)
 
     @_logged_rpc
@@ -377,6 +463,43 @@ def build_backend(config: ControllerConfig) -> SlurmBackend | None:
     )
 
 
+def open_database(config: ControllerConfig) -> Database | None:
+    """
+    Connects to the configured database and checks it before the Controller serves.
+
+    Verifies connectivity, the schema version, and every applied migration's
+    checksum, then records the environment's Provider Profiles. Never applies
+    migrations; run `nest-db upgrade` first.
+
+    Args:
+        config ([`config.ControllerConfig`]): Validated Controller configuration.
+
+    Returns:
+        [`db.Database`] or `None`: The open database, or `None` when
+            `NEST_DATABASE_URL` is unset (stateless Controller).
+
+    Raises:
+        [`db.DatabaseError`]: If the database is unreachable or not current.
+    """
+    if config.database is None:
+        return None
+    database = Database(config.database)
+    try:
+        database.open()
+        with database.connection() as conn:
+            verify(conn)
+        sync_providers(database, config.providers, config.default_provider)
+    except psycopg.Error as exc:
+        database.close()
+        raise DatabaseError(
+            f"Cannot check PostgreSQL at {database.describe()}: {database.scrub(str(exc))}"
+        ) from None
+    except BaseException:
+        database.close()
+        raise
+    return database
+
+
 def _add_port(server, config: ControllerConfig) -> int:
     if config.tls is None:
         return server.add_insecure_port(config.bind)
@@ -392,7 +515,9 @@ def main():
     Reads every setting through [`config.load_controller_config`]; see
     *Environment variables and defaults* for the contract. Invalid settings are
     all reported at once, before the listener starts, and the process exits with
-    status 2. Uses four RPC worker threads with port reuse disabled, and TLS when
+    status 2. When `NEST_DATABASE_URL` is set, the database must be reachable and
+    its schema current (see [`controller.open_database`]); otherwise the process
+    exits with status 3 instead of running without persistence. Uses four RPC worker threads with port reuse disabled, and TLS when
     `NEST_TLS_CERT_FILE` and `NEST_TLS_KEY_FILE` are set. Handles SIGTERM and SIGINT
     by allowing active RPCs up to ten seconds to finish.
 
@@ -406,6 +531,17 @@ def main():
         logger.error("%s", exc)
         raise SystemExit(2) from None
 
+    try:
+        database = open_database(config)
+    except DatabaseError as exc:
+        logger.error("%s", exc)
+        raise SystemExit(3) from None
+    jobs = (
+        JobStore(database, config.provider.id)
+        if database is not None and config.provider is not None
+        else None
+    )
+
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=4),
         options=[("grpc.so_reuseport", 0)],
@@ -414,7 +550,7 @@ def main():
     slurm_backend = build_backend(config)
 
     execution_pb2_grpc.add_ExecutionServiceServicer_to_server(
-        ExecutionService(slurm_backend, executor=config.executor),
+        ExecutionService(slurm_backend, executor=config.executor, jobs=jobs),
         server,
     )
 
@@ -432,11 +568,12 @@ def main():
             raise RuntimeError(f"Cannot bind Controller to {config.bind}")
         server.start()
         logger.info(
-            "Controller listening address=%s executor=%s slurm_configured=%s tls=%s",
+            "Controller listening address=%s executor=%s slurm_configured=%s tls=%s database=%s",
             config.bind,
             config.executor,
             slurm_backend is not None,
             config.tls is not None,
+            database.describe() if database else "none",
         )
         server.wait_for_termination()
     except KeyboardInterrupt:
@@ -446,6 +583,8 @@ def main():
         raise
     finally:
         server.stop(grace=0)
+        if database is not None:
+            database.close()
         logger.info("Controller stopped")
 
 

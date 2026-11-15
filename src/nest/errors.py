@@ -166,6 +166,18 @@ class RpcTimeoutError(NestTimeoutError):
     kind = "rpc_timeout"
 
 
+class DatabaseUnavailableError(InfrastructureError):
+    """
+    The Controller's PostgreSQL database could not record the request.
+
+    Raised before any SSH or Slurm side effect, so nothing was submitted and the
+    request can be retried once the database is reachable again.
+    """
+
+    kind = "database_unavailable"
+    status = grpc.StatusCode.UNAVAILABLE
+
+
 INFRASTRUCTURE_ERRORS: dict[str, type[InfrastructureError]] = {
     cls.kind: cls
     for cls in (
@@ -179,6 +191,7 @@ INFRASTRUCTURE_ERRORS: dict[str, type[InfrastructureError]] = {
         QueueTimeoutError,
         ExecutionTimeoutError,
         RpcTimeoutError,
+        DatabaseUnavailableError,
     )
 }
 """Maps each `kind` to its exception class."""

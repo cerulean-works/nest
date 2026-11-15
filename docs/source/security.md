@@ -35,6 +35,13 @@ container's environment, so prefer `NEST_SSH_IDENTITY_FILE` where a secret
 file mount is available. Mode B always uses `StrictHostKeyChecking=yes` and
 ignores every SSH configuration file.
 
+The Controller database (see [Store Controller records in PostgreSQL](database))
+holds job metadata, not payloads or credentials. Connect to it with
+`NEST_DATABASE_SSLMODE=verify-full` and a CA file, keep its password in
+`NEST_DATABASE_PASSWORD_FILE` rather than the URL, and store backups encrypted.
+Nest redacts the URL's password and query string in every error and log line.
+`compose.postgres-dev.yaml` uses a fixed password and no TLS; never deploy it.
+
 ## Known limitations
 
 - Experimental API with potential breaking changes.

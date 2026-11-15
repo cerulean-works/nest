@@ -26,3 +26,5 @@ started, the timeout raises [`errors.QueueTimeoutError`]; if it started, it rais
 inspect its status before submitting another execution.
 
 [[autodoc]] backends.slurm.SlurmBackend
+
+[[autodoc]] backends.slurm.new_execution_id

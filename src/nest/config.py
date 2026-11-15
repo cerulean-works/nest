@@ -16,6 +16,11 @@ SSH modes:
   environment variables (`-F none`, `StrictHostKeyChecking=yes`, an explicit
   `known_hosts` and key) and connects only to the profile's approved login nodes.
   Mode B reads no SSH configuration file and no `NEST_TAILSCALE_*` setting.
+
+Persistence is opt-in: with `NEST_DATABASE_URL` set, the Controller stores Provider
+Profiles and job records in an externally managed PostgreSQL database (see
+[`db.Database`]). Without it the Controller is stateless, unless
+`NEST_DATABASE_REQUIRED=true` makes the database mandatory.
 """
 
 from __future__ import annotations
@@ -27,7 +32,7 @@ import stat
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 from ._logging import LOG_LEVELS, parse_log_level
 
@@ -50,8 +55,29 @@ LEGACY_PROVIDER_ID = "default"
 EXECUTORS = ("local", "slurm")
 SSH_MODES = ("A", "B")
 
-RESERVED_SETTINGS = (
+DATABASE_SCHEMES = ("postgresql", "postgres")
+DATABASE_SSLMODES = ("disable", "allow", "prefer", "require", "verify-ca", "verify-full")
+DEFAULT_DATABASE_POOL_MIN_SIZE = 1
+DEFAULT_DATABASE_POOL_MAX_SIZE = 10
+DEFAULT_DATABASE_CONNECT_TIMEOUT = 10.0
+DEFAULT_DATABASE_POOL_TIMEOUT = 30.0
+
+DATABASE_SETTINGS = (
     "NEST_DATABASE_URL",
+    "NEST_DATABASE_REQUIRED",
+    "NEST_DATABASE_PASSWORD_FILE",
+    "NEST_DATABASE_SSLMODE",
+    "NEST_DATABASE_SSLROOTCERT",
+    "NEST_DATABASE_SSLCERT",
+    "NEST_DATABASE_SSLKEY",
+    "NEST_DATABASE_POOL_MIN_SIZE",
+    "NEST_DATABASE_POOL_MAX_SIZE",
+    "NEST_DATABASE_CONNECT_TIMEOUT",
+    "NEST_DATABASE_POOL_TIMEOUT",
+)
+"""Controller database settings, all read by [`config.load_database_config`]."""
+
+RESERVED_SETTINGS = (
     "NEST_AUTH_TOKEN_FILE",
     "NEST_RETENTION_DAYS",
     "NEST_INTEGRATIONS",
@@ -217,6 +243,72 @@ class TLSConfig:
 
 
 @dataclass(frozen=True)
+class DatabaseConfig:
+    """
+    Connection and pool settings for the Controller's PostgreSQL database.
+
+    The database is always externally managed: Nest never creates a server or a
+    database, and never falls back to another store when this one is unavailable.
+
+    Attributes:
+        url (`Secret`): libpq connection URL. It may hold a password, so it is
+            wrapped; log [`config.DatabaseConfig.redacted_url`] instead.
+        password_file (`str | None`): File whose contents are the password.
+        sslmode (`str | None`): libpq `sslmode` from `NEST_DATABASE_SSLMODE`. `None`
+            keeps the URL's own `sslmode`, or libpq's default (`prefer`). Defaults to
+            `verify-full` when only a CA file is given.
+        sslrootcert (`str | None`): CA bundle used to verify the server certificate.
+        sslcert (`str | None`): Client certificate for certificate authentication.
+        sslkey (`str | None`): Client private key. Must not be readable by others.
+        pool_min_size (`int`): Connections the pool keeps open.
+        pool_max_size (`int`): Most connections the pool opens.
+        connect_timeout (`float`): Seconds to wait for a new connection.
+        pool_timeout (`float`): Seconds a request waits for a free pooled connection.
+    """
+
+    url: Secret
+    password_file: str | None = None
+    sslmode: str | None = None
+    sslrootcert: str | None = None
+    sslcert: str | None = None
+    sslkey: str | None = None
+    pool_min_size: int = DEFAULT_DATABASE_POOL_MIN_SIZE
+    pool_max_size: int = DEFAULT_DATABASE_POOL_MAX_SIZE
+    connect_timeout: float = DEFAULT_DATABASE_CONNECT_TIMEOUT
+    pool_timeout: float = DEFAULT_DATABASE_POOL_TIMEOUT
+
+    @property
+    def redacted_url(self) -> str:
+        """The URL with its password and query string replaced by `***`."""
+        return redact_url(self.url.reveal())
+
+    @property
+    def effective_sslmode(self) -> str | None:
+        """The `sslmode` libpq will use, or `None` for libpq's default."""
+        if self.sslmode is not None:
+            return self.sslmode
+        values = parse_qs(urlsplit(self.url.reveal()).query).get("sslmode")
+        return values[-1] if values else None
+
+    def summary(self) -> dict[str, object]:
+        """
+        Returns a log-safe description of the database settings.
+
+        Returns:
+            `dict[str, object]`: Settings with the password and query masked.
+        """
+        return {
+            "url": self.redacted_url,
+            "password_file": self.password_file,
+            "sslmode": self.effective_sslmode,
+            "sslrootcert": self.sslrootcert,
+            "sslcert": self.sslcert,
+            "pool_min_size": self.pool_min_size,
+            "pool_max_size": self.pool_max_size,
+        }
+
+
+@dataclass(frozen=True)
 class ControllerConfig:
     """
     Validated Controller configuration.
@@ -232,6 +324,8 @@ class ControllerConfig:
         ssh (`SSHPolicy`): SSH policy and Mode B credentials.
         tls (`TLSConfig | None`): Server TLS, or `None` for plaintext.
         public_url (`str | None`): Advertised service URL, logged at startup.
+        database (`DatabaseConfig | None`): PostgreSQL settings, or `None` when the
+            Controller is stateless.
     """
 
     bind: str = DEFAULT_CONTROLLER_BIND
@@ -246,6 +340,7 @@ class ControllerConfig:
     ssh: SSHPolicy = field(default_factory=SSHPolicy)
     tls: TLSConfig | None = None
     public_url: str | None = None
+    database: DatabaseConfig | None = None
 
     @property
     def provider(self) -> ProviderProfile | None:
@@ -282,6 +377,7 @@ class ControllerConfig:
             "ssh_private_key": "***" if self.ssh.private_key else None,
             "ssh_identity_file": self.ssh.identity_file,
             "ssh_known_hosts_file": self.ssh.known_hosts_file,
+            "database": self.database.summary() if self.database else None,
         }
 
 
@@ -360,6 +456,21 @@ class _Reader:
             self.fail(f"{name} must be an absolute path, got {path!r}")
         elif not os.path.isfile(path) or not os.access(path, os.R_OK):
             self.fail(f"{name} points to {path!r}, which is not a readable file")
+        return path
+
+    def integer(self, name: str, default: int, minimum: int) -> int:
+        raw = self.get(name)
+        if raw is None:
+            return default
+        if not raw.isdecimal() or int(raw) < minimum:
+            self.fail(f"{name} must be a whole number of at least {minimum}, got {raw!r}")
+            return default
+        return int(raw)
+
+    def private_file(self, name: str) -> str | None:
+        path = self.readable_file(name)
+        if path and os.path.isfile(path) and os.stat(path).st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+            self.fail(f"{name} {path!r} is readable by other users; chmod 600 it")
         return path
 
     def address(self, name: str, default: str) -> str:
@@ -503,7 +614,7 @@ def _ssh_policy(reader: _Reader, profiles: list[ProviderProfile]) -> SSHPolicy:
 
     known_hosts_file = reader.readable_file("NEST_SSH_KNOWN_HOSTS")
     known_hosts_data = reader.get("NEST_SSH_KNOWN_HOSTS_DATA")
-    identity_file = reader.readable_file("NEST_SSH_IDENTITY_FILE")
+    identity_file = reader.private_file("NEST_SSH_IDENTITY_FILE")
     private_key_raw = reader.get("NEST_SSH_PRIVATE_KEY")
     if private_key_raw is not None and "PRIVATE KEY-----" not in private_key_raw:
         reader.fail("NEST_SSH_PRIVATE_KEY does not look like a PEM or OpenSSH private key")
@@ -511,12 +622,6 @@ def _ssh_policy(reader: _Reader, profiles: list[ProviderProfile]) -> SSHPolicy:
         reader.fail("Set only one of NEST_SSH_KNOWN_HOSTS and NEST_SSH_KNOWN_HOSTS_DATA")
     if identity_file and private_key_raw:
         reader.fail("Set only one of NEST_SSH_IDENTITY_FILE and NEST_SSH_PRIVATE_KEY")
-    if identity_file:
-        mode = os.stat(identity_file).st_mode if os.path.exists(identity_file) else 0
-        if mode & (stat.S_IRWXG | stat.S_IRWXO):
-            reader.fail(
-                f"NEST_SSH_IDENTITY_FILE {identity_file!r} is readable by other users; chmod 600 it"
-            )
 
     if any(p.ssh_mode == "B" for p in profiles):
         if not (known_hosts_file or known_hosts_data):
@@ -542,12 +647,137 @@ def _ssh_policy(reader: _Reader, profiles: list[ProviderProfile]) -> SSHPolicy:
 
 def _reserved(reader: _Reader) -> None:
     for name in RESERVED_SETTINGS:
-        raw = reader.get(name)
-        if raw is None:
-            continue
-        if name == "NEST_DATABASE_URL" and not urlsplit(raw).scheme:
-            reader.fail("NEST_DATABASE_URL must be a URL such as postgresql://host/db")
-        reader.fail(f"{name} is reserved for a future release and not supported yet; unset it")
+        if reader.get(name) is not None:
+            reader.fail(f"{name} is reserved for a future release and not supported yet; unset it")
+
+
+_DATABASE_URL_EXAMPLE = "postgresql://nest@db.example.internal:5432/nest"
+
+
+def _database(reader: _Reader) -> DatabaseConfig | None:
+    """
+    Reads the `NEST_DATABASE_*` settings.
+
+    Never echoes the URL: it can hold a password. Settings given both in the URL
+    query and as their own variable are rejected so only one value can apply.
+    """
+    raw = reader.get("NEST_DATABASE_URL")
+    required = reader.boolean("NEST_DATABASE_REQUIRED")
+    if raw is None:
+        if required:
+            reader.fail(
+                "NEST_DATABASE_REQUIRED=true but NEST_DATABASE_URL is unset; set it to the "
+                f"externally managed PostgreSQL database, such as {_DATABASE_URL_EXAMPLE}"
+            )
+        stray = [name for name in DATABASE_SETTINGS[2:] if reader.get(name) is not None]
+        if stray:
+            reader.fail(
+                ", ".join(stray) + " have no effect without NEST_DATABASE_URL; set or unset"
+            )
+        return None
+
+    try:
+        parts = urlsplit(raw)
+        parts.port  # noqa: B018 - validates the port
+        query = parse_qs(parts.query)
+    except ValueError:
+        reader.fail(f"NEST_DATABASE_URL is not a valid URL; use the form {_DATABASE_URL_EXAMPLE}")
+        return None
+    before = len(reader.problems)
+    if parts.scheme not in DATABASE_SCHEMES:
+        reader.fail(
+            "NEST_DATABASE_URL must start with postgresql:// (Nest supports only PostgreSQL), "
+            f"such as {_DATABASE_URL_EXAMPLE}"
+        )
+    if not parts.hostname and "host" not in query:
+        reader.fail(
+            "NEST_DATABASE_URL must name the database host; Nest never uses an implicit local "
+            "server"
+        )
+    if not parts.path.strip("/") and "dbname" not in query:
+        reader.fail("NEST_DATABASE_URL must name the database, such as .../nest")
+
+    password_file = reader.readable_file("NEST_DATABASE_PASSWORD_FILE")
+    if password_file and (parts.password or "password" in query):
+        reader.fail("Set the database password in NEST_DATABASE_URL or NEST_DATABASE_PASSWORD_FILE")
+
+    url_sslmode = query.get("sslmode", [None])[-1]
+    if url_sslmode is not None and url_sslmode not in DATABASE_SSLMODES:
+        # Query values are never echoed: the query string may carry secrets.
+        reader.fail(
+            "NEST_DATABASE_URL has an invalid sslmode in its query string (value not "
+            "shown); use one of " + ", ".join(DATABASE_SSLMODES)
+        )
+    sslmode = reader.choice("NEST_DATABASE_SSLMODE", DATABASE_SSLMODES, "")
+    files = {
+        "sslrootcert": reader.readable_file("NEST_DATABASE_SSLROOTCERT"),
+        "sslcert": reader.readable_file("NEST_DATABASE_SSLCERT"),
+        "sslkey": reader.private_file("NEST_DATABASE_SSLKEY"),
+    }
+    for key, variable in (("sslmode", sslmode), *files.items()):
+        if variable and key in query:
+            reader.fail(
+                f"{key} is set in both NEST_DATABASE_URL and NEST_DATABASE_{key.upper()}; keep one"
+            )
+    if (files["sslcert"] is None) != (files["sslkey"] is None):
+        reader.fail("Set both NEST_DATABASE_SSLCERT and NEST_DATABASE_SSLKEY, or neither")
+    if files["sslrootcert"] and not sslmode and url_sslmode is None:
+        sslmode = "verify-full"
+    effective = sslmode or url_sslmode
+    if files["sslrootcert"] and effective in ("disable", "allow", "prefer"):
+        reader.fail(
+            f"NEST_DATABASE_SSLROOTCERT is not used with sslmode={effective}; "
+            "use verify-full (recommended) or verify-ca"
+        )
+
+    pool_min = reader.integer("NEST_DATABASE_POOL_MIN_SIZE", DEFAULT_DATABASE_POOL_MIN_SIZE, 0)
+    pool_max = reader.integer("NEST_DATABASE_POOL_MAX_SIZE", DEFAULT_DATABASE_POOL_MAX_SIZE, 1)
+    if pool_min > pool_max:
+        reader.fail(
+            f"NEST_DATABASE_POOL_MIN_SIZE ({pool_min}) exceeds NEST_DATABASE_POOL_MAX_SIZE "
+            f"({pool_max})"
+        )
+    connect_timeout = reader.seconds(
+        "NEST_DATABASE_CONNECT_TIMEOUT", DEFAULT_DATABASE_CONNECT_TIMEOUT
+    )
+    pool_timeout = reader.seconds("NEST_DATABASE_POOL_TIMEOUT", DEFAULT_DATABASE_POOL_TIMEOUT)
+    if len(reader.problems) > before:
+        return None
+    return DatabaseConfig(
+        url=Secret(raw),
+        password_file=password_file,
+        sslmode=sslmode or None,
+        pool_min_size=pool_min,
+        pool_max_size=pool_max,
+        connect_timeout=connect_timeout,
+        pool_timeout=pool_timeout,
+        **files,
+    )
+
+
+def load_database_config(environ: Mapping[str, str] | None = None) -> DatabaseConfig:
+    """
+    Reads and validates the `NEST_DATABASE_*` settings for `nest-db`.
+
+    Args:
+        environ (`Mapping[str, str]`, *optional*): Environment. Defaults to `os.environ`.
+
+    Returns:
+        [`config.DatabaseConfig`]: The validated settings.
+
+    Raises:
+        [`config.ConfigError`]: If `NEST_DATABASE_URL` is unset or a setting is invalid.
+    """
+    reader = _Reader(environ)
+    database = _database(reader)
+    if database is None and not reader.problems:
+        reader.fail(
+            "NEST_DATABASE_URL is required; set it to the externally managed PostgreSQL "
+            f"database, such as {_DATABASE_URL_EXAMPLE}"
+        )
+    if reader.problems or database is None:
+        raise ConfigError(reader.problems)
+    return database
 
 
 def load_log_level(environ: Mapping[str, str] | None = None) -> tuple[str, bool]:
@@ -657,6 +887,7 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
         elif parts.password or parts.query:
             reader.fail("NEST_PUBLIC_URL must not contain credentials or a query string")
 
+    database = _database(reader)
     _reserved(reader)
 
     if reader.problems:
@@ -670,6 +901,7 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
         ssh=ssh,
         tls=tls,
         public_url=public_url,
+        database=database,
         **timeouts,
     )
 
