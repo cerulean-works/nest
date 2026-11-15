@@ -24,8 +24,19 @@ The database is **externally managed** and **opt-in**:
 | Table | Contents |
 | --- | --- |
 | `provider_profiles` | One row per Provider Profile (login nodes, SSH mode and user, Slurm defaults). The environment stays the source of truth: the Controller rewrites these rows at every start, marks the default, and marks profiles that were removed from the environment `active = false`. Rows are never deleted, so job records keep their provider. |
-| `jobs` | One row per `Execute` (kind `execution`) or `SubmitJob` (kind `batch`) request that reached Slurm: provider, Slurm job ID, request ID, script and directories, resources, Nest's `status`, the last observed Slurm state, and the error kind and message on failure. |
+| `jobs` | One row per `Execute` (kind `execution`) or `SubmitJob` (kind `batch`) request that reached Slurm: its Execution ID, provider, Slurm job ID, request ID, script and directories, resources, Nest's `status`, the last observed Slurm state, and the error kind and message on failure. |
 | `schema_migrations` | The applied schema versions and their checksums (see [Migrations](#migrations)). |
+
+Every record has an `execution_id`, a UUID written as 32 lowercase hexadecimal
+characters. The Controller generates it and stores the row before any SSH or Slurm
+command. For an `execution` record the same ID names the remote execution
+directory (`<workdir>/jobs/<execution_id>`, stored in `job_dir`) and is passed to
+the worker job. So even a record whose submission outcome is `unknown` identifies
+the directory to check for `output.pkl`:
+
+```sql
+SELECT execution_id, job_dir, error_message FROM jobs WHERE status = 'unknown';
+```
 
 A job record moves through these `status` values:
 
@@ -127,8 +138,9 @@ Nest keeps its whole schema in one ordered migration chain, packaged with Nest i
 - A PostgreSQL advisory lock is held for the whole run, so concurrent upgrades from
   several hosts or containers wait for each other instead of racing.
   `--lock-timeout` (60 s) bounds the wait.
-- `schema_migrations` records each version's SHA-256 checksum. An applied migration
-  is immutable: if its file changes, `upgrade` and `verify` refuse to continue.
+- `schema_migrations` records each version's name and SHA-256 checksum. An applied
+  migration is immutable: if its file is edited or renamed, `upgrade` and `verify`
+  both refuse to continue.
 - A database with a version this Nest does not know (it was migrated by a newer
   Nest) is rejected rather than used.
 
@@ -185,8 +197,8 @@ table and no per-component migration system or database.
 2. Write plain SQL without `BEGIN`, `COMMIT` or `ROLLBACK`; the runner wraps the
    file in a transaction. Statements that cannot run in a transaction, such as
    `CREATE INDEX CONCURRENTLY`, are not supported.
-3. Never edit or renumber a migration that has been released. Fix mistakes in a
-   new migration.
+3. Never edit, rename or renumber a migration that has been released. Fix mistakes
+   in a new migration.
 4. Prefer additive, backward-compatible changes (new tables, nullable columns) so
    the previous Controller keeps working between `nest-db upgrade` and restart.
 5. Run the PostgreSQL tests (see [Develop Nest](developing)).
@@ -253,4 +265,5 @@ example `NEST_DATABASE_SSLROOTCERT=/home/nest/.ssh/db-ca.crt`.
 | `The database has no Nest schema; run nest-db upgrade` | Run `nest-db upgrade` against this database. |
 | `The schema is at version N but this Nest needs M` | Run `nest-db upgrade` with this Nest version. |
 | `Migration ... was changed after it was applied` | Restore the original migration file; never edit applied migrations. |
+| `Migration ... was renamed to ... after it was applied` | Restore the original file name; `nest-db status` marks it `RENAMED`. |
 | `The database has migration ..., which this Nest version does not have` | Deploy the newer Nest that migrated this database, or restore a matching backup. |
