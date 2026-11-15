@@ -6,12 +6,19 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from contextlib import contextmanager
 
 import cloudpickle
 import grpc
 
-from nest.controller import MAX_STATUS_DETAILS_BYTES, _encoded_size, _status_details
+from nest.controller import (
+    MAX_STATUS_DETAILS_BYTES,
+    _abort_infrastructure,
+    _encoded_size,
+    _status_details,
+)
+from nest.errors import ERROR_KIND_METADATA, JOB_ID_METADATA, RemoteCommandError
 from nest.proto import execution_pb2, execution_pb2_grpc
 
 
@@ -190,6 +197,17 @@ class StatusDetailsTest(unittest.TestCase):
         marker = f"\n[... {omitted} characters omitted; see the Controller log ...]\n"
         head, tail = details.split(marker)
         self.assertEqual(message, head + message[len(head) : len(head) + omitted] + tail)
+
+    def test_abort_keeps_status_kind_and_job_id_for_long_messages(self):
+        context = unittest.mock.Mock()
+        error = RemoteCommandError("Remote command failed:\n" + "é" * 30_000, job_id=1234)
+        _abort_infrastructure(context, error, grpc.StatusCode.FAILED_PRECONDITION)
+        context.set_trailing_metadata.assert_called_once_with(
+            ((ERROR_KIND_METADATA, "remote_command_error"), (JOB_ID_METADATA, "1234"))
+        )
+        [(status, details)] = [call.args for call in context.abort.call_args_list]
+        self.assertEqual(status, grpc.StatusCode.FAILED_PRECONDITION)
+        self.assertLessEqual(_encoded_size(details), MAX_STATUS_DETAILS_BYTES)
 
     def test_encoded_size_counts_percent_encoded_bytes(self):
         self.assertEqual(_encoded_size("ab"), 2)

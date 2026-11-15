@@ -23,6 +23,7 @@ from nest.errors import (
     ExecutionTimeoutError,
     NestTimeoutError,
     QueueTimeoutError,
+    RemoteCommandError,
     RemoteExecutionError,
     RpcTimeoutError,
     SlurmJobError,
@@ -655,34 +656,80 @@ def test_rejected_submit_job_rpc_keeps_failed_precondition(slurm_controller, hpc
     assert hpc.calls("sbatch") == []
 
 
-def test_huge_remote_stderr_keeps_status_code(slurm_controller, hpc, tmp_path):
-    """Unbounded stderr must not push the status trailer past gRPC's trailer size limits."""
+def _fail_noisily(hpc, tool: str, last_line: str) -> None:
+    """Replaces a shim with one that prints far more stderr than a gRPC trailer can hold."""
+    # Non-ASCII bytes are percent-encoded threefold in the grpc-message trailer.
+    (hpc.bin / tool).write_text(
+        "#!/bin/sh\n"
+        f"echo '{tool}: warning: start of the noise' >&2\n"
+        "i=0\n"
+        f"while [ $i -lt 2000 ]; do echo '{'\u00e9' * 9} noise' >&2; i=$((i + 1)); done\n"
+        f"echo '{last_line}' >&2\n"
+        "exit 1\n"
+    )
+
+
+def _assert_bounded(error: grpc.Call, status: grpc.StatusCode, last_line: str) -> None:
+    """Checks that an oversized remote error kept its status, kind, and cause."""
+    details = error.details() or ""
+    assert error.code() == status
+    assert _metadata(error)[ERROR_KIND_METADATA] == "remote_command_error"
+    assert _encoded_size(details) <= MAX_STATUS_DETAILS_BYTES
+    assert details.startswith("Remote command failed:\n")
+    assert "characters omitted; see the Controller log" in details
+    assert details.endswith(last_line)
+
+
+# Unbounded stderr must not push the status trailer past gRPC's trailer size limits.
+
+
+def test_huge_stderr_from_submit_job_keeps_failed_precondition(slurm_controller, hpc, tmp_path):
     workdir = tmp_path / "batch"
     workdir.mkdir()
     (workdir / "job.sbatch").write_text("#!/bin/bash\nexit 0\n")
-    # Non-ASCII bytes are percent-encoded threefold in the grpc-message trailer.
-    (hpc.bin / "sbatch").write_text(
-        "#!/bin/sh\n"
-        "echo 'sbatch: warning: start of the noise' >&2\n"
-        "i=0\n"
-        "while [ $i -lt 2000 ]; do echo 'ééééééééé noise' >&2; i=$((i + 1)); done\n"
-        "echo 'sbatch: error: Batch job submission failed' >&2\n"
-        "exit 1\n"
-    )
+    last_line = "sbatch: error: Batch job submission failed"
+    _fail_noisily(hpc, "sbatch", last_line)
 
     with pytest.raises(grpc.RpcError) as caught:
         slurm_controller.SubmitJob(
             execution_pb2.SubmitJobRequest(workdir=str(workdir), script="job.sbatch"),
             timeout=30,
         )
-    error = cast(grpc.Call, caught.value)
-    details = error.details() or ""
-    assert error.code() == grpc.StatusCode.FAILED_PRECONDITION
-    assert _metadata(error)[ERROR_KIND_METADATA] == "remote_command_error"
-    assert _encoded_size(details) <= MAX_STATUS_DETAILS_BYTES
-    assert details.startswith("Remote command failed:\n")
-    assert "characters omitted; see the Controller log" in details
-    assert details.endswith("sbatch: error: Batch job submission failed")
+    _assert_bounded(cast(grpc.Call, caught.value), grpc.StatusCode.FAILED_PRECONDITION, last_line)
+
+
+def test_huge_stderr_from_execute_keeps_internal_and_error_kind(slurm_controller, hpc):
+    last_line = "sbatch: error: Batch job submission failed"
+    _fail_noisily(hpc, "sbatch", last_line)
+
+    @nest.remote()
+    def ping():
+        return "pong"
+
+    with pytest.raises(RemoteCommandError) as caught:
+        ping.remote()
+    # The client rebuilt the typed error from the kind; check the RPC it came from.
+    assert isinstance(caught.value.__cause__, grpc.Call)
+    _assert_bounded(caught.value.__cause__, grpc.StatusCode.INTERNAL, last_line)
+    assert caught.value.details().endswith(last_line)
+
+
+def test_huge_stderr_from_get_job_status_keeps_internal(slurm_controller, hpc):
+    last_line = "squeue: error: slurm_receive_msg: Socket timed out"
+    _fail_noisily(hpc, "squeue", last_line)
+
+    with pytest.raises(grpc.RpcError) as caught:
+        slurm_controller.GetJobStatus(execution_pb2.JobStatusRequest(job_id=1000), timeout=30)
+    _assert_bounded(cast(grpc.Call, caught.value), grpc.StatusCode.INTERNAL, last_line)
+
+
+def test_huge_stderr_from_cancel_job_keeps_failed_precondition(slurm_controller, hpc):
+    last_line = "scancel: error: Kill job error on job id 1000"
+    _fail_noisily(hpc, "scancel", last_line)
+
+    with pytest.raises(grpc.RpcError) as caught:
+        slurm_controller.CancelJob(execution_pb2.CancelJobRequest(job_id=1000), timeout=30)
+    _assert_bounded(cast(grpc.Call, caught.value), grpc.StatusCode.FAILED_PRECONDITION, last_line)
 
 
 def test_managed_ssh_profile_runs_without_any_ssh_config(start_slurm_controller, hpc, tmp_path):

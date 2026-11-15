@@ -182,6 +182,8 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
         try:
             return self.jobs.begin(kind, execution_id, request_id=current_request_id(), **fields)
         except DatabaseUnavailableError as exc:
+            # Log the full message, since the status message the client gets may be shortened.
+            logger.exception("Job record could not be stored kind=%s", kind)
             _abort_infrastructure(context, exc)
             raise AssertionError("context.abort raises") from None
 
