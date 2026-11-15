@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 from urllib.parse import urlsplit
@@ -19,6 +20,7 @@ from urllib.parse import urlsplit
 import cloudpickle
 import grpc
 from postgres_fixture import (
+    ADMIN_URL,
     PG_BIN,
     REQUIRED,
     TLS_CA_FILE,
@@ -29,6 +31,7 @@ from postgres_fixture import (
     connect,
     temporary_database,
 )
+from psycopg import sql
 from test_controller import controller_at_free_port, controller_environment
 
 from nest.config import ConfigError, load_controller_config, load_database_config
@@ -716,11 +719,36 @@ class QueryValueRedactionTests(PostgresTestCase):
 
     def setUp(self):
         super().setUp()
+        # A throwaway login role whose password is PASSWORD, so marker URLs carry a
+        # password that assert_clean can look for and that a server checking
+        # passwords (such as the postgres image's default scram-sha-256) accepts.
+        # Its cleanup is registered before the database's, so it runs after the
+        # database (and everything the role owns in it) is dropped.
+        self.role = f"nest_redact_{uuid.uuid4().hex[:12]}"
+        with connect(ADMIN_URL) as admin:
+            admin.execute(
+                sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
+                    sql.Identifier(self.role), sql.Literal(PASSWORD)
+                )
+            )
+        self.addCleanup(self._drop_role)
         self.url = self.database()
+        with connect(ADMIN_URL) as admin:
+            admin.execute(
+                sql.SQL("ALTER DATABASE {} OWNER TO {}").format(
+                    sql.Identifier(urlsplit(self.url).path.strip("/")),
+                    sql.Identifier(self.role),
+                )
+            )
 
-    def marker_url(self, query: str) -> str:
+    def _drop_role(self):
+        with connect(ADMIN_URL) as admin:
+            admin.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(self.role)))
+
+    def marker_url(self, query: str = "") -> str:
         parts = urlsplit(self.url)
-        return f"postgresql://{parts.username}:{PASSWORD}@{parts.hostname}:{parts.port}{parts.path}?{query}"
+        url = f"postgresql://{self.role}:{PASSWORD}@{parts.hostname}:{parts.port}{parts.path}"
+        return f"{url}?{query}" if query else url
 
     def run_entry_point(self, module, *args, url):
         env = controller_environment(NEST_CONTROLLER_BIND="127.0.0.1:0")
@@ -768,7 +796,8 @@ class QueryValueRedactionTests(PostgresTestCase):
                 self.assert_clean(output, marker)
 
     def test_successful_startup_logs_no_query_values(self):
-        with connect(self.url) as conn:
+        # Migrate as the role the Controller connects as, so it owns the schema.
+        with connect(self.marker_url()) as conn:
             upgrade(conn)
         url = self.marker_url("application_name=app-marker-8&keepalives_idle=30")
         env = controller_environment(NEST_CONTROLLER_BIND="127.0.0.1:0", NEST_DATABASE_URL=url)
