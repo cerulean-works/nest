@@ -5,6 +5,7 @@ by `NEST_TEST_DATABASE_URL` (see `postgres_fixture`). These are `unittest` cases
 they also run inside the Controller image, where PostgreSQL tests skip.
 """
 
+import logging
 import os
 import subprocess
 import sys
@@ -32,6 +33,7 @@ from postgres_fixture import (
     temporary_database,
 )
 from psycopg import sql
+from psycopg_pool import PoolTimeout
 from test_controller import controller_at_free_port, controller_environment
 
 from nest.config import ConfigError, load_controller_config, load_database_config
@@ -304,6 +306,63 @@ class UnavailableDatabaseTests(unittest.TestCase):
         backend.submit.assert_not_called()
         backend.submit_payload.assert_not_called()
         backend.prepare_environment_bytes.assert_not_called()
+
+
+class PoolOpenFailureTests(unittest.TestCase):
+    """A failed pool open leaves no scrub filter behind on `psycopg.pool`."""
+
+    def setUp(self):
+        self.pool_logger = logging.getLogger("psycopg.pool")
+        before = list(self.pool_logger.filters)
+        self.addCleanup(lambda: setattr(self.pool_logger, "filters", before))
+        self.config = _db_config("postgresql://nest@db.internal/nest")
+
+    def open_with_pool(self, pool_class):
+        database = Database(self.config)
+        with (
+            mock.patch.object(Database, "connect"),  # the direct probe succeeds
+            mock.patch.object(Database, "warn_if_unencrypted"),
+            mock.patch("nest.db.connection.ConnectionPool", pool_class),
+        ):
+            database.open()
+
+    def scrub_filters(self):
+        return [f for f in self.pool_logger.filters if type(f).__name__ == "_ScrubFilter"]
+
+    def test_repeated_pool_failures_do_not_accumulate_filters(self):
+        failures = (
+            ("timeout", PoolTimeout("pool timed out"), DatabaseError),
+            ("other error", RuntimeError("pool exploded"), RuntimeError),
+        )
+        for label, error, raised in failures:
+            with self.subTest(failure=label):
+                pool_class = mock.Mock()
+                pool_class.return_value.open.side_effect = error
+                for _ in range(3):
+                    with self.assertRaises(raised):
+                        self.open_with_pool(pool_class)
+                self.assertEqual(self.scrub_filters(), [])
+                # The half-opened pool is closed on every failure.
+                self.assertEqual(pool_class.return_value.close.call_count, 3)
+
+    def test_failure_creating_the_pool_removes_the_filter(self):
+        pool_class = mock.Mock(side_effect=ValueError("bad pool arguments"))
+        with self.assertRaises(ValueError):
+            self.open_with_pool(pool_class)
+        self.assertEqual(self.scrub_filters(), [])
+
+    def test_successful_open_keeps_one_filter_until_close(self):
+        database = Database(self.config)
+        pool_class = mock.Mock()
+        with (
+            mock.patch.object(Database, "connect"),
+            mock.patch.object(Database, "warn_if_unencrypted"),
+            mock.patch("nest.db.connection.ConnectionPool", pool_class),
+        ):
+            database.open()
+        self.assertEqual(len(self.scrub_filters()), 1)
+        database.close()
+        self.assertEqual(self.scrub_filters(), [])
 
 
 class MigrationTests(PostgresTestCase):

@@ -202,22 +202,31 @@ class Database:
             probe.execute("SELECT 1")
         self.warn_if_unencrypted()
         pool_logger = logging.getLogger("psycopg.pool")
-        if self._pool_filter not in pool_logger.filters:
+        added_filter = self._pool_filter not in pool_logger.filters
+        if added_filter:
             pool_logger.addFilter(self._pool_filter)
-        pool = ConnectionPool(
-            self.conninfo(),
-            min_size=self.config.pool_min_size,
-            max_size=self.config.pool_max_size,
-            timeout=self.config.pool_timeout,
-            check=ConnectionPool.check_connection,
-            name="nest",
-            open=False,
-        )
+        pool = None
         try:
+            pool = ConnectionPool(
+                self.conninfo(),
+                min_size=self.config.pool_min_size,
+                max_size=self.config.pool_max_size,
+                timeout=self.config.pool_timeout,
+                check=ConnectionPool.check_connection,
+                name="nest",
+                open=False,
+            )
             pool.open(wait=True, timeout=self.config.connect_timeout)
-        except PoolTimeout as exc:
-            pool.close()
-            raise self._error("open a connection pool to", exc) from None
+        except BaseException as exc:
+            # No pool is kept, so nothing will call close(): undo everything here,
+            # including the filter, so repeated failures do not accumulate filters.
+            if pool is not None:
+                pool.close()
+            if added_filter:
+                pool_logger.removeFilter(self._pool_filter)
+            if isinstance(exc, PoolTimeout):
+                raise self._error("open a connection pool to", exc) from None
+            raise
         self._pool = pool
         logger.info(
             "Database connected url=%s sslmode=%s pool_min=%s pool_max=%s",

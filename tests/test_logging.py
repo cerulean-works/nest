@@ -269,6 +269,22 @@ def test_slurm_forwards_context_without_payload_in_logs(backend, monkeypatch, ca
     assert "private-payload" not in caplog.text
 
 
+def test_stage_payload_operation_logs_only_the_upload(backend, monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG, logger="nest")
+    monkeypatch.setattr(backend, "_ssh", lambda command, **kwargs: None)
+    execution_id = "e" * 32
+
+    # Computing the path is not an operation and logs nothing.
+    assert backend.execution_dir(execution_id) == "/nest/jobs/" + execution_id
+    assert "Slurm stage_payload" not in caplog.text
+
+    assert backend.stage_payload(b"private-payload", execution_id) == "/nest/jobs/" + execution_id
+    messages = [r.getMessage() for r in caplog.records]
+    assert "Slurm stage_payload started" in messages
+    assert sum(m.startswith("Slurm stage_payload completed elapsed_ms=") for m in messages) == 1
+    assert "private-payload" not in caplog.text
+
+
 @pytest.mark.parametrize("cache_hit", [False, True])
 def test_environment_cache_logging_omits_dependency_contents(
     backend, monkeypatch, caplog, cache_hit

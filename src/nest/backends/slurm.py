@@ -441,7 +441,6 @@ class SlurmBackend:
         logger.info("Cancelling Slurm job job_id=%s", job_id)
         self._run_remote(f"scancel {job_id}")
 
-    @operation(logger, "Slurm stage_payload")
     def execution_dir(self, execution_id: str) -> str:
         """
         Returns the remote execution directory for an Execution ID. Runs no command.
@@ -464,6 +463,7 @@ class SlurmBackend:
             raise ValueError("Slurm work_root must be an absolute path")
         return f"{work_root.rstrip('/')}/{execution_id}"
 
+    @operation(logger, "Slurm stage_payload")
     def stage_payload(self, payload: bytes, execution_id: str | None = None) -> str:
         """
         Uploads a payload as `input.pkl` in a new remote execution directory.
