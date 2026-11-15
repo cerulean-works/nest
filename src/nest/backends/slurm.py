@@ -299,8 +299,8 @@ class SlurmBackend:
                 when unset or empty.
             partition (`str`, *optional*): Partition override. Uses the configured
                 partition when unset or empty.
-            time (`str`, *optional*): Time limit override. Uses the configured limit
-                when unset or empty. Omits the flag if neither has a value.
+            time (`str`, *optional*): Time limit override. When unset or empty, uses
+                the configured limit if `inherit_time` is set. Omits the flag otherwise.
             inherit_time (`bool`, *optional*, defaults to `True`): Whether an unset
                 `time` falls back to the configured limit. When `False`, an unset
                 `time` omits the flag, so the script's `#SBATCH --time` applies.
