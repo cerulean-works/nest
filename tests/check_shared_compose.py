@@ -36,6 +36,17 @@ CONTROLLER_SETTINGS = {
     "NEST_TLS_CERT_FILE",
     "NEST_TLS_KEY_FILE",
     "NEST_PUBLIC_URL",
+    "NEST_DATABASE_URL",
+    "NEST_DATABASE_REQUIRED",
+    "NEST_DATABASE_PASSWORD_FILE",
+    "NEST_DATABASE_SSLMODE",
+    "NEST_DATABASE_SSLROOTCERT",
+    "NEST_DATABASE_SSLCERT",
+    "NEST_DATABASE_SSLKEY",
+    "NEST_DATABASE_POOL_MIN_SIZE",
+    "NEST_DATABASE_POOL_MAX_SIZE",
+    "NEST_DATABASE_CONNECT_TIMEOUT",
+    "NEST_DATABASE_POOL_TIMEOUT",
 }
 COMMAND = shlex.split(os.environ.get("NEST_COMPOSE_COMMAND", "docker compose"))
 
@@ -125,6 +136,29 @@ def main():
     assert not managed.get("volumes"), "Mode B must not need a host mount"
     assert set(managed["environment"]) == CONTROLLER_SETTINGS
     assert managed["environment"]["NEST_SLURM_SSH_MODE"] == "B"
+    # Without the development override no database service exists, and an external
+    # NEST_DATABASE_URL passes through unchanged.
+    for name, rendered in (("compose.yaml", render("compose.yaml")), ("shared", shared)):
+        assert set(rendered["services"]) <= {"controller", "tailscale"}, name
+    external = render("compose.yaml", NEST_DATABASE_URL="postgresql://nest@db.example/nest")
+    assert (
+        external["services"]["controller"]["environment"]["NEST_DATABASE_URL"]
+        == "postgresql://nest@db.example/nest"
+    )
+    dev = render("compose.yaml", overrides=("compose.postgres-dev.yaml",))
+    services = dev["services"]
+    assert set(services) == {"controller", "postgres", "migrate"}
+    assert set(services["controller"]["environment"]) == CONTROLLER_SETTINGS
+    assert services["controller"]["environment"]["NEST_DATABASE_URL"].endswith(
+        "@postgres:5432/nest"
+    )
+    assert services["controller"]["environment"]["NEST_DATABASE_REQUIRED"] == "true"
+    assert services["controller"]["depends_on"]["migrate"]["condition"] == (
+        "service_completed_successfully"
+    )
+    assert services["migrate"]["entrypoint"] == ["nest-db"]
+    assert services["migrate"]["command"] == ["upgrade"]
+    assert not services["postgres"].get("ports"), "Development database must not be published"
     for deployment in (shared, outbound):
         secrets = deployment["services"]["tailscale"]["secrets"]
         assert [secret["source"] for secret in secrets] == ["tailscale_authkey"]
@@ -147,7 +181,10 @@ def main():
         assert deployed["services"]["tailscale"]["volumes"][1]["source"] == str(
             files / "tailscale/serve"
         )
-    print("PASS: rendered Compose isolation, Controller settings, state reuse, and Dokploy paths")
+    print(
+        "PASS: rendered Compose isolation, Controller settings, development database, state "
+        "reuse, and Dokploy paths"
+    )
 
 
 if __name__ == "__main__":

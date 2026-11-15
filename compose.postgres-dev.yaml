@@ -1,0 +1,55 @@
+# LOCAL DEVELOPMENT ONLY. Do not use this file in production.
+#
+# Production Controllers connect to an externally managed PostgreSQL: set
+# NEST_DATABASE_URL (and the NEST_DATABASE_SSL* settings) and run
+# `nest-db upgrade` yourself before each deployment. The Controller never creates
+# a database and never applies migrations.
+#
+# This override adds a throwaway PostgreSQL container, without TLS or published
+# ports, plus a one-shot `migrate` service that runs `nest-db upgrade` before the
+# Controller starts:
+#
+#   docker compose -f compose.yaml -f compose.postgres-dev.yaml up -d
+#
+# Data lives in the `nest-dev-postgres` volume; `down --volumes` deletes it.
+x-dev-database-url: &dev-database-url postgresql://nest:${NEST_DEV_POSTGRES_PASSWORD:-nest-dev-only}@postgres:5432/nest
+
+services:
+  postgres:
+    image: ${NEST_DEV_POSTGRES_IMAGE:-postgres:17}
+    environment:
+      POSTGRES_DB: nest
+      POSTGRES_USER: nest
+      POSTGRES_PASSWORD: ${NEST_DEV_POSTGRES_PASSWORD:-nest-dev-only}
+      POSTGRES_INITDB_ARGS: --encoding=UTF8
+    volumes:
+      - nest-dev-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "--username=nest", "--dbname=nest"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  migrate:
+    image: ${NEST_CONTROLLER_IMAGE:-nest-controller:local}
+    pull_policy: never
+    user: "10001"
+    entrypoint: ["nest-db"]
+    command: ["upgrade"]
+    environment:
+      NEST_DATABASE_URL: *dev-database-url
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  controller:
+    environment:
+      NEST_DATABASE_URL: *dev-database-url
+      NEST_DATABASE_REQUIRED: "true"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  nest-dev-postgres:
