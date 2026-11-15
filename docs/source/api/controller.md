@@ -13,11 +13,12 @@ listener when `NEST_TLS_CERT_FILE` and `NEST_TLS_KEY_FILE` are set. See
 | --- | --- | --- |
 | `Execute` | `payload` (bytes), `gpu` and `cpu` (int32), optional `environment` | `result` (bytes) |
 | `GetJobStatus` | `job_id` (int64) | `state` (string) |
-| `SubmitJob` | `workdir`, `script`, `account`, `partition`, `time` (strings), `gpu` (int32) | `job_id` (int64) |
+| `SubmitJob` | `workdir`, `script`, `account`, `partition`, `time` (strings), `gpu` and `cpu` (int32), `script_args` (repeated string) | `job_id` (int64) |
 | `CancelJob` | `job_id` (int64) | Empty response |
 
 `environment` contains `pyproject_toml` and `uv_lock` bytes. When supplied, both
-must be nonempty. `gpu` and `cpu` must not be negative. Slurm job operations
+must be nonempty. `gpu` and `cpu` must not be negative. `SubmitJob` passes
+`script_args` to the script as separate, shell-quoted arguments. Slurm job operations
 require a configured backend, even when `Execute` uses local mode. Cancellation
 requests do not wait for a job to stop.
 
