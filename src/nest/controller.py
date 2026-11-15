@@ -386,10 +386,14 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
         """
         Submits a batch script through the Slurm backend.
 
+        The request's `script_args` follow the script path as separate, shell-quoted
+        arguments. A `cpu` count of `0` omits `--cpus-per-task`, as `gpu` does for
+        `--gpus-per-node`.
+
         Args:
             request (`execution_pb2.SubmitJobRequest`): Job operation parameters.
             context (`grpc.ServicerContext`): RPC context for reporting failures.
-                Uses `INVALID_ARGUMENT` for a negative GPU count,
+                Uses `INVALID_ARGUMENT` for a negative GPU or CPU count,
                 `FAILED_PRECONDITION` for an absent backend or a rejected submission, and
                 the status and kind of other [`errors.InfrastructureError`] failures,
                 such as `UNKNOWN` with kind `submission_unknown` when SSH timed out
@@ -400,10 +404,10 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
         """
         backend = self._require_slurm_backend(context)
 
-        if request.gpu < 0:
+        if request.gpu < 0 or request.cpu < 0:
             context.abort(
                 grpc.StatusCode.INVALID_ARGUMENT,
-                "GPU count cannot be negative",
+                "Resource counts cannot be negative",
             )
 
         record = self._begin_record(
@@ -422,9 +426,11 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 workdir=request.workdir,
                 script=request.script,
                 gpu=request.gpu,
+                cpu=request.cpu,
                 account=request.account or None,
                 partition=request.partition or None,
                 time=request.time or None,
+                script_args=tuple(request.script_args),
             )
         except RemoteCommandError as exc:
             logger.exception("Batch job submission failed script=%s", request.script)

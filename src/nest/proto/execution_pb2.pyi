@@ -1,6 +1,7 @@
+from google.protobuf.internal import containers as _containers
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import message as _message
-from collections.abc import Mapping as _Mapping
+from collections.abc import Iterable as _Iterable, Mapping as _Mapping
 from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 
 DESCRIPTOR: _descriptor.FileDescriptor
@@ -44,20 +45,24 @@ class JobStatusResponse(_message.Message):
     def __init__(self, state: _Optional[str] = ...) -> None: ...
 
 class SubmitJobRequest(_message.Message):
-    __slots__ = ("workdir", "script", "gpu", "account", "partition", "time")
+    __slots__ = ("workdir", "script", "gpu", "account", "partition", "time", "cpu", "script_args")
     WORKDIR_FIELD_NUMBER: _ClassVar[int]
     SCRIPT_FIELD_NUMBER: _ClassVar[int]
     GPU_FIELD_NUMBER: _ClassVar[int]
     ACCOUNT_FIELD_NUMBER: _ClassVar[int]
     PARTITION_FIELD_NUMBER: _ClassVar[int]
     TIME_FIELD_NUMBER: _ClassVar[int]
+    CPU_FIELD_NUMBER: _ClassVar[int]
+    SCRIPT_ARGS_FIELD_NUMBER: _ClassVar[int]
     workdir: str
     script: str
     gpu: int
     account: str
     partition: str
     time: str
-    def __init__(self, workdir: _Optional[str] = ..., script: _Optional[str] = ..., gpu: _Optional[int] = ..., account: _Optional[str] = ..., partition: _Optional[str] = ..., time: _Optional[str] = ...) -> None: ...
+    cpu: int
+    script_args: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, workdir: _Optional[str] = ..., script: _Optional[str] = ..., gpu: _Optional[int] = ..., account: _Optional[str] = ..., partition: _Optional[str] = ..., time: _Optional[str] = ..., cpu: _Optional[int] = ..., script_args: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class SubmitJobResponse(_message.Message):
     __slots__ = ("job_id",)

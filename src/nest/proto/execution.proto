@@ -50,6 +50,9 @@ message SubmitJobRequest {
     string account = 4;
     string partition = 5;
     string time = 6;
+
+    int32 cpu = 7;
+    repeated string script_args = 8;
 }
 
 message SubmitJobResponse {

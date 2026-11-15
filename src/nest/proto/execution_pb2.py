@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1anest/proto/execution.proto\x12\x04nest\"h\n\x0e\x45xecuteRequest\x12\x0f\n\x07payload\x18\x01 \x01(\x0c\x12\x0b\n\x03gpu\x18\x02 \x01(\x05\x12\x0b\n\x03\x63pu\x18\x03 \x01(\x05\x12+\n\x0b\x65nvironment\x18\x04 \x01(\x0b\x32\x16.nest.EnvironmentFiles\";\n\x10\x45nvironmentFiles\x12\x16\n\x0epyproject_toml\x18\x01 \x01(\x0c\x12\x0f\n\x07uv_lock\x18\x02 \x01(\x0c\"!\n\x0f\x45xecuteResponse\x12\x0e\n\x06result\x18\x01 \x01(\x0c\"\"\n\x10JobStatusRequest\x12\x0e\n\x06job_id\x18\x01 \x01(\x03\"\"\n\x11JobStatusResponse\x12\r\n\x05state\x18\x01 \x01(\t\"r\n\x10SubmitJobRequest\x12\x0f\n\x07workdir\x18\x01 \x01(\t\x12\x0e\n\x06script\x18\x02 \x01(\t\x12\x0b\n\x03gpu\x18\x03 \x01(\x05\x12\x0f\n\x07\x61\x63\x63ount\x18\x04 \x01(\t\x12\x11\n\tpartition\x18\x05 \x01(\t\x12\x0c\n\x04time\x18\x06 \x01(\t\"#\n\x11SubmitJobResponse\x12\x0e\n\x06job_id\x18\x01 \x01(\x03\"\"\n\x10\x43\x61ncelJobRequest\x12\x0e\n\x06job_id\x18\x01 \x01(\x03\"\x13\n\x11\x43\x61ncelJobResponse2\x87\x02\n\x10\x45xecutionService\x12\x36\n\x07\x45xecute\x12\x14.nest.ExecuteRequest\x1a\x15.nest.ExecuteResponse\x12?\n\x0cGetJobStatus\x12\x16.nest.JobStatusRequest\x1a\x17.nest.JobStatusResponse\x12<\n\tSubmitJob\x12\x16.nest.SubmitJobRequest\x1a\x17.nest.SubmitJobResponse\x12<\n\tCancelJob\x12\x16.nest.CancelJobRequest\x1a\x17.nest.CancelJobResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1anest/proto/execution.proto\x12\x04nest\"h\n\x0e\x45xecuteRequest\x12\x0f\n\x07payload\x18\x01 \x01(\x0c\x12\x0b\n\x03gpu\x18\x02 \x01(\x05\x12\x0b\n\x03\x63pu\x18\x03 \x01(\x05\x12+\n\x0b\x65nvironment\x18\x04 \x01(\x0b\x32\x16.nest.EnvironmentFiles\";\n\x10\x45nvironmentFiles\x12\x16\n\x0epyproject_toml\x18\x01 \x01(\x0c\x12\x0f\n\x07uv_lock\x18\x02 \x01(\x0c\"!\n\x0f\x45xecuteResponse\x12\x0e\n\x06result\x18\x01 \x01(\x0c\"\"\n\x10JobStatusRequest\x12\x0e\n\x06job_id\x18\x01 \x01(\x03\"\"\n\x11JobStatusResponse\x12\r\n\x05state\x18\x01 \x01(\t\"\x94\x01\n\x10SubmitJobRequest\x12\x0f\n\x07workdir\x18\x01 \x01(\t\x12\x0e\n\x06script\x18\x02 \x01(\t\x12\x0b\n\x03gpu\x18\x03 \x01(\x05\x12\x0f\n\x07\x61\x63\x63ount\x18\x04 \x01(\t\x12\x11\n\tpartition\x18\x05 \x01(\t\x12\x0c\n\x04time\x18\x06 \x01(\t\x12\x0b\n\x03\x63pu\x18\x07 \x01(\x05\x12\x13\n\x0bscript_args\x18\x08 \x03(\t\"#\n\x11SubmitJobResponse\x12\x0e\n\x06job_id\x18\x01 \x01(\x03\"\"\n\x10\x43\x61ncelJobRequest\x12\x0e\n\x06job_id\x18\x01 \x01(\x03\"\x13\n\x11\x43\x61ncelJobResponse2\x87\x02\n\x10\x45xecutionService\x12\x36\n\x07\x45xecute\x12\x14.nest.ExecuteRequest\x1a\x15.nest.ExecuteResponse\x12?\n\x0cGetJobStatus\x12\x16.nest.JobStatusRequest\x1a\x17.nest.JobStatusResponse\x12<\n\tSubmitJob\x12\x16.nest.SubmitJobRequest\x1a\x17.nest.SubmitJobResponse\x12<\n\tCancelJob\x12\x16.nest.CancelJobRequest\x1a\x17.nest.CancelJobResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -41,14 +41,14 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_JOBSTATUSREQUEST']._serialized_end=272
   _globals['_JOBSTATUSRESPONSE']._serialized_start=274
   _globals['_JOBSTATUSRESPONSE']._serialized_end=308
-  _globals['_SUBMITJOBREQUEST']._serialized_start=310
-  _globals['_SUBMITJOBREQUEST']._serialized_end=424
-  _globals['_SUBMITJOBRESPONSE']._serialized_start=426
-  _globals['_SUBMITJOBRESPONSE']._serialized_end=461
-  _globals['_CANCELJOBREQUEST']._serialized_start=463
-  _globals['_CANCELJOBREQUEST']._serialized_end=497
-  _globals['_CANCELJOBRESPONSE']._serialized_start=499
-  _globals['_CANCELJOBRESPONSE']._serialized_end=518
-  _globals['_EXECUTIONSERVICE']._serialized_start=521
-  _globals['_EXECUTIONSERVICE']._serialized_end=784
+  _globals['_SUBMITJOBREQUEST']._serialized_start=311
+  _globals['_SUBMITJOBREQUEST']._serialized_end=459
+  _globals['_SUBMITJOBRESPONSE']._serialized_start=461
+  _globals['_SUBMITJOBRESPONSE']._serialized_end=496
+  _globals['_CANCELJOBREQUEST']._serialized_start=498
+  _globals['_CANCELJOBREQUEST']._serialized_end=532
+  _globals['_CANCELJOBRESPONSE']._serialized_start=534
+  _globals['_CANCELJOBRESPONSE']._serialized_end=553
+  _globals['_EXECUTIONSERVICE']._serialized_start=556
+  _globals['_EXECUTIONSERVICE']._serialized_end=819
 # @@protoc_insertion_point(module_scope)
