@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Compose smoke test for the optional Docker-managed PostgreSQL (the local-db
 # profile in compose.yaml):
-# - the default deployment starts no database and never falls back to one;
+# - the default deployment needs no database credential, starts no database, and
+#   never falls back to one;
 # - the profile starts PostgreSQL alone, with a file-based password;
 # - `nest-db upgrade` runs explicitly, and the Controller verifies the schema;
 # - Controller and database start, stop, and restart independently;
@@ -44,13 +45,12 @@ with_database() {
     NEST_DATABASE_URL=$database_url NEST_DATABASE_PASSWORD_FILE=$password_file "$@"
 }
 
-(umask 077 && openssl rand -hex 32 > "$fixture/nest-postgres-password")
-password=$(cat "$fixture/nest-postgres-password")
-
 docker compose config --quiet
 "${local_db[@]}" config --quiet
 
-# 1. Default deployment: no database service, container, or volume.
+# 1. Default deployment: no database service, container, or volume, and no
+# database credential: the profile's password file does not exist yet.
+test ! -e "$fixture/nest-postgres-password"
 docker compose up -d --no-build --pull never --wait --wait-timeout 60
 test "$(running)" = "controller "
 test -z "$("${local_db[@]}" ps --all --format '{{.Service}}' | grep -x postgres || true)"
@@ -61,12 +61,21 @@ fi
 # Pointed at the profile's database without the profile, the Controller fails
 # fast instead of starting PostgreSQL or running without it.
 status=0
-output=$(with_database docker compose run --rm --no-deps -e NEST_DATABASE_CONNECT_TIMEOUT=3 \
-    controller python -m nest.controller 2>&1) || status=$?
+output=$(NEST_DATABASE_URL=$database_url docker compose run --rm --no-deps \
+    -e NEST_DATABASE_CONNECT_TIMEOUT=3 controller python -m nest.controller 2>&1) || status=$?
 echo "$output"
 test "$status" = 3
 grep -q 'Cannot connect to PostgreSQL' <<<"$output"
 docker compose down --timeout 20
+# The profile, by contrast, refuses to start without its password file.
+if "${local_db[@]}" up -d --pull missing postgres 2>/dev/null; then
+    echo "FAIL: local-db started without a password file"
+    exit 1
+fi
+"${local_db[@]}" down --timeout 20 --volumes
+
+(umask 077 && openssl rand -hex 32 > "$fixture/nest-postgres-password")
+password=$(cat "$fixture/nest-postgres-password")
 
 # 2. The profile starts the database on its own; the Controller stays stopped.
 "${local_db[@]}" up -d --pull missing --wait --wait-timeout 120 postgres

@@ -258,15 +258,17 @@ major PostgreSQL upgrades, and disk monitoring. The service:
 - publishes port 5432 on `127.0.0.1` only, for a native Controller, `nest-db`, or
   your own client on the same host. Containers in the project reach it as
   `postgres:5432`;
-- has no TLS. Keep it on the host and the Compose network; for a database other
-  hosts reach, use a managed or separately operated PostgreSQL with
-  `verify-full` TLS.
+- has no TLS, so the interface is fixed: there is no setting that publishes it on
+  another address. To reach it from another machine for maintenance, use an SSH
+  tunnel (`ssh -L 5432:127.0.0.1:5432 host`). A Controller on another host needs a
+  managed or separately operated PostgreSQL with `verify-full` TLS instead.
+  Overriding `ports` in your own Compose file to publish it more widely sends
+  passwords and job records unencrypted, and is not supported.
 
 | Variable | Default | Behavior |
 | --- | --- | --- |
 | `NEST_POSTGRES_IMAGE` | `postgres:17.12-bookworm` | Official PostgreSQL image. Override only with a reviewed version; changing the major version needs the [upgrade procedure](#upgrade-postgresql). |
 | `NEST_POSTGRES_PASSWORD_FILE` | `${NEST_SSH_DIR}/nest-postgres-password` | Host file holding the password. It must exist before the first start; the password is fixed when the volume is initialized. |
-| `NEST_POSTGRES_HOST_IP` | `127.0.0.1` | Host interface for the published port. |
 | `NEST_POSTGRES_PORT` | `5432` | Published host port. Change it if another PostgreSQL already uses 5432. |
 | `NEST_POSTGRES_DATA_DIR` | `/var/lib/postgresql/data` | Where the volume is mounted in the container. Change it only when a new major image moves its data directory. |
 
@@ -375,12 +377,12 @@ verified:
    docker compose --profile local-db stop postgres
    docker volume create nest_postgres-data-pg17
    docker run --rm -v nest_postgres-data:/from:ro -v nest_postgres-data-pg17:/to \
-       alpine cp -a /from/. /to/
+       --entrypoint cp postgres:17.12-bookworm -a /from/. /to/
    docker compose --profile local-db rm -f postgres
    docker volume rm nest_postgres-data
    ```
 
-3. Set the new image in `.env`, for example `NEST_POSTGRES_IMAGE=postgres:18.1-bookworm`.
+3. Set the new image in `.env`, for example `NEST_POSTGRES_IMAGE=postgres:18.7-bookworm`.
    Read the image's release notes: official `postgres:18` and later images keep
    their data under `/var/lib/postgresql/18/docker` and expect the volume at
    `/var/lib/postgresql`, so also set `NEST_POSTGRES_DATA_DIR=/var/lib/postgresql`.
@@ -397,12 +399,27 @@ verified:
 
 5. Once the Controller works, delete the copy: `docker volume rm nest_postgres-data-pg17`.
 
-To roll back, remove the new volume, copy `nest_postgres-data-pg17` back into
-`nest_postgres-data` the same way, and restore the old `NEST_POSTGRES_IMAGE` and
-`NEST_POSTGRES_DATA_DIR`. The volume names above assume the default project name
-`nest`; `docker volume ls` shows yours. The database is initialized with the
-`C.UTF-8` locale, so the image's operating-system version does not change how text
-sorts.
+To roll back, restore the old `NEST_POSTGRES_IMAGE` and remove
+`NEST_POSTGRES_DATA_DIR` from `.env`, then put the copy back:
+
+```bash
+docker compose stop controller
+docker compose --profile local-db rm -sf postgres
+docker volume rm nest_postgres-data
+docker volume create nest_postgres-data
+docker run --rm -v nest_postgres-data-pg17:/from:ro -v nest_postgres-data:/to \
+    --entrypoint cp postgres:17.12-bookworm -a /from/. /to/
+docker compose --profile local-db up -d --wait postgres
+docker compose run --rm --no-deps controller nest-db verify
+docker compose up -d --wait controller
+```
+
+The volume names above assume the default project name `nest`; `docker volume ls`
+shows yours. Starting the new image on the old volume, with either data
+directory, fails with an error rather than touching the old data. The database is
+initialized with the `C.UTF-8` locale, so the image's operating-system version
+does not change how text sorts. `tests/smoke_compose_postgres_upgrade.sh` runs this
+whole procedure, including the rollback.
 
 ### Back up and restore the Docker-managed database
 

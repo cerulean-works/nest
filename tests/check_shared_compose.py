@@ -179,9 +179,13 @@ def main():
     ), "Default password file is inside NEST_SSH_DIR, shared with the Controller"
     moved = render("compose.yaml", profiles=("local-db",), NEST_POSTGRES_PASSWORD_FILE="/run/pw")
     assert moved["secrets"]["nest_postgres_password"]["file"] == "/run/pw"
-    # Published on loopback only, for a native Controller, nest-db, or pg_dump.
+    # Published on loopback only, for a native Controller, nest-db, or pg_dump. The
+    # server has no TLS, so no variable can widen the interface.
     [port] = postgres["ports"]
     assert (port["host_ip"], port["published"], port["target"]) == ("127.0.0.1", "5432", 5432)
+    widened = render("compose.yaml", profiles=("local-db",), NEST_POSTGRES_HOST_IP="0.0.0.0")
+    assert widened["services"]["postgres"]["ports"][0]["host_ip"] == "127.0.0.1"
+    assert "NEST_POSTGRES_HOST_IP" not in (ROOT / "compose.yaml").read_text()
     # A major-version upgrade can move the image's data directory without edits.
     upgraded = render(
         "compose.yaml",

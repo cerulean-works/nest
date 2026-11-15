@@ -427,6 +427,7 @@ docker build -t nest-controller:test .
 docker run --rm --volume "$PWD/tests:/tests:ro" --volume "$PWD/docker:/docker:ro" --volume "$PWD/scripts:/scripts:ro" --entrypoint python nest-controller:test -m unittest discover -s /tests -v
 bash tests/smoke_compose.sh
 bash tests/smoke_compose_postgres.sh
+bash tests/smoke_compose_postgres_upgrade.sh
 bash tests/smoke_tailnet_ssh.sh
 python tests/check_shared_compose.py
 uv run pytest tests/test_deployment_hygiene.py

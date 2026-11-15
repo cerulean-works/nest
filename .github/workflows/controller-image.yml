@@ -39,5 +39,7 @@ jobs:
         run: bash tests/smoke_compose.sh
       - name: Test Compose default and local-db PostgreSQL deployments, persistence, and backups
         run: bash tests/smoke_compose_postgres.sh
+      - name: Test the documented PostgreSQL 17 to 18 upgrade and rollback
+        run: bash tests/smoke_compose_postgres_upgrade.sh
       - name: Test Controller-to-Login-Node SSH through the Tailnet proxy path
         run: bash tests/smoke_tailnet_ssh.sh

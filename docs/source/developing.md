@@ -64,7 +64,9 @@ and clean container shutdown. It does not submit real Slurm jobs.
 default Compose deployment starts no database, the `local-db` profile starts
 PostgreSQL with a file-based password, data survives `down` and `up`, the
 Controller and database run independently, and the documented backup and restore
-commands work.
+commands work. `bash tests/smoke_compose_postgres_upgrade.sh` runs the documented
+PostgreSQL 17 to 18 upgrade and its rollback, and checks that records and the
+schema history survive both.
 
 ## Regenerate Protobuf Code
 

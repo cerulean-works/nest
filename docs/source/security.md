@@ -41,8 +41,9 @@ holds job metadata, not payloads or credentials. Connect to it with
 `NEST_DATABASE_PASSWORD_FILE` rather than the URL, and store backups encrypted.
 Nest redacts the URL's password and query string in every error and log line.
 The optional `local-db` Compose profile reads a generated password from a file
-and publishes PostgreSQL on `127.0.0.1` only. It has no TLS, so never publish it
-on another interface; databases other hosts reach need `verify-full` TLS.
+and publishes PostgreSQL on `127.0.0.1` only, with no setting to change the
+interface, because it has no TLS. Do not override its `ports` to publish it more
+widely; databases other hosts reach need `verify-full` TLS.
 
 ## Known limitations
 
