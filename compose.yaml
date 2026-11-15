@@ -63,3 +63,55 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  # Optional Docker-managed PostgreSQL. Started only with an explicit profile:
+  #
+  #   docker compose --profile local-db up -d --wait
+  #
+  # The default `docker compose up -d` starts no database. The Controller never
+  # applies migrations; run `nest-db upgrade` yourself (see docs/source/database.md).
+  postgres:
+    profiles: [local-db]
+    image: ${NEST_POSTGRES_IMAGE:-postgres:17.12-bookworm}
+    restart: unless-stopped
+    # The image stops on SIGINT (fast shutdown); allow it to finish a checkpoint.
+    stop_grace_period: 60s
+    environment:
+      POSTGRES_DB: nest
+      POSTGRES_USER: nest
+      POSTGRES_PASSWORD_FILE: /run/secrets/nest_postgres_password
+      POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale=C.UTF-8 --auth-host=scram-sha-256
+    secrets:
+      - nest_postgres_password
+    ports:
+      - "${NEST_POSTGRES_HOST_IP:-127.0.0.1}:${NEST_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - type: volume
+        source: postgres-data
+        target: ${NEST_POSTGRES_DATA_DIR:-/var/lib/postgresql/data}
+    shm_size: 256mb
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "pg_isready", "--host=127.0.0.1", "--username=nest", "--dbname=nest"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+secrets:
+  # Read only by the local-db profile. Generate it once, before the first start:
+  #   (umask 077; openssl rand -hex 32 > ssh/nest-postgres-password)
+  # The default path is inside NEST_SSH_DIR, so a Controller container also sees it
+  # as /home/nest/.ssh/nest-postgres-password (NEST_DATABASE_PASSWORD_FILE).
+  nest_postgres_password:
+    file: ${NEST_POSTGRES_PASSWORD_FILE:-${NEST_SSH_DIR:-./ssh}/nest-postgres-password}
+
+volumes:
+  # Survives `docker compose down`; only `down --volumes` deletes it.
+  postgres-data:

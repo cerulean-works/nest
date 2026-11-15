@@ -8,8 +8,10 @@ The database is **externally managed** and **opt-in**:
 
 - You provide the PostgreSQL server and an empty database, for example a managed
   cloud database or your organization's PostgreSQL cluster, and pass its URL in
-  `NEST_DATABASE_URL`. Nest never starts a server, never creates a database, and
-  never falls back to SQLite, files, or memory.
+  `NEST_DATABASE_URL`. The Controller never starts a server, never creates a
+  database, and never falls back to SQLite, files, or memory. For development or a
+  small self-hosted deployment, the optional `local-db` Compose profile can run the
+  server for you (see [Run PostgreSQL with Docker Compose](#run-postgresql-with-docker-compose)).
 - Without `NEST_DATABASE_URL`, the Controller runs stateless, as earlier releases
   did. Set `NEST_DATABASE_REQUIRED=true` to make a missing URL a startup error.
 - When `NEST_DATABASE_URL` is set, the Controller checks the database before it
@@ -235,24 +237,204 @@ newer Nest: deploy that version instead. Restoring does not change anything on
 the HPC cluster. Jobs submitted after the backup are missing from the restored
 records, but are still in Slurm.
 
-## Try it locally with Compose
+## Run PostgreSQL with Docker Compose
 
-`compose.postgres-dev.yaml` adds a throwaway PostgreSQL container and a one-shot
-`migrate` service that runs `nest-db upgrade` before the Controller starts. It is
-**only for local development**: the database has no TLS, a fixed default
-password, and lives in a Docker volume.
+`compose.yaml` includes an optional PostgreSQL service for local development and
+small self-hosted deployments. It starts **only** when you select the `local-db`
+profile. The default `docker compose up -d` starts no database, so a Controller
+there uses whatever external `NEST_DATABASE_URL` you configure, or none.
+
+The profile is a convenience, not a production requirement. You take on the
+database operations a managed service would otherwise do: backups, minor and
+major PostgreSQL upgrades, and disk monitoring. The service:
+
+- runs a pinned `postgres` image (`NEST_POSTGRES_IMAGE`), with a `pg_isready`
+  health check;
+- keeps its data in the named volume `<project>_postgres-data` (`nest_postgres-data`
+  by default), which survives `docker compose down` and image updates. Only
+  `docker compose down --volumes` or `docker volume rm` deletes it;
+- reads the `nest` user's password from a file, mounted as a Compose secret. No
+  password is set in `compose.yaml` or `.env`;
+- publishes port 5432 on `127.0.0.1` only, for a native Controller, `nest-db`, or
+  your own client on the same host. Containers in the project reach it as
+  `postgres:5432`;
+- has no TLS. Keep it on the host and the Compose network; for a database other
+  hosts reach, use a managed or separately operated PostgreSQL with
+  `verify-full` TLS.
+
+| Variable | Default | Behavior |
+| --- | --- | --- |
+| `NEST_POSTGRES_IMAGE` | `postgres:17.12-bookworm` | Official PostgreSQL image. Override only with a reviewed version; changing the major version needs the [upgrade procedure](#upgrade-postgresql). |
+| `NEST_POSTGRES_PASSWORD_FILE` | `${NEST_SSH_DIR}/nest-postgres-password` | Host file holding the password. It must exist before the first start; the password is fixed when the volume is initialized. |
+| `NEST_POSTGRES_HOST_IP` | `127.0.0.1` | Host interface for the published port. |
+| `NEST_POSTGRES_PORT` | `5432` | Published host port. Change it if another PostgreSQL already uses 5432. |
+| `NEST_POSTGRES_DATA_DIR` | `/var/lib/postgresql/data` | Where the volume is mounted in the container. Change it only when a new major image moves its data directory. |
+
+### Start the database
+
+Create the password file once. Its default location is inside `NEST_SSH_DIR`, so a
+Controller container sees the same file as `/home/nest/.ssh/nest-postgres-password`:
 
 ```bash
-docker compose -f compose.yaml -f compose.postgres-dev.yaml up -d --wait
-docker compose -f compose.yaml -f compose.postgres-dev.yaml exec postgres \
-    psql -U nest -c 'SELECT id, kind, status, slurm_job_id FROM jobs'
-docker compose -f compose.yaml -f compose.postgres-dev.yaml down --volumes  # deletes the data
+(umask 077; openssl rand -hex 32 > ssh/nest-postgres-password)
+docker compose --profile local-db up -d --wait postgres
 ```
 
-In production, use `compose.yaml` (or another Controller definition) with
-`NEST_DATABASE_URL` pointing at your managed database. TLS and password files go
-in `NEST_SSH_DIR`, so they appear under `/home/nest/.ssh` in the container, for
-example `NEST_DATABASE_SSLROOTCERT=/home/nest/.ssh/db-ca.crt`.
+To use the database from a Controller container, add to `.env`:
+
+```bash
+NEST_DATABASE_URL=postgresql://nest@postgres:5432/nest
+NEST_DATABASE_PASSWORD_FILE=/home/nest/.ssh/nest-postgres-password
+NEST_DATABASE_REQUIRED=true
+```
+
+Then apply the migrations and start the Controller. The Controller never applies
+migrations, and it does not wait for or start the database:
+
+```bash
+docker compose run --rm --no-deps controller nest-db upgrade
+docker compose up -d --wait controller
+```
+
+The Controller logs a warning that the connection is not encrypted, because
+`postgres` is not a loopback address. On the private Compose network that is
+expected.
+
+A native Controller or `nest-db` on the same host uses the published port
+instead, with the same password file:
+
+```bash
+export NEST_DATABASE_URL=postgresql://nest@127.0.0.1:5432/nest
+export NEST_DATABASE_PASSWORD_FILE=$PWD/ssh/nest-postgres-password
+uv run nest-db upgrade
+uv run python -m nest.controller
+```
+
+To open a SQL shell: `docker compose --profile local-db exec postgres psql -U nest`.
+
+### Operate the services independently
+
+The Controller and the database are separate services with no Compose dependency,
+so you can start, stop, update or replace either one alone:
+
+| Task | Command |
+| --- | --- |
+| Start or update only the database | `docker compose --profile local-db up -d --wait postgres` |
+| Start or update only the Controller | `docker compose up -d --wait controller` |
+| Stop only the Controller | `docker compose stop controller` |
+| Stop only the database | `docker compose --profile local-db stop postgres` |
+| Stop everything, keep the data | `docker compose --profile local-db down` |
+| Delete the database and its data | `docker compose --profile local-db down --volumes` |
+
+Include `--profile local-db` in any command that should act on the `postgres`
+service, or set `COMPOSE_PROFILES=local-db` in `.env` so every `docker compose`
+command includes it. While the database is stopped, a running Controller refuses
+new Slurm requests with `database_unavailable` and reconnects once it is back; a
+Controller that starts while the database is down exits with status 3, and
+Compose's restart policy retries it.
+
+### Upgrade Nest
+
+The [Deploy or upgrade Nest](#deploy-or-upgrade-nest) steps apply unchanged, using
+the profile's own `pg_dump` for the backup:
+
+```bash
+docker compose --profile local-db exec -T postgres \
+    pg_dump -U nest -d nest --format=custom > nest-before-upgrade.dump
+docker compose build controller
+docker compose run --rm --no-deps controller nest-db upgrade
+docker compose up -d --wait controller
+```
+
+### Upgrade PostgreSQL
+
+**Minor versions** (for example 17.12 to 17.13) keep the on-disk format. Set the
+new tag in `NEST_POSTGRES_IMAGE`, then recreate only the database:
+
+```bash
+docker compose --profile local-db pull postgres
+docker compose --profile local-db up -d --wait postgres
+```
+
+**Major versions** (for example 17 to 18) cannot read the old data directory. A
+new image started on the old volume refuses to start. Move the data with a dump
+and restore into a fresh volume, keeping the old volume until the new one is
+verified:
+
+1. Stop the Controller and take a dump with the **old** server:
+
+   ```bash
+   docker compose stop controller
+   docker compose --profile local-db exec -T postgres \
+       pg_dump -U nest -d nest --format=custom > nest-pg17.dump
+   ```
+
+2. Stop the database and copy the old volume aside, so you can roll back:
+
+   ```bash
+   docker compose --profile local-db stop postgres
+   docker volume create nest_postgres-data-pg17
+   docker run --rm -v nest_postgres-data:/from:ro -v nest_postgres-data-pg17:/to \
+       alpine cp -a /from/. /to/
+   docker compose --profile local-db rm -f postgres
+   docker volume rm nest_postgres-data
+   ```
+
+3. Set the new image in `.env`, for example `NEST_POSTGRES_IMAGE=postgres:18.1-bookworm`.
+   Read the image's release notes: official `postgres:18` and later images keep
+   their data under `/var/lib/postgresql/18/docker` and expect the volume at
+   `/var/lib/postgresql`, so also set `NEST_POSTGRES_DATA_DIR=/var/lib/postgresql`.
+4. Start the new, empty server. It initializes the volume with the same password
+   file. Restore the dump and verify the schema:
+
+   ```bash
+   docker compose --profile local-db up -d --wait postgres
+   docker compose --profile local-db exec -T postgres \
+       pg_restore -U nest -d nest --no-owner --exit-on-error < nest-pg17.dump
+   docker compose run --rm --no-deps controller nest-db verify
+   docker compose up -d --wait controller
+   ```
+
+5. Once the Controller works, delete the copy: `docker volume rm nest_postgres-data-pg17`.
+
+To roll back, remove the new volume, copy `nest_postgres-data-pg17` back into
+`nest_postgres-data` the same way, and restore the old `NEST_POSTGRES_IMAGE` and
+`NEST_POSTGRES_DATA_DIR`. The volume names above assume the default project name
+`nest`; `docker volume ls` shows yours. The database is initialized with the
+`C.UTF-8` locale, so the image's operating-system version does not change how text
+sorts.
+
+### Back up and restore the Docker-managed database
+
+The volume holds a live data directory. Copying it while PostgreSQL runs does not
+give a usable backup, so use `pg_dump`. The commands run inside the container, so
+the client always matches the server version. A dump taken while the Controller
+runs is consistent:
+
+```bash
+docker compose --profile local-db exec -T postgres \
+    pg_dump -U nest -d nest --format=custom > nest-$(date -u +%Y%m%dT%H%M%SZ).dump
+```
+
+Run it from cron or a systemd timer, keep copies off the host, and store them
+encrypted. To check a backup, or to restore, load it into an empty database next
+to the current one, verify it, and switch the Controller over:
+
+```bash
+docker compose stop controller
+docker compose --profile local-db exec -T postgres createdb -U nest nest_restored
+docker compose --profile local-db exec -T postgres \
+    pg_restore -U nest -d nest_restored --no-owner --exit-on-error < nest-20261115T120000Z.dump
+NEST_DATABASE_URL=postgresql://nest@postgres:5432/nest_restored \
+    docker compose run --rm --no-deps controller nest-db verify
+```
+
+Then set `NEST_DATABASE_URL=postgresql://nest@postgres:5432/nest_restored` in
+`.env` and run `docker compose up -d --wait controller`. To restore under the
+original name instead, drop it first, with the Controller stopped:
+`docker compose --profile local-db exec -T postgres dropdb -U nest --force nest`,
+then `createdb -U nest nest` and the same `pg_restore` into `nest`. The notes in
+[Back up and restore](#back-up-and-restore) about older and newer dumps apply.
 
 ## Troubleshooting
 

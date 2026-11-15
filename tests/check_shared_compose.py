@@ -6,6 +6,7 @@ Set NEST_COMPOSE_COMMAND to a standalone Compose binary if needed.
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import tempfile
@@ -51,7 +52,7 @@ CONTROLLER_SETTINGS = {
 COMMAND = shlex.split(os.environ.get("NEST_COMPOSE_COMMAND", "docker compose"))
 
 
-def render(filename, directory=ROOT, *, overrides=(), **settings):
+def render(filename, directory=ROOT, *, overrides=(), profiles=(), **settings):
     env = os.environ.copy()
     env.update(
         COMPOSE_PROJECT_NAME="nest-shared-check",
@@ -70,6 +71,7 @@ def render(filename, directory=ROOT, *, overrides=(), **settings):
             "--project-directory",
             str(directory),
             *(arg for name in (filename, *overrides) for arg in ("-f", str(ROOT / name))),
+            *(arg for profile in profiles for arg in ("--profile", profile)),
             "config",
             "--format",
             "json",
@@ -136,29 +138,59 @@ def main():
     assert not managed.get("volumes"), "Mode B must not need a host mount"
     assert set(managed["environment"]) == CONTROLLER_SETTINGS
     assert managed["environment"]["NEST_SLURM_SSH_MODE"] == "B"
-    # Without the development override no database service exists, and an external
-    # NEST_DATABASE_URL passes through unchanged.
-    for name, rendered in (("compose.yaml", render("compose.yaml")), ("shared", shared)):
+    # The default deployment starts no database: the Controller only receives an
+    # external NEST_DATABASE_URL, and nothing waits for or links to PostgreSQL.
+    default = render("compose.yaml")
+    for name, rendered in (("compose.yaml", default), ("shared", shared), ("outbound", outbound)):
         assert set(rendered["services"]) <= {"controller", "tailscale"}, name
+        assert "postgres-data" not in rendered.get("volumes", {}), name
+        assert not rendered["services"]["controller"].get("depends_on", {}).get("postgres")
     external = render("compose.yaml", NEST_DATABASE_URL="postgresql://nest@db.example/nest")
     assert (
         external["services"]["controller"]["environment"]["NEST_DATABASE_URL"]
         == "postgresql://nest@db.example/nest"
     )
-    dev = render("compose.yaml", overrides=("compose.postgres-dev.yaml",))
-    services = dev["services"]
-    assert set(services) == {"controller", "postgres", "migrate"}
-    assert set(services["controller"]["environment"]) == CONTROLLER_SETTINGS
-    assert services["controller"]["environment"]["NEST_DATABASE_URL"].endswith(
-        "@postgres:5432/nest"
-    )
-    assert services["controller"]["environment"]["NEST_DATABASE_REQUIRED"] == "true"
-    assert services["controller"]["depends_on"]["migrate"]["condition"] == (
-        "service_completed_successfully"
-    )
-    assert services["migrate"]["entrypoint"] == ["nest-db"]
-    assert services["migrate"]["command"] == ["upgrade"]
-    assert not services["postgres"].get("ports"), "Development database must not be published"
+    # The local-db profile adds only PostgreSQL. The Controller is unchanged, so
+    # either service can be started, stopped, or replaced without the other.
+    local = render("compose.yaml", profiles=("local-db",))
+    assert set(local["services"]) == {"controller", "postgres"}
+    assert local["services"]["controller"] == default["services"]["controller"]
+    postgres = local["services"]["postgres"]
+    assert postgres["profiles"] == ["local-db"]
+    assert re.fullmatch(r"postgres:\d+\.\d+(-[a-z]+)?", postgres["image"]), postgres["image"]
+    assert postgres["restart"] == "unless-stopped"
+    assert postgres["security_opt"] == ["no-new-privileges:true"]
+    assert postgres["healthcheck"]["test"][:2] == ["CMD", "pg_isready"]
+    # Data lives in a named volume, which `docker compose down` keeps.
+    [data] = postgres["volumes"]
+    assert data["type"] == "volume", "Database data must be in a named volume"
+    assert data["source"] == "postgres-data"
+    assert data["target"] == "/var/lib/postgresql/data"
+    assert local["volumes"]["postgres-data"]["name"] == "nest-shared-check_postgres-data"
+    assert not local["volumes"]["postgres-data"].get("external")
+    # The password comes from a file, never from Compose or the environment.
+    environment = postgres["environment"]
+    assert "POSTGRES_PASSWORD" not in environment
+    assert "POSTGRES_HOST_AUTH_METHOD" not in environment
+    assert environment["POSTGRES_PASSWORD_FILE"] == "/run/secrets/nest_postgres_password"
+    assert [secret["source"] for secret in postgres["secrets"]] == ["nest_postgres_password"]
+    assert local["secrets"]["nest_postgres_password"]["file"] == str(
+        ROOT / "ssh/nest-postgres-password"
+    ), "Default password file is inside NEST_SSH_DIR, shared with the Controller"
+    moved = render("compose.yaml", profiles=("local-db",), NEST_POSTGRES_PASSWORD_FILE="/run/pw")
+    assert moved["secrets"]["nest_postgres_password"]["file"] == "/run/pw"
+    # Published on loopback only, for a native Controller, nest-db, or pg_dump.
+    [port] = postgres["ports"]
+    assert (port["host_ip"], port["published"], port["target"]) == ("127.0.0.1", "5432", 5432)
+    # A major-version upgrade can move the image's data directory without edits.
+    upgraded = render(
+        "compose.yaml",
+        profiles=("local-db",),
+        NEST_POSTGRES_IMAGE="postgres:18.1",
+        NEST_POSTGRES_DATA_DIR="/var/lib/postgresql",
+    )["services"]["postgres"]
+    assert upgraded["image"] == "postgres:18.1"
+    assert upgraded["volumes"][0]["target"] == "/var/lib/postgresql"
     for deployment in (shared, outbound):
         secrets = deployment["services"]["tailscale"]["secrets"]
         assert [secret["source"] for secret in secrets] == ["tailscale_authkey"]
@@ -182,8 +214,8 @@ def main():
             files / "tailscale/serve"
         )
     print(
-        "PASS: rendered Compose isolation, Controller settings, development database, state "
-        "reuse, and Dokploy paths"
+        "PASS: rendered Compose isolation, Controller settings, default and local-db "
+        "databases, state reuse, and Dokploy paths"
     )
 
 

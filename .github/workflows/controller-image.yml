@@ -37,7 +37,7 @@ jobs:
             -m unittest discover -s /tests -v
       - name: Test Compose deployment and SSH credentials
         run: bash tests/smoke_compose.sh
-      - name: Test Compose PostgreSQL migrations, restart persistence, and fail-fast
+      - name: Test Compose default and local-db PostgreSQL deployments, persistence, and backups
         run: bash tests/smoke_compose_postgres.sh
       - name: Test Controller-to-Login-Node SSH through the Tailnet proxy path
         run: bash tests/smoke_tailnet_ssh.sh

@@ -40,7 +40,9 @@ holds job metadata, not payloads or credentials. Connect to it with
 `NEST_DATABASE_SSLMODE=verify-full` and a CA file, keep its password in
 `NEST_DATABASE_PASSWORD_FILE` rather than the URL, and store backups encrypted.
 Nest redacts the URL's password and query string in every error and log line.
-`compose.postgres-dev.yaml` uses a fixed password and no TLS; never deploy it.
+The optional `local-db` Compose profile reads a generated password from a file
+and publishes PostgreSQL on `127.0.0.1` only. It has no TLS, so never publish it
+on another interface; databases other hosts reach need `verify-full` TLS.
 
 ## Known limitations
 

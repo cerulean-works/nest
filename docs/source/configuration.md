@@ -200,6 +200,12 @@ These variables configure Compose itself:
 | `NEST_CONTROLLER_PORT` | `50051` | Published host port; the container always listens on port 50051. |
 | `NEST_SSH_DIR` | `./ssh` | Mode A: existing host directory containing the SSH configuration, key, and verified host keys. The container uses a private copy at `/home/nest/.ssh`, so in-container paths such as `/home/nest/.ssh/tls.key` work for the file settings above. |
 
+The optional `local-db` profile's PostgreSQL service also reads
+`NEST_POSTGRES_IMAGE`, `NEST_POSTGRES_PASSWORD_FILE`, `NEST_POSTGRES_HOST_IP`,
+`NEST_POSTGRES_PORT` and `NEST_POSTGRES_DATA_DIR`; see
+[Run PostgreSQL with Docker Compose](database#run-postgresql-with-docker-compose).
+The Controller never receives them.
+
 See [Deploy with Docker Compose](docker-compose) for setup and operating commands.
 
 **Mode B without host mounts.** `compose.managed-ssh.yaml` removes the SSH
