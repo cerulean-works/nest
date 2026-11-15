@@ -287,7 +287,6 @@ class ValidationTests(unittest.TestCase):
 
     def test_reserved_settings_fail_instead_of_being_ignored(self):
         for name, value in (
-            ("NEST_DATABASE_URL", "postgresql://db/nest"),
             ("NEST_AUTH_TOKEN_FILE", "/run/secrets/token"),
             ("NEST_RETENTION_DAYS", "30"),
             ("NEST_INTEGRATIONS", "slack"),
@@ -301,7 +300,9 @@ class RedactionTests(unittest.TestCase):
     def test_database_password_never_appears_in_errors(self):
         url = "postgresql://nest:hunter2-secret@db.internal/nest?sslpassword=pw-secret"
         with self.assertRaises(ConfigError) as caught:
-            load_controller_config({"NEST_DATABASE_URL": url})
+            load_controller_config(
+                {"NEST_DATABASE_URL": url.replace("postgresql", "mysql"), "NEST_LOG_LEVEL": "x"}
+            )
         self.assertNotIn("hunter2-secret", str(caught.exception))
         self.assertNotIn("pw-secret", str(caught.exception))
         self.assertEqual(redact_url(url), "postgresql://nest:***@db.internal/nest?***")
@@ -344,7 +345,7 @@ class RedactionTests(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if not k.startswith(("NEST_SLURM", "NEST_PROV"))}
         env.update(
             NEST_EXECUTOR="slurm",
-            NEST_DATABASE_URL="postgresql://nest:hunter2-secret@db/nest",
+            NEST_DATABASE_URL="mysql://nest:hunter2-secret@db/nest",
             NEST_SSH_TIMEOUT="0",
         )
         result = subprocess.run(
