@@ -15,7 +15,7 @@ from ._logging import (
     register_secret,
     request_context,
 )
-from .backends.slurm import SlurmBackend, SlurmConfig
+from .backends.slurm import SlurmBackend, SlurmConfig, new_execution_id
 from .config import (
     ConfigError,
     ControllerConfig,
@@ -115,7 +115,7 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
         self.executor = executor
         self.jobs = jobs
 
-    def _begin_record(self, context, kind: str, **fields) -> int | None:
+    def _begin_record(self, context, kind: str, execution_id: str, **fields) -> int | None:
         """
         Creates the job record before any side effect, aborting with `UNAVAILABLE`
         and kind `database_unavailable` when the database cannot store it.
@@ -123,7 +123,7 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
         if self.jobs is None:
             return None
         try:
-            return self.jobs.begin(kind, request_id=current_request_id(), **fields)
+            return self.jobs.begin(kind, execution_id, request_id=current_request_id(), **fields)
         except DatabaseUnavailableError as exc:
             _abort_infrastructure(context, exc)
             raise AssertionError("context.abort raises") from None
@@ -214,7 +214,23 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
 
         if mode == "slurm":
             backend = self._require_slurm_backend(context)
-            record = self._begin_record(context, "execution", gpu=request.gpu, cpu=request.cpu)
+            # The Execution ID is fixed and recorded before any SSH or Slurm side
+            # effect; the backend then uses it for the remote directory and worker.
+            execution_id = new_execution_id()
+            job_dir = None
+            if self.jobs is not None:
+                try:
+                    job_dir = backend.execution_dir(execution_id)
+                except ValueError:
+                    pass  # submit_payload reports it below, before any SSH command
+            record = self._begin_record(
+                context,
+                "execution",
+                execution_id,
+                job_dir=job_dir,
+                gpu=request.gpu,
+                cpu=request.cpu,
+            )
 
             try:
                 environment_id = None
@@ -241,6 +257,7 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                     gpu=request.gpu,
                     cpu=request.cpu,
                     environment_id=environment_id,
+                    execution_id=execution_id,
                 )
 
                 logger.info("Worker submitted job_id=%s job_dir=%s", job_id, job_dir)
@@ -332,6 +349,7 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
         record = self._begin_record(
             context,
             "batch",
+            new_execution_id(),
             script=request.script,
             workdir=request.workdir,
             account=request.account or None,
@@ -474,7 +492,7 @@ def open_database(config: ControllerConfig) -> Database | None:
     except psycopg.Error as exc:
         database.close()
         raise DatabaseError(
-            f"Cannot check PostgreSQL at {database.describe()}: " + " ".join(str(exc).split())
+            f"Cannot check PostgreSQL at {database.describe()}: {database.scrub(str(exc))}"
         ) from None
     except BaseException:
         database.close()

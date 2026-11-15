@@ -18,7 +18,16 @@ logger = get_logger("nest.db.store")
 
 JOB_STATUSES = ("submitting", "submitted", "succeeded", "failed", "unknown")
 _MAX_ERROR_MESSAGE = 4000
-_BEGIN_FIELDS = ("script", "workdir", "account", "partition", "time_limit", "gpu", "cpu")
+_BEGIN_FIELDS = (
+    "script",
+    "workdir",
+    "job_dir",
+    "account",
+    "partition",
+    "time_limit",
+    "gpu",
+    "cpu",
+)
 
 
 def sync_providers(
@@ -76,8 +85,7 @@ def sync_providers(
             )
     except psycopg.Error as exc:
         raise DatabaseError(
-            f"Cannot record Provider Profiles in {database.describe()}: "
-            + " ".join(str(exc).split())
+            f"Cannot record Provider Profiles in {database.describe()}: " + database.scrub(str(exc))
         ) from None
     logger.info("Provider Profiles recorded providers=%s", ",".join(providers) or "-")
 
@@ -100,14 +108,18 @@ class JobStore:
         self.database = database
         self.provider_id = provider_id
 
-    def begin(self, kind: str, *, request_id: str | None = None, **fields: Any) -> int:
+    def begin(
+        self, kind: str, execution_id: str, *, request_id: str | None = None, **fields: Any
+    ) -> int:
         """
         Creates a `submitting` record for a request.
 
         Args:
             kind (`str`): `"execution"` or `"batch"`.
+            execution_id (`str`): The request's Execution ID, generated before any
+                side effect. For executions it is also the remote directory name.
             request_id (`str`, *optional*): Correlation ID from the logs.
-            **fields: Any of `script`, `workdir`, `account`, `partition`,
+            **fields: Any of `script`, `workdir`, `job_dir`, `account`, `partition`,
                 `time_limit`, `gpu`, and `cpu`.
 
         Returns:
@@ -119,8 +131,8 @@ class JobStore:
         unknown = set(fields) - set(_BEGIN_FIELDS)
         if unknown:
             raise ValueError(f"Unknown job fields: {sorted(unknown)}")
-        columns = ["provider_id", "kind", "request_id", *fields]
-        values = [self.provider_id, kind, request_id, *fields.values()]
+        columns = ["execution_id", "provider_id", "kind", "request_id", *fields]
+        values = [execution_id, self.provider_id, kind, request_id, *fields.values()]
         query = sql.SQL("INSERT INTO jobs ({}) VALUES ({}) RETURNING id").format(
             sql.SQL(", ").join(map(sql.Identifier, columns)),
             sql.SQL(", ").join(sql.Placeholder() * len(values)),
@@ -129,7 +141,7 @@ class JobStore:
             with self.database.connection() as conn:
                 row = conn.execute(query, values).fetchone()
         except (psycopg.Error, DatabaseError) as exc:
-            logger.error("Job record could not be created: %s", " ".join(str(exc).split()))
+            logger.error("Job record could not be created: %s", self.database.scrub(str(exc)))
             raise DatabaseUnavailableError(
                 "The Controller database is unavailable, so the request was not run. "
                 "Nothing was submitted; retry later."
@@ -142,7 +154,9 @@ class JobStore:
             with self.database.connection() as conn:
                 conn.execute(query, params)
         except (psycopg.Error, DatabaseError) as exc:
-            logger.error("Job record update failed what=%s: %s", what, " ".join(str(exc).split()))
+            logger.error(
+                "Job record update failed what=%s: %s", what, self.database.scrub(str(exc))
+            )
 
     def submitted(self, record_id: int, slurm_job_id: int, job_dir: str | None = None) -> None:
         """Stores the Slurm job ID once `sbatch` returns it."""
@@ -202,6 +216,13 @@ class JobStore:
         """Returns a record as a dictionary, or `None`."""
         with self.database.connection() as conn, conn.cursor(row_factory=dict_row) as cursor:
             return cursor.execute("SELECT * FROM jobs WHERE id = %s", (record_id,)).fetchone()
+
+    def by_execution_id(self, execution_id: str) -> dict[str, Any] | None:
+        """Returns the record for an Execution ID, or `None`."""
+        with self.database.connection() as conn, conn.cursor(row_factory=dict_row) as cursor:
+            return cursor.execute(
+                "SELECT * FROM jobs WHERE execution_id = %s", (execution_id,)
+            ).fetchone()
 
     def find(self, slurm_job_id: int) -> dict[str, Any] | None:
         """Returns this provider's latest record for a Slurm job ID, or `None`."""

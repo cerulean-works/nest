@@ -703,9 +703,10 @@ def _database(reader: _Reader) -> DatabaseConfig | None:
 
     url_sslmode = query.get("sslmode", [None])[-1]
     if url_sslmode is not None and url_sslmode not in DATABASE_SSLMODES:
+        # Query values are never echoed: the query string may carry secrets.
         reader.fail(
-            f"NEST_DATABASE_URL has sslmode={url_sslmode!r}; use one of "
-            + ", ".join(DATABASE_SSLMODES)
+            "NEST_DATABASE_URL has an invalid sslmode in its query string (value not "
+            "shown); use one of " + ", ".join(DATABASE_SSLMODES)
         )
     sslmode = reader.choice("NEST_DATABASE_SSLMODE", DATABASE_SSLMODES, "")
     files = {

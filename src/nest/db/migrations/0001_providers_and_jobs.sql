@@ -28,6 +28,11 @@ CREATE UNIQUE INDEX provider_profiles_one_default
 
 CREATE TABLE jobs (
     id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    -- Stable Nest Execution ID, generated and stored before any SSH or Slurm
+    -- side effect. For 'execution' jobs it also names the remote execution
+    -- directory (<workdir>/jobs/<execution_id>) and is passed to the worker, so a
+    -- row whose submission is 'unknown' can still be matched to its directory.
+    execution_id  text NOT NULL UNIQUE CHECK (execution_id ~ '^[0-9a-f]{32}$'),
     provider_id   text NOT NULL REFERENCES provider_profiles (id),
     -- 'execution': an Execute RPC's worker job. 'batch': a SubmitJob RPC.
     kind          text NOT NULL CHECK (kind IN ('execution', 'batch')),

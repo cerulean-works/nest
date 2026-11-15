@@ -4,8 +4,9 @@ Versioned SQL migrations for the Nest control-plane schema.
 Nest has one ordered migration chain for its whole PostgreSQL schema. Each file in
 `nest/db/migrations` is named `NNNN_description.sql`, numbered from `0001` without
 gaps, and applied once, in order, in its own transaction. The `schema_migrations`
-table records each applied version with the SHA-256 checksum of its file, so an
-applied migration that was edited, or a database newer than the code, is detected.
+table records each applied version with its name and the SHA-256 checksum of its
+file. An applied migration that was edited or renamed, or a database newer than the
+code, is detected.
 
 Only `nest-db upgrade` applies migrations; the Controller only verifies them.
 """
@@ -105,6 +106,15 @@ class SchemaStatus:
         ]
 
     @property
+    def renamed(self) -> list[Migration]:
+        """Applied migrations whose file name no longer matches the recorded name."""
+        return [
+            m
+            for m in self.migrations
+            if m.version in self.applied and self.applied[m.version].name != m.name
+        ]
+
+    @property
     def unknown(self) -> list[AppliedMigration]:
         """Applied versions this code does not have (the database is newer)."""
         known = {m.version for m in self.migrations}
@@ -119,11 +129,19 @@ class SchemaStatus:
         return max((m.version for m in self.migrations), default=0)
 
     @property
-    def problems(self) -> list[str]:
-        """Actionable descriptions of everything that makes the schema unusable."""
-        if not self.initialized:
-            return ["The database has no Nest schema; run `nest-db upgrade`"]
+    def history_problems(self) -> list[str]:
+        """
+        Problems `nest-db upgrade` cannot fix: applied migrations that were edited or
+        renamed, and versions this code does not have. Upgrade refuses to run while
+        any exist; pending migrations are not included.
+        """
         problems = [
+            f"Migration {self.applied[m.version].version:04d}_{self.applied[m.version].name} "
+            f"was renamed to {m.label} after it was applied; restore the original file "
+            "name, and add a new migration for any change"
+            for m in self.renamed
+        ]
+        problems += [
             f"Migration {m.label} was changed after it was applied (checksum mismatch); "
             "restore the original file and add a new migration instead"
             for m in self.modified
@@ -133,6 +151,14 @@ class SchemaStatus:
             "does not have; upgrade Nest or restore a matching backup"
             for a in self.unknown
         ]
+        return problems
+
+    @property
+    def problems(self) -> list[str]:
+        """Actionable descriptions of everything that makes the schema unusable."""
+        if not self.initialized:
+            return ["The database has no Nest schema; run `nest-db upgrade`"]
+        problems = self.history_problems
         if self.pending:
             problems.append(
                 f"The schema is at version {self.current_version} but this Nest needs "
@@ -262,9 +288,9 @@ def upgrade(
     try:
         conn.execute(_CREATE_TABLE)
         status = schema_status(conn, migrations)
-        if status.modified or status.unknown:
+        if status.history_problems:
             # Pending migrations are what upgrade fixes; everything else blocks it.
-            raise MigrationError("; ".join(status.problems[: -1 if status.pending else None]))
+            raise MigrationError("; ".join(status.history_problems))
         applied = []
         for migration in status.pending:
             started = time.monotonic()
@@ -296,7 +322,8 @@ def upgrade(
 
 def verify(conn: psycopg.Connection, migrations: list[Migration] | None = None) -> None:
     """
-    Checks that every migration is applied unchanged and none is unknown.
+    Checks that every migration is applied with its recorded version, name and
+    checksum, and that the database has no version this code lacks.
 
     Raises:
         [`db.MigrationError`]: Listing each problem and how to fix it.

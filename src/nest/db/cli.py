@@ -76,6 +76,8 @@ def main(argv: list[str] | None = None) -> int:
                     state = "applied" if migration.version in status.applied else "pending"
                     if migration in status.modified:
                         state = "MODIFIED"
+                    elif migration in status.renamed:
+                        state = "RENAMED"
                     print(f"{state:8} {migration.label}")
                 for unknown in status.unknown:
                     print(f"{'UNKNOWN':8} {unknown.version:04d}_{unknown.name}")
@@ -94,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
             print(exc, file=sys.stderr)
             return 3
         except psycopg.Error as exc:
-            print(f"Database error: {' '.join(str(exc).split())}", file=sys.stderr)
+            print(f"Database error: {database.scrub(str(exc))}", file=sys.stderr)
             return 1
 
 
