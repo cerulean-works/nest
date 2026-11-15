@@ -78,6 +78,63 @@ def _logged_rpc(method):
     return wrapper
 
 
+MAX_STATUS_DETAILS_BYTES = 4096
+"""
+Largest status message the Controller sends, measured as gRPC encodes it.
+
+gRPC sends the message in the `grpc-message` trailer and percent-encodes every
+byte outside printable ASCII, so one such byte costs three. A client rejects
+trailers above a hard limit of 16 KiB, and some trailers above a soft limit of
+8 KiB, with `RESOURCE_EXHAUSTED`, which hides the intended status code.
+"""
+
+_HEAD_BYTES = 1024
+
+
+def _encoded_size(text: str) -> int:
+    """Returns the size of `text` once gRPC percent-encodes it as `grpc-message`."""
+    return sum(1 if 0x20 <= byte <= 0x7E and byte != 0x25 else 3 for byte in text.encode())
+
+
+def _prefix_within(text: str, budget: int) -> str:
+    """Returns the longest prefix of `text` whose encoded size fits `budget`."""
+    used = 0
+    for index, char in enumerate(text):
+        used += _encoded_size(char)
+        if used > budget:
+            return text[:index]
+    return text
+
+
+def _status_details(message: str) -> str:
+    """
+    Bounds a status message so the client receives the intended status code.
+
+    Messages often carry remote stderr, which has no size limit. A longer
+    message keeps its first kilobyte, which names the failure, and its end,
+    where commands usually print the cause. The Controller log keeps the full
+    message.
+
+    Args:
+        message (`str`): Status message to send.
+
+    Returns:
+        `str`: `message`, or a shortened copy whose encoded size is at most
+            `MAX_STATUS_DETAILS_BYTES`.
+    """
+    if _encoded_size(message) <= MAX_STATUS_DETAILS_BYTES:
+        return message
+    marker = "\n[... {} characters omitted; see the Controller log ...]\n"
+    # The omitted count is below len(message), so this reserves enough room for it.
+    tail_budget = (
+        MAX_STATUS_DETAILS_BYTES - _HEAD_BYTES - _encoded_size(marker.format(len(message)))
+    )
+    head = _prefix_within(message, _HEAD_BYTES)
+    tail = _prefix_within(message[len(head) :][::-1], tail_budget)[::-1]
+    omitted = len(message) - len(head) - len(tail)
+    return head + marker.format(omitted) + tail
+
+
 def _abort_infrastructure(context, exc: InfrastructureError, status=None):
     """
     Aborts an RPC with an infrastructure error's status, kind, and job ID.
@@ -91,7 +148,7 @@ def _abort_infrastructure(context, exc: InfrastructureError, status=None):
     if exc.job_id is not None:
         metadata.append((JOB_ID_METADATA, str(exc.job_id)))
     context.set_trailing_metadata(tuple(metadata))
-    context.abort(status or exc.status, str(exc))
+    context.abort(status or exc.status, _status_details(str(exc)))
 
 
 class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
@@ -125,6 +182,8 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
         try:
             return self.jobs.begin(kind, execution_id, request_id=current_request_id(), **fields)
         except DatabaseUnavailableError as exc:
+            # Log the full message, since the status message the client gets may be shortened.
+            logger.exception("Job record could not be stored kind=%s", kind)
             _abort_infrastructure(context, exc)
             raise AssertionError("context.abort raises") from None
 
@@ -280,7 +339,7 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 self._fail_record(record, exc)
                 context.abort(
                     grpc.StatusCode.INTERNAL,
-                    str(exc),
+                    _status_details(str(exc)),
                 )
 
         # Original local executor
@@ -313,7 +372,7 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
             logger.exception("Job status query failed job_id=%s", request.job_id)
             context.abort(
                 grpc.StatusCode.INTERNAL,
-                str(exc),
+                _status_details(str(exc)),
             )
 
         logger.debug("Job status job_id=%s state=%s", request.job_id, state)

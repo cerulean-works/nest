@@ -307,6 +307,21 @@ class UnavailableDatabaseTests(unittest.TestCase):
         backend.submit_payload.assert_not_called()
         backend.prepare_environment_bytes.assert_not_called()
 
+    def test_controller_log_keeps_the_full_message_when_details_are_shortened(self):
+        message = "The Controller database is unavailable: " + "é" * 5_000 + " end of the cause"
+        jobs = mock.Mock()
+        jobs.begin.side_effect = DatabaseUnavailableError(message)
+        service = ExecutionService(mock.Mock(), executor="slurm", jobs=jobs)
+        context = _Context()
+        with self.assertLogs("nest.controller", level="ERROR") as logs, self.assertRaises(_Aborted):
+            service.SubmitJob(
+                execution_pb2.SubmitJobRequest(workdir="/w", script="a.sbatch"), context
+            )
+        self.assertEqual(context.status, grpc.StatusCode.UNAVAILABLE)
+        self.assertIn((ERROR_KIND_METADATA, "database_unavailable"), context.trailing)
+        self.assertLess(len(context.message or ""), len(message))
+        self.assertTrue(any(message in record for record in logs.output))
+
 
 class PoolOpenFailureTests(unittest.TestCase):
     """A failed pool open leaves no scrub filter behind on `psycopg.pool`."""
