@@ -387,8 +387,8 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
         Submits a batch script through the Slurm backend.
 
         Each element of the request's `script_args` reaches the script verbatim as one
-        argument after the script path. A `cpu` count of `0` omits `--cpus-per-task`, as `gpu` does for
-        `--gpus-per-node`.
+        argument after the script path. A `cpu` count of `0` omits `--cpus-per-task`, as
+        `gpu` does for `--gpus-per-node`.
 
         Args:
             request (`execution_pb2.SubmitJobRequest`): Job operation parameters.
