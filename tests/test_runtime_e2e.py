@@ -361,7 +361,8 @@ def test_controller_ssh_and_sbatch_commands_are_stable(slurm_controller, hpc, pr
     gpu_job, cpu_job = _worker_jobs(hpc)
     common = ["--parsable", "--account=test-account", "--partition=dev"]
     resources = ["--gpus-per-node=2", "--cpus-per-task=1"]
-    assert build["flags"] == [*common, *resources, "--time=00:05:00"]
+    # The build keeps its script's own time limit instead of the worker job default.
+    assert build["flags"] == [*common, *resources]
     assert gpu_job["flags"] == [*common, *resources, "--time=00:05:00"]
     # cpu=0 and gpu=0 leave both counts to the deployed worker script.
     assert cpu_job["flags"] == [*common, "--time=00:05:00"]
