@@ -55,6 +55,7 @@ are also `TimeoutError`s.
 | `SubmissionUnknownError` | `submission_unknown` | `UNKNOWN` | `sbatch` may have submitted a job, but Nest got no job ID: SSH timed out or dropped after `sbatch` started, or `sbatch` printed no ID. | Not blindly. See below. |
 | `SSHError` | `ssh_error` | `UNAVAILABLE` | SSH could not reach or log in to the login node before running the command. | Yes, after fixing connectivity, unless `exc.job_id` names a job that was already submitted. |
 | `RemoteCommandError` | `remote_command_error` | `INTERNAL` (`FAILED_PRECONDITION` for `SubmitJob` and `CancelJob`) | A remote command, such as a rejected `sbatch`, exited unsuccessfully. | Yes, after fixing the cause. |
+| `DatabaseUnavailableError` | `database_unavailable` | `UNAVAILABLE` | The Controller's PostgreSQL database could not record the request, so it was refused before anything ran. | Yes. Nothing was submitted. |
 | `SlurmJobError` | `slurm_job_failed` | `INTERNAL` | The job ended in a failure state such as `FAILED`, `NODE_FAIL`, or `OUT_OF_MEMORY`. | Yes, after reading the job's output file. |
 
 A Controller that has not been upgraded sends no `nest-error-kind`. Its timeouts

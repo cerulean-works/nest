@@ -143,7 +143,9 @@ gRPC is plaintext unless `NEST_TLS_CERT_FILE` and `NEST_TLS_KEY_FILE` are set
 (clients then set `NEST_CONTROLLER_TLS` or `NEST_CONTROLLER_TLS_CA_FILE`). Without
 TLS it is protected only by the network, such as Tailscale, between client and host.
 Nest has no application-level authentication, and every caller uses one HPC SSH
-identity (see [Security](security)). `NEST_AUTH_TOKEN_FILE` and `NEST_DATABASE_URL`
-are reserved for this work and rejected at startup until it lands. A multi-user
+identity (see [Security](security)). `NEST_AUTH_TOKEN_FILE` is reserved for this
+work and rejected at startup until it lands. Accounts will be stored in the
+Controller's PostgreSQL database (see [Store Controller records in
+PostgreSQL](database)) and added to its single migration chain. A multi-user
 deployment needs per-caller authentication and authorization, and eventually
 per-user HPC identities.

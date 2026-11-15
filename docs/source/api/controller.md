@@ -48,3 +48,5 @@ deadline. The Controller never retries `sbatch`. See
 [[autodoc]] controller.main
 
 [[autodoc]] controller.build_backend
+
+[[autodoc]] controller.open_database

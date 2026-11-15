@@ -19,6 +19,18 @@ Run the Controller integration tests:
 uv run python -m unittest discover -s tests -v
 ```
 
+The PostgreSQL tests (migrations, `nest-db`, Controller restart persistence) need a
+real server and are skipped without one. Point them at any PostgreSQL 14 or newer
+whose user may create databases; each test creates and drops its own database:
+
+```bash
+docker run -d --name nest-test-postgres -e POSTGRES_PASSWORD=postgres -p 127.0.0.1:5432:5432 postgres:17
+export NEST_TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/postgres
+uv run pytest tests/test_database.py
+```
+
+CI sets `NEST_TEST_DATABASE_REQUIRED=1`, which turns those skips into failures.
+
 To build and test the Compose deployment, with Docker Engine running:
 
 ```bash

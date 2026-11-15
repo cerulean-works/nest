@@ -24,6 +24,8 @@ what each error means and when it is safe to call again.
 
 [[autodoc]] errors.SubmissionUnknownError
 
+[[autodoc]] errors.DatabaseUnavailableError
+
 ## Timeouts
 
 [[autodoc]] errors.NestTimeoutError

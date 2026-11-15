@@ -8,7 +8,8 @@ Credentials stay in files or your platform's secret store, never in the reposito
 
 Every entry point reads settings through `nest.config`. The Controller validates the
 whole environment before it starts listening and reports **every** problem at once,
-each naming the variable to change, then exits with status 2:
+each naming the variable to change, then exits with status 2 (status 3 means a
+configured database is unreachable or not migrated):
 
 ```text
 ERROR nest.controller pid=7 request_id=- Invalid Nest configuration:
@@ -142,6 +143,31 @@ Mode B needs one host-key source and one key source; set only one of each pair.
 Prefer files or your platform's secret store for the key. An inline key is
 visible to anyone who can inspect the process or container environment.
 
+### Database
+
+PostgreSQL persistence is opt-in. Without `NEST_DATABASE_URL` the Controller is
+stateless. With it, the Controller verifies the database and its schema before
+serving and exits with status 3 if either check fails; it never falls back to
+running without the database. See [Store Controller records in PostgreSQL](database)
+for TLS, pooling, migrations, and backups.
+
+| Variable | Default | Behavior |
+| --- | --- | --- |
+| `NEST_DATABASE_URL` | Unset (stateless) | Externally managed PostgreSQL, such as `postgresql://nest@db.example.internal:5432/nest`. Must name the host and database. A secret: its password and query string are always redacted. |
+| `NEST_DATABASE_REQUIRED` | `false` | `true` makes an unset `NEST_DATABASE_URL` a configuration error. |
+| `NEST_DATABASE_PASSWORD_FILE` | Unset | Absolute path to a file holding the password. Do not also put a password in the URL. |
+| `NEST_DATABASE_SSLMODE` | URL's `sslmode`, else libpq's `prefer` | One of `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`. Use `verify-full` for remote databases. `verify-full` when only `NEST_DATABASE_SSLROOTCERT` is set. |
+| `NEST_DATABASE_SSLROOTCERT` | Unset | Absolute path to the CA bundle that verifies the server certificate. |
+| `NEST_DATABASE_SSLCERT`, `NEST_DATABASE_SSLKEY` | Unset | Client certificate and key, set together. The key must not be readable by group or others. |
+| `NEST_DATABASE_POOL_MIN_SIZE` | `1` | Connections kept open. `0` or more. |
+| `NEST_DATABASE_POOL_MAX_SIZE` | `10` | Most connections the pool opens. At least 1 and at least the minimum. |
+| `NEST_DATABASE_CONNECT_TIMEOUT` | `10` | Seconds to establish each connection. |
+| `NEST_DATABASE_POOL_TIMEOUT` | `30` | Seconds an RPC waits for a free connection before failing with `database_unavailable`. |
+
+Settings may not appear both in the URL query and as a variable, and
+`NEST_DATABASE_*` settings without `NEST_DATABASE_URL` are rejected rather than
+ignored. `nest-db` reads the same variables.
+
 ### Reserved settings
 
 These names are part of the contract for features that do not exist yet. The
@@ -149,7 +175,6 @@ Controller refuses to start when one is set, rather than ignoring it:
 
 | Variable | Planned use |
 | --- | --- |
-| `NEST_DATABASE_URL` | Job and audit database. Its password and query string are always redacted. |
 | `NEST_AUTH_TOKEN_FILE` | Caller authentication. |
 | `NEST_RETENTION_DAYS` | Retention of job records and staged files. |
 | `NEST_INTEGRATIONS` | Optional integrations, comma-separated. |
