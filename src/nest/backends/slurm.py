@@ -278,6 +278,7 @@ class SlurmBackend:
         account: str | None = None,
         partition: str | None = None,
         time: str | None = None,
+        inherit_time: bool = True,
         script_args: tuple[str, ...] = (),
     ) -> int:
         """
@@ -300,6 +301,9 @@ class SlurmBackend:
                 partition when unset or empty.
             time (`str`, *optional*): Time limit override. Uses the configured limit
                 when unset or empty. Omits the flag if neither has a value.
+            inherit_time (`bool`, *optional*, defaults to `True`): Whether an unset
+                `time` falls back to the configured limit. When `False`, an unset
+                `time` omits the flag, so the script's `#SBATCH --time` applies.
             script_args (`tuple[str, ...]`, *optional*, defaults to `()`): Arguments
                 appended after the script path.
 
@@ -338,7 +342,7 @@ class SlurmBackend:
         if cpu > 0:
             args.append(f"--cpus-per-task={cpu}")
 
-        time_limit = time or self.config.time
+        time_limit = time or (self.config.time if inherit_time else None)
 
         if time_limit:
             args.append(f"--time={time_limit}")
@@ -851,6 +855,9 @@ class SlurmBackend:
         """
         Submits the environment build script for a staged environment directory.
 
+        Omits `--time`, so the build keeps the script's own limit (10 minutes in
+        `scripts/environment-smoke.sbatch`) instead of the configured job limit.
+
         Args:
             env_dir (`str`): Directory under `worker_workdir/environments` whose name
                 is a 64-character lowercase hexadecimal environment ID.
@@ -886,6 +893,8 @@ class SlurmBackend:
             script="project/scripts/environment-smoke.sbatch",
             gpu=gpu,
             cpu=cpu,
+            # The build script sets its own limit; the worker job default is often too short.
+            inherit_time=False,
             script_args=(env_id, self.config.worker_workdir),
         )
 
