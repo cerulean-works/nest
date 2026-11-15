@@ -17,6 +17,7 @@ from fake_hpc import FakeHpc
 from test_controller import controller_at_free_port
 
 import nest
+from nest.controller import MAX_STATUS_DETAILS_BYTES, _encoded_size
 from nest.errors import (
     ERROR_KIND_METADATA,
     ExecutionTimeoutError,
@@ -652,6 +653,36 @@ def test_rejected_submit_job_rpc_keeps_failed_precondition(slurm_controller, hpc
     assert error.code() == grpc.StatusCode.FAILED_PRECONDITION
     assert _metadata(error)[ERROR_KIND_METADATA] == "remote_command_error"
     assert hpc.calls("sbatch") == []
+
+
+def test_huge_remote_stderr_keeps_status_code(slurm_controller, hpc, tmp_path):
+    """Unbounded stderr must not push the status trailer past gRPC's trailer size limits."""
+    workdir = tmp_path / "batch"
+    workdir.mkdir()
+    (workdir / "job.sbatch").write_text("#!/bin/bash\nexit 0\n")
+    # Non-ASCII bytes are percent-encoded threefold in the grpc-message trailer.
+    (hpc.bin / "sbatch").write_text(
+        "#!/bin/sh\n"
+        "echo 'sbatch: warning: start of the noise' >&2\n"
+        "i=0\n"
+        "while [ $i -lt 2000 ]; do echo 'ééééééééé noise' >&2; i=$((i + 1)); done\n"
+        "echo 'sbatch: error: Batch job submission failed' >&2\n"
+        "exit 1\n"
+    )
+
+    with pytest.raises(grpc.RpcError) as caught:
+        slurm_controller.SubmitJob(
+            execution_pb2.SubmitJobRequest(workdir=str(workdir), script="job.sbatch"),
+            timeout=30,
+        )
+    error = cast(grpc.Call, caught.value)
+    details = error.details() or ""
+    assert error.code() == grpc.StatusCode.FAILED_PRECONDITION
+    assert _metadata(error)[ERROR_KIND_METADATA] == "remote_command_error"
+    assert _encoded_size(details) <= MAX_STATUS_DETAILS_BYTES
+    assert details.startswith("Remote command failed:\n")
+    assert "characters omitted; see the Controller log" in details
+    assert details.endswith("sbatch: error: Batch job submission failed")
 
 
 def test_managed_ssh_profile_runs_without_any_ssh_config(start_slurm_controller, hpc, tmp_path):

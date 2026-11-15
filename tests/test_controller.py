@@ -11,6 +11,7 @@ from contextlib import contextmanager
 import cloudpickle
 import grpc
 
+from nest.controller import MAX_STATUS_DETAILS_BYTES, _encoded_size, _status_details
 from nest.proto import execution_pb2, execution_pb2_grpc
 
 
@@ -163,6 +164,37 @@ class ControllerTests(unittest.TestCase):
             NEST_SLURM_WORKDIR="/home/test/nest",
         ) as (process, _):
             self.assertIsNone(process.poll())
+
+
+class StatusDetailsTest(unittest.TestCase):
+    def test_short_message_is_unchanged(self):
+        message = "Remote command failed:\nsbatch: error: Invalid account"
+        self.assertEqual(_status_details(message), message)
+
+    def test_long_message_keeps_head_and_tail_within_limit(self):
+        for filler in ("x", "é", "日本"):
+            with self.subTest(filler=filler):
+                message = "Remote command failed:\n" + filler * 30_000 + "\nthe actual cause"
+                details = _status_details(message)
+                self.assertLessEqual(_encoded_size(details), MAX_STATUS_DETAILS_BYTES)
+                self.assertTrue(details.startswith("Remote command failed:\n"))
+                self.assertTrue(details.endswith("\nthe actual cause"))
+                self.assertRegex(
+                    details, r"\[\.\.\. \d+ characters omitted; see the Controller log"
+                )
+
+    def test_omitted_count_matches_dropped_characters(self):
+        message = "a" * 5_000 + "é" * 5_000
+        details = _status_details(message)
+        omitted = int(details.split("[... ", 1)[1].split(" characters", 1)[0])
+        marker = f"\n[... {omitted} characters omitted; see the Controller log ...]\n"
+        head, tail = details.split(marker)
+        self.assertEqual(message, head + message[len(head) : len(head) + omitted] + tail)
+
+    def test_encoded_size_counts_percent_encoded_bytes(self):
+        self.assertEqual(_encoded_size("ab"), 2)
+        self.assertEqual(_encoded_size("%\n"), 6)
+        self.assertEqual(_encoded_size("é"), 6)
 
 
 if __name__ == "__main__":
