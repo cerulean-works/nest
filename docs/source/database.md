@@ -27,6 +27,7 @@ The database is **externally managed** and **opt-in**:
 | --- | --- |
 | `provider_profiles` | One row per Provider Profile (login nodes, SSH mode and user, Slurm defaults). The environment stays the source of truth: the Controller rewrites these rows at every start, marks the default, and marks profiles that were removed from the environment `active = false`. Rows are never deleted, so job records keep their provider. |
 | `jobs` | One row per `Execute` (kind `execution`) or `SubmitJob` (kind `batch`) request that reached Slurm: its Execution ID, provider, Slurm job ID, request ID, script and directories, resources, Nest's `status`, the last observed Slurm state, and the error kind and message on failure. |
+| `email_outbox` | Messages queued for optional email delivery and their delivery status (see [Send email with SMTP](email)). Empty unless `NEST_EMAIL_ENABLED=true`. Each row keeps its recipient address; the body is cleared once the message is sent. |
 | `schema_migrations` | The applied schema versions and their checksums (see [Migrations](#migrations)). |
 
 Every record has an `execution_id`, a UUID written as 32 lowercase hexadecimal

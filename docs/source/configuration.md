@@ -18,7 +18,8 @@ ERROR nest.controller pid=7 request_id=- Invalid Nest configuration:
 ```
 
 An empty value means unset. Error messages never repeat secret values
-(`NEST_SSH_PRIVATE_KEY`, the password and query of `NEST_DATABASE_URL`). The
+(`NEST_SSH_PRIVATE_KEY`, `NEST_SMTP_PASSWORD`, the password and query of
+`NEST_DATABASE_URL`). The
 Controller logs a redacted `Controller configuration {...}` line at startup, and
 its log handler masks an inline private key if any message ever contains it.
 
@@ -54,7 +55,7 @@ Tailnet name. The SDK no longer assumes any Tailnet: set
 | `NEST_POLL_INTERVAL` | `5` | Seconds between Slurm status queries. |
 | `NEST_TLS_CERT_FILE` | Unset | Absolute path to the PEM certificate chain. Set with `NEST_TLS_KEY_FILE` to serve TLS. |
 | `NEST_TLS_KEY_FILE` | Unset | Absolute path to the PEM private key. Both TLS files, or neither. |
-| `NEST_PUBLIC_URL` | Unset | Advertised `grpc://`, `grpcs://`, `http://` or `https://` URL, logged at startup. Must not contain credentials or a query string. |
+| `NEST_PUBLIC_URL` | Unset | Advertised `grpc://`, `grpcs://`, `http://` or `https://` URL, logged at startup. Must not contain credentials or a query string. With email enabled it is also the base of links in messages, so it is required and must be `https://` (`http://` only for `localhost`). |
 
 The four timing settings accept positive numbers, including fractions.
 
@@ -167,6 +168,33 @@ for TLS, pooling, migrations, and backups.
 Settings may not appear both in the URL query and as a variable, and
 `NEST_DATABASE_*` settings without `NEST_DATABASE_URL` are rejected rather than
 ignored. `nest-db` reads the same variables.
+
+### Email delivery
+
+Email is opt-in. Unless `NEST_EMAIL_ENABLED=true`, none of the other settings below
+are read or validated, and the Controller never contacts an SMTP server. When it is
+enabled, every required setting is checked before the Controller starts, and an
+insecure transport is never chosen silently. See [Send email with SMTP](email) for
+TLS, credential rotation, the outbox and retries.
+
+| Variable | Default | Behavior |
+| --- | --- | --- |
+| `NEST_EMAIL_ENABLED` | `false` | `true` turns on email delivery. Requires `NEST_DATABASE_URL`, `NEST_EMAIL_FROM`, `NEST_PUBLIC_URL` and `NEST_SMTP_HOST`. |
+| `NEST_EMAIL_PROVIDER` | `smtp` | Transport. Only `smtp` is supported. |
+| `NEST_EMAIL_FROM` | Unset | Verified sender, such as `Nest <nest@example.com>`: the `From` header and envelope sender of every message. Exactly one address. |
+| `NEST_SMTP_HOST` | Unset | SMTP server host name. Its certificate must be valid for this name. |
+| `NEST_SMTP_PORT` | `587` (`465` with implicit TLS) | SMTP server port. |
+| `NEST_SMTP_STARTTLS` | `true` | Upgrade the connection with STARTTLS, failing if the server does not offer it. |
+| `NEST_SMTP_IMPLICIT_TLS` | `false` | Use TLS from the first byte instead (SMTPS). Only one of the two TLS settings may be `true`; neither is an error, because Nest never sends mail unencrypted. |
+| `NEST_SMTP_USERNAME` | Unset | Login name. Unset for a relay that needs no authentication. Needs a password. |
+| `NEST_SMTP_PASSWORD_FILE` | Unset | Absolute path to a file holding the password, such as a mounted secret. Re-read for each connection, so rotation needs no restart. Must not be empty. |
+| `NEST_SMTP_PASSWORD` | Unset | The password inline. A secret: never logged or echoed. Set only one of the two password settings. |
+| `NEST_SMTP_CA_FILE` | Unset (system roots) | Absolute path to a PEM CA bundle for a relay with a private CA. Certificate verification is always on. |
+| `NEST_SMTP_TIMEOUT` | `30` | Seconds for the connection and each SMTP command. |
+| `NEST_EMAIL_MAX_ATTEMPTS` | `5` | Delivery attempts per message, 1 to 100. |
+| `NEST_EMAIL_RETRY_DELAY` | `60` | Seconds before the first retry after a transient failure; doubles per attempt. |
+| `NEST_EMAIL_RETRY_MAX_DELAY` | `3600` | Longest wait between attempts. At least `NEST_EMAIL_RETRY_DELAY`. |
+| `NEST_EMAIL_POLL_INTERVAL` | `15` | Seconds between outbox scans. Newly queued messages are sent without waiting. |
 
 ### Reserved settings
 

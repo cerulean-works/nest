@@ -27,6 +27,8 @@ guide:
         title: Run a local Controller
       - local: database
         title: Store Controller records in PostgreSQL
+      - local: email
+        title: Send email with SMTP
       - local: deployment-architecture
         title: Deployment validation and roadmap
   - title: Contributing
@@ -50,6 +52,8 @@ reference:
         title: Slurm backend
       - local: api/db
         title: Database and migrations
+      - local: api/mail
+        title: Email delivery
       - local: api/runtime
         title: Executor and workers
   - title: Operations

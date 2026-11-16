@@ -99,7 +99,9 @@ with_database docker compose up -d --no-build --pull never --wait --wait-timeout
 test "$(running)" = "controller postgres "
 grep -q 'Database connected' <<<"$(docker compose logs --no-color controller)"
 grep -q 'Schema is current' <<<"$(docker compose exec -T controller nest-db verify)"
-test "$(psql 'SELECT count(*) FROM schema_migrations')" = 1
+# Every packaged migration is applied, however many the chain holds.
+migrations=(src/nest/db/migrations/[0-9][0-9][0-9][0-9]_*.sql)
+test "$(psql 'SELECT count(*) FROM schema_migrations')" = "${#migrations[@]}"
 
 # 4. Independent lifecycles: stopping or replacing one leaves the other running.
 controller_id=$(docker compose ps --quiet controller)

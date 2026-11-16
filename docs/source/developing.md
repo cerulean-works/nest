@@ -46,6 +46,12 @@ Two groups need more than one server:
 - **The backup and restore test** needs `pg_dump` and `pg_restore` at least as new
   as the server, on `PATH` or in `NEST_TEST_PG_BIN`.
 
+- **The email tests** (`tests/test_email.py`) need `openssl` on `PATH` to create
+  throwaway certificates for the in-process fake SMTP server in
+  `tests/fake_smtp.py`; they never contact a real mail provider. Their outbox and
+  Controller delivery cases use `NEST_TEST_DATABASE_URL`. See
+  [Send email with SMTP](email#test-email-delivery).
+
 CI sets `NEST_TEST_DATABASE_REQUIRED=1`, which turns all of these skips into
 failures.
 

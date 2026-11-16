@@ -40,6 +40,10 @@ except ConfigError as error:
 
 [[autodoc]] config.DatabaseConfig
 
+[[autodoc]] config.EmailConfig
+
+[[autodoc]] config.SMTPConfig
+
 [[autodoc]] config.ClientConfig
 
 ## Secrets
