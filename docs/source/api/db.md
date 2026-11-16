@@ -62,16 +62,15 @@ from datetime import UTC, datetime, timedelta
 from nest.db import IdentityStore, hash_token
 
 identities = IdentityStore(database)
-user = identities.find_user(issuer="https://accounts.google.com", subject=claims["sub"])
-if user is None:
-    user = identities.create_user(display_name=claims["name"], email=claims["email"])
-identities.link_identity(
-    user.id,
+# Atomic: concurrent first sign-ins with the same subject create one User.
+user, identity, created = identities.sign_in(
     issuer="https://accounts.google.com",
     subject=claims["sub"],
     email=claims["email"],
     email_verified=claims["email_verified"],
+    display_name=claims["name"],
 )
+# Refused with UserNotActiveError if the User is disabled.
 identities.create_session(
     user.id,
     kind="browser",
@@ -87,6 +86,8 @@ identities.create_session(
 [[autodoc]] db.Identity
 
 [[autodoc]] db.Session
+
+[[autodoc]] db.UserNotActiveError
 
 [[autodoc]] db.hash_token
 

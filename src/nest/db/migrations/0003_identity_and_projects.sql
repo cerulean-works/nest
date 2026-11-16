@@ -228,7 +228,11 @@ CREATE TABLE project_email_invitations (
     revoked_at                timestamptz,
     revoked_by_user_id        uuid REFERENCES users (id) ON DELETE RESTRICT,
     CHECK (expires_at > created_at),
-    CHECK ((status = 'accepted') = (accepted_at IS NOT NULL AND accepted_by_user_id IS NOT NULL)),
+    -- Each completion is a timestamp/actor pair set together, and only in the
+    -- status it completes, so no partial or contradictory state can be stored.
+    CHECK ((accepted_at IS NULL) = (accepted_by_user_id IS NULL)),
+    CHECK ((revoked_at IS NULL) = (revoked_by_user_id IS NULL)),
+    CHECK ((status = 'accepted') = (accepted_at IS NOT NULL)),
     CHECK ((status = 'declined') = (declined_at IS NOT NULL)),
     CHECK ((status = 'revoked') = (revoked_at IS NOT NULL))
 );

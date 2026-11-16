@@ -458,13 +458,14 @@ class ProjectStore:
         return row["role"] if row else None
 
     def members(self, project_id: UUID | str) -> list[Membership]:
-        """Returns the Project's active members, Owner first."""
+        """Returns the Project's active members, Owner first. Empty for a deleted Project."""
         pid = as_uuid(project_id, "project_id")
         with transaction(self.database, None, "list Project members") as cursor:
             rows = cursor.execute(
                 f"SELECT {_MEMBERSHIP_COLUMNS} FROM project_memberships WHERE project_id = %s "
+                "AND EXISTS (SELECT 1 FROM projects WHERE id = %s AND deleted_at IS NULL) "
                 "ORDER BY array_position(%s::text[], role), created_at, user_id",
-                (pid, list(PROJECT_ROLES)),
+                (pid, pid, list(PROJECT_ROLES)),
             ).fetchall()
         return [Membership(**row) for row in rows]
 

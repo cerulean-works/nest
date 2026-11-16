@@ -37,6 +37,10 @@ class IdentityConflictError(Exception):
     """The external identity is already linked to a different User."""
 
 
+class UserNotActiveError(Exception):
+    """The User is disabled, so no new session can be created for them."""
+
+
 def hash_token(token: str) -> bytes:
     """Returns the SHA-256 digest stored for a session or invitation secret."""
     return hashlib.sha256(token.encode()).digest()
@@ -192,6 +196,84 @@ class IdentityStore:
                 raise IdentityConflictError("The identity is already linked to another User")
         return Identity(**row)
 
+    def sign_in(
+        self,
+        *,
+        issuer: str,
+        subject: str,
+        email: str | None = None,
+        email_verified: bool = False,
+        display_name: str | None = None,
+        conn: psycopg.Connection | None = None,
+    ) -> tuple[User, Identity, bool]:
+        """
+        Returns the User for an external identity, creating both on first sign-in.
+
+        This is the sign-in path: it is atomic, so concurrent first sign-ins with
+        the same (issuer, subject) create exactly one User and leave no orphan.
+        For an existing identity it refreshes the email claims and
+        `last_login_at`, as [`db.IdentityStore.link_identity`] does. It does not
+        check the User's status; [`db.IdentityStore.create_session`] refuses a
+        disabled User.
+
+        Args:
+            issuer (`str`): OIDC issuer.
+            subject (`str`): The issuer's stable subject ID.
+            email (`str`, *optional*): Email claim.
+            email_verified (`bool`, *optional*): Whether the claim is verified.
+            display_name (`str`, *optional*): Name for a newly created User.
+            conn (`psycopg.Connection`, *optional*): Transaction to join.
+
+        Returns:
+            `tuple[User, Identity, bool]`: The User, the identity, and whether the
+            User was created by this call.
+        """
+        if not issuer or not subject:
+            raise ValueError("issuer and subject are required")
+        with transaction(self.database, conn, "sign in") as cursor:
+            identity = cursor.execute(
+                "UPDATE user_identities SET email = %s, email_verified = %s, "
+                "last_login_at = now() WHERE issuer = %s AND subject = %s "
+                f"RETURNING {_IDENTITY_COLUMNS}",
+                (email, email_verified, issuer, subject),
+            ).fetchone()
+            created = False
+            if identity is None:
+                # Create the User and identity inside a savepoint. A concurrent
+                # first sign-in that wins the unique (issuer, subject) index makes
+                # this insert do nothing; the savepoint is then rolled back so no
+                # orphan User remains, and the winner's identity is used.
+                with cursor.connection.transaction() as savepoint:
+                    user = cursor.execute(
+                        "INSERT INTO users (display_name, email) VALUES (%s, %s) RETURNING id",
+                        (display_name, email),
+                    ).fetchone()
+                    assert user is not None
+                    identity = cursor.execute(
+                        "INSERT INTO user_identities (user_id, issuer, subject, email, "
+                        "email_verified, last_login_at) VALUES (%s, %s, %s, %s, %s, now()) "
+                        f"ON CONFLICT (issuer, subject) DO NOTHING RETURNING {_IDENTITY_COLUMNS}",
+                        (user["id"], issuer, subject, email, email_verified),
+                    ).fetchone()
+                    if identity is None:
+                        raise psycopg.Rollback(savepoint)
+                    created = True
+                if identity is None:
+                    identity = cursor.execute(
+                        "UPDATE user_identities SET email = %s, email_verified = %s, "
+                        "last_login_at = now() WHERE issuer = %s AND subject = %s "
+                        f"RETURNING {_IDENTITY_COLUMNS}",
+                        (email, email_verified, issuer, subject),
+                    ).fetchone()
+                    assert identity is not None
+            row = cursor.execute(
+                f"SELECT {_USER_COLUMNS} FROM users WHERE id = %s", (identity["user_id"],)
+            ).fetchone()
+        assert row is not None
+        if created:
+            logger.info("User created at first sign-in user_id=%s", row["id"])
+        return User(**row), Identity(**identity), created
+
     def find_user(self, *, issuer: str, subject: str) -> User | None:
         """Returns the User linked to an external identity, or `None`."""
         with transaction(self.database, None, "find a User by identity") as cursor:
@@ -263,6 +345,10 @@ class IdentityStore:
             token_hash (`bytes`): [`db.hash_token`] of the session secret.
             expires_at (`datetime`): Timezone-aware expiry.
             conn (`psycopg.Connection`, *optional*): Transaction to join.
+
+        Raises:
+            [`db.UserNotActiveError`]: If the User is disabled.
+            `LookupError`: If the User does not exist.
         """
         uid = as_uuid(user_id, "user_id")
         if kind not in SESSION_KINDS:
@@ -272,6 +358,16 @@ class IdentityStore:
         if expires_at.tzinfo is None:
             raise ValueError("expires_at must be timezone-aware")
         with transaction(self.database, conn, "create a session") as cursor:
+            # FOR SHARE conflicts with set_user_status()'s UPDATE, so a disable
+            # either commits first and is seen here, or waits for this session to
+            # commit and then revokes it.
+            user = cursor.execute(
+                "SELECT status FROM users WHERE id = %s FOR SHARE", (uid,)
+            ).fetchone()
+            if user is None:
+                raise LookupError("The User does not exist")
+            if user["status"] != "active":
+                raise UserNotActiveError("The User is disabled")
             row = cursor.execute(
                 "INSERT INTO user_sessions (user_id, kind, token_hash, expires_at) "
                 f"VALUES (%s, %s, %s, %s) RETURNING {_SESSION_COLUMNS}",

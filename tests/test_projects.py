@@ -10,6 +10,7 @@ import threading
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import psycopg
 from postgres_fixture import PostgresTestCase, connect
@@ -27,6 +28,7 @@ from nest.db import (
     Project,
     ProjectNotFoundError,
     ProjectStore,
+    UserNotActiveError,
     UserNotFoundError,
     hash_token,
     load_migrations,
@@ -408,6 +410,8 @@ class OwnershipTests(_Base):
         for extra in members[3:]:
             self.projects.add_member(pid, extra, "member")
 
+        refused = (OwnerRuleError, MemberNotFoundError, DuplicateMemberError)
+
         def churn(seed: int):
             outcomes = []
             for step in range(6):
@@ -423,7 +427,7 @@ class OwnershipTests(_Base):
                             pid, actor_user_id=current.owner_user_id, new_owner_user_id=target
                         )
                     outcomes.append("ok")
-                except OwnerRuleError, MemberNotFoundError, DuplicateMemberError:
+                except refused:
                     outcomes.append("refused")
             return outcomes
 
@@ -512,6 +516,9 @@ class OwnershipTests(_Base):
         for user in (self.alice, self.bob):
             self.assertIsNone(self.projects.role_of(pid, user))
             self.assertEqual(self.projects.projects_for_user(user), [])
+        # The membership rows remain for history, but nobody is an active member.
+        self.assertEqual(self.projects.members(pid), [])
+        self.assertEqual(len(self.owners(pid)), 1)
         with self.assertRaises(ProjectNotFoundError):
             self.projects.add_member(pid, self.user(), "member")
         with self.assertRaises(ProjectNotFoundError):
@@ -644,6 +651,45 @@ class IdentityTests(_Base):
         count = self.conn.execute("SELECT count(*) FROM user_identities").fetchone()
         self.assertEqual(count, (1,))
 
+    def test_first_sign_in_creates_one_user_and_later_sign_ins_reuse_it(self):
+        user, identity, created = self.identities.sign_in(
+            issuer=GOOGLE,
+            subject="42",
+            email="a@example.com",
+            email_verified=True,
+            display_name="Alice",
+        )
+        self.assertTrue(created)
+        self.assertEqual((identity.user_id, user.display_name), (user.id, "Alice"))
+        again, identity, created = self.identities.sign_in(
+            issuer=GOOGLE, subject="42", email="a.new@example.com", email_verified=True
+        )
+        self.assertFalse(created)
+        self.assertEqual(again.id, user.id)
+        self.assertEqual(identity.email, "a.new@example.com")
+        self.assertEqual(self.conn.execute("SELECT count(*) FROM users").fetchone(), (1,))
+
+    def test_concurrent_first_sign_ins_create_one_user_and_no_orphans(self):
+        results = self.run_concurrently(
+            *[
+                lambda: self.identities.sign_in(issuer=GOOGLE, subject="bootstrap-admin")
+                for _ in range(6)
+            ]
+        )
+        self.assertFalse([r for r in results if isinstance(r, Exception)], results)
+        user_ids = {r[0].id for r in results}  # type: ignore[index]
+        self.assertEqual(len(user_ids), 1)
+        self.assertEqual(sum(r[2] for r in results), 1)  # type: ignore[index]
+        self.assertEqual(self.conn.execute("SELECT count(*) FROM users").fetchone(), (1,))
+        self.assertEqual(self.conn.execute("SELECT count(*) FROM user_identities").fetchone(), (1,))
+
+    def test_sign_in_joins_the_callers_transaction(self):
+        with self.db.connection() as conn:
+            self.identities.sign_in(issuer=GOOGLE, subject="rolled-back", conn=conn)
+            conn.rollback()
+        self.assertIsNone(self.identities.find_user(issuer=GOOGLE, subject="rolled-back"))
+        self.assertEqual(self.conn.execute("SELECT count(*) FROM users").fetchone(), (0,))
+
     def test_sessions_are_persisted_and_revocable(self):
         alice = self.user()
         token = hash_token("browser-secret")
@@ -700,6 +746,76 @@ class IdentityTests(_Base):
         self.assertIsNone(self.identities.active_session(late))
         self.identities.set_user_status(alice, "active")
         self.assertIsNone(self.identities.active_session(late))
+
+    def test_disabled_or_missing_user_gets_no_session(self):
+        alice = self.user()
+        self.identities.set_user_status(alice, "disabled")
+        with self.assertRaises(UserNotActiveError):
+            self.identities.create_session(
+                alice, kind="browser", token_hash=hash_token("x"), expires_at=in_hours(1)
+            )
+        with self.assertRaises(LookupError):
+            self.identities.create_session(
+                uuid.uuid4(), kind="browser", token_hash=hash_token("y"), expires_at=in_hours(1)
+            )
+        self.identities.set_user_status(alice, "active")
+        count = self.conn.execute("SELECT count(*) FROM user_sessions").fetchone()
+        self.assertEqual(count, (0,))
+
+    def test_session_created_during_a_disable_is_refused(self):
+        """A disable that commits while a session is being created wins."""
+        alice = self.user()
+        token = hash_token("racing-create")
+        with self.db.connection() as disabling:
+            self.identities.set_user_status(alice, "disabled", conn=disabling)
+            result: list[object] = []
+            creator = threading.Thread(
+                target=lambda: result.append(
+                    self._try(
+                        lambda: self.identities.create_session(
+                            alice, kind="browser", token_hash=token, expires_at=in_hours(1)
+                        )
+                    )
+                )
+            )
+            creator.start()
+            time.sleep(0.5)
+            self.assertTrue(creator.is_alive(), "create_session should wait for the disable")
+            disabling.commit()
+        creator.join(timeout=30)
+        self.assertIsInstance(result[0], UserNotActiveError)
+        self.identities.set_user_status(alice, "active")
+        self.assertIsNone(self.identities.active_session(token))
+
+    def test_disable_during_session_creation_revokes_the_new_session(self):
+        """A session committed while a disable waits is revoked by that disable."""
+        alice = self.user()
+        token = hash_token("racing-disable")
+        with self.db.connection() as creating:
+            self.identities.create_session(
+                alice, kind="cli", token_hash=token, expires_at=in_hours(1), conn=creating
+            )
+            disabler = threading.Thread(
+                target=lambda: self.identities.set_user_status(alice, "disabled")
+            )
+            disabler.start()
+            time.sleep(0.5)
+            self.assertTrue(disabler.is_alive(), "the disable should wait for the session")
+            creating.commit()
+        disabler.join(timeout=30)
+        self.identities.set_user_status(alice, "active")
+        self.assertIsNone(self.identities.active_session(token))
+        reason = self.conn.execute(
+            "SELECT revoked_reason FROM user_sessions WHERE token_hash = %s", (token,)
+        ).fetchone()
+        self.assertEqual(reason, ("user_disabled",))
+
+    @staticmethod
+    def _try(call):
+        try:
+            return call()
+        except Exception as exc:  # noqa: BLE001 - returned to the test to assert on
+            return exc
 
     def test_platform_and_organization_roles_are_persisted(self):
         alice, bob = self.user(), self.user()
@@ -816,6 +932,52 @@ class InvitationSchemaTests(_Base):
                 "UPDATE project_email_invitations SET role = 'admin' WHERE id = %s",
                 (invitation,),
             )
+
+    def test_invitation_partial_completion_states_are_refused(self):
+        invitee = self.user()
+        partial_states: dict[str, dict[str, Any]] = {
+            "pending with accepted_at only": {"accepted_at": in_hours(0)},
+            "pending with accepted_by only": {"accepted_by_user_id": invitee},
+            "pending with both accepted fields": {
+                "accepted_at": in_hours(0),
+                "accepted_by_user_id": invitee,
+            },
+            "accepted without accepted_by": {"status": "accepted", "accepted_at": in_hours(0)},
+            "accepted without accepted_at": {
+                "status": "accepted",
+                "accepted_by_user_id": invitee,
+            },
+            "pending with revoked_by only": {"revoked_by_user_id": self.owner},
+            "pending with revoked_at only": {"revoked_at": in_hours(0)},
+            "revoked without revoked_by": {"status": "revoked", "revoked_at": in_hours(0)},
+            "revoked without revoked_at": {"status": "revoked", "revoked_by_user_id": self.owner},
+            "declined with accepted fields": {
+                "status": "declined",
+                "declined_at": in_hours(0),
+                "accepted_at": in_hours(0),
+                "accepted_by_user_id": invitee,
+            },
+            "accepted with revoked fields": {
+                "status": "accepted",
+                "accepted_at": in_hours(0),
+                "accepted_by_user_id": invitee,
+                "revoked_at": in_hours(0),
+                "revoked_by_user_id": self.owner,
+            },
+            "expired with declined_at": {"status": "expired", "declined_at": in_hours(0)},
+        }
+        for name, columns in partial_states.items():
+            with self.subTest(name), self.assertRaises(psycopg.errors.CheckViolation):
+                self.invite(email=f"{uuid.uuid4().hex[:8]}@example.org", **columns)
+        # Each complete state is accepted.
+        complete_states: tuple[dict[str, Any], ...] = (
+            {"status": "accepted", "accepted_at": in_hours(0), "accepted_by_user_id": invitee},
+            {"status": "declined", "declined_at": in_hours(0)},
+            {"status": "revoked", "revoked_at": in_hours(0), "revoked_by_user_id": self.owner},
+            {"status": "expired"},
+        )
+        for columns in complete_states:
+            self.invite(email=f"{uuid.uuid4().hex[:8]}@example.org", **columns)
 
     def test_invitation_rows_never_appear_in_database_errors(self):
         self.invite()

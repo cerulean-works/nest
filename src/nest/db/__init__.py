@@ -7,7 +7,15 @@ and refuses to serve when it is unreachable or out of date.
 """
 
 from .connection import Database, DatabaseError
-from .identity import Identity, IdentityConflictError, IdentityStore, Session, User, hash_token
+from .identity import (
+    Identity,
+    IdentityConflictError,
+    IdentityStore,
+    Session,
+    User,
+    UserNotActiveError,
+    hash_token,
+)
 from .migrate import (
     Migration,
     MigrationError,
@@ -58,6 +66,7 @@ __all__ = [
     "SchemaStatus",
     "Session",
     "User",
+    "UserNotActiveError",
     "UserNotFoundError",
     "hash_token",
     "load_migrations",
