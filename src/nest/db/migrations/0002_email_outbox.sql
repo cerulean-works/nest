@@ -38,6 +38,10 @@ CREATE TABLE email_outbox (
     max_attempts     integer NOT NULL CHECK (max_attempts BETWEEN 1 AND 100),
     next_attempt_at  timestamptz NOT NULL DEFAULT now(),
     locked_until     timestamptz,
+    -- Random token of the current claim. A worker records its result only while
+    -- the row still carries its token, so a worker whose lease expired cannot
+    -- overwrite the outcome of the worker that claimed the message after it.
+    claim_token      uuid,
     -- Last failure, without addresses or server text: an error class and SMTP
     -- reply code, such as 'SMTPConnectError code=421'.
     last_error       text,
@@ -47,6 +51,7 @@ CREATE TABLE email_outbox (
     updated_at       timestamptz NOT NULL DEFAULT now(),
     sent_at          timestamptz,
     CHECK ((status = 'sent') = (sent_at IS NOT NULL)),
+    CHECK ((status = 'sending') = (claim_token IS NOT NULL AND locked_until IS NOT NULL)),
     CHECK (status = 'sent' OR body_text IS NOT NULL)
 );
 

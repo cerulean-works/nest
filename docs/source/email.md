@@ -125,7 +125,7 @@ instead of a second one, so a retried request never sends twice.
 | Status | Meaning |
 | --- | --- |
 | `pending` | Waiting for its next attempt at `next_attempt_at`. |
-| `sending` | Claimed by a worker. A claim older than its lease is assumed interrupted and claimed again. |
+| `sending` | Claimed by a worker, with a random claim token. A claim older than its lease is assumed interrupted and claimed again with a new token. A worker records its result only while the row still carries its own token, so a worker that outlived its lease can never overwrite the newer claim's outcome; it logs `Email result not recorded` instead. |
 | `sent` | Accepted by the SMTP server. The stored body, which can hold an invitation link, is cleared. |
 | `failed` | Rejected permanently, or out of attempts. Not retried until queued again. |
 
@@ -141,9 +141,10 @@ Failures are classified:
 
 A `failed` message can be queued again with `EmailOutbox.retry`: its
 attempt count restarts. A `sent` message cannot be re-triggered, so resending never
-duplicates a delivered message. Delivery is at least once: if a Controller stops
-after the server accepted a message but before recording it, the message is sent
-again with the same `Message-ID` header, which lets mail clients recognize the copy.
+duplicates a delivered message. Delivery is at least once: if a Controller stops,
+or an attempt outlasts its lease, after the server accepted a message but before
+the result was recorded, the message is sent again with the same `Message-ID`
+header, which lets mail clients recognize the copy.
 
 ### Observe delivery
 
@@ -157,7 +158,12 @@ ERROR nest.mail ... Email delivery failed outbox_id=13 kind=project_invitation a
 ```
 
 The stored `last_error` has the same form: an error class and SMTP reply code,
-never the server's reply text, which can echo addresses. Delivery status returned
+never the server's reply text, which can echo addresses. Database errors from the
+outbox are reported the same way, as the error class, SQLSTATE and constraint,
+table and column names only (for example `CheckViolation sqlstate=23514
+constraint=email_outbox_kind_check table=email_outbox`): PostgreSQL's message text
+is dropped, because its `DETAIL` can quote the whole row, recipient and body
+included. Delivery status returned
 by `EmailOutbox.status` and `EmailOutbox.statuses` contains no recipient or
 content, so it can be shown to the Project administrators who manage the
 invitation; recipients and bodies are read only by the delivery worker. To watch
@@ -194,8 +200,9 @@ authentication and injected failures. `tests/test_email.py` covers:
   recipient failures classified by code, and no secrets in errors or logs;
 - outbox (PostgreSQL): idempotent and transactional queuing, delivery and body
   clearing, bounded backoff, permanent failures, re-triggering without duplicates,
-  concurrent workers, interrupted claims, and a stand-in invitation that stays
-  `PENDING` throughout;
+  concurrent workers, interrupted claims, stale workers fenced off by claim tokens
+  (late successes and failures after a reclaim), database errors that never echo
+  row contents, and a stand-in invitation that stays `PENDING` throughout;
 - the Controller process: starting with email disabled, rejecting invalid enabled
   settings, starting while SMTP is unreachable, and delivering a queued message.
 

@@ -346,9 +346,11 @@ class OutboxWorker:
         Attempts every due message once.
 
         Returns:
-            `dict[str, int]`: Counts of `sent`, `retrying` and `failed` messages.
+            `dict[str, int]`: Counts of `sent`, `retrying` and `failed` messages, and
+                `superseded` ones whose claim expired before the result was recorded
+                (another worker owns them now, so nothing was written).
         """
-        result = {"sent": 0, "retrying": 0, "failed": 0}
+        result = {"sent": 0, "retrying": 0, "failed": 0, "superseded": 0}
         for message in self.outbox.claim(self.batch_size):
             result[self._deliver(message)] += 1
         return result
@@ -366,6 +368,8 @@ class OutboxWorker:
         except Exception as exc:  # noqa: BLE001 - every failure is recorded, then retried
             error = classify(exc)
             status = self.outbox.mark_failed(message, error.description, permanent=error.permanent)
+            if status is None:
+                return "superseded"
             if status.status == "failed":
                 logger.error(
                     "Email delivery failed outbox_id=%s kind=%s attempt=%s/%s error=%s "
@@ -389,7 +393,10 @@ class OutboxWorker:
                 self.outbox.retry_wait(message.attempts),
             )
             return "retrying"
-        self.outbox.mark_sent(message)
+        if not self.outbox.mark_sent(message):
+            # Another worker owns the message now; at-least-once delivery means it
+            # may be sent again, with the same Message-ID.
+            return "superseded"
         logger.info(
             "Email sent outbox_id=%s kind=%s attempt=%s/%s",
             message.id,

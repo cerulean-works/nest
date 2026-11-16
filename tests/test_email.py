@@ -519,7 +519,9 @@ class OutboxTests(PostgresTestCase):
 
     def test_queued_message_is_delivered_and_its_body_cleared(self):
         invitation = self.invite()
-        self.assertEqual(self.worker.deliver_once(), {"sent": 1, "retrying": 0, "failed": 0})
+        self.assertEqual(
+            self.worker.deliver_once(), {"sent": 1, "retrying": 0, "failed": 0, "superseded": 0}
+        )
         [message] = self.server.messages
         self.assertEqual(message.recipients, [RECIPIENT])
         status = self.status()
@@ -529,7 +531,9 @@ class OutboxTests(PostgresTestCase):
         self.assertIsNone(row["body_text"])
         self.assertIn(row["message_id"], message.data)
         self.assertEqual(self.invitation_status(invitation), "PENDING")
-        self.assertEqual(self.worker.deliver_once(), {"sent": 0, "retrying": 0, "failed": 0})
+        self.assertEqual(
+            self.worker.deliver_once(), {"sent": 0, "retrying": 0, "failed": 0, "superseded": 0}
+        )
 
     def test_enqueue_is_idempotent(self):
         self.invite()
@@ -641,6 +645,111 @@ class OutboxTests(PostgresTestCase):
         self.assertEqual(self.outbox.claim(), [])
         status = self.status()
         self.assertEqual((status.status, status.last_error), ("failed", "DeliveryInterrupted"))
+
+    def expire_claims(self) -> None:
+        with connect(self.url) as conn:
+            conn.execute("UPDATE email_outbox SET locked_until = now() - interval '1 second'")
+
+    def test_an_expired_claim_cannot_overwrite_the_newer_claim(self):
+        self.invite()
+        [stale] = self.outbox.claim()
+        self.expire_claims()
+        [current] = self.outbox.claim()
+        self.assertNotEqual(stale.claim_token, current.claim_token)
+        self.assertEqual(current.attempts, 2)
+
+        # The stale worker finishes late, either way: nothing it reports is kept.
+        logs = CapturedLogs(self)
+        self.assertFalse(self.outbox.mark_sent(stale))
+        self.assertIsNone(self.outbox.mark_failed(stale, "SMTPConnectError", permanent=True))
+        row = self.row()
+        self.assertEqual((row["status"], str(row["claim_token"])), ("sending", current.claim_token))
+        self.assertIsNotNone(row["body_text"])
+        self.assertIn("Email result not recorded", logs.text)
+
+        # The current claim still records its own result, exactly once.
+        self.assertTrue(self.outbox.mark_sent(current))
+        self.assertFalse(self.outbox.mark_sent(current))
+        self.assertIsNone(self.outbox.mark_failed(current, "SMTPDataError", permanent=True))
+        status = self.status()
+        self.assertEqual((status.status, status.last_error), ("sent", None))
+        self.assertIsNone(self.row()["claim_token"])
+
+    def test_a_stale_failure_cannot_undo_a_newer_success(self):
+        self.invite()
+        [stale] = self.outbox.claim()
+        self.expire_claims()
+        [current] = self.outbox.claim()
+        self.assertTrue(self.outbox.mark_sent(current))
+        self.assertIsNone(self.outbox.mark_failed(stale, "SMTPDataError code=554", permanent=True))
+        self.assertEqual(self.status().status, "sent")
+        self.assertFalse(self.outbox.retry("invitation:1:send:1"))
+
+    def test_a_slow_worker_is_fenced_off_after_its_lease_expires(self):
+        self.invite()
+        test = self
+
+        class SlowSender:
+            """Sends, but only after the lease expired and another worker took over."""
+
+            def __init__(self):
+                self.taken_over = None
+
+            def send(self, message):
+                test.expire_claims()
+                [self.taken_over] = test.outbox.claim()
+                test.sender.send(message)
+
+        slow = SlowSender()
+        stale_worker = OutboxWorker(self.outbox, slow)
+        self.assertEqual(stale_worker.deliver_once()["superseded"], 1)
+        taken_over = slow.taken_over
+        assert taken_over is not None
+        row = self.row()
+        self.assertEqual(row["status"], "sending", "the newer claim still owns the message")
+        self.assertEqual(str(row["claim_token"]), taken_over.claim_token)
+        # The newer claim completes normally; the copy carries the same Message-ID.
+        self.assertTrue(self.outbox.mark_sent(taken_over))
+        self.assertEqual(self.status().status, "sent")
+        [first] = self.server.messages
+        self.assertIn(row["message_id"], first.data)
+
+    def test_database_errors_never_echo_row_contents(self):
+        # A CHECK violation's DETAIL is "Failing row contains (...)" with every
+        # column, including the recipient and a body holding an invitation token.
+        for conn_given in (False, True):
+            with self.subTest(conn_given=conn_given):
+                logs = CapturedLogs(self)
+                with self.assertRaises(DatabaseError) as caught:
+                    if conn_given:
+                        with self.db.connection() as conn:
+                            self.outbox.enqueue(
+                                message_key="invitation:3:send:1",
+                                kind="Not A Valid Kind",
+                                recipient=RECIPIENT,
+                                subject=f"Invite {TOKEN}",
+                                body_text=f"https://nest.example.com/#token={TOKEN}",
+                                conn=conn,
+                            )
+                    else:
+                        self.outbox.enqueue(
+                            message_key="invitation:3:send:1",
+                            kind="Not A Valid Kind",
+                            recipient=RECIPIENT,
+                            subject=f"Invite {TOKEN}",
+                            body_text=f"https://nest.example.com/#token={TOKEN}",
+                        )
+                error = caught.exception
+                message = str(error)
+                self.assertIn("CheckViolation sqlstate=23514", message)
+                self.assertIn("constraint=email_outbox_kind_check", message)
+                self.assertIn("table=email_outbox", message)
+                for private in (RECIPIENT, TOKEN, "Failing row"):
+                    self.assertNotIn(private, message)
+                    self.assertNotIn(private, logs.text)
+                self.assertIsNone(error.__cause__)
+                self.assertTrue(error.__suppress_context__)
+        self.assertIsNone(self.outbox.status("invitation:3:send:1"))
 
     def test_background_worker_delivers_after_wake(self):
         service = EmailService(email_config(), self.outbox, self.worker)

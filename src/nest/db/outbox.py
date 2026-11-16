@@ -84,6 +84,9 @@ class QueuedEmail:
         message_id (`str`): Stable `Message-ID` header shared by every attempt.
         attempts (`int`): This attempt's number, starting at 1.
         max_attempts (`int`): Attempts allowed.
+        claim_token (`str`): Identifies this claim. Results are recorded only while
+            the row still carries it, so a worker whose lease expired and whose
+            message was claimed again cannot overwrite the newer claim's outcome.
     """
 
     id: int
@@ -94,6 +97,7 @@ class QueuedEmail:
     message_id: str
     attempts: int
     max_attempts: int
+    claim_token: str
 
     def __repr__(self) -> str:
         return f"QueuedEmail(id={self.id}, kind={self.kind!r}, attempts={self.attempts})"
@@ -117,6 +121,26 @@ def normalize_recipient(address: str) -> str:
     except ValueError:
         raise ValueError("The recipient is not a single valid email address") from None
     return f"{parsed.username}@{parsed.domain.lower()}"
+
+
+def safe_diagnostic(exc: psycopg.Error) -> str:
+    """
+    Describes a database error by its class, SQLSTATE and constraint name only.
+
+    PostgreSQL's message and `DETAIL` can quote the offending row ("Failing row
+    contains (...)"), which for the outbox means a recipient address and a body
+    with an invitation link. Scrubbing that text cannot be made reliable, so none
+    of it is kept: only schema-defined identifiers are.
+    """
+    parts = [type(exc).__name__]
+    diag = exc.diag
+    if exc.sqlstate:
+        parts.append(f"sqlstate={exc.sqlstate}")
+    for field in ("constraint_name", "table_name", "column_name"):
+        value = getattr(diag, field, None)
+        if value:
+            parts.append(f"{field.removesuffix('_name')}={value}")
+    return " ".join(parts)
 
 
 def message_id_for(message_key: str, domain: str) -> str:
@@ -181,7 +205,7 @@ class EmailOutbox:
         except psycopg.Error as exc:
             raise DatabaseError(
                 f"Email outbox operation failed in {self.database.describe()}: "
-                + self.database.scrub(str(exc))
+                + safe_diagnostic(exc)
             ) from None
 
     def retry_wait(self, attempts: int) -> float:
@@ -267,15 +291,16 @@ class EmailOutbox:
         Reserves due messages for one delivery attempt each.
 
         Concurrent workers never claim the same message. A claim whose lease
-        expired (its worker stopped before recording a result) is claimed again;
-        its earlier attempt still counts, and it fails once out of attempts.
+        expired (its worker stopped, or is still waiting on the SMTP server) is
+        claimed again with a new claim token, which fences off the earlier worker;
+        its attempt still counts, and the message fails once out of attempts.
         """
         with self._cursor() as cursor:
             cursor.execute(
                 """
                 UPDATE email_outbox SET status = 'failed', locked_until = NULL,
-                    last_error = 'DeliveryInterrupted', last_error_kind = 'transient',
-                    updated_at = now()
+                    claim_token = NULL, last_error = 'DeliveryInterrupted',
+                    last_error_kind = 'transient', updated_at = now()
                 WHERE status = 'sending' AND locked_until < now() AND attempts >= max_attempts
                 """
             )
@@ -290,26 +315,46 @@ class EmailOutbox:
                     FOR UPDATE SKIP LOCKED
                 )
                 UPDATE email_outbox AS o SET status = 'sending', attempts = o.attempts + 1,
+                    claim_token = gen_random_uuid(),
                     locked_until = now() + make_interval(secs => %s), updated_at = now()
                 FROM due WHERE o.id = due.id
                 RETURNING o.id, o.kind, o.recipient, o.subject, o.body_text, o.message_id,
-                    o.attempts, o.max_attempts
+                    o.attempts, o.max_attempts, o.claim_token::text AS claim_token
                 """,
                 (limit, self.lease),
             ).fetchall()
         return [QueuedEmail(**row) for row in rows]
 
-    def mark_sent(self, message: QueuedEmail) -> None:
-        """Records acceptance by the SMTP server and clears the stored body."""
+    def mark_sent(self, message: QueuedEmail) -> bool:
+        """
+        Records acceptance by the SMTP server and clears the stored body.
+
+        Returns:
+            `bool`: `False` when this claim was superseded (its lease expired and
+                another worker claimed the message), in which case nothing changes.
+        """
         with self._cursor() as cursor:
             cursor.execute(
                 "UPDATE email_outbox SET status = 'sent', sent_at = now(), body_text = NULL, "
-                "locked_until = NULL, last_error = NULL, last_error_kind = NULL, "
-                "updated_at = now() WHERE id = %s AND status = 'sending'",
-                (message.id,),
+                "locked_until = NULL, claim_token = NULL, last_error = NULL, "
+                "last_error_kind = NULL, updated_at = now() "
+                "WHERE id = %s AND status = 'sending' AND claim_token = %s::uuid",
+                (message.id, message.claim_token),
             )
+            recorded = cursor.rowcount == 1
+        if not recorded:
+            logger.warning(
+                "Email result not recorded outbox_id=%s kind=%s attempt=%s: the claim "
+                "expired and the message was claimed again",
+                message.id,
+                message.kind,
+                message.attempts,
+            )
+        return recorded
 
-    def mark_failed(self, message: QueuedEmail, error: str, *, permanent: bool) -> DeliveryStatus:
+    def mark_failed(
+        self, message: QueuedEmail, error: str, *, permanent: bool
+    ) -> DeliveryStatus | None:
         """
         Records a failed attempt: schedules a retry, or marks the message `failed`.
 
@@ -319,16 +364,17 @@ class EmailOutbox:
             permanent (`bool`): Whether the server rejected the message for good.
 
         Returns:
-            [`db.DeliveryStatus`]: The message's new state.
+            [`db.DeliveryStatus`] or `None`: The message's new state, or `None` when
+                this claim was superseded and nothing changed.
         """
         final = permanent or message.attempts >= message.max_attempts
         with self._cursor() as cursor:
             row = cursor.execute(
                 f"""
-                UPDATE email_outbox SET status = %s, locked_until = NULL,
+                UPDATE email_outbox SET status = %s, locked_until = NULL, claim_token = NULL,
                     last_error = %s, last_error_kind = %s, updated_at = now(),
                     next_attempt_at = now() + make_interval(secs => %s)
-                WHERE id = %s AND status = 'sending'
+                WHERE id = %s AND status = 'sending' AND claim_token = %s::uuid
                 RETURNING {_STATUS_COLUMNS}
                 """,
                 (
@@ -337,13 +383,18 @@ class EmailOutbox:
                     "permanent" if permanent else "transient",
                     0 if final else self.retry_wait(message.attempts),
                     message.id,
+                    message.claim_token,
                 ),
             ).fetchone()
-            if row is None:
-                row = cursor.execute(
-                    f"SELECT {_STATUS_COLUMNS} FROM email_outbox WHERE id = %s", (message.id,)
-                ).fetchone()
-        assert row is not None
+        if row is None:
+            logger.warning(
+                "Email result not recorded outbox_id=%s kind=%s attempt=%s: the claim "
+                "expired and the message was claimed again",
+                message.id,
+                message.kind,
+                message.attempts,
+            )
+            return None
         return DeliveryStatus(**row)
 
     def retry(self, message_key: str, *, conn: psycopg.Connection | None = None) -> bool:
