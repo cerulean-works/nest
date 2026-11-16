@@ -27,6 +27,8 @@ _BEGIN_FIELDS = (
     "time_limit",
     "gpu",
     "cpu",
+    "project_id",
+    "submitted_by_user_id",
 )
 
 
@@ -120,7 +122,9 @@ class JobStore:
                 side effect. For executions it is also the remote directory name.
             request_id (`str`, *optional*): Correlation ID from the logs.
             **fields: Any of `script`, `workdir`, `job_dir`, `account`, `partition`,
-                `time_limit`, `gpu`, and `cpu`.
+                `time_limit`, `gpu`, `cpu`, `project_id` and `submitted_by_user_id`.
+                The last two record the Run's Project and submitter; they must be
+                given together and can never be changed afterwards.
 
         Returns:
             `int`: The record's ID.
