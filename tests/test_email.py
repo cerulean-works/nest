@@ -6,6 +6,7 @@ provider. Outbox and Controller tests also need the PostgreSQL server named by
 `NEST_TEST_DATABASE_URL` (see `postgres_fixture`).
 """
 
+import atexit
 import logging
 import os
 import shutil
@@ -41,7 +42,9 @@ TOKEN = "inviteTOKEN-9f2c1d7e5b"
 RECIPIENT = "invitee.private@example.org"
 DATABASE_URL = "postgresql://nest@db.example.internal/nest"
 CERTS = make_certificates()
-unittest.addModuleCleanup(CERTS.cleanup)
+# Not unittest.addModuleCleanup: its list is shared by every module, so under plain
+# `unittest` (as in the Controller image) it would run after the first module.
+atexit.register(CERTS.cleanup)
 
 
 def private_file(directory: Path, name: str, text: str) -> str:
