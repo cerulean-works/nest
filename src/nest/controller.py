@@ -420,6 +420,7 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
             partition=request.partition or None,
             time_limit=request.time or None,
             gpu=request.gpu,
+            cpu=request.cpu,
         )
         try:
             job_id = backend.submit(

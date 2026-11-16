@@ -730,6 +730,21 @@ class ControllerDatabaseTests(PostgresTestCase):
         self.assertIsNone(row["slurm_job_id"])
         self.assertRegex(row["execution_id"], r"^[0-9a-f]{32}$")
 
+    def test_batch_record_keeps_the_requested_cpu_count(self):
+        url, hpc, settings = self.slurm_controller_settings()
+        workdir = hpc.base.parent / "batch"
+        workdir.mkdir()
+        (workdir / "hello.sbatch").write_text("#!/bin/bash\necho hello > hello.out\n")
+        with controller_at_free_port(**settings) as (_, stub, _address):
+            stub.SubmitJob(
+                execution_pb2.SubmitJobRequest(
+                    workdir=str(workdir), script="hello.sbatch", cpu=4, script_args=["a"]
+                ),
+                timeout=30,
+            )
+        [row] = self.job_rows(url)
+        self.assertEqual((row["kind"], row["status"], row["cpu"]), ("batch", "submitted", 4))
+
     def test_records_survive_a_controller_restart(self):
         url, hpc, settings = self.slurm_controller_settings()
         root = hpc.base.parent
