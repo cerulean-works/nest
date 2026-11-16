@@ -52,6 +52,13 @@ Logs, errors and stored delivery errors never contain the password, recipient
 addresses, message bodies, or invitation tokens. The `email_outbox` table does
 hold recipients and, until delivery, bodies, so limit access to the database.
 
+The database also holds Users' names and email addresses, invited email
+addresses, and identity-provider subject IDs (see
+[Users, Projects and memberships](database#users-projects-and-memberships)).
+Session secrets and invitation tokens are stored only as SHA-256 hashes, and
+database errors that Nest logs name only the failing constraint, never row
+values.
+
 ## Known limitations
 
 - Experimental API with potential breaking changes.

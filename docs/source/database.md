@@ -28,6 +28,10 @@ The database is **externally managed** and **opt-in**:
 | `provider_profiles` | One row per Provider Profile (login nodes, SSH mode and user, Slurm defaults). The environment stays the source of truth: the Controller rewrites these rows at every start, marks the default, and marks profiles that were removed from the environment `active = false`. Rows are never deleted, so job records keep their provider. |
 | `jobs` | One row per `Execute` (kind `execution`) or `SubmitJob` (kind `batch`) request that reached Slurm: its Execution ID, provider, Slurm job ID, request ID, script and directories, resources, Nest's `status`, the last observed Slurm state, and the error kind and message on failure. |
 | `email_outbox` | Messages queued for optional email delivery and their delivery status (see [Send email with SMTP](email)). Empty unless `NEST_EMAIL_ENABLED=true`. Each row keeps its recipient address; the body is cleared once the message is sent. |
+| `users`, `user_identities`, `user_sessions`, `platform_role_assignments` | Nest Users, the external sign-in identities linked to them, signed-in sessions (stored as SHA-256 hashes of their secrets) and service-wide roles. See [Users, Projects and memberships](#users-projects-and-memberships). |
+| `organizations`, `organization_memberships` | Optional Organizations that group Projects, and their members' Organization roles. |
+| `projects`, `project_memberships` | Nest Projects and their active members with their Project roles. |
+| `project_email_invitations`, `project_invite_links`, `project_invitation_redemptions` | Pending email invitations, Invite Link grants, and each User's redemption of a link. Kept apart from memberships. |
 | `schema_migrations` | The applied schema versions and their checksums (see [Migrations](#migrations)). |
 
 Every record has an `execution_id`, a UUID written as 32 lowercase hexadecimal
@@ -61,6 +65,74 @@ submitted, so the call is safe to retry. Updates after a job was submitted are
 logged as errors instead, and the RPC still returns its result, because the
 job cannot be un-submitted. The pool reconnects on its own once the database is
 back.
+
+## Users, Projects and memberships
+
+Migration `0003_identity_and_projects` adds the records that authentication and
+shared Projects build on. No RPC uses them yet: sign-in, the authorization policy,
+and invitation flows are separate features. The data model and its rules are
+already enforced by the database.
+
+**Separate identities.** Each kind of identity has its own key, and none is
+derived from another:
+
+| Identity | Key | Notes |
+| --- | --- | --- |
+| Nest User | `users.id`, a generated UUID | Never an email address. A User row exists only once a person has signed in or an operator has created it. |
+| External sign-in identity | `user_identities (issuer, subject)` | The identity provider's stable subject ID (Google's `sub`) under its issuer, linked to one User. A changed email keeps the same User; a reused address on another subject is a different identity. These identity providers are unrelated to Compute Providers. |
+| Nest Project | `projects.id`, a generated UUID | Independent of its name, Owner and Provider Accounts. Two Projects may share a name. |
+| Provider and Provider Account | `provider_profiles.id` and the Provider's account name | No identity or Project table references them. |
+
+**Membership.** Users and Projects are many-to-many through `project_memberships`,
+one row per (Project, User) (`UNIQUE (project_id, user_id)`), with a role of
+`owner`, `admin`, `member` or `viewer`. Removing a member deletes the row, and
+the member's access ends when that transaction commits.
+
+**Exactly one Owner.** The Owner is the membership with role `owner`. The
+database enforces exactly one per Project: a unique index allows at most one at
+any moment, even across concurrent transactions, and a deferred constraint trigger
+checks at commit that there is one. A Project and its first Owner are therefore
+created in one transaction, and an Ownership Transfer demotes the old Owner and
+promotes the new one in one transaction. `nest.db.ProjectStore` ([reference](api/db#projects-and-memberships)) applies these rules
+for every caller:
+
+- Creating a Project makes its creator the Owner.
+- `owner` can be assigned only by the current Owner's transfer, never by adding a
+  member, changing a role, or an invitation.
+- The Owner cannot be removed or demoted; they transfer ownership first.
+- Only the current Owner can transfer ownership or delete the Project. Deleting
+  marks the Project `deleted_at`; its rows and job records are kept, and it no
+  longer has members with access.
+- Each change locks the Project row first, so concurrent changes to one Project
+  apply one after another: of two racing transfers, the second finds its actor is
+  no longer the Owner and fails. Writers that bypass the store are still stopped
+  by the constraints.
+
+**Creator, Owner and submitter are separate.** `projects.created_by_user_id`
+records who created the Project, for audit only, and cannot be updated. The
+current Owner is the `owner` membership. A job record's `project_id` and
+`submitted_by_user_id` record the Run's Project and submitter. They are written
+with the record, together or not at all, and a trigger rejects any later change,
+so ownership transfers and membership changes never alter who submitted a Run.
+Records written before authentication have neither. Projects and Users referenced
+by job records cannot be deleted.
+
+**Pending invitations are not memberships.** `project_email_invitations` holds an
+invitation for a normalized email address, which needs no User row. At most one
+invitation per address and Project is `pending`; its status (`pending`,
+`accepted`, `declined`, `revoked`, `expired`) must match its timestamps. An
+invitation's email delivery state is the `email_outbox` row whose `subject_ref` is
+`invitation:<id>` (see [Send email with SMTP](email)), not a column here.
+`project_invite_links` holds bounded, revocable Invite Link grants; its
+`use_count` can never exceed `max_uses`, and `project_invitation_redemptions`
+records each User's single redemption of a link. No invitation or link can grant
+`owner`. Tokens are stored only as SHA-256 hashes.
+
+**Sessions and other roles.** `user_sessions` stores browser and CLI sessions by
+the hash of their secret, with an expiry and a revocation time; disabling a User
+revokes all their sessions. `platform_role_assignments` holds `platform_admin`,
+and `organization_memberships` holds `org_admin` and `member`. Neither grants a
+Project role, and no role grants Provider or HPC access.
 
 ## Configure the connection
 
@@ -122,7 +194,9 @@ maximum.
 
 Create a dedicated role and database. The role that runs `nest-db upgrade` needs to
 create tables in the target schema; the Controller then needs only `SELECT`,
-`INSERT` and `UPDATE` on the Nest tables. For example:
+`INSERT` and `UPDATE` on the Nest tables, plus `DELETE` on `project_memberships`,
+`organization_memberships` and `platform_role_assignments` (removing a member or a
+role deletes its row). For example:
 
 ```sql
 CREATE ROLE nest LOGIN PASSWORD '...';
@@ -219,7 +293,10 @@ pg_dump --format=custom --no-owner --file=nest-$(date -u +%Y%m%dT%H%M%SZ).dump \
 
 Use a `pg_dump` at least as new as the server. A dump taken while the Controller
 runs is consistent. Store dumps encrypted; they contain job metadata such as
-script paths and error messages, though no payloads or credentials.
+script paths and error messages, and personal data: Users' names and email
+addresses, invited email addresses, and identity-provider subject IDs. They hold
+no payloads or credentials; sessions and invitation tokens are stored only as
+hashes.
 
 To restore into an **empty** database:
 
