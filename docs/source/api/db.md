@@ -48,3 +48,5 @@ Settings are read by [`config.load_database_config`] into a [`config.DatabaseCon
 [[autodoc]] db.sync_providers
 
 [[autodoc]] db.JobStore
+
+The email outbox ([`db.EmailOutbox`]) is documented with [Email delivery](mail).

@@ -26,7 +26,7 @@ def controller_environment(**settings):
     env = os.environ.copy()
     for name in ("NEST_SLURM_HOST", "NEST_SLURM_ACCOUNT", "NEST_SLURM_WORKDIR"):
         env.pop(name, None)
-    for name in [name for name in env if name.startswith("NEST_DATABASE_")]:
+    for name in [n for n in env if n.startswith(("NEST_DATABASE_", "NEST_EMAIL_", "NEST_SMTP_"))]:
         env.pop(name)
     env.update(NEST_EXECUTOR="local", PYTHONUNBUFFERED="1")
     env.update(settings)

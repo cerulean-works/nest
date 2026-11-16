@@ -33,6 +33,7 @@ from .errors import (
     SubmissionUnknownError,
 )
 from .executor import execute
+from .mail import start_email_service
 from .proto import execution_pb2, execution_pb2_grpc
 
 logger = get_logger("nest.controller")
@@ -576,7 +577,9 @@ def main():
     all reported at once, before the listener starts, and the process exits with
     status 2. When `NEST_DATABASE_URL` is set, the database must be reachable and
     its schema current (see [`controller.open_database`]); otherwise the process
-    exits with status 3 instead of running without persistence. Uses four RPC worker threads with port reuse disabled, and TLS when
+    exits with status 3 instead of running without persistence. Email delivery
+    starts only with `NEST_EMAIL_ENABLED=true` and never contacts the SMTP server
+    at startup (see [`mail.start_email_service`]). Uses four RPC worker threads with port reuse disabled, and TLS when
     `NEST_TLS_CERT_FILE` and `NEST_TLS_KEY_FILE` are set. Handles SIGTERM and SIGINT
     by allowing active RPCs up to ten seconds to finish.
 
@@ -595,6 +598,7 @@ def main():
     except DatabaseError as exc:
         logger.error("%s", exc)
         raise SystemExit(3) from None
+    email = start_email_service(config.email, database)
     jobs = (
         JobStore(database, config.provider.id)
         if database is not None and config.provider is not None
@@ -627,12 +631,14 @@ def main():
             raise RuntimeError(f"Cannot bind Controller to {config.bind}")
         server.start()
         logger.info(
-            "Controller listening address=%s executor=%s slurm_configured=%s tls=%s database=%s",
+            "Controller listening address=%s executor=%s slurm_configured=%s tls=%s database=%s "
+            "email=%s",
             config.bind,
             config.executor,
             slurm_backend is not None,
             config.tls is not None,
             database.describe() if database else "none",
+            "enabled" if email.enabled else "disabled",
         )
         server.wait_for_termination()
     except KeyboardInterrupt:
@@ -642,6 +648,8 @@ def main():
         raise
     finally:
         server.stop(grace=0)
+        if email.worker is not None:
+            email.worker.stop(timeout=10)
         if database is not None:
             database.close()
         logger.info("Controller stopped")

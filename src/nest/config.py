@@ -17,6 +17,11 @@ SSH modes:
   `known_hosts` and key) and connects only to the profile's approved login nodes.
   Mode B reads no SSH configuration file and no `NEST_TAILSCALE_*` setting.
 
+Email delivery is opt-in too: with `NEST_EMAIL_ENABLED=true` the Controller sends
+queued messages (such as Project invitations) from a persistent outbox over SMTP
+with verified TLS (see [`mail`]). Without it no SMTP setting is read or validated,
+and nothing else in Nest depends on mail.
+
 Persistence is opt-in: with `NEST_DATABASE_URL` set, the Controller stores Provider
 Profiles and job records in an externally managed PostgreSQL database (see
 [`db.Database`]). Without it the Controller is stateless, unless
@@ -32,6 +37,8 @@ import stat
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from email.headerregistry import Address
+from email.utils import parseaddr
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 from ._logging import LOG_LEVELS, parse_log_level
@@ -77,6 +84,37 @@ DATABASE_SETTINGS = (
 )
 """Controller database settings, all read by [`config.load_database_config`]."""
 
+EMAIL_PROVIDERS = ("smtp",)
+SMTP_TLS_MODES = ("starttls", "implicit")
+DEFAULT_SMTP_STARTTLS_PORT = 587
+DEFAULT_SMTP_IMPLICIT_TLS_PORT = 465
+DEFAULT_SMTP_TIMEOUT = 30.0
+DEFAULT_EMAIL_MAX_ATTEMPTS = 5
+DEFAULT_EMAIL_RETRY_DELAY = 60.0
+DEFAULT_EMAIL_RETRY_MAX_DELAY = 3600.0
+DEFAULT_EMAIL_POLL_INTERVAL = 15.0
+
+EMAIL_SETTINGS = (
+    "NEST_EMAIL_ENABLED",
+    "NEST_EMAIL_PROVIDER",
+    "NEST_EMAIL_FROM",
+    "NEST_EMAIL_MAX_ATTEMPTS",
+    "NEST_EMAIL_RETRY_DELAY",
+    "NEST_EMAIL_RETRY_MAX_DELAY",
+    "NEST_EMAIL_POLL_INTERVAL",
+    "NEST_SMTP_HOST",
+    "NEST_SMTP_PORT",
+    "NEST_SMTP_STARTTLS",
+    "NEST_SMTP_IMPLICIT_TLS",
+    "NEST_SMTP_USERNAME",
+    "NEST_SMTP_PASSWORD",
+    "NEST_SMTP_PASSWORD_FILE",
+    "NEST_SMTP_CA_FILE",
+    "NEST_SMTP_TIMEOUT",
+)
+"""Email delivery settings, read by [`config.load_controller_config`] only when
+`NEST_EMAIL_ENABLED=true`."""
+
 RESERVED_SETTINGS = (
     "NEST_AUTH_TOKEN_FILE",
     "NEST_RETENTION_DAYS",
@@ -84,7 +122,7 @@ RESERVED_SETTINGS = (
 )
 """Settings reserved by the contract for features that do not exist yet."""
 
-SECRET_SETTINGS = ("NEST_DATABASE_URL", "NEST_SSH_PRIVATE_KEY")
+SECRET_SETTINGS = ("NEST_DATABASE_URL", "NEST_SSH_PRIVATE_KEY", "NEST_SMTP_PASSWORD")
 """Variables whose values are never echoed in errors or logs."""
 
 _PROVIDER_ID = re.compile(r"[a-z][a-z0-9_]{0,31}")
@@ -309,6 +347,96 @@ class DatabaseConfig:
 
 
 @dataclass(frozen=True)
+class SMTPConfig:
+    """
+    SMTP transport settings. Every connection is encrypted and the server
+    certificate and host name are always verified; there is no plaintext mode.
+
+    Attributes:
+        host (`str`): SMTP server (relay or submission) host name. Certificates are
+            checked against this name.
+        port (`int`): Server port: 587 for STARTTLS or 465 for implicit TLS by default.
+        tls_mode (`str`): `"starttls"` (upgrade a plain connection, and fail when the
+            server does not offer STARTTLS) or `"implicit"` (TLS from the first byte).
+        username (`str | None`): Login name, or `None` for a relay that needs no
+            authentication.
+        password (`Secret | None`): Inline password from `NEST_SMTP_PASSWORD`.
+        password_file (`str | None`): File holding the password, re-read on each
+            connection so a rotated secret applies without a restart.
+        ca_file (`str | None`): PEM CA bundle that replaces the system roots, for a
+            relay with a private CA. Verification is never disabled.
+        timeout (`float`): Seconds for the connection and each SMTP command.
+    """
+
+    host: str
+    port: int
+    tls_mode: str = "starttls"
+    username: str | None = None
+    password: Secret | None = None
+    password_file: str | None = None
+    ca_file: str | None = None
+    timeout: float = DEFAULT_SMTP_TIMEOUT
+
+    def read_password(self) -> str | None:
+        """Returns the current password, reading the file when one is set. Never log it."""
+        if self.password_file is not None:
+            with open(self.password_file) as handle:
+                return handle.read().strip()
+        return self.password.reveal() if self.password is not None else None
+
+
+@dataclass(frozen=True)
+class EmailConfig:
+    """
+    Optional outbound email delivery. Present only when `NEST_EMAIL_ENABLED=true`.
+
+    Attributes:
+        provider (`str`): Transport; only `"smtp"`.
+        sender (`str`): `NEST_EMAIL_FROM`, such as `Nest <nest@example.com>`. Used as
+            the `From` header and the envelope sender. It must be an address the SMTP
+            account may send as and whose domain publishes SPF/DKIM/DMARC.
+        sender_address (`str`): The bare address part of `sender`.
+        public_url (`str`): `NEST_PUBLIC_URL`, the base of every link in a message.
+        smtp (`SMTPConfig`): Transport settings.
+        max_attempts (`int`): Delivery attempts per message before it is `failed`.
+        retry_delay (`float`): Seconds before the first retry; doubles per attempt.
+        retry_max_delay (`float`): Longest wait between attempts.
+        poll_interval (`float`): Seconds between outbox scans.
+    """
+
+    sender: str
+    sender_address: str
+    public_url: str
+    smtp: SMTPConfig
+    provider: str = "smtp"
+    max_attempts: int = DEFAULT_EMAIL_MAX_ATTEMPTS
+    retry_delay: float = DEFAULT_EMAIL_RETRY_DELAY
+    retry_max_delay: float = DEFAULT_EMAIL_RETRY_MAX_DELAY
+    poll_interval: float = DEFAULT_EMAIL_POLL_INTERVAL
+
+    def summary(self) -> dict[str, object]:
+        """
+        Returns a log-safe description of the email settings.
+
+        Returns:
+            `dict[str, object]`: Settings with the password replaced by `***`.
+        """
+        return {
+            "provider": self.provider,
+            "from": self.sender_address,
+            "public_url": self.public_url,
+            "smtp_host": self.smtp.host,
+            "smtp_port": self.smtp.port,
+            "smtp_tls": self.smtp.tls_mode,
+            "smtp_username": self.smtp.username,
+            "smtp_password": "***" if self.smtp.password else None,
+            "smtp_password_file": self.smtp.password_file,
+            "smtp_ca_file": self.smtp.ca_file,
+            "max_attempts": self.max_attempts,
+        }
+
+
+@dataclass(frozen=True)
 class ControllerConfig:
     """
     Validated Controller configuration.
@@ -326,6 +454,8 @@ class ControllerConfig:
         public_url (`str | None`): Advertised service URL, logged at startup.
         database (`DatabaseConfig | None`): PostgreSQL settings, or `None` when the
             Controller is stateless.
+        email (`EmailConfig | None`): Email delivery settings, or `None` when
+            `NEST_EMAIL_ENABLED` is not `true`.
     """
 
     bind: str = DEFAULT_CONTROLLER_BIND
@@ -341,6 +471,7 @@ class ControllerConfig:
     tls: TLSConfig | None = None
     public_url: str | None = None
     database: DatabaseConfig | None = None
+    email: EmailConfig | None = None
 
     @property
     def provider(self) -> ProviderProfile | None:
@@ -378,6 +509,7 @@ class ControllerConfig:
             "ssh_identity_file": self.ssh.identity_file,
             "ssh_known_hosts_file": self.ssh.known_hosts_file,
             "database": self.database.summary() if self.database else None,
+            "email": self.email.summary() if self.email else None,
         }
 
 
@@ -755,6 +887,157 @@ def _database(reader: _Reader) -> DatabaseConfig | None:
     )
 
 
+_SENDER_EXAMPLE = "Nest <nest@example.com>"
+
+
+def _loopback_host(host: str) -> bool:
+    return host == "localhost" or host.endswith(".localhost") or host in ("127.0.0.1", "::1")
+
+
+def _sender(reader: _Reader) -> tuple[str, str] | None:
+    raw = reader.get("NEST_EMAIL_FROM")
+    if raw is None:
+        reader.fail(
+            "NEST_EMAIL_FROM is required when NEST_EMAIL_ENABLED=true; set it to the "
+            f"verified sender, such as {_SENDER_EXAMPLE!r}"
+        )
+        return None
+    name, address = parseaddr(raw, strict=True)
+    try:
+        if not address or "\r" in raw or "\n" in raw:
+            raise ValueError
+        parsed = Address(display_name=name, addr_spec=address)
+        if not parsed.username or "." not in parsed.domain:
+            raise ValueError
+    except ValueError:
+        reader.fail(f"NEST_EMAIL_FROM must be one address such as {_SENDER_EXAMPLE!r}, got {raw!r}")
+        return None
+    return str(parsed), parsed.addr_spec
+
+
+def _email_public_url(reader: _Reader) -> str | None:
+    raw = reader.get("NEST_PUBLIC_URL")
+    if raw is None:
+        reader.fail(
+            "NEST_PUBLIC_URL is required when NEST_EMAIL_ENABLED=true: links in messages "
+            "are built from it, such as https://nest.example.com"
+        )
+        return None
+    parts = urlsplit(raw)
+    hostname = parts.hostname or ""
+    if parts.scheme != "https" and not (parts.scheme == "http" and _loopback_host(hostname)):
+        reader.fail(
+            "NEST_PUBLIC_URL must be an https:// URL when email is enabled, because "
+            f"invitation links carry tokens; got {raw!r}"
+        )
+        return None
+    if parts.fragment:
+        reader.fail("NEST_PUBLIC_URL must not contain a fragment when email is enabled")
+        return None
+    return raw.rstrip("/")
+
+
+def _email(reader: _Reader, database: DatabaseConfig | None) -> EmailConfig | None:
+    """
+    Reads the `NEST_EMAIL_*` and `NEST_SMTP_*` settings.
+
+    Nothing is read unless `NEST_EMAIL_ENABLED=true`, so a deployment without mail
+    never fails on a stale SMTP setting. When enabled, every required setting is
+    validated and an insecure transport is never chosen silently.
+    """
+    if not reader.boolean("NEST_EMAIL_ENABLED"):
+        return None
+    before = len(reader.problems)
+    provider = reader.choice("NEST_EMAIL_PROVIDER", EMAIL_PROVIDERS, "smtp")
+    sender = _sender(reader)
+    public_url = _email_public_url(reader)
+    if database is None and reader.get("NEST_DATABASE_URL") is None:
+        reader.fail(
+            "NEST_EMAIL_ENABLED=true needs NEST_DATABASE_URL: queued messages and their "
+            "delivery status are kept in the database outbox"
+        )
+
+    host = reader.get("NEST_SMTP_HOST")
+    if host is None:
+        reader.fail("NEST_SMTP_HOST is required when NEST_EMAIL_ENABLED=true")
+    elif not _HOST.fullmatch(host):
+        reader.fail(f"NEST_SMTP_HOST must be a host name, got {host!r}")
+
+    starttls = reader.boolean("NEST_SMTP_STARTTLS", default=True)
+    implicit = reader.boolean("NEST_SMTP_IMPLICIT_TLS", default=False)
+    if implicit and reader.get("NEST_SMTP_STARTTLS") is None:
+        starttls = False
+    if starttls and implicit:
+        reader.fail("Set only one of NEST_SMTP_STARTTLS=true and NEST_SMTP_IMPLICIT_TLS=true")
+    elif not (starttls or implicit):
+        reader.fail(
+            "NEST_SMTP_STARTTLS=false needs NEST_SMTP_IMPLICIT_TLS=true: Nest never sends "
+            "mail over an unencrypted connection"
+        )
+    tls_mode = "implicit" if implicit and not starttls else "starttls"
+    default_port = (
+        DEFAULT_SMTP_IMPLICIT_TLS_PORT if tls_mode == "implicit" else DEFAULT_SMTP_STARTTLS_PORT
+    )
+    port = reader.integer("NEST_SMTP_PORT", default_port, 1)
+    if port > 65535:
+        reader.fail(f"NEST_SMTP_PORT must be at most 65535, got {port}")
+
+    username = reader.get("NEST_SMTP_USERNAME")
+    password_raw = reader.get("NEST_SMTP_PASSWORD")
+    before_file = len(reader.problems)
+    password_file = reader.readable_file("NEST_SMTP_PASSWORD_FILE")
+    if len(reader.problems) > before_file:
+        password_file = None
+    if password_raw is not None and reader.get("NEST_SMTP_PASSWORD_FILE") is not None:
+        reader.fail("Set only one of NEST_SMTP_PASSWORD and NEST_SMTP_PASSWORD_FILE")
+    if password_file is not None:
+        with open(password_file) as handle:
+            if not handle.read().strip():
+                reader.fail(f"NEST_SMTP_PASSWORD_FILE {password_file!r} is empty")
+    has_password = password_raw is not None or reader.get("NEST_SMTP_PASSWORD_FILE") is not None
+    if username is None and has_password:
+        reader.fail("NEST_SMTP_PASSWORD needs NEST_SMTP_USERNAME")
+    if username is not None and not has_password:
+        reader.fail(
+            "NEST_SMTP_USERNAME needs a password: set NEST_SMTP_PASSWORD_FILE (recommended) "
+            "or NEST_SMTP_PASSWORD"
+        )
+    ca_file = reader.readable_file("NEST_SMTP_CA_FILE")
+    timeout = reader.seconds("NEST_SMTP_TIMEOUT", DEFAULT_SMTP_TIMEOUT)
+
+    max_attempts = reader.integer("NEST_EMAIL_MAX_ATTEMPTS", DEFAULT_EMAIL_MAX_ATTEMPTS, 1)
+    if max_attempts > 100:
+        reader.fail(f"NEST_EMAIL_MAX_ATTEMPTS must be at most 100, got {max_attempts}")
+    retry_delay = reader.seconds("NEST_EMAIL_RETRY_DELAY", DEFAULT_EMAIL_RETRY_DELAY)
+    retry_max_delay = reader.seconds("NEST_EMAIL_RETRY_MAX_DELAY", DEFAULT_EMAIL_RETRY_MAX_DELAY)
+    if retry_max_delay < retry_delay:
+        reader.fail("NEST_EMAIL_RETRY_MAX_DELAY must be at least NEST_EMAIL_RETRY_DELAY")
+    poll_interval = reader.seconds("NEST_EMAIL_POLL_INTERVAL", DEFAULT_EMAIL_POLL_INTERVAL)
+
+    if len(reader.problems) > before or sender is None or public_url is None or host is None:
+        return None
+    return EmailConfig(
+        provider=provider,
+        sender=sender[0],
+        sender_address=sender[1],
+        public_url=public_url,
+        smtp=SMTPConfig(
+            host=host,
+            port=port,
+            tls_mode=tls_mode,
+            username=username,
+            password=Secret(password_raw) if password_raw is not None else None,
+            password_file=password_file,
+            ca_file=ca_file,
+            timeout=timeout,
+        ),
+        max_attempts=max_attempts,
+        retry_delay=retry_delay,
+        retry_max_delay=retry_max_delay,
+        poll_interval=poll_interval,
+    )
+
+
 def load_database_config(environ: Mapping[str, str] | None = None) -> DatabaseConfig:
     """
     Reads and validates the `NEST_DATABASE_*` settings for `nest-db`.
@@ -888,6 +1171,7 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
             reader.fail("NEST_PUBLIC_URL must not contain credentials or a query string")
 
     database = _database(reader)
+    email = _email(reader, database)
     _reserved(reader)
 
     if reader.problems:
@@ -902,6 +1186,7 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
         tls=tls,
         public_url=public_url,
         database=database,
+        email=email,
         **timeouts,
     )
 

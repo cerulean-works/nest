@@ -16,14 +16,18 @@ from .migrate import (
     upgrade,
     verify,
 )
+from .outbox import DeliveryStatus, EmailOutbox, QueuedEmail
 from .store import JobStore, sync_providers
 
 __all__ = [
     "Database",
     "DatabaseError",
+    "DeliveryStatus",
+    "EmailOutbox",
     "JobStore",
     "Migration",
     "MigrationError",
+    "QueuedEmail",
     "SchemaStatus",
     "load_migrations",
     "schema_status",

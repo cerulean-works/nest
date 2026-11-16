@@ -45,6 +45,13 @@ and publishes PostgreSQL on `127.0.0.1` only, with no setting to change the
 interface, because it has no TLS. Do not override its `ports` to publish it more
 widely; databases other hosts reach need `verify-full` TLS.
 
+Optional email delivery (see [Send email with SMTP](email)) always uses STARTTLS
+or implicit TLS with a verified certificate, and never falls back to plaintext.
+Keep the SMTP password in `NEST_SMTP_PASSWORD_FILE` from your secret manager.
+Logs, errors and stored delivery errors never contain the password, recipient
+addresses, message bodies, or invitation tokens. The `email_outbox` table does
+hold recipients and, until delivery, bodies, so limit access to the database.
+
 ## Known limitations
 
 - Experimental API with potential breaking changes.
