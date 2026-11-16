@@ -736,12 +736,16 @@ class ControllerDatabaseTests(PostgresTestCase):
         workdir.mkdir()
         (workdir / "hello.sbatch").write_text("#!/bin/bash\necho hello > hello.out\n")
         with controller_at_free_port(**settings) as (_, stub, _address):
+            with self.assertRaises(grpc.RpcError):
+                stub.SubmitJob(
+                    execution_pb2.SubmitJobRequest(workdir=str(workdir), script="a", cpu=-1),
+                    timeout=30,
+                )
             stub.SubmitJob(
-                execution_pb2.SubmitJobRequest(
-                    workdir=str(workdir), script="hello.sbatch", cpu=4, script_args=["a"]
-                ),
+                execution_pb2.SubmitJobRequest(workdir=str(workdir), script="hello.sbatch", cpu=4),
                 timeout=30,
             )
+        # The refused request left no record.
         [row] = self.job_rows(url)
         self.assertEqual((row["kind"], row["status"], row["cpu"]), ("batch", "submitted", 4))
 
