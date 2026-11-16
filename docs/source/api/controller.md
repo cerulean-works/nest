@@ -17,8 +17,9 @@ listener when `NEST_TLS_CERT_FILE` and `NEST_TLS_KEY_FILE` are set. See
 | `CancelJob` | `job_id` (int64) | Empty response |
 
 `environment` contains `pyproject_toml` and `uv_lock` bytes. When supplied, both
-must be nonempty. `gpu` and `cpu` must not be negative. `SubmitJob` passes
-each `script_args` element to the script verbatim as one argument. Slurm job operations
+must be nonempty. `gpu` and `cpu` must not be negative; `0` omits the Slurm flag.
+`SubmitJob` passes each `script_args` element to the script, after its path, verbatim
+as one argument, so an element is never an `sbatch` option. Slurm job operations
 require a configured backend, even when `Execute` uses local mode. Cancellation
 requests do not wait for a job to stop.
 
