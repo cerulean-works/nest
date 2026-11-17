@@ -12,6 +12,7 @@ dependencies = [
     "protobuf>=7.36.2",
     "psycopg-pool>=3.2",
     "psycopg[binary]>=3.2",
+    "pyjwt[crypto]>=2.10",
     "pytest>=9.2.0",
     "pytest-cov>=7.1.0",
 ]

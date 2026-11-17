@@ -16,6 +16,7 @@ from .identity import (
     UserNotActiveError,
     hash_token,
 )
+from .login_flows import LoginFlow, LoginFlowStore, TooManyPendingSignInsError
 from .migrate import (
     Migration,
     MigrationError,
@@ -53,6 +54,8 @@ __all__ = [
     "IdentityConflictError",
     "IdentityStore",
     "JobStore",
+    "LoginFlow",
+    "LoginFlowStore",
     "MemberNotFoundError",
     "Membership",
     "Migration",
@@ -65,6 +68,7 @@ __all__ = [
     "QueuedEmail",
     "SchemaStatus",
     "Session",
+    "TooManyPendingSignInsError",
     "User",
     "UserNotActiveError",
     "UserNotFoundError",
