@@ -41,7 +41,9 @@ from nest.db import (
     Database,
     IdentityStore,
     LoginFlowStore,
+    PlatformAdminBootstrap,
     TooManyPendingSignInsError,
+    bootstrap_state,
     hash_token,
     upgrade,
 )
@@ -458,6 +460,27 @@ class GoogleSignInFlowTests(PostgresTestCase):
         b = self.identities.find_user(issuer=GOOGLE_ISSUER, subject="108000000000000000999")
         assert a is not None and b is not None
         self.assertNotEqual(a.id, b.id)
+
+    def test_configured_account_becomes_the_first_platform_admin(self):
+        # B03: the bootstrap runs in the sign-in's own transaction.
+        self.sign_in.bootstrap = PlatformAdminBootstrap(self.db, "Researcher@Example.org")
+        _, status, _, _ = self.login()
+        self.assertEqual(status, 200)
+        admin = self.identities.find_user(issuer=GOOGLE_ISSUER, subject=self.fake.account.sub)
+        assert admin is not None
+        self.assertEqual(self.identities.platform_roles(admin.id), {"platform_admin"})
+        state = bootstrap_state(self.db)
+        assert state is not None
+        self.assertEqual((state.method, state.user_id), ("google_first_login", admin.id))
+        # Pointing the setting at another account later grants it nothing.
+        self.sign_in.bootstrap = PlatformAdminBootstrap(self.db, "other@example.org")
+        self.fake.account = Account(sub="108000000000000000777", email="other@example.org")
+        _, status, _, _ = self.login()
+        self.assertEqual(status, 200)
+        other = self.identities.find_user(issuer=GOOGLE_ISSUER, subject="108000000000000000777")
+        assert other is not None
+        self.assertEqual(self.identities.platform_roles(other.id), set())
+        self.assertEqual(self.count("platform_role_assignments"), 1)
 
     # State, binding and replay ------------------------------------------------
 

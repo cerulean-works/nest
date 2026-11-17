@@ -269,7 +269,11 @@ def _split_bind(bind: str) -> tuple[str, int]:
 
 
 def start_auth_service(
-    config: GoogleAuthConfig | None, database: Database | None, *, sign_in=None
+    config: GoogleAuthConfig | None,
+    database: Database | None,
+    *,
+    sign_in=None,
+    bootstrap_admin_email: str | None = None,
 ) -> AuthService:
     """
     Starts the auth listener when Google sign-in is configured.
@@ -281,6 +285,8 @@ def start_auth_service(
         database ([`db.Database`] or `None`): Open database; required when enabled.
         sign_in ([`auth.GoogleSignIn`], *optional*): Replaces the default service,
             for tests with a fake provider.
+        bootstrap_admin_email (`str`, *optional*): `NEST_BOOTSTRAP_ADMIN_GOOGLE_EMAIL`,
+            passed to the default [`auth.GoogleSignIn`].
 
     Raises:
         `OSError`: If `NEST_AUTH_HTTP_BIND` cannot be bound.
@@ -290,7 +296,7 @@ def start_auth_service(
         return AuthService()
     if database is None:
         raise RuntimeError("Google sign-in needs the database")
-    sign_in = sign_in or GoogleSignIn(config, database)
+    sign_in = sign_in or GoogleSignIn(config, database, bootstrap_admin_email=bootstrap_admin_email)
     server = AuthHTTPServer(sign_in, _split_bind(config.http_bind))
     thread = threading.Thread(target=server.serve_forever, name="nest-auth-http", daemon=True)
     thread.start()

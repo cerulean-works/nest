@@ -9,7 +9,8 @@ an existing administrator or an operator with database credentials can grant the
 role.
 
 The bootstrap needs the PostgreSQL database (`NEST_DATABASE_URL`) with migration
-`0004_platform_admin_bootstrap` applied (`nest-db upgrade`).
+`0005_platform_admin_bootstrap` applied (`nest-db upgrade`), and
+[Google sign-in](authentication) enabled (`NEST_GOOGLE_CLIENT_ID`).
 
 ## Bootstrap the first administrator
 
@@ -59,7 +60,7 @@ The bootstrap needs the PostgreSQL database (`NEST_DATABASE_URL`) with migration
   other way before the configured account signs in, through `nest-db admin
   grant`, the Python API or plain SQL, that grant records the bootstrap
   (`method=direct_grant`) and the setting can no longer take effect. A
-  database that already had an administrator when migration 0004 was applied
+  database that already had an administrator when migration 0005 was applied
   is recorded as `method=preexisting_admin`.
 - **Audited.** The claim, every grant and revocation of `platform_admin`, and
   every refused claim by an identity with the configured address are written to
@@ -153,8 +154,10 @@ the log. Read it with `nest-db admin audit [--user-id UUID] [--limit N]` or
 
 ## Integrate the bootstrap with sign-in
 
-The sign-in flow calls [`db.PlatformAdminBootstrap.claim`] after every successful
-sign-in, ideally in the same transaction:
+The Controller's Google sign-in ([`auth.GoogleSignIn`]) already calls
+[`db.PlatformAdminBootstrap.claim`] on every successful sign-in, in the same
+transaction as the sign-in and its session. A different sign-in flow can do the
+same:
 
 ```python
 from nest.db import BootstrapOutcome, IdentityStore, PlatformAdminBootstrap

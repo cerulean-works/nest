@@ -89,7 +89,7 @@ class _Base(PostgresTestCase):
 
 class ClaimTests(_Base):
     def test_migration_is_part_of_the_one_chain(self):
-        self.assertIn("0004_platform_admin_bootstrap", [m.label for m in load_migrations()])
+        self.assertIn("0005_platform_admin_bootstrap", [m.label for m in load_migrations()])
 
     def test_configured_verified_google_account_claims_once(self):
         self.assertIsNone(bootstrap_state(self.db))
@@ -280,7 +280,7 @@ class OneTimeTests(_Base):
     def test_existing_administrator_counts_as_bootstrapped(self):
         url = self.database()
         with connect(url) as conn:
-            upgrade(conn, [m for m in load_migrations() if m.version < 4])
+            upgrade(conn, [m for m in load_migrations() if m.version < 5])
             user = conn.execute("INSERT INTO users DEFAULT VALUES RETURNING id").fetchone()
             assert user is not None
             conn.execute(
@@ -437,7 +437,7 @@ class RecoveryCLITests(_Base):
     def test_schema_must_be_current(self):
         url = self.database()
         with connect(url) as conn:
-            upgrade(conn, [m for m in load_migrations() if m.version < 4])
+            upgrade(conn, [m for m in load_migrations() if m.version < 5])
         code, _, err = self.run_cli("status", url=url)
         self.assertEqual(code, 1)
         self.assertIn("nest-db upgrade", err)
@@ -445,7 +445,10 @@ class RecoveryCLITests(_Base):
 
 class ConfigTests(unittest.TestCase):
     DB: ClassVar[dict[str, str]] = {
-        "NEST_DATABASE_URL": "postgresql://nest@db.example.internal:5432/nest"
+        "NEST_DATABASE_URL": "postgresql://nest@db.example.internal:5432/nest",
+        "NEST_GOOGLE_CLIENT_ID": "1234-example.apps.googleusercontent.com",
+        "NEST_GOOGLE_CLIENT_SECRET": "test-client-secret",
+        "NEST_GOOGLE_REDIRECT_URL": "https://nest.example.com/auth/google/callback",
     }
 
     def test_unset_by_default(self):
@@ -461,7 +464,7 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(config.summary()["bootstrap_admin_configured"])
         self.assertNotIn(ADMIN_EMAIL, repr(config.summary()).lower())
 
-    def test_invalid_address_or_missing_database_is_rejected_without_echoing(self):
+    def test_invalid_address_or_missing_prerequisites_are_rejected_without_echoing(self):
         for settings, expected in (
             (
                 {**self.DB, "NEST_BOOTSTRAP_ADMIN_GOOGLE_EMAIL": "secret-not-an-address"},
@@ -469,6 +472,13 @@ class ConfigTests(unittest.TestCase):
             ),
             ({**self.DB, "NEST_BOOTSTRAP_ADMIN_GOOGLE_EMAIL": "a@b.com, c@d.com"}, "must be one"),
             ({"NEST_BOOTSTRAP_ADMIN_GOOGLE_EMAIL": ADMIN_EMAIL}, "needs NEST_DATABASE_URL"),
+            (
+                {
+                    "NEST_DATABASE_URL": self.DB["NEST_DATABASE_URL"],
+                    "NEST_BOOTSTRAP_ADMIN_GOOGLE_EMAIL": ADMIN_EMAIL,
+                },
+                "without Google sign-in",
+            ),
         ):
             with self.subTest(settings=settings):
                 with self.assertRaises(ConfigError) as caught:

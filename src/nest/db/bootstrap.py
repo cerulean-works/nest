@@ -72,7 +72,7 @@ class BootstrapState:
     Attributes:
         method (`str`): `google_first_login`, `direct_grant` (an administrator was
             granted another way first) or `preexisting_admin` (one existed when
-            migration 0004 was applied).
+            migration 0005 was applied).
         user_id (`UUID`): The first administrator.
         issuer, subject (`str | None`): The Google identity that claimed it, for
             `google_first_login`.

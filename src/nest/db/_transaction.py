@@ -64,7 +64,7 @@ def audit_context(
 ) -> Generator[None]:
     """
     Names who is making the platform changes run inside it, for the audit triggers
-    of migration 0004. The settings are local to the transaction and cleared on
+    of migration 0005. The settings are local to the transaction and cleared on
     exit, so they never describe a later change in the same transaction.
     """
     if operator is not None and not 1 <= len(operator.strip()) <= 200:

@@ -217,7 +217,7 @@ the checks applied to each sign-in.
 
 | Variable | Default | Behavior |
 | --- | --- | --- |
-| `NEST_BOOTSTRAP_ADMIN_GOOGLE_EMAIL` | Unset | The Google account that becomes the first `platform_admin` at its first sign-in with a verified address. Takes effect once: after the bootstrap is recorded in the database, changing or unsetting it grants and removes nothing. Requires `NEST_DATABASE_URL`. Never logged. See [Bootstrap and recover platform administration](platform-admin). |
+| `NEST_BOOTSTRAP_ADMIN_GOOGLE_EMAIL` | Unset | The Google account that becomes the first `platform_admin` at its first sign-in with a verified address. Takes effect once: after the bootstrap is recorded in the database, changing or unsetting it grants and removes nothing. Requires `NEST_DATABASE_URL` and Google sign-in (`NEST_GOOGLE_CLIENT_ID`). Never logged. See [Bootstrap and recover platform administration](platform-admin). |
 
 ### Reserved settings
 

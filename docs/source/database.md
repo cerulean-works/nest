@@ -136,7 +136,7 @@ the hash of their secret, with an expiry and a revocation time; disabling a User
 revokes all their sessions. `platform_role_assignments` holds `platform_admin`,
 and `organization_memberships` holds `org_admin` and `member`. Neither grants a
 Project role, and no role grants Provider or HPC access. Migration
-`0004_platform_admin_bootstrap` makes platform role assignments grant-or-revoke
+`0005_platform_admin_bootstrap` makes platform role assignments grant-or-revoke
 only, audits every change in `platform_audit_events`, and adds the one-time
 `platform_bootstrap` record (see
 [Bootstrap and recover platform administration](platform-admin)).

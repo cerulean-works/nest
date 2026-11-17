@@ -1,4 +1,4 @@
--- 0004: one-time platform administrator bootstrap and the platform audit log (B03).
+-- 0005: one-time platform administrator bootstrap and the platform audit log (B03).
 --
 -- Applied migrations are immutable: never edit this file. Change the schema by
 -- adding the next numbered file (see "Database migrations" in the docs).
@@ -59,7 +59,7 @@ CREATE TABLE platform_bootstrap (
     -- 'google_first_login': the configured account claimed it at sign-in.
     -- 'direct_grant': a platform_admin was granted another way first, which
     --   closes the bootstrap for good.
-    -- 'preexisting_admin': an administrator already existed when 0004 was applied.
+    -- 'preexisting_admin': an administrator already existed when 0005 was applied.
     method        text NOT NULL
                   CHECK (method IN ('google_first_login', 'direct_grant', 'preexisting_admin')),
     -- The first administrator. Not a foreign key: this is history.

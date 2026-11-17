@@ -653,7 +653,9 @@ def main():
         if not _add_port(server, config):
             raise RuntimeError(f"Cannot bind Controller to {config.bind}")
         server.start()
-        auth = start_auth_service(config.google, database)
+        auth = start_auth_service(
+            config.google, database, bootstrap_admin_email=config.bootstrap_admin_email
+        )
         logger.info(
             "Controller listening address=%s executor=%s slurm_configured=%s tls=%s database=%s "
             "email=%s google_sign_in=%s",

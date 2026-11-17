@@ -879,6 +879,10 @@ def _bootstrap_admin_email(reader: _Reader, database: DatabaseConfig | None) -> 
         reader.fail(
             f"{name} needs NEST_DATABASE_URL: the one-time bootstrap is recorded in the database"
         )
+    if reader.get("NEST_GOOGLE_CLIENT_ID") is None:
+        reader.fail(
+            f"{name} has no effect without Google sign-in; set NEST_GOOGLE_CLIENT_ID or unset it"
+        )
     return raw.lower()
 
 
