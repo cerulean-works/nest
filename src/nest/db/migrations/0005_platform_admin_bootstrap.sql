@@ -122,15 +122,18 @@ CREATE TRIGGER platform_role_assignments_audit AFTER INSERT OR DELETE ON platfor
 CREATE TRIGGER platform_role_assignments_immutable BEFORE UPDATE ON platform_role_assignments
     FOR EACH ROW EXECUTE FUNCTION nest_forbid_column_change('user_id', 'role', 'granted_at');
 
--- The grantor may only be cleared, as its ON DELETE SET NULL foreign key (0003)
--- does when the granting User is deleted. Who granted the role stays in
+-- The grantor may only be cleared, and only by the ON DELETE SET NULL foreign key
+-- (0003) when the granting User is deleted. That referential action runs after
+-- the User row is gone, so a grantor that still exists means a direct UPDATE,
+-- which is refused like any other rewrite. Who granted the role stays in
 -- platform_audit_events (actor_user_id), which has no foreign keys.
 CREATE FUNCTION nest_platform_role_grantor_only_cleared() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
-    IF NEW.granted_by_user_id IS NOT NULL
-       AND NEW.granted_by_user_id IS DISTINCT FROM OLD.granted_by_user_id THEN
-        RAISE EXCEPTION 'platform_role_assignments.granted_by_user_id can only be cleared'
+    IF NEW.granted_by_user_id IS DISTINCT FROM OLD.granted_by_user_id
+       AND (NEW.granted_by_user_id IS NOT NULL
+            OR EXISTS (SELECT 1 FROM users WHERE id = OLD.granted_by_user_id)) THEN
+        RAISE EXCEPTION 'platform_role_assignments.granted_by_user_id is immutable'
             USING ERRCODE = 'integrity_constraint_violation',
                   CONSTRAINT = 'platform_role_assignments_granted_by_user_id_immutable';
     END IF;

@@ -137,7 +137,7 @@ revokes all their sessions. `platform_role_assignments` holds `platform_admin`,
 and `organization_memberships` holds `org_admin` and `member`. Neither grants a
 Project role, and no role grants Provider or HPC access. Migration
 `0005_platform_admin_bootstrap` makes platform role assignments grant-or-revoke
-only (their `granted_by_user_id` can only be cleared, as happens when the
+only (their `granted_by_user_id` is cleared only by the foreign key when the
 granting User is deleted; the audit log keeps the grantor), audits every change in `platform_audit_events`, and adds the one-time
 `platform_bootstrap` record (see
 [Bootstrap and recover platform administration](platform-admin)).

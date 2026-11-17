@@ -318,6 +318,19 @@ class OneTimeTests(_Base):
     def test_deleting_a_grantor_keeps_the_grant_and_its_history(self):
         grantor, admin = self.identities.create_user().id, self.identities.create_user().id
         self.identities.grant_platform_role(admin, granted_by_user_id=grantor)
+        # While the grantor exists, the grantor cannot be cleared or replaced directly.
+        for value in (None, admin):
+            with self.subTest(value=value), self.assertRaises(psycopg.Error):
+                self.conn.execute(
+                    "UPDATE platform_role_assignments SET granted_by_user_id = %s "
+                    "WHERE user_id = %s",
+                    (value, admin),
+                )
+        row = self.conn.execute(
+            "SELECT granted_by_user_id FROM platform_role_assignments WHERE user_id = %s",
+            (admin,),
+        ).fetchone()
+        self.assertEqual(row, (grantor,))
         # The 0003 foreign key clears granted_by_user_id; the deletion must not fail.
         self.conn.execute("DELETE FROM users WHERE id = %s", (grantor,))
         row = self.conn.execute(
@@ -329,12 +342,20 @@ class OneTimeTests(_Base):
         (granted,) = self.events("platform_role_granted")
         self.assertEqual((granted.target_user_id, granted.actor_user_id), (admin, grantor))
         self.assertEqual(self.events("platform_role_revoked"), [])
-        # Only clearing is allowed: the grantor can never be set or replaced.
+        # Once cleared, the grantor can never be set again.
         with self.assertRaises(psycopg.Error):
             self.conn.execute(
                 "UPDATE platform_role_assignments SET granted_by_user_id = %s WHERE user_id = %s",
                 (admin, admin),
             )
+
+    def test_deleting_a_self_granted_admin_removes_and_audits_the_grant(self):
+        admin = self.identities.create_user().id
+        self.identities.grant_platform_role(admin, granted_by_user_id=admin)
+        self.conn.execute("DELETE FROM users WHERE id = %s", (admin,))
+        self.assertEqual(self.admins(), set())
+        (revoked,) = self.events("platform_role_revoked")
+        self.assertEqual(revoked.target_user_id, admin)
 
 
 class AuditContextTests(_Base):
