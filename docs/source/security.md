@@ -52,6 +52,12 @@ Logs, errors and stored delivery errors never contain the password, recipient
 addresses, message bodies, or invitation tokens. The `email_outbox` table does
 hold recipients and, until delivery, bodies, so limit access to the database.
 
+Optional Google sign-in (see [Sign in with Google](authentication)) verifies each
+ID token's signature, issuer, audience, expiry, nonce and `email_verified`, binds
+every callback to the browser that started it, and links Users by Google's `sub`,
+never by email. Keep the client secret in `NEST_GOOGLE_CLIENT_SECRET_FILE`, and
+serve the auth listener only through a TLS-terminating proxy.
+
 The database also holds Users' names and email addresses, invited email
 addresses, and identity-provider subject IDs (see
 [Users, Projects and memberships](database#users-projects-and-memberships)).

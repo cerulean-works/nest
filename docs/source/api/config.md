@@ -44,6 +44,8 @@ except ConfigError as error:
 
 [[autodoc]] config.SMTPConfig
 
+[[autodoc]] config.GoogleAuthConfig
+
 [[autodoc]] config.ClientConfig
 
 ## Secrets

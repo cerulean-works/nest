@@ -29,6 +29,8 @@ guide:
         title: Store Controller records in PostgreSQL
       - local: email
         title: Send email with SMTP
+      - local: authentication
+        title: Sign in with Google
       - local: deployment-architecture
         title: Deployment validation and roadmap
   - title: Contributing
@@ -54,6 +56,8 @@ reference:
         title: Database and migrations
       - local: api/mail
         title: Email delivery
+      - local: api/auth
+        title: Sign-in
       - local: api/runtime
         title: Executor and workers
   - title: Operations
