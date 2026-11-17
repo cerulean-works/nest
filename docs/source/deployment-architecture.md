@@ -71,7 +71,8 @@ The deployment mostly follows that. These are the remaining gaps, most important
 `NEST_SLURM_PARTITION` and `NEST_SLURM_TIME` (and the per-profile
 `NEST_PROVIDER_<ID>_PARTITION` / `_TIME`) default to `dev` and `00:05:00`, are
 validated at startup, and pass through every Compose file. The `--time` option
-overrides the `#SBATCH --time` line still in `scripts/worker.sbatch`.
+overrides the `#SBATCH --time` line still in `scripts/worker.sbatch`. Environment
+builds receive no `--time` and keep the limit in `scripts/environment-smoke.sbatch`.
 
 ### Keep the Controller definitions from drifting
 

@@ -78,7 +78,7 @@ using the first one.
 | `NEST_SLURM_SSH_USER` | Unset | Remote user. Required in Mode B; in Mode A it overrides the SSH config. |
 | `NEST_SLURM_ACCOUNT` | Unset | Default Slurm account. |
 | `NEST_SLURM_PARTITION` | `dev` | Default Slurm partition. |
-| `NEST_SLURM_TIME` | `00:05:00` | Default `sbatch --time`, in a Slurm format such as `30`, `00:05:00` or `1-00:00:00`. |
+| `NEST_SLURM_TIME` | `00:05:00` | Default `sbatch --time`, in a Slurm format such as `30`, `00:05:00` or `1-00:00:00`. Environment builds keep their script's limit. |
 | `NEST_SLURM_WORKDIR` | Unset | Absolute shared HPC directory containing `project/`, `images/`, `environments/` and `jobs/`. |
 
 With `NEST_EXECUTOR=slurm`, a login node, account and work directory are required.
@@ -273,6 +273,7 @@ The image healthcheck runs `python -m nest.healthcheck`, which reads the same
 | Worker job polling | 600 seconds | `NEST_RESULT_TIMEOUT` | `QueueTimeoutError` if the job never started, otherwise `ExecutionTimeoutError` |
 | Environment build polling | 1,800 seconds | `NEST_ENVIRONMENT_TIMEOUT` | `QueueTimeoutError` or `ExecutionTimeoutError` |
 | Slurm job time limit | `00:05:00` | `NEST_SLURM_TIME` or `NEST_PROVIDER_<ID>_TIME` | `ExecutionTimeoutError` (Slurm state `TIMEOUT`) |
+| Environment build time limit | `00:10:00` | `#SBATCH --time` in `scripts/environment-smoke.sbatch` | `ExecutionTimeoutError` (Slurm state `TIMEOUT`) |
 
 The client RPC deadline covers the whole call: environment preparation, queueing,
 execution, and download. The Controller deadlines are counted separately, so the
