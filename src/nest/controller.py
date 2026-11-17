@@ -24,7 +24,7 @@ from .config import (
     load_executor,
     materialize_ssh_credentials,
 )
-from .db import Database, DatabaseError, JobStore, sync_providers, verify
+from .db import Database, DatabaseError, JobStore, bootstrap_state, sync_providers, verify
 from .errors import (
     ERROR_KIND_METADATA,
     JOB_ID_METADATA,
@@ -524,6 +524,24 @@ def build_backend(config: ControllerConfig) -> SlurmBackend | None:
     )
 
 
+def _log_bootstrap(database: Database, config: ControllerConfig) -> None:
+    """Says whether NEST_BOOTSTRAP_ADMIN_GOOGLE_EMAIL can still take effect."""
+    if config.bootstrap_admin_email is None:
+        return
+    state = bootstrap_state(database)
+    if state is None:
+        logger.info(
+            "Platform bootstrap pending: the configured Google account becomes "
+            "platform_admin at its first verified sign-in"
+        )
+    else:
+        logger.info(
+            "Platform bootstrap already completed method=%s; "
+            "NEST_BOOTSTRAP_ADMIN_GOOGLE_EMAIL has no effect and can be unset",
+            state.method,
+        )
+
+
 def open_database(config: ControllerConfig) -> Database | None:
     """
     Connects to the configured database and checks it before the Controller serves.
@@ -550,6 +568,7 @@ def open_database(config: ControllerConfig) -> Database | None:
         with database.connection() as conn:
             verify(conn)
         sync_providers(database, config.providers, config.default_provider)
+        _log_bootstrap(database, config)
     except psycopg.Error as exc:
         database.close()
         raise DatabaseError(
@@ -634,7 +653,9 @@ def main():
         if not _add_port(server, config):
             raise RuntimeError(f"Cannot bind Controller to {config.bind}")
         server.start()
-        auth = start_auth_service(config.google, database)
+        auth = start_auth_service(
+            config.google, database, bootstrap_admin_email=config.bootstrap_admin_email
+        )
         logger.info(
             "Controller listening address=%s executor=%s slurm_configured=%s tls=%s database=%s "
             "email=%s google_sign_in=%s",

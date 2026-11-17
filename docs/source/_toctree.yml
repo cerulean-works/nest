@@ -31,6 +31,8 @@ guide:
         title: Send email with SMTP
       - local: authentication
         title: Sign in with Google
+      - local: platform-admin
+        title: Bootstrap and recover platform administration
       - local: deployment-architecture
         title: Deployment validation and roadmap
   - title: Contributing

@@ -65,6 +65,13 @@ Session secrets and invitation tokens are stored only as SHA-256 hashes, and
 database errors that Nest logs name only the failing constraint, never row
 values.
 
+The first `platform_admin` is created once, from the verified Google account
+named by `NEST_BOOTSTRAP_ADMIN_GOOGLE_EMAIL`; later changes to the setting grant
+nothing. Anyone holding the database credentials can grant the role with
+`nest-db admin`, so treat those credentials as administrator credentials. Role
+changes and bootstrap events are kept in an append-only audit log. See
+[Bootstrap and recover platform administration](platform-admin).
+
 ## Known limitations
 
 - Experimental API with potential breaking changes.

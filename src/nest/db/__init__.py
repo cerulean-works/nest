@@ -6,6 +6,15 @@ are applied only by `nest-db upgrade`; the Controller verifies the schema at sta
 and refuses to serve when it is unreachable or out of date.
 """
 
+from .bootstrap import (
+    GOOGLE_ISSUERS,
+    AuditEvent,
+    BootstrapOutcome,
+    BootstrapState,
+    PlatformAdminBootstrap,
+    audit_events,
+    bootstrap_state,
+)
 from .connection import Database, DatabaseError
 from .identity import (
     Identity,
@@ -15,6 +24,7 @@ from .identity import (
     User,
     UserNotActiveError,
     hash_token,
+    normalize_email,
 )
 from .login_flows import LoginFlow, LoginFlowStore, TooManyPendingSignInsError
 from .migrate import (
@@ -44,7 +54,11 @@ from .store import JobStore, sync_providers
 
 __all__ = [
     "ASSIGNABLE_ROLES",
+    "GOOGLE_ISSUERS",
     "PROJECT_ROLES",
+    "AuditEvent",
+    "BootstrapOutcome",
+    "BootstrapState",
     "Database",
     "DatabaseError",
     "DeliveryStatus",
@@ -61,6 +75,7 @@ __all__ = [
     "Migration",
     "MigrationError",
     "OwnerRuleError",
+    "PlatformAdminBootstrap",
     "Project",
     "ProjectError",
     "ProjectNotFoundError",
@@ -72,8 +87,11 @@ __all__ = [
     "User",
     "UserNotActiveError",
     "UserNotFoundError",
+    "audit_events",
+    "bootstrap_state",
     "hash_token",
     "load_migrations",
+    "normalize_email",
     "schema_status",
     "sync_providers",
     "upgrade",

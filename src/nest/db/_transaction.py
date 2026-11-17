@@ -51,6 +51,49 @@ def transaction(
         ) from None
 
 
+_AUDIT_SETTINGS = ("nest.audit_actor_user_id", "nest.audit_operator", "nest.audit_reason")
+
+
+@contextmanager
+def audit_context(
+    cursor: psycopg.Cursor[Any],
+    *,
+    actor_user_id: UUID | None = None,
+    operator: str | None = None,
+    reason: str | None = None,
+) -> Generator[None]:
+    """
+    Names who is making the platform changes run inside it, for the audit triggers
+    of migration 0005. The settings are local to the transaction and cleared on
+    exit, so they never describe a later change in the same transaction.
+    """
+    if operator is not None and not 1 <= len(operator.strip()) <= 200:
+        raise ValueError("operator must be 1 to 200 characters")
+    if reason is not None and not 1 <= len(reason.strip()) <= 1000:
+        raise ValueError("reason must be 1 to 1000 characters")
+    values = (
+        str(actor_user_id) if actor_user_id else "",
+        operator.strip() if operator else "",
+        reason.strip() if reason else "",
+    )
+    cursor.execute(
+        "SELECT " + ", ".join("set_config(%s, %s, true)" for _ in _AUDIT_SETTINGS),
+        [item for pair in zip(_AUDIT_SETTINGS, values, strict=True) for item in pair],
+    )
+    try:
+        yield
+    finally:
+        if (
+            not cursor.closed
+            and not cursor.connection.closed
+            and (cursor.connection.info.transaction_status == TransactionStatus.INTRANS)
+        ):
+            cursor.execute(
+                "SELECT " + ", ".join("set_config(%s, '', true)" for _ in _AUDIT_SETTINGS),
+                list(_AUDIT_SETTINGS),
+            )
+
+
 def as_uuid(value: UUID | str, name: str) -> UUID:
     """Parses an ID, raising `ValueError` that names the argument, not the value."""
     if isinstance(value, UUID):

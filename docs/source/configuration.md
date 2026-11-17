@@ -213,6 +213,12 @@ the checks applied to each sign-in.
 | `NEST_GOOGLE_REDIRECT_URL` | Unset | The callback URL registered with the OAuth client, such as `https://nest.example.com/auth/google/callback`. Must be `https://` (`http://` only for `localhost` and `127.0.0.1`), have a path other than `/` and `/auth/google/login`, and contain no credentials, query string or fragment. The auth listener serves its path; `https://` also makes cookies `Secure`. |
 | `NEST_AUTH_HTTP_BIND` | `127.0.0.1:8080` | `host:port` of the plain-HTTP auth listener. Put a TLS-terminating reverse proxy in front of it. |
 
+### Platform administrator bootstrap
+
+| Variable | Default | Behavior |
+| --- | --- | --- |
+| `NEST_BOOTSTRAP_ADMIN_GOOGLE_EMAIL` | Unset | The Google account that becomes the first `platform_admin` at its first sign-in with a verified address. Takes effect once: after the bootstrap is recorded in the database, changing or unsetting it grants and removes nothing. Requires `NEST_DATABASE_URL` and Google sign-in (`NEST_GOOGLE_CLIENT_ID`). Never logged. See [Bootstrap and recover platform administration](platform-admin). |
+
 ### Reserved settings
 
 These names are part of the contract for features that do not exist yet. The

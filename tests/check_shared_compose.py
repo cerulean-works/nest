@@ -64,6 +64,7 @@ CONTROLLER_SETTINGS = {
     "NEST_SMTP_PASSWORD_FILE",
     "NEST_SMTP_CA_FILE",
     "NEST_SMTP_TIMEOUT",
+    "NEST_BOOTSTRAP_ADMIN_GOOGLE_EMAIL",
 }
 COMMAND = shlex.split(os.environ.get("NEST_COMPOSE_COMMAND", "docker compose"))
 

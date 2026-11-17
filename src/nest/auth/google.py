@@ -33,6 +33,7 @@ from ..db import (
     Identity,
     IdentityStore,
     LoginFlowStore,
+    PlatformAdminBootstrap,
     Session,
     TooManyPendingSignInsError,
     User,
@@ -315,6 +316,9 @@ class GoogleSignIn:
             replaces them with a local fake provider.
         timeout (`float`): Seconds for each request to Google.
         session_ttl (`timedelta`): Lifetime of the browser session.
+        bootstrap_admin_email (`str`, *optional*): `NEST_BOOTSTRAP_ADMIN_GOOGLE_EMAIL`.
+            Each sign-in then tries the one-time platform administrator bootstrap
+            (see [`db.PlatformAdminBootstrap`]) in its own transaction.
     """
 
     provider = "google"
@@ -327,6 +331,7 @@ class GoogleSignIn:
         endpoints: OIDCEndpoints = GOOGLE_ENDPOINTS,
         timeout: float = 10.0,
         session_ttl: timedelta = SESSION_TTL,
+        bootstrap_admin_email: str | None = None,
     ):
         self.config = config
         self.endpoints = endpoints
@@ -335,6 +340,7 @@ class GoogleSignIn:
         self.identities = IdentityStore(database)
         self.flows = LoginFlowStore(database)
         self.database = database
+        self.bootstrap = PlatformAdminBootstrap(database, bootstrap_admin_email)
         self.verifier = IDTokenVerifier(config.client_id, endpoints, timeout=timeout)
         if config.client_secret is not None:
             register_secret(config.client_secret.reveal())
@@ -436,6 +442,8 @@ class GoogleSignIn:
                     expires_at=datetime.now(UTC) + self.session_ttl,
                     conn=conn,
                 )
+                # Committed with the sign-in, or not at all.
+                self.bootstrap.claim(linked, conn=conn)
         except UserNotActiveError:
             logger.warning("Sign-in refused for a disabled User")
             raise SignInError("user_disabled") from None

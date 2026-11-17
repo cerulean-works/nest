@@ -132,6 +132,10 @@ GOOGLE_SETTINGS = (
 """Google sign-in settings, read by [`config.load_controller_config`] when any of the
 `NEST_GOOGLE_*` settings is set."""
 
+BOOTSTRAP_SETTINGS = ("NEST_BOOTSTRAP_ADMIN_GOOGLE_EMAIL",)
+"""The one-time platform administrator bootstrap, read by
+[`config.load_controller_config`]. Needs `NEST_DATABASE_URL`."""
+
 RESERVED_SETTINGS = (
     "NEST_AUTH_TOKEN_FILE",
     "NEST_RETENTION_DAYS",
@@ -152,6 +156,7 @@ _HOST = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?")
 _SLURM_TIME = re.compile(r"\d+(?::\d{1,2}){0,2}|\d+-\d+(?::\d{1,2}){0,2}")
 _SLURM_NAME = re.compile(r"[A-Za-z0-9_.-]+")
 _SSH_USER = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,31}")
+_EMAIL_ADDRESS = re.compile(r"[^@\s<>,;\"]{1,64}@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
 
 
 class ConfigError(ValueError):
@@ -531,6 +536,10 @@ class ControllerConfig:
             `NEST_EMAIL_ENABLED` is not `true`.
         google (`GoogleAuthConfig | None`): Google sign-in settings, or `None` when
             `NEST_GOOGLE_CLIENT_ID` is unset.
+        bootstrap_admin_email (`str | None`): `NEST_BOOTSTRAP_ADMIN_GOOGLE_EMAIL`,
+            trimmed and lowercased: the Google account that becomes the first
+            `platform_admin` at its first verified sign-in. Has no effect once the
+            bootstrap has completed.
     """
 
     bind: str = DEFAULT_CONTROLLER_BIND
@@ -548,6 +557,7 @@ class ControllerConfig:
     database: DatabaseConfig | None = None
     email: EmailConfig | None = None
     google: GoogleAuthConfig | None = None
+    bootstrap_admin_email: str | None = None
 
     @property
     def provider(self) -> ProviderProfile | None:
@@ -587,6 +597,8 @@ class ControllerConfig:
             "database": self.database.summary() if self.database else None,
             "email": self.email.summary() if self.email else None,
             "google": self.google.summary() if self.google else None,
+            # The address is personal data, so only whether it is set is logged.
+            "bootstrap_admin_configured": self.bootstrap_admin_email is not None,
         }
 
 
@@ -852,6 +864,26 @@ def _ssh_policy(reader: _Reader, profiles: list[ProviderProfile]) -> SSHPolicy:
         if private_key_raw
         else None,
     )
+
+
+def _bootstrap_admin_email(reader: _Reader, database: DatabaseConfig | None) -> str | None:
+    """Reads `NEST_BOOTSTRAP_ADMIN_GOOGLE_EMAIL`. The value is never echoed in errors."""
+    name = "NEST_BOOTSTRAP_ADMIN_GOOGLE_EMAIL"
+    raw = reader.get(name)
+    if raw is None:
+        return None
+    if not _EMAIL_ADDRESS.fullmatch(raw) or len(raw) > 320:
+        reader.fail(f"{name} must be one Google account address, such as admin@example.com")
+        return None
+    if database is None and reader.get("NEST_DATABASE_URL") is None:
+        reader.fail(
+            f"{name} needs NEST_DATABASE_URL: the one-time bootstrap is recorded in the database"
+        )
+    if reader.get("NEST_GOOGLE_CLIENT_ID") is None:
+        reader.fail(
+            f"{name} has no effect without Google sign-in; set NEST_GOOGLE_CLIENT_ID or unset it"
+        )
+    return raw.lower()
 
 
 def _reserved(reader: _Reader) -> None:
@@ -1350,6 +1382,7 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
     database = _database(reader)
     email = _email(reader, database)
     google = _google(reader, database)
+    bootstrap_admin_email = _bootstrap_admin_email(reader, database)
     _reserved(reader)
 
     if reader.problems:
@@ -1366,6 +1399,7 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
         database=database,
         email=email,
         google=google,
+        bootstrap_admin_email=bootstrap_admin_email,
         **timeouts,
     )
 

@@ -17,7 +17,7 @@ from uuid import UUID
 import psycopg
 
 from .._logging import get_logger
-from ._transaction import as_uuid, transaction
+from ._transaction import as_uuid, audit_context, transaction
 from .connection import Database
 
 logger = get_logger("nest.db.identity")
@@ -39,6 +39,11 @@ class IdentityConflictError(Exception):
 
 class UserNotActiveError(Exception):
     """The User is disabled, so no new session can be created for them."""
+
+
+def normalize_email(email: str) -> str:
+    """Returns an address trimmed and lowercased, the form addresses are compared in."""
+    return email.strip().lower()
 
 
 def hash_token(token: str) -> bytes:
@@ -439,20 +444,42 @@ class IdentityStore:
         role: str = "platform_admin",
         *,
         granted_by_user_id: UUID | str | None = None,
+        operator: str | None = None,
+        reason: str | None = None,
         conn: psycopg.Connection | None = None,
     ) -> bool:
-        """Grants a platform role. Returns `False` if the User already had it."""
+        """
+        Grants a platform role. Returns `False` if the User already had it.
+
+        Every grant is recorded in the platform audit log, and the first
+        `platform_admin` granted this way closes the one-time bootstrap (see
+        [`db.PlatformAdminBootstrap`]).
+
+        Args:
+            user_id (`UUID`): The User to grant the role to.
+            role (`str`, *optional*): Defaults to `platform_admin`.
+            granted_by_user_id (`UUID`, *optional*): The administrator granting it.
+            operator (`str`, *optional*): Operator name, for an operator recovery.
+            reason (`str`, *optional*): Why, for the audit log.
+            conn (`psycopg.Connection`, *optional*): Transaction to join.
+
+        Raises:
+            `LookupError`: If the User does not exist.
+        """
         uid = as_uuid(user_id, "user_id")
         by = as_uuid(granted_by_user_id, "granted_by_user_id") if granted_by_user_id else None
         if role not in PLATFORM_ROLES:
             raise ValueError(f"role must be one of {PLATFORM_ROLES}")
         with transaction(self.database, conn, "grant a platform role") as cursor:
-            cursor.execute(
-                "INSERT INTO platform_role_assignments (user_id, role, granted_by_user_id) "
-                "VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
-                (uid, role, by),
-            )
-            granted = cursor.rowcount == 1
+            if cursor.execute("SELECT 1 FROM users WHERE id = %s", (uid,)).fetchone() is None:
+                raise LookupError("The User does not exist")
+            with audit_context(cursor, actor_user_id=by, operator=operator, reason=reason):
+                cursor.execute(
+                    "INSERT INTO platform_role_assignments (user_id, role, granted_by_user_id) "
+                    "VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                    (uid, role, by),
+                )
+                granted = cursor.rowcount == 1
         if granted:
             logger.info("Platform role granted user_id=%s role=%s", uid, role)
         return granted
@@ -462,11 +489,31 @@ class IdentityStore:
         user_id: UUID | str,
         role: str = "platform_admin",
         *,
+        revoked_by_user_id: UUID | str | None = None,
+        operator: str | None = None,
+        reason: str | None = None,
         conn: psycopg.Connection | None = None,
     ) -> bool:
-        """Revokes a platform role. Returns whether the User had it."""
+        """
+        Revokes a platform role. Returns whether the User had it.
+
+        Every revocation is recorded in the platform audit log. Revoking never
+        reopens the one-time bootstrap.
+
+        Args:
+            user_id (`UUID`): The User to revoke the role from.
+            role (`str`, *optional*): Defaults to `platform_admin`.
+            revoked_by_user_id (`UUID`, *optional*): The administrator revoking it.
+            operator (`str`, *optional*): Operator name, for an operator recovery.
+            reason (`str`, *optional*): Why, for the audit log.
+            conn (`psycopg.Connection`, *optional*): Transaction to join.
+        """
         uid = as_uuid(user_id, "user_id")
-        with transaction(self.database, conn, "revoke a platform role") as cursor:
+        by = as_uuid(revoked_by_user_id, "revoked_by_user_id") if revoked_by_user_id else None
+        with (
+            transaction(self.database, conn, "revoke a platform role") as cursor,
+            audit_context(cursor, actor_user_id=by, operator=operator, reason=reason),
+        ):
             cursor.execute(
                 "DELETE FROM platform_role_assignments WHERE user_id = %s AND role = %s",
                 (uid, role),
@@ -475,6 +522,37 @@ class IdentityStore:
         if revoked:
             logger.info("Platform role revoked user_id=%s role=%s", uid, role)
         return revoked
+
+    def platform_admins(self) -> list[tuple[UUID, datetime]]:
+        """Returns the current `platform_admin` Users and when each was granted, oldest first."""
+        with transaction(self.database, None, "list platform administrators") as cursor:
+            rows = cursor.execute(
+                "SELECT user_id, granted_at FROM platform_role_assignments "
+                "WHERE role = 'platform_admin' ORDER BY granted_at, user_id"
+            ).fetchall()
+        return [(row["user_id"], row["granted_at"]) for row in rows]
+
+    def find_users_by_email(self, email: str) -> list[tuple[User, Identity]]:
+        """
+        Returns the Users whose sign-in identities last reported this address, with
+        those identities. Matching ignores case. For operators locating a User;
+        an address never identifies a User by itself.
+        """
+        normalized = normalize_email(email)
+        with transaction(self.database, None, "find Users by email") as cursor:
+            rows = cursor.execute(
+                f"SELECT {_IDENTITY_COLUMNS} FROM user_identities "
+                "WHERE lower(email) = %s ORDER BY user_id, id",
+                (normalized,),
+            ).fetchall()
+            users = {
+                row["id"]: User(**row)
+                for row in cursor.execute(
+                    f"SELECT {_USER_COLUMNS} FROM users WHERE id = ANY(%s)",
+                    ([row["user_id"] for row in rows],),
+                ).fetchall()
+            }
+        return [(users[row["user_id"]], Identity(**row)) for row in rows]
 
     def platform_roles(self, user_id: UUID | str) -> set[str]:
         """Returns a User's platform roles."""
