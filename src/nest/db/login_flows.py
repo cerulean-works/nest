@@ -20,6 +20,11 @@ from .connection import Database
 
 logger = get_logger("nest.db.login_flows")
 
+PENDING_CAP_LOCK_CLASS = 0x4E534C46
+"""First key of the per-provider `pg_advisory_xact_lock` that serializes the
+pending-sign-in cap ("NSLF"). The two-key form never collides with the one-key
+migration lock."""
+
 
 class TooManyPendingSignInsError(Exception):
     """Too many sign-ins are waiting for their callback; try again later."""
@@ -71,12 +76,21 @@ class LoginFlowStore:
         Raises:
             [`db.TooManyPendingSignInsError`]: If `max_pending` unexpired sign-ins
                 already wait, which bounds what unauthenticated requests can store.
+                The bound holds under concurrent starts: they are serialized per
+                provider by a transaction-scoped advisory lock.
         """
         if len(state_hash) != 32 or len(binding_hash) != 32:
             raise ValueError("state_hash and binding_hash must be SHA-256 digests")
         if ttl_seconds <= 0:
             raise ValueError("ttl_seconds must be positive")
         with transaction(self.database, conn, "start a sign-in") as cursor:
+            # Under READ COMMITTED, concurrent starts could all count below the cap
+            # and each insert. This lock, held to the end of the transaction,
+            # makes the count and insert atomic per provider.
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+                (PENDING_CAP_LOCK_CLASS, provider),
+            )
             cursor.execute("DELETE FROM oidc_login_flows WHERE expires_at <= now()")
             row = cursor.execute(
                 "SELECT count(*) AS pending FROM oidc_login_flows WHERE provider = %s",

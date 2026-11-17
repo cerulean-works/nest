@@ -12,6 +12,7 @@ import logging
 import os
 import socket
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -596,6 +597,42 @@ class GoogleSignInFlowTests(PostgresTestCase):
         create("a")
         with self.assertRaises(TooManyPendingSignInsError):
             create("b")
+
+    def test_pending_sign_in_cap_holds_under_concurrent_starts(self):
+        flows = LoginFlowStore(self.db)
+        starts, cap = 8, 3
+        barrier = threading.Barrier(starts)
+        results: list[object] = [None] * starts
+
+        def create(index: int):
+            state = f"concurrent-{index}"
+            with self.db.connection() as conn:
+                barrier.wait()
+                try:
+                    flows.create(
+                        state_hash=hash_token(state),
+                        binding_hash=hash_token(state + "-binding"),
+                        provider="google",
+                        ttl_seconds=600,
+                        max_pending=cap,
+                        conn=conn,
+                    )
+                    # Hold the transaction open so the starts overlap.
+                    time.sleep(0.2)
+                    results[index] = "created"
+                except TooManyPendingSignInsError as exc:
+                    results[index] = exc
+
+        threads = [threading.Thread(target=create, args=(i,)) for i in range(starts)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        self.assertEqual(results.count("created"), cap, results)
+        self.assertEqual(
+            sum(isinstance(r, TooManyPendingSignInsError) for r in results), starts - cap
+        )
+        self.assertEqual(self.count("oidc_login_flows"), cap)
 
     def test_logs_contain_no_secrets(self):
         with self.assertLogs("nest", logging.DEBUG) as logs:
