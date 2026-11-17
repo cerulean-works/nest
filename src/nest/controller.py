@@ -15,6 +15,7 @@ from ._logging import (
     register_secret,
     request_context,
 )
+from .auth.web import start_auth_service
 from .backends.slurm import SlurmBackend, SlurmConfig, new_execution_id
 from .config import (
     ConfigError,
@@ -598,7 +599,9 @@ def main():
     its schema current (see [`controller.open_database`]); otherwise the process
     exits with status 3 instead of running without persistence. Email delivery
     starts only with `NEST_EMAIL_ENABLED=true` and never contacts the SMTP server
-    at startup (see [`mail.start_email_service`]). Uses four RPC worker threads with port reuse disabled, and TLS when
+    at startup (see [`mail.start_email_service`]). Google sign-in is served on
+    `NEST_AUTH_HTTP_BIND` only when `NEST_GOOGLE_CLIENT_ID` is set, and never
+    contacts Google at startup (see [`auth.start_auth_service`]). Uses four RPC worker threads with port reuse disabled, and TLS when
     `NEST_TLS_CERT_FILE` and `NEST_TLS_KEY_FILE` are set. Handles SIGTERM and SIGINT
     by allowing active RPCs up to ten seconds to finish.
 
@@ -644,20 +647,23 @@ def main():
     signal.signal(signal.SIGTERM, stop_server)
     signal.signal(signal.SIGINT, stop_server)
 
+    auth = None
     try:
         logger.info("Controller configuration %s", json.dumps(config.summary(), sort_keys=True))
         if not _add_port(server, config):
             raise RuntimeError(f"Cannot bind Controller to {config.bind}")
         server.start()
+        auth = start_auth_service(config.google, database)
         logger.info(
             "Controller listening address=%s executor=%s slurm_configured=%s tls=%s database=%s "
-            "email=%s",
+            "email=%s google_sign_in=%s",
             config.bind,
             config.executor,
             slurm_backend is not None,
             config.tls is not None,
             database.describe() if database else "none",
             "enabled" if email.enabled else "disabled",
+            auth.address or "disabled",
         )
         server.wait_for_termination()
     except KeyboardInterrupt:
@@ -667,6 +673,8 @@ def main():
         raise
     finally:
         server.stop(grace=0)
+        if auth is not None:
+            auth.stop()
         if email.worker is not None:
             email.worker.stop(timeout=10)
         if database is not None:

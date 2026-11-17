@@ -29,6 +29,7 @@ The database is **externally managed** and **opt-in**:
 | `jobs` | One row per `Execute` (kind `execution`) or `SubmitJob` (kind `batch`) request that reached Slurm: its Execution ID, provider, Slurm job ID, request ID, script and directories, resources, Nest's `status`, the last observed Slurm state, and the error kind and message on failure. |
 | `email_outbox` | Messages queued for optional email delivery and their delivery status (see [Send email with SMTP](email)). Empty unless `NEST_EMAIL_ENABLED=true`. Each row keeps its recipient address; the body is cleared once the message is sent. |
 | `users`, `user_identities`, `user_sessions`, `platform_role_assignments` | Nest Users, the external sign-in identities linked to them, signed-in sessions (stored as SHA-256 hashes of their secrets) and service-wide roles. See [Users, Projects and memberships](#users-projects-and-memberships). |
+| `oidc_login_flows` | Google sign-ins started and not yet finished: SHA-256 hashes of the OAuth `state` and of the browser's sign-in cookie, with a 10-minute expiry (see [Sign in with Google](authentication)). Each row is deleted when its callback arrives or, once expired, when a later sign-in starts. Empty unless Google sign-in is enabled. |
 | `organizations`, `organization_memberships` | Optional Organizations that group Projects, and their members' Organization roles. |
 | `projects`, `project_memberships` | Nest Projects and their active members with their Project roles. |
 | `project_email_invitations`, `project_invite_links`, `project_invitation_redemptions` | Pending email invitations, Invite Link grants, and each User's redemption of a link. Kept apart from memberships. |
@@ -70,8 +71,9 @@ back.
 ## Users, Projects and memberships
 
 Migration `0003_identity_and_projects` adds the records that authentication and
-shared Projects build on. No RPC uses them yet: sign-in, the authorization policy,
-and invitation flows are separate features. The data model and its rules are
+shared Projects build on. [Google sign-in](authentication) creates Users,
+identities and browser sessions; no RPC uses them yet, and the authorization
+policy and invitation flows are separate features. The data model and its rules are
 already enforced by the database.
 
 **Separate identities.** Each kind of identity has its own key, and none is
@@ -201,7 +203,8 @@ Create a dedicated role and database. The role that runs `nest-db upgrade` needs
 create tables in the target schema; the Controller then needs only `SELECT`,
 `INSERT` and `UPDATE` on the Nest tables, plus `DELETE` on `project_memberships`,
 `organization_memberships` and `platform_role_assignments` (removing a member or a
-role deletes its row). For example:
+role deletes its row) and on `oidc_login_flows` (a finished or expired sign-in
+deletes its row). For example:
 
 ```sql
 CREATE ROLE nest LOGIN PASSWORD '...';

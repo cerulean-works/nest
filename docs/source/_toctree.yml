@@ -29,6 +29,8 @@ guide:
         title: Store Controller records in PostgreSQL
       - local: email
         title: Send email with SMTP
+      - local: authentication
+        title: Sign in with Google
       - local: platform-admin
         title: Bootstrap and recover platform administration
       - local: deployment-architecture
@@ -56,6 +58,8 @@ reference:
         title: Database and migrations
       - local: api/mail
         title: Email delivery
+      - local: api/auth
+        title: Sign-in
       - local: api/runtime
         title: Executor and workers
   - title: Operations

@@ -22,6 +22,11 @@ queued messages (such as Project invitations) from a persistent outbox over SMTP
 with verified TLS (see [`mail`]). Without it no SMTP setting is read or validated,
 and nothing else in Nest depends on mail.
 
+Google sign-in is opt-in as well: setting `NEST_GOOGLE_CLIENT_ID` enables the OAuth
+authorization code flow with PKCE and OIDC ID-token verification (see [`auth`]), served
+on a small HTTP listener at `NEST_AUTH_HTTP_BIND`. Without it no `NEST_GOOGLE_*` setting
+is read.
+
 Persistence is opt-in: with `NEST_DATABASE_URL` set, the Controller stores Provider
 Profiles and job records in an externally managed PostgreSQL database (see
 [`db.Database`]). Without it the Controller is stateless, unless
@@ -115,6 +120,18 @@ EMAIL_SETTINGS = (
 """Email delivery settings, read by [`config.load_controller_config`] only when
 `NEST_EMAIL_ENABLED=true`."""
 
+DEFAULT_AUTH_HTTP_BIND = "127.0.0.1:8080"
+
+GOOGLE_SETTINGS = (
+    "NEST_GOOGLE_CLIENT_ID",
+    "NEST_GOOGLE_CLIENT_SECRET",
+    "NEST_GOOGLE_CLIENT_SECRET_FILE",
+    "NEST_GOOGLE_REDIRECT_URL",
+    "NEST_AUTH_HTTP_BIND",
+)
+"""Google sign-in settings, read by [`config.load_controller_config`] when any of the
+`NEST_GOOGLE_*` settings is set."""
+
 BOOTSTRAP_SETTINGS = ("NEST_BOOTSTRAP_ADMIN_GOOGLE_EMAIL",)
 """The one-time platform administrator bootstrap, read by
 [`config.load_controller_config`]. Needs `NEST_DATABASE_URL`."""
@@ -126,7 +143,12 @@ RESERVED_SETTINGS = (
 )
 """Settings reserved by the contract for features that do not exist yet."""
 
-SECRET_SETTINGS = ("NEST_DATABASE_URL", "NEST_SSH_PRIVATE_KEY", "NEST_SMTP_PASSWORD")
+SECRET_SETTINGS = (
+    "NEST_DATABASE_URL",
+    "NEST_SSH_PRIVATE_KEY",
+    "NEST_SMTP_PASSWORD",
+    "NEST_GOOGLE_CLIENT_SECRET",
+)
 """Variables whose values are never echoed in errors or logs."""
 
 _PROVIDER_ID = re.compile(r"[a-z][a-z0-9_]{0,31}")
@@ -442,6 +464,57 @@ class EmailConfig:
 
 
 @dataclass(frozen=True)
+class GoogleAuthConfig:
+    """
+    Google sign-in settings. Present only when `NEST_GOOGLE_CLIENT_ID` is set.
+
+    Attributes:
+        client_id (`str`): OAuth client ID from the Google Cloud console. ID tokens
+            must name it as their audience.
+        client_secret (`Secret | None`): Inline secret from `NEST_GOOGLE_CLIENT_SECRET`.
+        client_secret_file (`str | None`): File holding the secret, re-read on each
+            code exchange so a rotated secret applies without a restart.
+        redirect_url (`str`): `NEST_GOOGLE_REDIRECT_URL`, the exact callback URL
+            registered with Google. The auth listener serves its path.
+        http_bind (`str`): `NEST_AUTH_HTTP_BIND`, the auth listener's `host:port`.
+    """
+
+    client_id: str
+    redirect_url: str
+    client_secret: Secret | None = None
+    client_secret_file: str | None = None
+    http_bind: str = DEFAULT_AUTH_HTTP_BIND
+
+    def read_client_secret(self) -> str:
+        """Returns the current client secret, reading the file when one is set. Never log it."""
+        if self.client_secret_file is not None:
+            with open(self.client_secret_file) as handle:
+                return handle.read().strip()
+        assert self.client_secret is not None
+        return self.client_secret.reveal()
+
+    @property
+    def secure_cookies(self) -> bool:
+        """Whether cookies get the `Secure` attribute: `True` for an `https://` redirect URL."""
+        return self.redirect_url.startswith("https://")
+
+    def summary(self) -> dict[str, object]:
+        """
+        Returns a log-safe description of the Google sign-in settings.
+
+        Returns:
+            `dict[str, object]`: Settings with the client secret replaced by `***`.
+        """
+        return {
+            "client_id": self.client_id,
+            "client_secret": "***" if self.client_secret else None,
+            "client_secret_file": self.client_secret_file,
+            "redirect_url": self.redirect_url,
+            "http_bind": self.http_bind,
+        }
+
+
+@dataclass(frozen=True)
 class ControllerConfig:
     """
     Validated Controller configuration.
@@ -461,6 +534,8 @@ class ControllerConfig:
             Controller is stateless.
         email (`EmailConfig | None`): Email delivery settings, or `None` when
             `NEST_EMAIL_ENABLED` is not `true`.
+        google (`GoogleAuthConfig | None`): Google sign-in settings, or `None` when
+            `NEST_GOOGLE_CLIENT_ID` is unset.
         bootstrap_admin_email (`str | None`): `NEST_BOOTSTRAP_ADMIN_GOOGLE_EMAIL`,
             trimmed and lowercased: the Google account that becomes the first
             `platform_admin` at its first verified sign-in. Has no effect once the
@@ -481,6 +556,7 @@ class ControllerConfig:
     public_url: str | None = None
     database: DatabaseConfig | None = None
     email: EmailConfig | None = None
+    google: GoogleAuthConfig | None = None
     bootstrap_admin_email: str | None = None
 
     @property
@@ -520,6 +596,7 @@ class ControllerConfig:
             "ssh_known_hosts_file": self.ssh.known_hosts_file,
             "database": self.database.summary() if self.database else None,
             "email": self.email.summary() if self.email else None,
+            "google": self.google.summary() if self.google else None,
             # The address is personal data, so only whether it is set is logged.
             "bootstrap_admin_configured": self.bootstrap_admin_email is not None,
         }
@@ -1066,6 +1143,106 @@ def _email(reader: _Reader, database: DatabaseConfig | None) -> EmailConfig | No
     )
 
 
+_REDIRECT_EXAMPLE = "https://nest.example.com/auth/google/callback"
+_GOOGLE_CLIENT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}")
+
+
+def _google_redirect_url(reader: _Reader) -> str | None:
+    raw = reader.get("NEST_GOOGLE_REDIRECT_URL")
+    if raw is None:
+        reader.fail(
+            "NEST_GOOGLE_REDIRECT_URL is required with NEST_GOOGLE_CLIENT_ID; set it to the "
+            f"callback URL registered with Google, such as {_REDIRECT_EXAMPLE!r}"
+        )
+        return None
+    try:
+        parts = urlsplit(raw)
+        parts.port  # noqa: B018 - raises ValueError for an invalid port
+    except ValueError:
+        reader.fail(f"NEST_GOOGLE_REDIRECT_URL must be a URL, got {raw!r}")
+        return None
+    hostname = parts.hostname or ""
+    if parts.scheme != "https" and not (parts.scheme == "http" and _loopback_host(hostname)):
+        reader.fail(
+            "NEST_GOOGLE_REDIRECT_URL must be an https:// URL (http:// only for localhost), "
+            f"because it receives authorization codes; got {raw!r}"
+        )
+        return None
+    if not hostname or parts.username or parts.password:
+        reader.fail("NEST_GOOGLE_REDIRECT_URL must name a host and contain no credentials")
+        return None
+    if parts.query or parts.fragment or "#" in raw:
+        reader.fail("NEST_GOOGLE_REDIRECT_URL must not contain a query string or fragment")
+        return None
+    if not parts.path.startswith("/") or parts.path == "/":
+        reader.fail(
+            f"NEST_GOOGLE_REDIRECT_URL must have a callback path, such as {_REDIRECT_EXAMPLE!r}"
+        )
+        return None
+    if parts.path == "/auth/google/login":
+        reader.fail(
+            "NEST_GOOGLE_REDIRECT_URL must not use /auth/google/login, which starts a "
+            f"sign-in; use a callback path such as {_REDIRECT_EXAMPLE!r}"
+        )
+        return None
+    return raw
+
+
+def _google(reader: _Reader, database: DatabaseConfig | None) -> GoogleAuthConfig | None:
+    """
+    Reads the `NEST_GOOGLE_*` settings and `NEST_AUTH_HTTP_BIND`.
+
+    Google sign-in is enabled by `NEST_GOOGLE_CLIENT_ID`. A secret or redirect URL
+    without a client ID is reported rather than ignored, so a half-configured
+    deployment fails at startup instead of silently running without sign-in.
+    """
+    client_id = reader.get("NEST_GOOGLE_CLIENT_ID")
+    if client_id is None:
+        stray = [n for n in GOOGLE_SETTINGS if n != "NEST_GOOGLE_CLIENT_ID" and reader.get(n)]
+        if stray:
+            reader.fail(f"{', '.join(stray)} needs NEST_GOOGLE_CLIENT_ID")
+        return None
+    before = len(reader.problems)
+    if not _GOOGLE_CLIENT_ID.fullmatch(client_id):
+        reader.fail(
+            "NEST_GOOGLE_CLIENT_ID must be the OAuth client ID, such as "
+            "'1234-abc.apps.googleusercontent.com'"
+        )
+    secret_raw = reader.get("NEST_GOOGLE_CLIENT_SECRET")
+    secret_file_set = reader.get("NEST_GOOGLE_CLIENT_SECRET_FILE") is not None
+    before_file = len(reader.problems)
+    secret_file = reader.readable_file("NEST_GOOGLE_CLIENT_SECRET_FILE")
+    if len(reader.problems) > before_file:
+        secret_file = None
+    if secret_raw is not None and secret_file_set:
+        reader.fail("Set only one of NEST_GOOGLE_CLIENT_SECRET and NEST_GOOGLE_CLIENT_SECRET_FILE")
+    elif secret_raw is None and not secret_file_set:
+        reader.fail(
+            "NEST_GOOGLE_CLIENT_ID needs a client secret: set NEST_GOOGLE_CLIENT_SECRET_FILE "
+            "(recommended) or NEST_GOOGLE_CLIENT_SECRET"
+        )
+    if secret_file is not None:
+        with open(secret_file) as handle:
+            if not handle.read().strip():
+                reader.fail(f"NEST_GOOGLE_CLIENT_SECRET_FILE {secret_file!r} is empty")
+    redirect_url = _google_redirect_url(reader)
+    http_bind = reader.address("NEST_AUTH_HTTP_BIND", DEFAULT_AUTH_HTTP_BIND)
+    if database is None and reader.get("NEST_DATABASE_URL") is None:
+        reader.fail(
+            "NEST_GOOGLE_CLIENT_ID needs NEST_DATABASE_URL: Users, their Google identities, "
+            "sessions and pending sign-ins are stored in the database"
+        )
+    if len(reader.problems) > before or redirect_url is None:
+        return None
+    return GoogleAuthConfig(
+        client_id=client_id,
+        redirect_url=redirect_url,
+        client_secret=Secret(secret_raw) if secret_raw is not None else None,
+        client_secret_file=secret_file,
+        http_bind=http_bind,
+    )
+
+
 def load_database_config(environ: Mapping[str, str] | None = None) -> DatabaseConfig:
     """
     Reads and validates the `NEST_DATABASE_*` settings for `nest-db`.
@@ -1200,6 +1377,7 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
 
     database = _database(reader)
     email = _email(reader, database)
+    google = _google(reader, database)
     bootstrap_admin_email = _bootstrap_admin_email(reader, database)
     _reserved(reader)
 
@@ -1216,6 +1394,7 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
         public_url=public_url,
         database=database,
         email=email,
+        google=google,
         bootstrap_admin_email=bootstrap_admin_email,
         **timeouts,
     )

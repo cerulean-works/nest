@@ -18,8 +18,8 @@ ERROR nest.controller pid=7 request_id=- Invalid Nest configuration:
 ```
 
 An empty value means unset. Error messages never repeat secret values
-(`NEST_SSH_PRIVATE_KEY`, `NEST_SMTP_PASSWORD`, the password and query of
-`NEST_DATABASE_URL`). The
+(`NEST_SSH_PRIVATE_KEY`, `NEST_SMTP_PASSWORD`, `NEST_GOOGLE_CLIENT_SECRET`, the
+password and query of `NEST_DATABASE_URL`). The
 Controller logs a redacted `Controller configuration {...}` line at startup, and
 its log handler masks an inline private key if any message ever contains it.
 
@@ -195,6 +195,23 @@ TLS, credential rotation, the outbox and retries.
 | `NEST_EMAIL_RETRY_DELAY` | `60` | Seconds before the first retry after a transient failure; doubles per attempt. |
 | `NEST_EMAIL_RETRY_MAX_DELAY` | `3600` | Longest wait between attempts. At least `NEST_EMAIL_RETRY_DELAY`. |
 | `NEST_EMAIL_POLL_INTERVAL` | `15` | Seconds between outbox scans. Newly queued messages are sent without waiting. |
+
+### Google sign-in
+
+Google sign-in is opt-in and enabled by `NEST_GOOGLE_CLIENT_ID`. Without it none of
+the settings below are read and no HTTP listener is opened; setting any of them
+without the client ID is an error. When enabled, the Controller serves
+`/auth/google/login` and the redirect URL's path on `NEST_AUTH_HTTP_BIND`. See
+[Sign in with Google](authentication) for the OAuth client, the reverse proxy, and
+the checks applied to each sign-in.
+
+| Variable | Default | Behavior |
+| --- | --- | --- |
+| `NEST_GOOGLE_CLIENT_ID` | Unset (disabled) | OAuth client ID of a Google **Web application** client, such as `1234-example.apps.googleusercontent.com`. ID tokens must name it as their audience. Requires `NEST_DATABASE_URL`, a client secret and `NEST_GOOGLE_REDIRECT_URL`. |
+| `NEST_GOOGLE_CLIENT_SECRET_FILE` | Unset | Absolute path to a file holding the client secret, such as a mounted secret. Re-read for each code exchange, so rotation needs no restart. Must not be empty. |
+| `NEST_GOOGLE_CLIENT_SECRET` | Unset | The client secret inline. A secret: never logged or echoed. Set only one of the two secret settings. |
+| `NEST_GOOGLE_REDIRECT_URL` | Unset | The callback URL registered with the OAuth client, such as `https://nest.example.com/auth/google/callback`. Must be `https://` (`http://` only for `localhost` and `127.0.0.1`), have a path other than `/` and `/auth/google/login`, and contain no credentials, query string or fragment. The auth listener serves its path; `https://` also makes cookies `Secure`. |
+| `NEST_AUTH_HTTP_BIND` | `127.0.0.1:8080` | `host:port` of the plain-HTTP auth listener. Put a TLS-terminating reverse proxy in front of it. |
 
 ### Platform administrator bootstrap
 
