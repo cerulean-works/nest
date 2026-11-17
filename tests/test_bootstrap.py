@@ -315,6 +315,27 @@ class OneTimeTests(_Base):
         self.assertEqual(self.admins(), {user.id})
         self.assertEqual(self.count("platform_audit_events"), 2)
 
+    def test_deleting_a_grantor_keeps_the_grant_and_its_history(self):
+        grantor, admin = self.identities.create_user().id, self.identities.create_user().id
+        self.identities.grant_platform_role(admin, granted_by_user_id=grantor)
+        # The 0003 foreign key clears granted_by_user_id; the deletion must not fail.
+        self.conn.execute("DELETE FROM users WHERE id = %s", (grantor,))
+        row = self.conn.execute(
+            "SELECT granted_by_user_id FROM platform_role_assignments WHERE user_id = %s",
+            (admin,),
+        ).fetchone()
+        self.assertEqual(row, (None,))
+        self.assertEqual(self.admins(), {admin})
+        (granted,) = self.events("platform_role_granted")
+        self.assertEqual((granted.target_user_id, granted.actor_user_id), (admin, grantor))
+        self.assertEqual(self.events("platform_role_revoked"), [])
+        # Only clearing is allowed: the grantor can never be set or replaced.
+        with self.assertRaises(psycopg.Error):
+            self.conn.execute(
+                "UPDATE platform_role_assignments SET granted_by_user_id = %s WHERE user_id = %s",
+                (admin, admin),
+            )
+
 
 class AuditContextTests(_Base):
     def test_role_changes_record_actor_operator_and_reason(self):
