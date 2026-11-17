@@ -196,6 +196,12 @@ TLS, credential rotation, the outbox and retries.
 | `NEST_EMAIL_RETRY_MAX_DELAY` | `3600` | Longest wait between attempts. At least `NEST_EMAIL_RETRY_DELAY`. |
 | `NEST_EMAIL_POLL_INTERVAL` | `15` | Seconds between outbox scans. Newly queued messages are sent without waiting. |
 
+### Platform administrator bootstrap
+
+| Variable | Default | Behavior |
+| --- | --- | --- |
+| `NEST_BOOTSTRAP_ADMIN_GOOGLE_EMAIL` | Unset | The Google account that becomes the first `platform_admin` at its first sign-in with a verified address. Takes effect once: after the bootstrap is recorded in the database, changing or unsetting it grants and removes nothing. Requires `NEST_DATABASE_URL`. Never logged. See [Bootstrap and recover platform administration](platform-admin). |
+
 ### Reserved settings
 
 These names are part of the contract for features that do not exist yet. The

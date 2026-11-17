@@ -29,6 +29,8 @@ guide:
         title: Store Controller records in PostgreSQL
       - local: email
         title: Send email with SMTP
+      - local: platform-admin
+        title: Bootstrap and recover platform administration
       - local: deployment-architecture
         title: Deployment validation and roadmap
   - title: Contributing

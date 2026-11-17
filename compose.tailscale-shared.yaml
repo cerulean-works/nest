@@ -62,6 +62,7 @@ services:
       NEST_SMTP_PASSWORD_FILE: ${NEST_SMTP_PASSWORD_FILE:-}
       NEST_SMTP_CA_FILE: ${NEST_SMTP_CA_FILE:-}
       NEST_SMTP_TIMEOUT: ${NEST_SMTP_TIMEOUT:-}
+      NEST_BOOTSTRAP_ADMIN_GOOGLE_EMAIL: ${NEST_BOOTSTRAP_ADMIN_GOOGLE_EMAIL:-}
     depends_on:
       tailscale:
         condition: service_healthy

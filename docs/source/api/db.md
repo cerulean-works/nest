@@ -93,6 +93,24 @@ identities.create_session(
 
 [[autodoc]] db.IdentityConflictError
 
+## Platform administrator bootstrap
+
+See [Bootstrap and recover platform administration](../platform-admin).
+
+[[autodoc]] db.PlatformAdminBootstrap
+
+[[autodoc]] db.BootstrapOutcome
+
+[[autodoc]] db.BootstrapState
+
+[[autodoc]] db.bootstrap_state
+
+[[autodoc]] db.AuditEvent
+
+[[autodoc]] db.audit_events
+
+[[autodoc]] db.normalize_email
+
 ## Projects and memberships
 
 ```python

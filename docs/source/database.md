@@ -32,6 +32,7 @@ The database is **externally managed** and **opt-in**:
 | `organizations`, `organization_memberships` | Optional Organizations that group Projects, and their members' Organization roles. |
 | `projects`, `project_memberships` | Nest Projects and their active members with their Project roles. |
 | `project_email_invitations`, `project_invite_links`, `project_invitation_redemptions` | Pending email invitations, Invite Link grants, and each User's redemption of a link. Kept apart from memberships. |
+| `platform_bootstrap`, `platform_audit_events` | The one-time record of how the first `platform_admin` was created, and the append-only audit log of platform role changes. See [Bootstrap and recover platform administration](platform-admin). |
 | `schema_migrations` | The applied schema versions and their checksums (see [Migrations](#migrations)). |
 
 Every record has an `execution_id`, a UUID written as 32 lowercase hexadecimal
@@ -132,7 +133,11 @@ records each User's single redemption of a link. No invitation or link can grant
 the hash of their secret, with an expiry and a revocation time; disabling a User
 revokes all their sessions. `platform_role_assignments` holds `platform_admin`,
 and `organization_memberships` holds `org_admin` and `member`. Neither grants a
-Project role, and no role grants Provider or HPC access.
+Project role, and no role grants Provider or HPC access. Migration
+`0004_platform_admin_bootstrap` makes platform role assignments grant-or-revoke
+only, audits every change in `platform_audit_events`, and adds the one-time
+`platform_bootstrap` record (see
+[Bootstrap and recover platform administration](platform-admin)).
 
 ## Configure the connection
 
