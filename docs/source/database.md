@@ -58,7 +58,7 @@ A job record moves through these `status` values:
 | `unknown` | `sbatch` may have submitted a job, but no job ID arrived (`submission_unknown`). |
 
 Local execution (`NEST_EXECUTOR=local`) creates no job records. No user payloads,
-results, or credentials are stored.
+results, or credentials are stored, nor are `SubmitJob` script arguments.
 
 **If the database fails while the Controller runs**, a new Slurm request is refused
 before any side effect, with gRPC status `UNAVAILABLE` and error kind

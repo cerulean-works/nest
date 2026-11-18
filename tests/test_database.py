@@ -730,6 +730,39 @@ class ControllerDatabaseTests(PostgresTestCase):
         self.assertIsNone(row["slurm_job_id"])
         self.assertRegex(row["execution_id"], r"^[0-9a-f]{32}$")
 
+    def test_batch_record_keeps_the_cpu_count_and_refusals_leave_none(self):
+        url, hpc, settings = self.slurm_controller_settings()
+        workdir = hpc.base.parent / "batch"
+        workdir.mkdir()
+        (workdir / "hello.sbatch").write_text("#!/bin/bash\necho hello > hello.out\n")
+        with controller_at_free_port(**settings) as (_, stub, _address):
+            with self.assertRaises(grpc.RpcError) as caught:
+                stub.SubmitJob(
+                    execution_pb2.SubmitJobRequest(workdir=str(workdir), script="a", cpu=-1),
+                    timeout=30,
+                )
+            # Refused by validation, not by the table's CHECK constraint.
+            code = caught.exception.code()  # ty: ignore[missing-attribute]
+            self.assertEqual(code, grpc.StatusCode.INVALID_ARGUMENT)
+            # A NUL byte cannot reach a command line, so it is refused before any record.
+            with self.assertRaises(grpc.RpcError) as caught:
+                stub.SubmitJob(
+                    execution_pb2.SubmitJobRequest(
+                        workdir=str(workdir), script="hello.sbatch", script_args=["ok", "a\0b"]
+                    ),
+                    timeout=30,
+                )
+            code = caught.exception.code()  # ty: ignore[missing-attribute]
+            self.assertEqual(code, grpc.StatusCode.INVALID_ARGUMENT)
+            self.assertEqual(hpc.calls("sbatch"), [])
+            stub.SubmitJob(
+                execution_pb2.SubmitJobRequest(workdir=str(workdir), script="hello.sbatch", cpu=4),
+                timeout=30,
+            )
+        # The refused requests left no record.
+        [row] = self.job_rows(url)
+        self.assertEqual((row["kind"], row["status"], row["cpu"]), ("batch", "submitted", 4))
+
     def test_records_survive_a_controller_restart(self):
         url, hpc, settings = self.slurm_controller_settings()
         root = hpc.base.parent

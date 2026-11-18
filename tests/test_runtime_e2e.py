@@ -422,6 +422,7 @@ def test_batch_job_rpcs_submit_query_and_cancel(slurm_controller, hpc, tmp_path)
         "--partition=dev",
         "--time=00:05:00",
     ]
+    assert hpc.calls("sbatch")[-1]["args"] == []
     assert (
         stub.GetJobStatus(execution_pb2.JobStatusRequest(job_id=pending.job_id), timeout=30).state
         == "PENDING"
@@ -435,6 +436,51 @@ def test_batch_job_rpcs_submit_query_and_cancel(slurm_controller, hpc, tmp_path)
     with pytest.raises(grpc.RpcError) as caught:
         stub.CancelJob(execution_pb2.CancelJobRequest(job_id=999999), timeout=30)
     assert cast(grpc.Call, caught.value).code() == grpc.StatusCode.FAILED_PRECONDITION
+
+
+def test_submit_job_passes_script_args_verbatim_and_cpu(slurm_controller, hpc, tmp_path):
+    workdir = tmp_path / "batch"
+    workdir.mkdir()
+    (workdir / "args.sbatch").write_text('#!/bin/bash\nprintf "%s\\n" "$@" > args.out\n')
+    script_args = ["abc123", "flock eval run", "--out=/work/a b", "$(touch pwned)", "it's;ls"]
+
+    slurm_controller.SubmitJob(
+        execution_pb2.SubmitJobRequest(
+            workdir=str(workdir), script="args.sbatch", cpu=4, script_args=script_args
+        ),
+        timeout=30,
+    )
+    # Each argument reaches the script unchanged and nothing in it runs as shell code.
+    assert (workdir / "args.out").read_text().splitlines() == script_args
+    assert not (workdir / "pwned").exists()
+    assert hpc.calls("sbatch")[-1]["flags"] == [
+        "--parsable",
+        "--account=test-account",
+        "--partition=dev",
+        "--cpus-per-task=4",
+        "--time=00:05:00",
+    ]
+
+    submitted = len(hpc.calls("sbatch"))
+    with pytest.raises(grpc.RpcError) as caught:
+        slurm_controller.SubmitJob(
+            execution_pb2.SubmitJobRequest(workdir=str(workdir), script="args.sbatch", cpu=-1),
+            timeout=30,
+        )
+    assert cast(grpc.Call, caught.value).code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert len(hpc.calls("sbatch")) == submitted
+
+    # A NUL byte cannot reach a command line, so it is refused before SSH.
+    ssh_calls = len(hpc.calls("ssh"))
+    with pytest.raises(grpc.RpcError) as caught:
+        slurm_controller.SubmitJob(
+            execution_pb2.SubmitJobRequest(
+                workdir=str(workdir), script="args.sbatch", script_args=["ok", "a\0b"]
+            ),
+            timeout=30,
+        )
+    assert cast(grpc.Call, caught.value).code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert len(hpc.calls("ssh")) == ssh_calls
 
 
 # CPU resource forwarding
