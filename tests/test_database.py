@@ -744,11 +744,22 @@ class ControllerDatabaseTests(PostgresTestCase):
             # Refused by validation, not by the table's CHECK constraint.
             code = caught.exception.code()  # ty: ignore[missing-attribute]
             self.assertEqual(code, grpc.StatusCode.INVALID_ARGUMENT)
+            # A NUL byte cannot reach a command line, so it is refused before any record.
+            with self.assertRaises(grpc.RpcError) as caught:
+                stub.SubmitJob(
+                    execution_pb2.SubmitJobRequest(
+                        workdir=str(workdir), script="hello.sbatch", script_args=["ok", "a\0b"]
+                    ),
+                    timeout=30,
+                )
+            code = caught.exception.code()  # ty: ignore[missing-attribute]
+            self.assertEqual(code, grpc.StatusCode.INVALID_ARGUMENT)
+            self.assertEqual(hpc.calls("sbatch"), [])
             stub.SubmitJob(
                 execution_pb2.SubmitJobRequest(workdir=str(workdir), script="hello.sbatch", cpu=4),
                 timeout=30,
             )
-        # The refused request left no record.
+        # The refused requests left no record.
         [row] = self.job_rows(url)
         self.assertEqual((row["kind"], row["status"], row["cpu"]), ("batch", "submitted", 4))
 

@@ -469,6 +469,18 @@ def test_submit_job_passes_script_args_verbatim_and_cpu(slurm_controller, hpc, t
     assert cast(grpc.Call, caught.value).code() == grpc.StatusCode.INVALID_ARGUMENT
     assert len(hpc.calls("sbatch")) == submitted
 
+    # A NUL byte cannot reach a command line, so it is refused before SSH.
+    ssh_calls = len(hpc.calls("ssh"))
+    with pytest.raises(grpc.RpcError) as caught:
+        slurm_controller.SubmitJob(
+            execution_pb2.SubmitJobRequest(
+                workdir=str(workdir), script="args.sbatch", script_args=["ok", "a\0b"]
+            ),
+            timeout=30,
+        )
+    assert cast(grpc.Call, caught.value).code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert len(hpc.calls("ssh")) == ssh_calls
+
 
 # CPU resource forwarding
 
