@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 from uuid import UUID
 
 import psycopg
@@ -40,6 +41,25 @@ class IdentityConflictError(Exception):
 
 class UserNotActiveError(Exception):
     """The User is disabled, so no new session can be created for them."""
+
+
+SESSION_FAMILY_LOCK_CLASS = 0x4E53534E
+"""First key of the per-family `pg_advisory_xact_lock` that serializes a refresh
+with the revocation of its family ("NSSN")."""
+
+
+def lock_session_family(cursor: psycopg.Cursor[Any], family_id: UUID) -> None:
+    """
+    Takes the transaction-scoped lock of a session family.
+
+    Rotation and family revocation both hold it, so a revocation that waits for a
+    rotation sees the session that rotation inserted. Take it before any User or
+    session row lock, the order every caller uses.
+    """
+    cursor.execute(
+        "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+        (SESSION_FAMILY_LOCK_CLASS, str(family_id)),
+    )
 
 
 def normalize_email(email: str) -> str:
@@ -442,12 +462,19 @@ class IdentityStore:
         """
         sid = as_uuid(session_id, "session_id")
         with transaction(self.database, conn, "revoke a session") as cursor:
-            rows = cursor.execute(
-                "UPDATE user_sessions SET revoked_at = now(), revoked_reason = %s "
-                "WHERE family_id = (SELECT family_id FROM user_sessions WHERE id = %s) "
-                "AND revoked_at IS NULL RETURNING id",
-                (reason, sid),
-            ).fetchall()
+            family = cursor.execute(
+                "SELECT family_id FROM user_sessions WHERE id = %s", (sid,)
+            ).fetchone()
+            rows = []
+            if family is not None:
+                lock_session_family(cursor, family["family_id"])
+                # A new statement after the lock: under READ COMMITTED it sees the
+                # replacement of any rotation that held the lock first.
+                rows = cursor.execute(
+                    "UPDATE user_sessions SET revoked_at = now(), revoked_reason = %s "
+                    "WHERE family_id = %s AND revoked_at IS NULL RETURNING id",
+                    (reason, family["family_id"]),
+                ).fetchall()
             revoked = bool(rows)
             if revoked:
                 cursor.execute(
@@ -468,6 +495,9 @@ class IdentityStore:
         """Revokes every active session of a User. Returns how many were revoked."""
         uid = as_uuid(user_id, "user_id")
         with transaction(self.database, conn, "revoke sessions") as cursor:
+            # Conflicts with a rotation's FOR SHARE, so this waits for one in progress;
+            # the UPDATE below is a new statement and sees its replacement session.
+            cursor.execute("SELECT 1 FROM users WHERE id = %s FOR UPDATE", (uid,))
             cursor.execute(
                 "UPDATE user_sessions SET revoked_at = now(), revoked_reason = %s "
                 "WHERE user_id = %s AND revoked_at IS NULL",

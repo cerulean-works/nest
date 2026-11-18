@@ -168,7 +168,9 @@ expired, its refresh session is neither revoked nor expired, and its User is act
 A refresh is refused when its secret is unknown, expired, revoked or already
 rotated, or its User is disabled. Because every check is made in PostgreSQL on each
 request, logout and revocation take effect immediately: there is no window in which
-a revoked session's access token still works.
+a revoked session's access token still works. A logout or revocation that races a refresh
+waits for it and then revokes the session the refresh created as well, so a refresh
+in flight cannot leave a revoked sign-in with a working pair of secrets.
 
 ### Revoke sessions
 

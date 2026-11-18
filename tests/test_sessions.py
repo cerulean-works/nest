@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import unittest
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -339,6 +340,71 @@ class SessionStoreTests(_StoreBase):
         rotated = [r for r in results if not isinstance(r, str)]
         self.assertEqual(len(rotated), 1, results)
         self.assertEqual(sorted(r for r in results if isinstance(r, str)), ["reused"] * 5)
+
+    def _revoke_during_rotation(self, revoke):
+        """
+        Runs `revoke` while a rotation of a fresh sign-in is uncommitted, commits the
+        rotation, and returns (revoke's result, the new refresh, the new access).
+        """
+        alice = self.user()
+        first, refresh, _ = self.sign_in(alice)
+        result: list[object] = []
+        with self.db.connection() as rotating:
+            new_refresh, new_access = "raced-refresh", "raced-access"
+            self.sessions.rotate(
+                hash_token(refresh),
+                new_refresh_hash=hash_token(new_refresh),
+                new_access_hash=hash_token(new_access),
+                refresh_ttl=3600,
+                access_ttl=900,
+                conn=rotating,
+            )
+            revoker = threading.Thread(target=lambda: result.append(revoke(alice, first)))
+            revoker.start()
+            time.sleep(0.5)
+            self.assertTrue(revoker.is_alive(), "the revocation should wait for the rotation")
+            rotating.commit()
+        revoker.join(timeout=30)
+        self.assertFalse(revoker.is_alive())
+        return result[0], new_refresh, new_access
+
+    def test_logout_during_a_refresh_revokes_the_replacement(self):
+        revoked, new_refresh, new_access = self._revoke_during_rotation(
+            lambda _, first: self.identities.revoke_session(first.id, reason="logout")
+        )
+        self.assertTrue(revoked)
+        self.assertFalse(self.authenticated(new_access))
+        self.assertEqual(self.refused(new_refresh), "revoked")
+
+    def test_user_revocation_during_a_refresh_revokes_the_replacement(self):
+        count, new_refresh, new_access = self._revoke_during_rotation(
+            lambda alice, _: self.identities.revoke_user_sessions(alice)
+        )
+        self.assertEqual(count, 1)
+        self.assertFalse(self.authenticated(new_access))
+        self.assertEqual(self.refused(new_refresh), "revoked")
+
+    def test_disable_during_a_refresh_revokes_the_replacement(self):
+        _, new_refresh, new_access = self._revoke_during_rotation(
+            lambda alice, _: self.identities.set_user_status(alice, "disabled")
+        )
+        self.assertFalse(self.authenticated(new_access))
+        self.assertEqual(self.refused(new_refresh), "revoked")
+
+    def test_refresh_after_a_concurrent_logout_is_refused(self):
+        alice = self.user()
+        first, refresh, _ = self.sign_in(alice)
+        result: list[object] = []
+        with self.db.connection() as revoking:
+            self.identities.revoke_session(first.id, reason="logout", conn=revoking)
+            refresher = threading.Thread(target=lambda: result.append(self.refused(refresh)))
+            refresher.start()
+            time.sleep(0.5)
+            self.assertTrue(refresher.is_alive(), "the refresh should wait for the logout")
+            revoking.commit()
+        refresher.join(timeout=30)
+        self.assertEqual(result, ["revoked"])
+        self.assertEqual(self.sessions.active_sessions(alice), [])
 
     def test_invalid_arguments(self):
         alice = self.user()

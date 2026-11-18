@@ -22,7 +22,7 @@ import psycopg
 from .._logging import get_logger
 from ._transaction import as_uuid, transaction
 from .connection import Database
-from .identity import _SESSION_COLUMNS, Session
+from .identity import _SESSION_COLUMNS, Session, lock_session_family
 
 logger = get_logger("nest.db.sessions")
 
@@ -164,6 +164,7 @@ class SessionStore:
         new_access_hash: bytes,
         refresh_ttl: float,
         access_ttl: float,
+        conn: psycopg.Connection | None = None,
     ) -> Rotation:
         """
         Replaces the refresh session for `refresh_hash` with a new one and issues
@@ -173,6 +174,10 @@ class SessionStore:
         family's end. The old session is revoked as `rotated` and its access tokens
         are deleted. Concurrent refreshes of one secret are serialized: one rotates,
         the others see a rotated secret.
+
+        Args:
+            conn (`psycopg.Connection`, *optional*): Transaction to join. The caller
+                then commits, including the family revocation of a `reused` secret.
 
         Raises:
             [`db.SessionRefreshError`]: If the secret is unknown, expired or
@@ -186,15 +191,29 @@ class SessionStore:
         _positive(refresh_ttl, "refresh_ttl")
         _positive(access_ttl, "access_ttl")
         refused: tuple[str, Session | None] | None = None
-        with transaction(self.database, None, "refresh a session") as cursor:
-            row = cursor.execute(
-                f"SELECT {_S_COLUMNS}, s.expires_at <= now() AS expired, u.status "
-                "FROM user_sessions s JOIN users u ON u.id = s.user_id "
-                # FOR SHARE OF u: a concurrent disable either commits first and is seen
-                # here, or waits and then revokes the new session.
-                "WHERE s.token_hash = %s FOR UPDATE OF s FOR SHARE OF u",
+        with transaction(self.database, conn, "refresh a session") as cursor:
+            # The family and User never change, so they can be read before locking.
+            owner = cursor.execute(
+                "SELECT family_id, user_id FROM user_sessions WHERE token_hash = %s",
                 (refresh_hash,),
             ).fetchone()
+            row = None
+            if owner is not None:
+                # Locks in the order every revocation uses: family, User, session.
+                # The family lock serializes this rotation with revoke_session(); the
+                # User lock (FOR SHARE) with revoke_user_sessions() and a disable.
+                # Each waits, then reads the replacement this rotation committed.
+                lock_session_family(cursor, owner["family_id"])
+                user = cursor.execute(
+                    "SELECT status FROM users WHERE id = %s FOR SHARE", (owner["user_id"],)
+                ).fetchone()
+                row = cursor.execute(
+                    f"SELECT {_SESSION_COLUMNS}, expires_at <= now() AS expired "
+                    "FROM user_sessions WHERE token_hash = %s FOR UPDATE",
+                    (refresh_hash,),
+                ).fetchone()
+                if row is not None and user is not None:
+                    row["status"] = user["status"]
             if row is None:
                 refused = ("unknown", None)
             elif row["revoked_reason"] == "rotated":
