@@ -133,7 +133,14 @@ records each User's single redemption of a link. No invitation or link can grant
 
 **Sessions and other roles.** `user_sessions` stores browser and CLI sessions by
 the hash of their secret, with an expiry and a revocation time; disabling a User
-revokes all their sessions. `platform_role_assignments` holds `platform_admin`,
+revokes all their sessions. Migration `0006_browser_session_rotation` makes each
+row one refresh session in a *family* (`family_id`, capped by `family_expires_at`):
+a refresh revokes the row as `rotated`, links it to its replacement
+(`replaced_by_session_id`) and inserts the next row of the family. A revoked row
+can never be restored, and a session's User, secret and family never change.
+`session_access_tokens` holds the hashes of short-lived access tokens, each tied to
+one session and deleted when that session is rotated or revoked. See
+[Browser sessions](authentication#browser-sessions). `platform_role_assignments` holds `platform_admin`,
 and `organization_memberships` holds `org_admin` and `member`. Neither grants a
 Project role, and no role grants Provider or HPC access. Migration
 `0005_platform_admin_bootstrap` makes platform role assignments grant-or-revoke

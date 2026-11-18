@@ -27,7 +27,7 @@ from urllib.parse import urlencode
 import jwt
 
 from .._logging import get_logger, register_secret
-from ..config import GoogleAuthConfig
+from ..config import GoogleAuthConfig, SessionPolicy
 from ..db import (
     Database,
     Identity,
@@ -35,6 +35,7 @@ from ..db import (
     LoginFlowStore,
     PlatformAdminBootstrap,
     Session,
+    SessionStore,
     TooManyPendingSignInsError,
     User,
     UserNotActiveError,
@@ -51,9 +52,6 @@ GOOGLE_ISSUERS = ("https://accounts.google.com", "accounts.google.com")
 
 SIGN_IN_TTL = 600.0
 """Seconds between starting a sign-in and its callback."""
-
-SESSION_TTL = timedelta(hours=12)
-"""Lifetime of the browser session created by a sign-in."""
 
 MAX_PENDING_SIGN_INS = 10_000
 """Most unexpired sign-ins kept at once, bounding what unauthenticated requests store."""
@@ -170,16 +168,22 @@ class SignInResult:
         user ([`db.User`]): The signed-in User.
         identity ([`db.Identity`]): The Google identity used.
         created (`bool`): Whether this sign-in created the User.
-        session ([`db.Session`]): The new browser session.
-        session_token (`str`): The session secret for the browser's cookie. Only its
-            hash is stored. Never log it.
+        session ([`db.Session`]): The new refresh session, which starts a session
+            family.
+        refresh_token (`str`): The refresh secret for the browser's refresh cookie.
+            Only its hash is stored. Never log it.
+        access_token (`str`): The short-lived access token for the browser's session
+            cookie. Only its hash is stored. Never log it.
+        access_expires_at (`datetime`): When the access token stops being accepted.
     """
 
     user: User
     identity: Identity
     created: bool
     session: Session
-    session_token: str
+    refresh_token: str
+    access_token: str
+    access_expires_at: datetime
 
 
 def _b64url(data: bytes) -> str:
@@ -315,7 +319,8 @@ class GoogleSignIn:
         endpoints ([`auth.OIDCEndpoints`], *optional*): Google's, unless a test
             replaces them with a local fake provider.
         timeout (`float`): Seconds for each request to Google.
-        session_ttl (`timedelta`): Lifetime of the browser session.
+        sessions ([`config.SessionPolicy`], *optional*): Session lifetimes. Defaults
+            to `config.sessions`.
         bootstrap_admin_email (`str`, *optional*): `NEST_BOOTSTRAP_ADMIN_GOOGLE_EMAIL`.
             Each sign-in then tries the one-time platform administrator bootstrap
             (see [`db.PlatformAdminBootstrap`]) in its own transaction.
@@ -330,15 +335,16 @@ class GoogleSignIn:
         *,
         endpoints: OIDCEndpoints = GOOGLE_ENDPOINTS,
         timeout: float = 10.0,
-        session_ttl: timedelta = SESSION_TTL,
+        sessions: SessionPolicy | None = None,
         bootstrap_admin_email: str | None = None,
     ):
         self.config = config
         self.endpoints = endpoints
         self.timeout = timeout
-        self.session_ttl = session_ttl
+        self.sessions = sessions or config.sessions
         self.identities = IdentityStore(database)
         self.flows = LoginFlowStore(database)
+        self.session_store = SessionStore(database)
         self.database = database
         self.bootstrap = PlatformAdminBootstrap(database, bootstrap_admin_email)
         self.verifier = IDTokenVerifier(config.client_id, endpoints, timeout=timeout)
@@ -424,7 +430,9 @@ class GoogleSignIn:
         id_token = self._exchange(code, verifier)
         identity = self.verifier.verify(id_token, nonce=nonce)
 
-        token = secrets.token_urlsafe(32)
+        refresh_token = secrets.token_urlsafe(32)
+        access_token = secrets.token_urlsafe(32)
+        now = datetime.now(UTC)
         try:
             with self.database.connection() as conn:
                 user, linked, created = self.identities.sign_in(
@@ -438,8 +446,15 @@ class GoogleSignIn:
                 session = self.identities.create_session(
                     user.id,
                     kind="browser",
-                    token_hash=hash_token(token),
-                    expires_at=datetime.now(UTC) + self.session_ttl,
+                    token_hash=hash_token(refresh_token),
+                    expires_at=now + timedelta(seconds=self.sessions.refresh_ttl),
+                    family_expires_at=now + timedelta(seconds=self.sessions.max_lifetime),
+                    conn=conn,
+                )
+                access_expires_at = self.session_store.issue_access_token(
+                    session.id,
+                    token_hash=hash_token(access_token),
+                    ttl_seconds=self.sessions.access_token_ttl,
                     conn=conn,
                 )
                 # Committed with the sign-in, or not at all.
@@ -455,7 +470,13 @@ class GoogleSignIn:
             session.id,
         )
         return SignInResult(
-            user=user, identity=linked, created=created, session=session, session_token=token
+            user=user,
+            identity=linked,
+            created=created,
+            session=session,
+            refresh_token=refresh_token,
+            access_token=access_token,
+            access_expires_at=access_expires_at,
         )
 
     def _exchange(self, code: str, verifier: str) -> str:

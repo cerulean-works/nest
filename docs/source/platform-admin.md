@@ -125,9 +125,10 @@ database role if you need to tell operators apart.
        --reason "Account compromised; ticket OPS-123"
    ```
 
-   To end that User's existing sessions as well, disable the User (for example
-   with [`db.IdentityStore.set_user_status`]), which revokes all of their
-   sessions.
+   To end that User's existing sessions as well, run
+   `nest-db sessions revoke --user-id 0b6c…`, or disable the User (for example
+   with [`db.IdentityStore.set_user_status`]), which also revokes all of their
+   sessions. See [Revoke sessions](authentication#revoke-sessions).
 
 6. Confirm with `nest-db admin status` and `nest-db admin audit`.
 

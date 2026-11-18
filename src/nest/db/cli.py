@@ -14,9 +14,13 @@ Usage:
     nest-db admin revoke --user-id UUID --operator NAME --reason TEXT
     nest-db admin audit  [--user-id UUID] [--limit N]
 
+    # Browser and CLI sessions (see "Revoke sessions"):
+    nest-db sessions list   --user-id UUID
+    nest-db sessions revoke --user-id UUID | --session-id UUID
+
 Reads the same `NEST_DATABASE_*` settings as the Controller. Exit status: 0 on
 success, 1 when the schema is not current, a migration failed or an admin change
-was not made, 2 for invalid configuration or arguments, 3 when the database is
+or revocation was not made, 2 for invalid configuration or arguments, 3 when the database is
 unreachable.
 """
 
@@ -35,6 +39,7 @@ from .bootstrap import audit_events, bootstrap_state
 from .connection import Database, DatabaseError
 from .identity import IdentityStore
 from .migrate import MigrationError, schema_status, upgrade, verify
+from .sessions import SessionStore
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -77,7 +82,55 @@ def _parser() -> argparse.ArgumentParser:
     audit = actions.add_parser("audit", help="show the platform audit log, newest first")
     audit.add_argument("--user-id", type=UUID, metavar="UUID", help="only entries about this User")
     audit.add_argument("--limit", type=int, default=50)
+
+    sessions = commands.add_parser(
+        "sessions",
+        help="list and revoke Users' sessions",
+        description=(
+            "Administrative session revocation. Authenticated by the database "
+            "credentials in NEST_DATABASE_*. Revocation takes effect at once: the "
+            "session's access tokens and refresh secret are refused from then on."
+        ),
+    )
+    session_actions = sessions.add_subparsers(dest="action", required=True)
+    listing = session_actions.add_parser("list", help="list a User's active sessions")
+    listing.add_argument("--user-id", required=True, type=UUID, metavar="UUID")
+    revoke = session_actions.add_parser("revoke", help="revoke one session or all of a User's")
+    target = revoke.add_mutually_exclusive_group(required=True)
+    target.add_argument("--user-id", type=UUID, metavar="UUID", help="every session of this User")
+    target.add_argument(
+        "--session-id",
+        type=UUID,
+        metavar="UUID",
+        help="this session and every session rotated from the same sign-in",
+    )
     return parser
+
+
+def _sessions(database: Database, args: argparse.Namespace) -> int:
+    """Runs one `nest-db sessions` action on an open, verified database."""
+    if args.action == "list":
+        for session in SessionStore(database).active_sessions(args.user_id):
+            print(
+                f"{session.id} kind={session.kind} family={session.family_id} "
+                f"created={session.created_at.isoformat()} "
+                f"expires={session.expires_at.isoformat()} "
+                f"family_expires={session.family_expires_at.isoformat()}"
+            )
+        return 0
+    identities = IdentityStore(database)
+    if args.session_id is not None:
+        if not identities.revoke_session(args.session_id, reason="admin_revoked"):
+            print("No change: no active session in that session's family", file=sys.stderr)
+            return 1
+        print(f"Revoked the session family of {args.session_id}")
+        return 0
+    count = identities.revoke_user_sessions(args.user_id, reason="admin_revoked")
+    if not count:
+        print("No change: the User has no active session", file=sys.stderr)
+        return 1
+    print(f"Revoked {count} session(s) of {args.user_id}")
+    return 0
 
 
 def _admin(database: Database, args: argparse.Namespace) -> int:
@@ -162,7 +215,7 @@ def main(argv: list[str] | None = None) -> int:
         print(exc, file=sys.stderr)
         return 2
     database = Database(config, application_name="nest-db")
-    if args.command == "admin":
+    if args.command in ("admin", "sessions"):
         try:
             database.open()
         except DatabaseError as exc:
@@ -171,7 +224,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             with database.connection() as conn:
                 verify(conn)
-            return _admin(database, args)
+            return (_admin if args.command == "admin" else _sessions)(database, args)
         except MigrationError as exc:
             print(f"{exc}; run nest-db upgrade first", file=sys.stderr)
             return 1

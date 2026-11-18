@@ -61,7 +61,8 @@ serve the auth listener only through a TLS-terminating proxy.
 The database also holds Users' names and email addresses, invited email
 addresses, and identity-provider subject IDs (see
 [Users, Projects and memberships](database#users-projects-and-memberships)).
-Session secrets and invitation tokens are stored only as SHA-256 hashes, and
+Session secrets (refresh secrets and access tokens) and invitation tokens are
+stored only as SHA-256 hashes, and
 database errors that Nest logs name only the failing constraint, never row
 values.
 

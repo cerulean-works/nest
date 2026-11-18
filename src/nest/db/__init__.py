@@ -50,12 +50,14 @@ from .projects import (
     ProjectStore,
     UserNotFoundError,
 )
+from .sessions import AccessGrant, Rotation, SessionRefreshError, SessionStore
 from .store import JobStore, sync_providers
 
 __all__ = [
     "ASSIGNABLE_ROLES",
     "GOOGLE_ISSUERS",
     "PROJECT_ROLES",
+    "AccessGrant",
     "AuditEvent",
     "BootstrapOutcome",
     "BootstrapState",
@@ -81,8 +83,11 @@ __all__ = [
     "ProjectNotFoundError",
     "ProjectStore",
     "QueuedEmail",
+    "Rotation",
     "SchemaStatus",
     "Session",
+    "SessionRefreshError",
+    "SessionStore",
     "TooManyPendingSignInsError",
     "User",
     "UserNotActiveError",
