@@ -393,11 +393,11 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
         Args:
             request (`execution_pb2.SubmitJobRequest`): Job operation parameters.
             context (`grpc.ServicerContext`): RPC context for reporting failures.
-                Uses `INVALID_ARGUMENT` for a negative GPU or CPU count,
-                `FAILED_PRECONDITION` for an absent backend or a rejected submission, and
-                the status and kind of other [`errors.InfrastructureError`] failures,
-                such as `UNKNOWN` with kind `submission_unknown` when SSH timed out
-                during `sbatch`. Never resubmits.
+                Uses `INVALID_ARGUMENT` for a negative GPU or CPU count or a script
+                argument containing a NUL byte, `FAILED_PRECONDITION` for an absent
+                backend or a rejected submission, and the status and kind of other
+                [`errors.InfrastructureError`] failures, such as `UNKNOWN` with kind
+                `submission_unknown` when SSH timed out during `sbatch`. Never resubmits.
 
         Returns:
             `execution_pb2.SubmitJobResponse`: The job operation response.
@@ -408,6 +408,11 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
             context.abort(
                 grpc.StatusCode.INVALID_ARGUMENT,
                 "Resource counts cannot be negative",
+            )
+        if any("\0" in arg for arg in request.script_args):
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                "Script arguments cannot contain NUL bytes",
             )
 
         record = self._begin_record(
