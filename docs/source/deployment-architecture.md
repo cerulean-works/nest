@@ -69,7 +69,7 @@ The deployment mostly follows that. These are the remaining gaps, most important
 ### Expose the hardcoded Slurm defaults (done)
 
 `NEST_SLURM_PARTITION` and `NEST_SLURM_TIME` (and the per-profile
-`NEST_PROVIDER_<ID>_PARTITION` / `_TIME`) default to `8gpus` and `00:05:00`, are
+`NEST_PROVIDER_<ID>_PARTITION` / `_TIME`) default to `h200_256gpu` and `00:05:00`, are
 validated at startup, and pass through every Compose file. The `--time` option
 overrides the `#SBATCH --time` line still in `scripts/worker.sbatch`. Environment
 builds receive no `--time` and keep the limit in `scripts/environment-smoke.sbatch`.

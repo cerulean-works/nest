@@ -75,7 +75,7 @@ using the first one.
 | `NEST_SLURM_SSH_MODE` | `A` | `A` (trusted operator SSH) or `B` (managed SSH); see below. |
 | `NEST_SLURM_SSH_USER` | Unset | Remote user. Required in Mode B; in Mode A it overrides the SSH config. |
 | `NEST_SLURM_ACCOUNT` | Unset | Default Slurm account. |
-| `NEST_SLURM_PARTITION` | `8gpus` | Default Slurm partition. |
+| `NEST_SLURM_PARTITION` | `h200_256gpu` | Slurm partition for the team allocation. Set this to a partition available to the configured account for other deployments. |
 | `NEST_SLURM_TIME` | `00:05:00` | Default `sbatch --time`, in a Slurm format such as `30`, `00:05:00` or `1-00:00:00`. Environment builds keep their script's limit. |
 | `NEST_SLURM_WORKDIR` | Unset | Absolute shared HPC directory containing `project/`, `images/`, `environments/` and `jobs/`. |
 
@@ -319,7 +319,7 @@ Controller passes `gpu` to the worker job as `--gpus-per-node` and `cpu` as
 `--cpus-per-task`. A count of `0` uses the worker script's `#SBATCH` directive
 (one CPU in `scripts/worker.sbatch`). Environment builds use the resource
 counts and time limit in the deployed `scripts/environment-smoke.sbatch`.
-On Nano4, `8gpus` allows one to eight GPUs per job. Use `gpu=1` for a smoke test.
+Use `gpu=1` for a smoke test on the team's Nano4 partition.
 Negative counts are rejected before anything is submitted. The local Controller
 does not allocate resources.
 
