@@ -17,7 +17,6 @@ def main():
         SlurmConfig(
             ssh_host=os.environ["NEST_SLURM_HOST"],
             account=os.environ["NEST_SLURM_ACCOUNT"],
-            partition="dev",
             worker_workdir=workdir,
         )
     )

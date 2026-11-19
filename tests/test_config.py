@@ -190,10 +190,10 @@ class ValidationTests(unittest.TestCase):
         self.assertIn("only one of NEST_SLURM_HOST and NEST_SLURM_LOGIN_NODES", text)
         self.assertIn("NEST_SLURM_SSH_USER", self.problems({**LEGACY, "NEST_SLURM_SSH_MODE": "B"}))
 
-    def test_partition_and_time_keep_their_old_defaults(self):
+    def test_default_partition_and_time(self):
         profile = load_controller_config(LEGACY).provider
         assert profile is not None
-        self.assertEqual((profile.partition, profile.time), ("dev", "00:05:00"))
+        self.assertEqual((profile.partition, profile.time), ("8gpus", "00:05:00"))
 
     def test_slurm_names_and_times_are_validated(self):
         text = self.problems(
