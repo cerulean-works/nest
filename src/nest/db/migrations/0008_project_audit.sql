@@ -4,7 +4,7 @@
 -- adding the next numbered file (see "Database migrations" in the docs).
 --
 -- Every change to a Project's name or deletion and to its memberships writes one
--- row here, from triggers, whoever made the change: the authorization layer, an
+-- row here, and Projects can only be soft-deleted, from triggers, whoever made the change: the authorization layer, an
 -- invitation flow or an operator with database credentials. Rows are never
 -- updated or deleted. IDs are not foreign keys, so the history outlives the
 -- Users and Projects it names. No email address is stored here.
@@ -82,6 +82,24 @@ $$;
 
 CREATE TRIGGER projects_stays_deleted BEFORE UPDATE ON projects
     FOR EACH ROW EXECUTE FUNCTION nest_project_stays_deleted();
+
+-- Projects are only ever soft-deleted (deleted_at), which the audit trigger above
+-- records. A hard DELETE or TRUNCATE would remove the row and cascade away its
+-- memberships without a project_deleted event, so both are refused for every
+-- writer, including operators with database credentials.
+CREATE FUNCTION nest_forbid_project_hard_delete() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'Projects cannot be hard-deleted; set deleted_at instead'
+        USING ERRCODE = 'integrity_constraint_violation',
+              CONSTRAINT = 'projects_soft_delete_only';
+END;
+$$;
+
+CREATE TRIGGER projects_soft_delete_only BEFORE DELETE ON projects
+    FOR EACH ROW EXECUTE FUNCTION nest_forbid_project_hard_delete();
+CREATE TRIGGER projects_no_truncate BEFORE TRUNCATE ON projects
+    FOR EACH STATEMENT EXECUTE FUNCTION nest_forbid_project_hard_delete();
 
 CREATE FUNCTION nest_audit_project_membership() RETURNS trigger
 LANGUAGE plpgsql AS $$

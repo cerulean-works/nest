@@ -603,7 +603,11 @@ class AttributionTests(_Base):
         alice = self.user()
         project = self.projects.create_project("p", created_by_user_id=alice)
         self.jobs.begin("batch", "3" * 32, project_id=project.id, submitted_by_user_id=alice)
-        with self.assertRaises(psycopg.errors.ForeignKeyViolation), self.conn.transaction():
+        # Refused before the foreign key is checked: Projects are never hard-deleted (0008).
+        with (
+            self.assertRaises(psycopg.errors.IntegrityConstraintViolation),
+            self.conn.transaction(),
+        ):
             self.conn.execute("DELETE FROM projects WHERE id = %s", (project.id,))
         with self.assertRaises(psycopg.errors.ForeignKeyViolation), self.conn.transaction():
             self.conn.execute("DELETE FROM users WHERE id = %s", (alice,))

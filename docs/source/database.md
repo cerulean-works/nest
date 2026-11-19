@@ -159,7 +159,9 @@ granting User is deleted; the audit log keeps the grantor), audits every change 
 **Project audit history.** Migration `0008_project_audit` adds the append-only
 `project_audit_events`, written by triggers on every Project creation, rename and
 deletion and every membership addition, role change and removal, whoever makes
-it. It also keeps a deleted Project deleted. See
+it. Projects can then only be soft-deleted: a direct `DELETE` or `TRUNCATE` on
+`projects` is refused for every writer, so no Project row, membership history or
+deletion record can be removed, and a deleted Project cannot be restored. See
 [Audit history](projects#audit-history).
 
 ## Configure the connection

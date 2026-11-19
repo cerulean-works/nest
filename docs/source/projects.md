@@ -35,7 +35,9 @@ Owner.
   themselves Owner, and nobody can remove or demote the Owner, so a Project always
   has its one Owner.
 - Deleting a Project keeps its rows, Runs and history, but nobody has a role in it
-  any more and it cannot be restored.
+  any more and it cannot be restored. The database refuses a hard `DELETE` or
+  `TRUNCATE` of `projects` from any writer, so deletion is always this audited
+  soft delete.
 - Everything not allowed above is refused, including any action by a User who is
   not a member, by a disabled User, or on a deleted Project.
 

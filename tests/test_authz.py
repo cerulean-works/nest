@@ -573,6 +573,31 @@ class ProjectAuditTests(_Base):
             ("member_removed", users["viewer"], "ops", "ticket 7"),
         )
 
+    def test_projects_cannot_be_hard_deleted(self):
+        """A direct DELETE or TRUNCATE would bypass soft deletion and its audit entry."""
+        pid, users = self.team()
+        before = self.store.audit_history(pid)
+        for statement, args in (
+            ("DELETE FROM projects WHERE id = %s", (pid,)),
+            ("TRUNCATE projects CASCADE", ()),
+        ):
+            with (
+                self.subTest(statement=statement),
+                self.assertRaises(psycopg.errors.IntegrityConstraintViolation) as caught,
+            ):
+                self.conn.execute(statement, args)
+            self.assertEqual(caught.exception.diag.constraint_name, "projects_soft_delete_only")
+        # Nothing changed: the Project, its members and its history are intact.
+        self.assertEqual(self.project(pid).id, pid)
+        self.assertEqual(len(self.store.members(pid)), 4)
+        self.assertEqual(self.store.audit_history(pid), before)
+        # Even a deleted Project's row stays, with its project_deleted entry.
+        self.service.delete_project(browser(users["owner"]), pid)
+        with self.assertRaises(psycopg.errors.IntegrityConstraintViolation):
+            self.conn.execute("DELETE FROM projects WHERE id = %s", (pid,))
+        self.assertEqual(self.store.audit_history(pid, limit=1)[0].event, "project_deleted")
+        self.assertIsNotNone(self.store.get_project(pid, include_deleted=True))
+
     def test_a_deleted_project_cannot_be_restored(self):
         pid, users = self.team()
         self.service.delete_project(browser(users["owner"]), pid)
