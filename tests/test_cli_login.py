@@ -733,7 +733,8 @@ class HPCCredentialSeparationTests(unittest.TestCase):
     def test_hpc_code_never_reads_nest_sessions(self):
         """Nest sessions are not HPC credentials: the SSH and Slurm code paths never
         import the CLI session module or read its file."""
-        source = Path(__file__).resolve().parent.parent / "src" / "nest"
+        # The installed package: in the controller image the tests are not beside src/.
+        source = Path(nest_login.__file__).resolve().parent
         for name in ("remote.py", "client.py", "controller.py", "backends/slurm.py", "worker.py"):
             with self.subTest(module=name):
                 text = (source / name).read_text()
