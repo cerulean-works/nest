@@ -30,9 +30,14 @@ A versioned release installation command will be provided when the first Early A
 
 ## Quick Start
 
-The SDK connects to the team Controller at `nest.cerulean.works:50051` by default.
-Connect to the authorized Tailscale network or accept a Controller node share
-before running remote calls against the team deployment.
+For the team deployment, connect to the authorized Tailscale network or accept
+a Controller node share. This deployment uses plaintext gRPC inside the encrypted
+Tailscale network. Select the address and transport explicitly.
+
+```bash
+export NEST_CONTROLLER_ADDRESS="nest.cerulean.works:50051"
+export NEST_CONTROLLER_TLS=false
+```
 
 Create `main.py`:
 
@@ -61,11 +66,14 @@ python main.py
 
 ### Using a Different Controller
 
-Set the address of your Controller. For a [local Controller](docs/source/local-controller.md),
-use `127.0.0.1:50051`.
+The SDK defaults to a [local Controller](docs/source/local-controller.md) at
+`127.0.0.1:50051`. For a TLS-enabled remote Controller, set its address and enable
+TLS. The client verifies the server certificate with gRPC's default trust roots or
+the PEM roots specified by `NEST_CONTROLLER_TLS_CA_FILE`.
 
 ```bash
 export NEST_CONTROLLER_ADDRESS="your-controller:50051"
+export NEST_CONTROLLER_TLS=true
 ```
 
 ## Project Dependencies

@@ -100,7 +100,8 @@ def execute_remote(
     Reads its settings with [`config.load_client_config`]. `NEST_CONTROLLER_ADDRESS`
     overrides [`config.DEFAULT_CONTROLLER_ADDRESS`]. The call has a 900-second
     deadline unless `NEST_RPC_TIMEOUT` sets another positive number of seconds.
-    `NEST_CONTROLLER_TLS` or `NEST_CONTROLLER_TLS_CA_FILE` selects a TLS channel.
+    Non-loopback addresses require an explicit `NEST_CONTROLLER_TLS` setting or
+    `NEST_CONTROLLER_TLS_CA_FILE`.
     The call is never retried. Only send trusted functions and accept results from
     trusted hosts: deserializing Python objects can execute code.
 

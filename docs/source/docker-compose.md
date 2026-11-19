@@ -130,7 +130,9 @@ and is not needed to validate Tailnet connectivity.
 
 Then run the [quickstart](quickstart) from a trusted client. Set
 `NEST_CONTROLLER_ADDRESS` to the Docker host's selected address and published
-port. A successful remote function call verifies the full HPC execution path.
+port. For a non-loopback address, configure the client [TLS settings](configuration#client)
+to match the deployment. A successful remote function call verifies the full HPC
+execution path.
 
 The container restarts automatically unless you stop it explicitly. Its root
 filesystem is read-only, with temporary files and the private SSH copy in

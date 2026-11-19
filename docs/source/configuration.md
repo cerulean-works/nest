@@ -27,19 +27,18 @@ its log handler masks an inline private key if any message ever contains it.
 
 | Variable | Default | Behavior |
 | --- | --- | --- |
-| `NEST_CONTROLLER_ADDRESS` | `nest.cerulean.works:50051` | Controller `host:port` for each remote call. |
+| `NEST_CONTROLLER_ADDRESS` | `127.0.0.1:50051` | Controller `host:port` for each remote call. |
 | `NEST_RPC_TIMEOUT` | `900` | Seconds allowed for each `Execute` RPC. Must be a positive number. When it expires, the call raises `RpcTimeoutError`. |
-| `NEST_CONTROLLER_TLS` | `false` (`true` when a CA file is set) | Use a TLS channel. Accepts `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`. |
-| `NEST_CONTROLLER_TLS_CA_FILE` | Unset | Absolute path to PEM roots for the Controller's certificate. Unset uses the system roots. |
+| `NEST_CONTROLLER_TLS` | `false` for loopback, `true` when a CA file is set | Use a TLS channel with server certificate verification. Accepts `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`. |
+| `NEST_CONTROLLER_TLS_CA_FILE` | Unset | Absolute path to PEM roots for the Controller's certificate. With TLS enabled, an unset file uses gRPC's default trust roots. |
 
 Set these in the process running your Nest application. They do not configure
 where the Controller listens. Invalid client settings raise `nest.config.ConfigError`
 (a `ValueError`) from `.remote()`.
 
-```{note}
-Set `NEST_CONTROLLER_ADDRESS=127.0.0.1:50051` to connect to a
-[local Controller](local-controller) using its default listener.
-```
+For a non-loopback address, set `NEST_CONTROLLER_TLS=true` or provide a CA file
+to use TLS. Set `NEST_CONTROLLER_TLS=false` explicitly for a plaintext deployment
+on a trusted private network such as an authorized Tailnet.
 
 ## Controller
 
