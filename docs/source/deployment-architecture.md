@@ -119,10 +119,11 @@ healthy until the first call fails. Options:
 - A standard `grpc.health.v1` service. `scripts/verify-grpc.py` then would not
   need to rely on rejecting an empty environment.
 
-### Remove the Tailnet-specific client default (done)
+### Use the team hostname as the client default (done)
 
-The SDK's default `NEST_CONTROLLER_ADDRESS` is now `127.0.0.1:50051`. Team users set
-the Tailnet address explicitly; nothing in the SDK or Mode B depends on Tailscale.
+The SDK's default `NEST_CONTROLLER_ADDRESS` is `nest.cerulean.works:50051`.
+Set `NEST_CONTROLLER_ADDRESS` to the address of any other deployment, including
+the Tailnet address for a shared Tailscale Controller.
 
 ### Check sidecar preferences in both modes
 

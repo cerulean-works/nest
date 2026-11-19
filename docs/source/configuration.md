@@ -27,7 +27,7 @@ its log handler masks an inline private key if any message ever contains it.
 
 | Variable | Default | Behavior |
 | --- | --- | --- |
-| `NEST_CONTROLLER_ADDRESS` | `127.0.0.1:50051` | Controller `host:port` for each remote call. |
+| `NEST_CONTROLLER_ADDRESS` | `nest.cerulean.works:50051` | Controller `host:port` for each remote call. |
 | `NEST_RPC_TIMEOUT` | `900` | Seconds allowed for each `Execute` RPC. Must be a positive number. When it expires, the call raises `RpcTimeoutError`. |
 | `NEST_CONTROLLER_TLS` | `false` (`true` when a CA file is set) | Use a TLS channel. Accepts `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`. |
 | `NEST_CONTROLLER_TLS_CA_FILE` | Unset | Absolute path to PEM roots for the Controller's certificate. Unset uses the system roots. |
@@ -37,9 +37,8 @@ where the Controller listens. Invalid client settings raise `nest.config.ConfigE
 (a `ValueError`) from `.remote()`.
 
 ```{note}
-Earlier releases defaulted to `nest-tag.tail8e5ba1.ts.net:50051`, one team's
-Tailnet name. The SDK no longer assumes any Tailnet: set
-`NEST_CONTROLLER_ADDRESS` to reach a shared Controller.
+Set `NEST_CONTROLLER_ADDRESS=127.0.0.1:50051` to connect to a
+[local Controller](local-controller) using its default listener.
 ```
 
 ## Controller

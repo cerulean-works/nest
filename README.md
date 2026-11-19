@@ -30,13 +30,9 @@ A versioned release installation command will be provided when the first Early A
 
 ## Quick Start
 
-For the current team deployment, make sure your device is connected to the authorized Tailscale network.
-
-Point the SDK at the team Controller:
-
-```bash
-export NEST_CONTROLLER_ADDRESS="nest-tag.tail8e5ba1.ts.net:50051"
-```
+The SDK connects to the team Controller at `nest.cerulean.works:50051` by default.
+Connect to the authorized Tailscale network or accept a Controller node share
+before running remote calls against the team deployment.
 
 Create `main.py`:
 
@@ -63,15 +59,10 @@ python main.py
 - `.local()` executes the function on your machine.
 - `.remote()` sends the function to the Nest Controller, which schedules execution on the HPC cluster.
 
-Without `NEST_CONTROLLER_ADDRESS`, the SDK connects to `127.0.0.1:50051`, a
-[local Controller](docs/source/local-controller.md). Earlier releases defaulted to the team's
-Tailnet address; the SDK no longer depends on any Tailnet. Access to the team
-Controller still needs Tailscale connected and access granted through the team
-Tailnet or an accepted Controller node share.
-
 ### Using a Different Controller
 
-Set the address of any other Controller:
+Set the address of your Controller. For a [local Controller](docs/source/local-controller.md),
+use `127.0.0.1:50051`.
 
 ```bash
 export NEST_CONTROLLER_ADDRESS="your-controller:50051"

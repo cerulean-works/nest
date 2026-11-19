@@ -114,11 +114,10 @@ class DefaultsTests(unittest.TestCase):
         )
         self.assertEqual(load_controller_config(settings), load_controller_config({}))
 
-    def test_client_defaults_to_localhost_not_a_tailnet(self):
+    def test_client_defaults_to_the_team_controller(self):
         config = load_client_config({})
         self.assertEqual(config.address, DEFAULT_CONTROLLER_ADDRESS)
-        self.assertEqual(config.address, "127.0.0.1:50051")
-        self.assertNotIn("ts.net", config.address)
+        self.assertEqual(config.address, "nest.cerulean.works:50051")
         self.assertFalse(config.tls)
         self.assertEqual(config.rpc_timeout, 900)
 

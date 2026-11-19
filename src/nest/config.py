@@ -51,7 +51,7 @@ from ._logging import LOG_LEVELS, parse_log_level
 DEFAULT_CONTROLLER_BIND = "127.0.0.1:50051"
 """Listener address used when `NEST_CONTROLLER_BIND` is unset."""
 
-DEFAULT_CONTROLLER_ADDRESS = "127.0.0.1:50051"
+DEFAULT_CONTROLLER_ADDRESS = "nest.cerulean.works:50051"
 """Client address used when `NEST_CONTROLLER_ADDRESS` is unset."""
 
 DEFAULT_RPC_TIMEOUT = 900.0
