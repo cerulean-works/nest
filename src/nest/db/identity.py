@@ -31,7 +31,7 @@ _USER_COLUMNS = "id, display_name, email, status, created_at, updated_at, disabl
 _IDENTITY_COLUMNS = "id, user_id, issuer, subject, email, email_verified, created_at, last_login_at"
 _SESSION_COLUMNS = (
     "id, user_id, kind, created_at, expires_at, last_used_at, revoked_at, revoked_reason, "
-    "family_id, family_expires_at, replaced_by_session_id"
+    "family_id, family_expires_at, replaced_by_session_id, scope"
 )
 
 
@@ -144,6 +144,8 @@ class Session:
             refreshed.
         replaced_by_session_id (`UUID | None`): The session that replaced this one
             when it was rotated.
+        scope (`str | None`): Space-separated scopes of a `cli` session, such as
+            `jobs:run projects:read`. `None` for a browser session.
     """
 
     id: UUID
@@ -157,6 +159,12 @@ class Session:
     family_id: UUID
     family_expires_at: datetime
     replaced_by_session_id: UUID | None
+    scope: str | None = None
+
+    @property
+    def scopes(self) -> frozenset[str]:
+        """The session's scopes as a set; empty for a browser session."""
+        return frozenset(self.scope.split()) if self.scope else frozenset()
 
 
 class IdentityStore:
@@ -379,6 +387,7 @@ class IdentityStore:
         token_hash: bytes,
         expires_at: datetime,
         family_expires_at: datetime | None = None,
+        scope: str | None = None,
         conn: psycopg.Connection | None = None,
     ) -> Session:
         """
@@ -392,6 +401,8 @@ class IdentityStore:
             family_expires_at (`datetime`, *optional*): When the family ends however
                 often it is refreshed. Defaults to `expires_at`, so the session cannot
                 be extended.
+            scope (`str`, *optional*): Space-separated scopes of a `cli` session. A
+                `cli` session without one is granted nothing.
             conn (`psycopg.Connection`, *optional*): Transaction to join.
 
         Raises:
@@ -411,6 +422,8 @@ class IdentityStore:
             raise ValueError("family_expires_at must be timezone-aware")
         if family_expires_at < expires_at:
             raise ValueError("family_expires_at must not be before expires_at")
+        if scope is not None and kind != "cli":
+            raise ValueError("only a cli session has a scope")
         with transaction(self.database, conn, "create a session") as cursor:
             # FOR SHARE conflicts with set_user_status()'s UPDATE, so a disable
             # either commits first and is seen here, or waits for this session to
@@ -424,9 +437,9 @@ class IdentityStore:
                 raise UserNotActiveError("The User is disabled")
             row = cursor.execute(
                 "INSERT INTO user_sessions "
-                "(user_id, kind, token_hash, expires_at, family_expires_at) "
-                f"VALUES (%s, %s, %s, %s, %s) RETURNING {_SESSION_COLUMNS}",
-                (uid, kind, token_hash, expires_at, family_expires_at),
+                "(user_id, kind, token_hash, expires_at, family_expires_at, scope) "
+                f"VALUES (%s, %s, %s, %s, %s, %s) RETURNING {_SESSION_COLUMNS}",
+                (uid, kind, token_hash, expires_at, family_expires_at, scope),
             ).fetchone()
         assert row is not None
         logger.info("Session created session_id=%s user_id=%s kind=%s", row["id"], uid, kind)

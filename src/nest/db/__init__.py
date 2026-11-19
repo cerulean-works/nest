@@ -15,6 +15,13 @@ from .bootstrap import (
     audit_events,
     bootstrap_state,
 )
+from .cli_logins import (
+    CLILoginRequest,
+    CLILoginStore,
+    CLIPoll,
+    TooManyPendingCLILoginsError,
+    UserCodeCollisionError,
+)
 from .connection import Database, DatabaseError
 from .identity import (
     Identity,
@@ -61,6 +68,9 @@ __all__ = [
     "AuditEvent",
     "BootstrapOutcome",
     "BootstrapState",
+    "CLILoginRequest",
+    "CLILoginStore",
+    "CLIPoll",
     "Database",
     "DatabaseError",
     "DeliveryStatus",
@@ -88,8 +98,10 @@ __all__ = [
     "Session",
     "SessionRefreshError",
     "SessionStore",
+    "TooManyPendingCLILoginsError",
     "TooManyPendingSignInsError",
     "User",
+    "UserCodeCollisionError",
     "UserNotActiveError",
     "UserNotFoundError",
     "audit_events",

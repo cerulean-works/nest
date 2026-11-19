@@ -140,7 +140,13 @@ a refresh revokes the row as `rotated`, links it to its replacement
 can never be restored, and a session's User, secret and family never change.
 `session_access_tokens` holds the hashes of short-lived access tokens, each tied to
 one session and deleted when that session is rotated or revoked. See
-[Browser sessions](authentication#browser-sessions). `platform_role_assignments` holds `platform_admin`,
+[Browser sessions](authentication#browser-sessions). Migration
+`0007_cli_login_requests` adds `cli_login_requests`, the pending browser-approved
+CLI sign-ins (hashes of their device and user codes, the requested scope, and the
+decision, which moves only from `pending` to `approved` or `denied` and from
+`approved` to `consumed`), and an immutable `scope` on `user_sessions`, set only for
+`cli` sessions. See [Sign in from the command line](cli-login).
+`platform_role_assignments` holds `platform_admin`,
 and `organization_memberships` holds `org_admin` and `member`. Neither grants a
 Project role, and no role grants Provider or HPC access. Migration
 `0005_platform_admin_bootstrap` makes platform role assignments grant-or-revoke

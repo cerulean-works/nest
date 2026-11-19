@@ -97,6 +97,29 @@ See [Browser sessions](../authentication#browser-sessions).
 
 [[autodoc]] db.SessionRefreshError
 
+## CLI sign-in
+
+See [Sign in from the command line](../cli-login). The client side is
+[`login.ensure_session`].
+
+[[autodoc]] auth.CLISignIn
+
+[[autodoc]] auth.CLISignInStart
+
+[[autodoc]] auth.CLITokens
+
+[[autodoc]] auth.CLISignInError
+
+[[autodoc]] auth.normalize_user_code
+
+[[autodoc]] db.CLILoginStore
+
+[[autodoc]] db.CLILoginRequest
+
+[[autodoc]] db.CLIPoll
+
+[[autodoc]] db.TooManyPendingCLILoginsError
+
 ## Pending sign-ins
 
 [[autodoc]] db.LoginFlowStore

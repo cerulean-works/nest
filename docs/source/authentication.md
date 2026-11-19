@@ -29,8 +29,9 @@ HTTP listener and reads no other Google setting.
    ```
 
 4. Serve `https://nest.example.com` from a TLS-terminating reverse proxy that
-   forwards `/auth/google/login`, the redirect URL's path and `/auth/session`
-   (with `/auth/session/refresh` and `/auth/session/logout`), unchanged, to
+   forwards `/auth/google/login`, the redirect URL's path, `/auth/session`
+   (with `/auth/session/refresh` and `/auth/session/logout`) and `/auth/cli/`
+   (see [Sign in from the command line](cli-login)), unchanged, to
    `NEST_AUTH_HTTP_BIND`.
 
 At startup the Controller logs
@@ -115,8 +116,9 @@ Browser                    Nest auth listener                 Google
    [Browser sessions](#browser-sessions)). Only SHA-256 digests of the secrets are
    stored. A disabled User gets no session.
 
-CLI sign-in is a separate feature; this page covers the Google sign-in and the
-browser sessions it creates.
+The command line signs in by having a signed-in browser approve it; see
+[Sign in from the command line](cli-login). This page covers the Google sign-in and
+the browser sessions it creates.
 
 ## Browser sessions
 

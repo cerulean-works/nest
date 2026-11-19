@@ -58,6 +58,15 @@ every callback to the browser that started it, and links Users by Google's `sub`
 never by email. Keep the client secret in `NEST_GOOGLE_CLIENT_SECRET_FILE`, and
 serve the auth listener only through a TLS-terminating proxy.
 
+Command-line sign-in (see [Sign in from the command line](cli-login)) is approved
+in a signed-in browser, so no credential is typed into a terminal or passed in
+`argv`. CLI sessions are scoped, short-lived and rotating, revocable with
+`nest logout` or `nest-db sessions revoke`, and kept in a `0600` file. A Nest
+session is not an HPC credential: it is never sent to a login node, and NCHC SSH
+passwords and one-time codes are never asked for or stored by Nest sign-in.
+Approve only sign-ins you started yourself: someone who sends you an approval link
+is asking for your Nest account.
+
 The database also holds Users' names and email addresses, invited email
 addresses, and identity-provider subject IDs (see
 [Users, Projects and memberships](database#users-projects-and-memberships)).
