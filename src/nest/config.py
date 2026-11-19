@@ -123,12 +123,31 @@ EMAIL_SETTINGS = (
 
 DEFAULT_AUTH_HTTP_BIND = "127.0.0.1:8080"
 
+DEFAULT_ACCESS_TOKEN_TTL = 900.0
+"""Seconds a browser access token is accepted: 15 minutes."""
+
+DEFAULT_REFRESH_TTL = 86_400.0
+"""Seconds a refresh session stays usable without being refreshed: 24 hours."""
+
+DEFAULT_SESSION_MAX_LIFETIME = 604_800.0
+"""Seconds from sign-in after which a session family ends, however often it is
+refreshed: 7 days."""
+
+MAX_SESSION_LIFETIME = 7_776_000.0
+"""Longest accepted `NEST_AUTH_SESSION_MAX_LIFETIME`: 90 days."""
+
+AUTH_SESSION_PATHS = ("/auth/session", "/auth/session/refresh", "/auth/session/logout")
+"""Browser session routes served by the auth listener."""
+
 GOOGLE_SETTINGS = (
     "NEST_GOOGLE_CLIENT_ID",
     "NEST_GOOGLE_CLIENT_SECRET",
     "NEST_GOOGLE_CLIENT_SECRET_FILE",
     "NEST_GOOGLE_REDIRECT_URL",
     "NEST_AUTH_HTTP_BIND",
+    "NEST_AUTH_ACCESS_TOKEN_TTL",
+    "NEST_AUTH_REFRESH_TTL",
+    "NEST_AUTH_SESSION_MAX_LIFETIME",
 )
 """Google sign-in settings, read by [`config.load_controller_config`] when any of the
 `NEST_GOOGLE_*` settings is set."""
@@ -465,6 +484,41 @@ class EmailConfig:
 
 
 @dataclass(frozen=True)
+class SessionPolicy:
+    """
+    Lifetimes of browser sessions, in seconds.
+
+    Attributes:
+        access_token_ttl (`float`): `NEST_AUTH_ACCESS_TOKEN_TTL`, how long an access
+            token is accepted. Short, because it is presented on every request.
+        refresh_ttl (`float`): `NEST_AUTH_REFRESH_TTL`, how long a refresh session
+            stays usable without being refreshed. Each refresh rotates it and starts
+            this period again.
+        max_lifetime (`float`): `NEST_AUTH_SESSION_MAX_LIFETIME`, how long after
+            sign-in the session ends however often it is refreshed. The User then
+            signs in again.
+    """
+
+    access_token_ttl: float = DEFAULT_ACCESS_TOKEN_TTL
+    refresh_ttl: float = DEFAULT_REFRESH_TTL
+    max_lifetime: float = DEFAULT_SESSION_MAX_LIFETIME
+
+    def __post_init__(self):
+        if not 0 < self.access_token_ttl <= self.refresh_ttl <= self.max_lifetime:
+            raise ValueError(
+                "Session lifetimes must satisfy 0 < access_token_ttl <= refresh_ttl <= max_lifetime"
+            )
+
+    def summary(self) -> dict[str, float]:
+        """Returns the lifetimes for logging."""
+        return {
+            "access_token_ttl": self.access_token_ttl,
+            "refresh_ttl": self.refresh_ttl,
+            "max_lifetime": self.max_lifetime,
+        }
+
+
+@dataclass(frozen=True)
 class GoogleAuthConfig:
     """
     Google sign-in settings. Present only when `NEST_GOOGLE_CLIENT_ID` is set.
@@ -478,6 +532,7 @@ class GoogleAuthConfig:
         redirect_url (`str`): `NEST_GOOGLE_REDIRECT_URL`, the exact callback URL
             registered with Google. The auth listener serves its path.
         http_bind (`str`): `NEST_AUTH_HTTP_BIND`, the auth listener's `host:port`.
+        sessions ([`config.SessionPolicy`]): Browser session lifetimes.
     """
 
     client_id: str
@@ -485,6 +540,7 @@ class GoogleAuthConfig:
     client_secret: Secret | None = None
     client_secret_file: str | None = None
     http_bind: str = DEFAULT_AUTH_HTTP_BIND
+    sessions: SessionPolicy = field(default_factory=SessionPolicy)
 
     def read_client_secret(self) -> str:
         """Returns the current client secret, reading the file when one is set. Never log it."""
@@ -512,6 +568,7 @@ class GoogleAuthConfig:
             "client_secret_file": self.client_secret_file,
             "redirect_url": self.redirect_url,
             "http_bind": self.http_bind,
+            "sessions": self.sessions.summary(),
         }
 
 
@@ -1190,7 +1247,43 @@ def _google_redirect_url(reader: _Reader) -> str | None:
             f"sign-in; use a callback path such as {_REDIRECT_EXAMPLE!r}"
         )
         return None
+    if parts.path in AUTH_SESSION_PATHS:
+        reader.fail(
+            f"NEST_GOOGLE_REDIRECT_URL must not use {parts.path}, a browser session route; "
+            f"use a callback path such as {_REDIRECT_EXAMPLE!r}"
+        )
+        return None
     return raw
+
+
+def _session_policy(reader: _Reader) -> SessionPolicy:
+    """Reads the `NEST_AUTH_*` session lifetimes and checks that they nest."""
+    before = len(reader.problems)
+    access = reader.seconds("NEST_AUTH_ACCESS_TOKEN_TTL", DEFAULT_ACCESS_TOKEN_TTL)
+    refresh = reader.seconds("NEST_AUTH_REFRESH_TTL", DEFAULT_REFRESH_TTL)
+    lifetime = reader.seconds("NEST_AUTH_SESSION_MAX_LIFETIME", DEFAULT_SESSION_MAX_LIFETIME)
+    if not 60 <= access <= 3600:
+        reader.fail(
+            f"NEST_AUTH_ACCESS_TOKEN_TTL must be between 60 and 3600 seconds, got {access:g}"
+        )
+    elif refresh < access:
+        reader.fail(
+            f"NEST_AUTH_REFRESH_TTL ({refresh:.0f} seconds) must be at least "
+            f"NEST_AUTH_ACCESS_TOKEN_TTL ({access:.0f} seconds)"
+        )
+    elif lifetime < refresh:
+        reader.fail(
+            f"NEST_AUTH_SESSION_MAX_LIFETIME ({lifetime:.0f} seconds) must be at least "
+            f"NEST_AUTH_REFRESH_TTL ({refresh:.0f} seconds)"
+        )
+    if lifetime > MAX_SESSION_LIFETIME:
+        reader.fail(
+            f"NEST_AUTH_SESSION_MAX_LIFETIME must be at most {MAX_SESSION_LIFETIME:.0f} seconds "
+            f"(90 days), got {lifetime:.0f}"
+        )
+    if len(reader.problems) > before:
+        return SessionPolicy()
+    return SessionPolicy(access, refresh, lifetime)
 
 
 def _google(reader: _Reader, database: DatabaseConfig | None) -> GoogleAuthConfig | None:
@@ -1232,6 +1325,7 @@ def _google(reader: _Reader, database: DatabaseConfig | None) -> GoogleAuthConfi
                 reader.fail(f"NEST_GOOGLE_CLIENT_SECRET_FILE {secret_file!r} is empty")
     redirect_url = _google_redirect_url(reader)
     http_bind = reader.address("NEST_AUTH_HTTP_BIND", DEFAULT_AUTH_HTTP_BIND)
+    sessions = _session_policy(reader)
     if database is None and reader.get("NEST_DATABASE_URL") is None:
         reader.fail(
             "NEST_GOOGLE_CLIENT_ID needs NEST_DATABASE_URL: Users, their Google identities, "
@@ -1245,6 +1339,7 @@ def _google(reader: _Reader, database: DatabaseConfig | None) -> GoogleAuthConfi
         client_secret=Secret(secret_raw) if secret_raw is not None else None,
         client_secret_file=secret_file,
         http_bind=http_bind,
+        sessions=sessions,
     )
 
 

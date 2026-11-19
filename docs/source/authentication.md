@@ -29,7 +29,8 @@ HTTP listener and reads no other Google setting.
    ```
 
 4. Serve `https://nest.example.com` from a TLS-terminating reverse proxy that
-   forwards `/auth/google/login` and the redirect URL's path, unchanged, to
+   forwards `/auth/google/login`, the redirect URL's path and `/auth/session`
+   (with `/auth/session/refresh` and `/auth/session/logout`), unchanged, to
    `NEST_AUTH_HTTP_BIND`.
 
 At startup the Controller logs
@@ -72,7 +73,7 @@ Browser                    Nest auth listener                 Google
    |                          |<---------------------------------|
    |                          | verify ID token with Google JWKS |
    |                          | sign in User by (issuer, sub)    |
-   |  200 + session cookie    | create browser session           |
+   |  200 + session cookies   | create browser session           |
    |<-------------------------|                                  |
 ```
 
@@ -109,15 +110,90 @@ Browser                    Nest auth listener                 Google
    email address is a different User: Nest never links accounts by email. The
    identity's email address and `email_verified` claim are refreshed on every
    sign-in, for invitation matching.
-6. **Session.** In the same transaction Nest creates a browser session valid for 12
-   hours and sets it as the `HttpOnly`, `SameSite=Lax`, `Path=/` cookie
-   `__Host-nest_session` (`nest_session` for an `http://localhost` redirect URL,
-   where browsers refuse the `__Host-` prefix). Only the SHA-256 of the session
-   secret is stored. A disabled User gets no session.
+6. **Session.** In the same transaction Nest creates a refresh session and a
+   short-lived access token for it, and sets both as cookies (see
+   [Browser sessions](#browser-sessions)). Only SHA-256 digests of the secrets are
+   stored. A disabled User gets no session.
 
-Browser session renewal, logout and revocation endpoints belong to browser session
-management, as do CLI sign-in and the one-time admin bootstrap; this page covers
-only the Google sign-in itself.
+CLI sign-in is a separate feature; this page covers the Google sign-in and the
+browser sessions it creates.
+
+## Browser sessions
+
+A sign-in starts a *session family*: a refresh session plus an access token tied to
+it. Each has its own secret and its own cookie.
+
+| | Access token | Refresh session |
+| --- | --- | --- |
+| Cookie | `__Host-nest_session` (`nest_session` on `http://localhost`) | `__Secure-nest_refresh` (`nest_refresh` on `http://localhost`) |
+| Attributes | `HttpOnly`, `SameSite=Lax`, `Path=/`, `Secure` on `https://` | `HttpOnly`, `SameSite=Strict`, `Path=/auth/session`, `Secure` on `https://` |
+| Lifetime | `NEST_AUTH_ACCESS_TOKEN_TTL`, default 15 minutes | `NEST_AUTH_REFRESH_TTL`, default 24 hours, started again by each refresh |
+| Sent | On every request to Nest | Only to `/auth/session/refresh` and `/auth/session/logout` |
+
+The whole family ends `NEST_AUTH_SESSION_MAX_LIFETIME` after sign-in (default 7
+days), however often it is refreshed; the User then signs in again. No access token
+outlives its refresh session, and no refresh session outlives its family. See
+[Environment variables and defaults](configuration#google-sign-in) for the limits.
+
+### Routes
+
+| Route | Does |
+| --- | --- |
+| `GET /auth/session` | `200` with the User ID and the expiry of the access token, the refresh session and the family, for a valid access token; otherwise `401 {"error": "unauthenticated"}`. |
+| `POST /auth/session/refresh` | Rotates the refresh session: the presented refresh secret is revoked as `rotated`, a new refresh session in the same family and a new access token are issued, and both cookies are replaced. `200` with the same fields as `GET /auth/session`. A refused refresh answers `401` and clears both cookies. |
+| `POST /auth/session/logout` | Revokes the whole family named by the refresh cookie, or failing that by the access cookie, and clears both cookies. Always `200 {"signed_out": true}`. |
+
+The session routes answer JSON. A page refreshes before the access token expires,
+or when a request is refused with `401`:
+
+```javascript
+await fetch("/auth/session/refresh", { method: "POST", credentials: "same-origin" });
+```
+
+### Rotation and reuse detection
+
+A refresh secret works once. Refreshing revokes it and issues a new one, so a copy
+of an old secret is worthless after its owner has refreshed. If a rotated secret is
+presented again, either the browser or someone holding a copy is replaying it, and
+Nest cannot tell which: it revokes every session of the family (reason
+`refresh_reuse`), logs `Refresh secret reused; session family revoked`, and the User
+signs in again. Concurrent refreshes with the same secret are serialized in the
+database; only the first succeeds, so a page should not send several refreshes at
+once.
+
+### What is refused
+
+An access token is accepted only while all of these hold: the token itself has not
+expired, its refresh session is neither revoked nor expired, and its User is active.
+A refresh is refused when its secret is unknown, expired, revoked or already
+rotated, or its User is disabled. Because every check is made in PostgreSQL on each
+request, logout and revocation take effect immediately: there is no window in which
+a revoked session's access token still works. A logout or revocation that races a refresh
+waits for it and then revokes the session the refresh created as well, so a refresh
+in flight cannot leave a revoked sign-in with a working pair of secrets.
+
+### Revoke sessions
+
+- **Logout** revokes the browser's own session family.
+- **Disabling a User** (for example with [`db.IdentityStore.set_user_status`])
+  revokes all their sessions.
+- **Administrative revocation** with `nest-db`, which authenticates with the
+  database credentials:
+
+  ```bash
+  nest-db sessions list   --user-id 0b6c…   # active sessions, with their family IDs
+  nest-db sessions revoke --session-id 7f1e… # that session's whole family
+  nest-db sessions revoke --user-id 0b6c…    # every session of the User
+  ```
+
+  Revocations are recorded with reason `admin_revoked`. Both commands exit with
+  status 1 when there was nothing to revoke, 2 for invalid arguments and 3 when the
+  database is unreachable. From Python, use [`db.IdentityStore.revoke_session`]
+  and [`db.IdentityStore.revoke_user_sessions`].
+
+A revoked session can never be restored: the database refuses any change to a
+revoked session's revocation time or reason, and to a session's User, secret or
+family.
 
 ## Refused sign-ins
 
@@ -151,11 +227,18 @@ that failed, such as `check=ExpiredSignatureError`.
 - **Replay.** Each `state` is consumed once; Google's codes are single-use, and the
   nonce binds the ID token to this sign-in.
 - **Storage.** The database holds only SHA-256 digests of the `state`, the sign-in
-  cookie secret and the session secret. Pending sign-ins are capped at 10,000 and
+  cookie secret, the refresh secrets and the access tokens. Pending sign-ins are capped at 10,000 and
   expired rows are deleted as new sign-ins start.
 - **Logging.** The listener never logs request URLs' query strings, so codes and
-  states stay out of logs. The client secret is masked in every log line, and log
+  states stay out of logs, nor cookies or request headers, so session secrets stay
+  out too; session log lines name session, family and User IDs only. The client secret is masked in every log line, and log
   lines name User IDs, not email addresses.
+- **Session theft.** Access tokens are short-lived, and refresh secrets are
+  rotated on every use with reuse detection. The refresh cookie is `SameSite=Strict`
+  and scoped to `/auth/session`, so it is not sent on ordinary requests.
+- **Cross-site requests.** `POST /auth/session/refresh` and `/auth/session/logout`
+  are refused with `403 {"error": "cross_origin"}` when the browser's `Origin` is
+  not the redirect URL's origin or `Sec-Fetch-Site` is not `same-origin`.
 - **Headers.** Every response carries `Cache-Control: no-store`,
   `Referrer-Policy: no-referrer` (the callback URL holds the code),
   `X-Frame-Options: DENY`, and a `default-src 'none'` content security policy.

@@ -199,7 +199,8 @@ TLS, credential rotation, the outbox and retries.
 Google sign-in is opt-in and enabled by `NEST_GOOGLE_CLIENT_ID`. Without it none of
 the settings below are read and no HTTP listener is opened; setting any of them
 without the client ID is an error. When enabled, the Controller serves
-`/auth/google/login` and the redirect URL's path on `NEST_AUTH_HTTP_BIND`. See
+`/auth/google/login`, the redirect URL's path and the `/auth/session` routes on
+`NEST_AUTH_HTTP_BIND`. See
 [Sign in with Google](authentication) for the OAuth client, the reverse proxy, and
 the checks applied to each sign-in.
 
@@ -208,8 +209,11 @@ the checks applied to each sign-in.
 | `NEST_GOOGLE_CLIENT_ID` | Unset (disabled) | OAuth client ID of a Google **Web application** client, such as `1234-example.apps.googleusercontent.com`. ID tokens must name it as their audience. Requires `NEST_DATABASE_URL`, a client secret and `NEST_GOOGLE_REDIRECT_URL`. |
 | `NEST_GOOGLE_CLIENT_SECRET_FILE` | Unset | Absolute path to a file holding the client secret, such as a mounted secret. Re-read for each code exchange, so rotation needs no restart. Must not be empty. |
 | `NEST_GOOGLE_CLIENT_SECRET` | Unset | The client secret inline. A secret: never logged or echoed. Set only one of the two secret settings. |
-| `NEST_GOOGLE_REDIRECT_URL` | Unset | The callback URL registered with the OAuth client, such as `https://nest.example.com/auth/google/callback`. Must be `https://` (`http://` only for `localhost` and `127.0.0.1`), have a path other than `/` and `/auth/google/login`, and contain no credentials, query string or fragment. The auth listener serves its path; `https://` also makes cookies `Secure`. |
+| `NEST_GOOGLE_REDIRECT_URL` | Unset | The callback URL registered with the OAuth client, such as `https://nest.example.com/auth/google/callback`. Must be `https://` (`http://` only for `localhost` and `127.0.0.1`), have a path other than `/`, `/auth/google/login` and the `/auth/session` routes, and contain no credentials, query string or fragment. The auth listener serves its path; `https://` also makes cookies `Secure`. |
 | `NEST_AUTH_HTTP_BIND` | `127.0.0.1:8080` | `host:port` of the plain-HTTP auth listener. Put a TLS-terminating reverse proxy in front of it. |
+| `NEST_AUTH_ACCESS_TOKEN_TTL` | `900` | Seconds a browser access token (the session cookie) is accepted. 60 to 3600. See [Browser sessions](authentication#browser-sessions). |
+| `NEST_AUTH_REFRESH_TTL` | `86400` | Seconds a refresh session stays usable without being refreshed. Each refresh rotates it and starts this period again. At least `NEST_AUTH_ACCESS_TOKEN_TTL`. |
+| `NEST_AUTH_SESSION_MAX_LIFETIME` | `604800` | Seconds after sign-in when the session ends however often it is refreshed; the User then signs in again. At least `NEST_AUTH_REFRESH_TTL`, at most 7776000 (90 days). |
 
 ### Platform administrator bootstrap
 

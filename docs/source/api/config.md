@@ -46,6 +46,8 @@ except ConfigError as error:
 
 [[autodoc]] config.GoogleAuthConfig
 
+[[autodoc]] config.SessionPolicy
+
 [[autodoc]] config.ClientConfig
 
 ## Secrets

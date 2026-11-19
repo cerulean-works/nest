@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 from uuid import UUID
 
 import psycopg
@@ -29,7 +30,8 @@ ORGANIZATION_ROLES = ("org_admin", "member")
 _USER_COLUMNS = "id, display_name, email, status, created_at, updated_at, disabled_at"
 _IDENTITY_COLUMNS = "id, user_id, issuer, subject, email, email_verified, created_at, last_login_at"
 _SESSION_COLUMNS = (
-    "id, user_id, kind, created_at, expires_at, last_used_at, revoked_at, revoked_reason"
+    "id, user_id, kind, created_at, expires_at, last_used_at, revoked_at, revoked_reason, "
+    "family_id, family_expires_at, replaced_by_session_id"
 )
 
 
@@ -39,6 +41,25 @@ class IdentityConflictError(Exception):
 
 class UserNotActiveError(Exception):
     """The User is disabled, so no new session can be created for them."""
+
+
+SESSION_FAMILY_LOCK_CLASS = 0x4E53534E
+"""First key of the per-family `pg_advisory_xact_lock` that serializes a refresh
+with the revocation of its family ("NSSN")."""
+
+
+def lock_session_family(cursor: psycopg.Cursor[Any], family_id: UUID) -> None:
+    """
+    Takes the transaction-scoped lock of a session family.
+
+    Rotation and family revocation both hold it, so a revocation that waits for a
+    rotation sees the session that rotation inserted. Take it before any User or
+    session row lock, the order every caller uses.
+    """
+    cursor.execute(
+        "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+        (SESSION_FAMILY_LOCK_CLASS, str(family_id)),
+    )
 
 
 def normalize_email(email: str) -> str:
@@ -103,7 +124,10 @@ class Identity:
 @dataclass(frozen=True)
 class Session:
     """
-    A signed-in session. Its secret is never stored or returned.
+    A signed-in (refresh) session. Its secret is never stored or returned.
+
+    Each refresh replaces a session with a new one in the same family (see
+    [`db.SessionStore.rotate`]).
 
     Attributes:
         id (`UUID`): Session ID.
@@ -112,7 +136,14 @@ class Session:
         created_at, expires_at (`datetime`): Lifetime.
         last_used_at (`datetime | None`): Last recorded use.
         revoked_at (`datetime | None`): When it was revoked.
-        revoked_reason (`str | None`): Such as `logout` or `admin_revoked`.
+        revoked_reason (`str | None`): Such as `logout`, `rotated`, `refresh_reuse`
+            or `admin_revoked`.
+        family_id (`UUID`): The sign-in this session descends from by rotation: the
+            ID of its first session.
+        family_expires_at (`datetime`): When the family ends, however often it is
+            refreshed.
+        replaced_by_session_id (`UUID | None`): The session that replaced this one
+            when it was rotated.
     """
 
     id: UUID
@@ -123,6 +154,9 @@ class Session:
     last_used_at: datetime | None
     revoked_at: datetime | None
     revoked_reason: str | None
+    family_id: UUID
+    family_expires_at: datetime
+    replaced_by_session_id: UUID | None
 
 
 class IdentityStore:
@@ -327,6 +361,11 @@ class IdentityStore:
                     "WHERE user_id = %s AND revoked_at IS NULL",
                     (uid,),
                 )
+                cursor.execute(
+                    "DELETE FROM session_access_tokens WHERE session_id IN "
+                    "(SELECT id FROM user_sessions WHERE user_id = %s)",
+                    (uid,),
+                )
         logger.info("User status changed user_id=%s status=%s", uid, status)
         return User(**row)
 
@@ -339,16 +378,20 @@ class IdentityStore:
         kind: str,
         token_hash: bytes,
         expires_at: datetime,
+        family_expires_at: datetime | None = None,
         conn: psycopg.Connection | None = None,
     ) -> Session:
         """
-        Stores a new session for a User.
+        Stores a new session for a User. It starts a new session family.
 
         Args:
             user_id (`UUID`): The signed-in User.
             kind (`str`): `browser` or `cli`.
             token_hash (`bytes`): [`db.hash_token`] of the session secret.
             expires_at (`datetime`): Timezone-aware expiry.
+            family_expires_at (`datetime`, *optional*): When the family ends however
+                often it is refreshed. Defaults to `expires_at`, so the session cannot
+                be extended.
             conn (`psycopg.Connection`, *optional*): Transaction to join.
 
         Raises:
@@ -362,6 +405,12 @@ class IdentityStore:
             raise ValueError("token_hash must be a SHA-256 digest")
         if expires_at.tzinfo is None:
             raise ValueError("expires_at must be timezone-aware")
+        if family_expires_at is None:
+            family_expires_at = expires_at
+        if family_expires_at.tzinfo is None:
+            raise ValueError("family_expires_at must be timezone-aware")
+        if family_expires_at < expires_at:
+            raise ValueError("family_expires_at must not be before expires_at")
         with transaction(self.database, conn, "create a session") as cursor:
             # FOR SHARE conflicts with set_user_status()'s UPDATE, so a disable
             # either commits first and is seen here, or waits for this session to
@@ -374,9 +423,10 @@ class IdentityStore:
             if user["status"] != "active":
                 raise UserNotActiveError("The User is disabled")
             row = cursor.execute(
-                "INSERT INTO user_sessions (user_id, kind, token_hash, expires_at) "
-                f"VALUES (%s, %s, %s, %s) RETURNING {_SESSION_COLUMNS}",
-                (uid, kind, token_hash, expires_at),
+                "INSERT INTO user_sessions "
+                "(user_id, kind, token_hash, expires_at, family_expires_at) "
+                f"VALUES (%s, %s, %s, %s, %s) RETURNING {_SESSION_COLUMNS}",
+                (uid, kind, token_hash, expires_at, family_expires_at),
             ).fetchone()
         assert row is not None
         logger.info("Session created session_id=%s user_id=%s kind=%s", row["id"], uid, kind)
@@ -404,15 +454,33 @@ class IdentityStore:
         reason: str = "logout",
         conn: psycopg.Connection | None = None,
     ) -> bool:
-        """Revokes one session. Returns whether it was active until now."""
+        """
+        Revokes a session and every session rotated from the same sign-in, and
+        deletes their access tokens. Returns whether one was active until now.
+
+        Any session ID of the family works, including a rotated one.
+        """
         sid = as_uuid(session_id, "session_id")
         with transaction(self.database, conn, "revoke a session") as cursor:
-            cursor.execute(
-                "UPDATE user_sessions SET revoked_at = now(), revoked_reason = %s "
-                "WHERE id = %s AND revoked_at IS NULL",
-                (reason, sid),
-            )
-            revoked = cursor.rowcount == 1
+            family = cursor.execute(
+                "SELECT family_id FROM user_sessions WHERE id = %s", (sid,)
+            ).fetchone()
+            rows = []
+            if family is not None:
+                lock_session_family(cursor, family["family_id"])
+                # A new statement after the lock: under READ COMMITTED it sees the
+                # replacement of any rotation that held the lock first.
+                rows = cursor.execute(
+                    "UPDATE user_sessions SET revoked_at = now(), revoked_reason = %s "
+                    "WHERE family_id = %s AND revoked_at IS NULL RETURNING id",
+                    (reason, family["family_id"]),
+                ).fetchall()
+            revoked = bool(rows)
+            if revoked:
+                cursor.execute(
+                    "DELETE FROM session_access_tokens WHERE session_id = ANY(%s)",
+                    ([row["id"] for row in rows],),
+                )
         if revoked:
             logger.info("Session revoked session_id=%s reason=%s", sid, reason)
         return revoked
@@ -427,12 +495,20 @@ class IdentityStore:
         """Revokes every active session of a User. Returns how many were revoked."""
         uid = as_uuid(user_id, "user_id")
         with transaction(self.database, conn, "revoke sessions") as cursor:
+            # Conflicts with a rotation's FOR SHARE, so this waits for one in progress;
+            # the UPDATE below is a new statement and sees its replacement session.
+            cursor.execute("SELECT 1 FROM users WHERE id = %s FOR UPDATE", (uid,))
             cursor.execute(
                 "UPDATE user_sessions SET revoked_at = now(), revoked_reason = %s "
                 "WHERE user_id = %s AND revoked_at IS NULL",
                 (reason, uid),
             )
             count = cursor.rowcount
+            cursor.execute(
+                "DELETE FROM session_access_tokens WHERE session_id IN "
+                "(SELECT id FROM user_sessions WHERE user_id = %s)",
+                (uid,),
+            )
         logger.info("Sessions revoked user_id=%s count=%s reason=%s", uid, count, reason)
         return count
 

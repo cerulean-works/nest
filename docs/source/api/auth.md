@@ -26,7 +26,28 @@ try:
 except SignInError as exc:
     respond(exc.status, str(exc))  # exc.reason is a stable code
 else:
-    set_session_cookie(result.session_token)  # only its hash is stored
+    # Only their hashes are stored. The access token is short-lived; the refresh
+    # secret is presented only to refresh (see "Browser sessions").
+    set_session_cookies(result.access_token, result.refresh_token)
+```
+
+Refresh and check browser sessions with [`db.SessionStore`]:
+
+```python
+from nest.db import SessionStore, SessionRefreshError, hash_token
+
+sessions = SessionStore(database)
+grant = sessions.authenticate(hash_token(access_cookie))  # None when refused
+try:
+    rotation = sessions.rotate(
+        hash_token(refresh_cookie),
+        new_refresh_hash=hash_token(new_refresh),
+        new_access_hash=hash_token(new_access),
+        refresh_ttl=config.google.sessions.refresh_ttl,
+        access_ttl=config.google.sessions.access_token_ttl,
+    )
+except SessionRefreshError as exc:
+    ...  # exc.reason: unknown, expired, revoked, reused or user_disabled
 ```
 
 ## Sign-in service
@@ -63,6 +84,18 @@ local fake provider; no setting points Nest at another issuer.
 [[autodoc]] auth.AuthService
 
 [[autodoc]] auth.AuthHTTPServer
+
+## Browser sessions
+
+See [Browser sessions](../authentication#browser-sessions).
+
+[[autodoc]] db.SessionStore
+
+[[autodoc]] db.AccessGrant
+
+[[autodoc]] db.Rotation
+
+[[autodoc]] db.SessionRefreshError
 
 ## Pending sign-ins
 

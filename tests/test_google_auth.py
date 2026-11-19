@@ -26,6 +26,7 @@ from postgres_fixture import PostgresTestCase, connect
 
 from nest.auth import (
     GOOGLE_ISSUER,
+    INSECURE_REFRESH_COOKIE,
     INSECURE_SESSION_COOKIE,
     LOGIN_PATH,
     SIGN_IN_COOKIE,
@@ -42,6 +43,7 @@ from nest.db import (
     IdentityStore,
     LoginFlowStore,
     PlatformAdminBootstrap,
+    SessionStore,
     TooManyPendingSignInsError,
     bootstrap_state,
     hash_token,
@@ -296,9 +298,9 @@ class Browser:
         self.cookies: dict[str, tuple[str, str, dict[str, str]]] = {}
         self.opener = urllib.request.build_opener(_NoRedirect)
 
-    def get(self, url: str, method: str = "GET"):
+    def get(self, url: str, method: str = "GET", headers: dict[str, str] | None = None):
         path = urlsplit(url).path
-        request = urllib.request.Request(url, method=method)
+        request = urllib.request.Request(url, method=method, headers=headers or {})
         sent = [f"{k}={v}" for k, (v, p, _) in self.cookies.items() if path.startswith(p)]
         if sent:
             request.add_header("Cookie", "; ".join(sent))
@@ -398,28 +400,38 @@ class GoogleSignInFlowTests(PostgresTestCase):
         self.assertIn("signed in to Nest as researcher@example.org", body)
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertEqual(headers["Referrer-Policy"], "no-referrer")
-        # The one-time sign-in cookie is cleared; a session cookie replaces it.
+        # The one-time sign-in cookie is cleared; session and refresh cookies replace it.
         self.assertNotIn(SIGN_IN_COOKIE, browser.cookies)
         token, path, attrs = browser.cookies[INSECURE_SESSION_COOKIE]
         self.assertEqual(path, "/")
         self.assertEqual(attrs["httponly"], "True")
         self.assertEqual(attrs["samesite"], "Lax")
-        self.assertEqual(attrs["max-age"], str(12 * 3600))
+        self.assertEqual(attrs["max-age"], str(15 * 60))
+        refresh, path, attrs = browser.cookies[INSECURE_REFRESH_COOKIE]
+        self.assertEqual(path, "/auth/session")
+        self.assertEqual(attrs["httponly"], "True")
+        self.assertEqual(attrs["samesite"], "Strict")
+        self.assertEqual(attrs["max-age"], str(24 * 3600))
 
         user = self.identities.find_user(issuer=GOOGLE_ISSUER, subject=self.fake.account.sub)
         assert user is not None
         self.assertEqual(user.email, "researcher@example.org")
         self.assertEqual(user.display_name, "Test Researcher")
-        session = self.identities.active_session(hash_token(token))
+        session = self.identities.active_session(hash_token(refresh))
         assert session is not None
         self.assertEqual((session.user_id, session.kind), (user.id, "browser"))
+        grant = SessionStore(self.db).authenticate(hash_token(token))
+        assert grant is not None
+        self.assertEqual(grant.session.id, session.id)
         [identity] = self.identities.identities(user.id)
         self.assertTrue(identity.email_verified)
 
-        # Only the hash of the session secret is stored, and the pending sign-in is gone.
+        # Only the hashes of the session secrets are stored, and the pending sign-in is gone.
         with connect(self.url) as conn:
             [row] = conn.execute("SELECT token_hash FROM user_sessions").fetchall()
-        self.assertEqual(bytes(row[0]), hash_token(token))
+            [access] = conn.execute("SELECT token_hash FROM session_access_tokens").fetchall()
+        self.assertEqual(bytes(row[0]), hash_token(refresh))
+        self.assertEqual(bytes(access[0]), hash_token(token))
         self.assertEqual(self.count("oidc_login_flows"), 0)
 
         # The configured redirect URL and S256 PKCE were used end to end; the fake's
@@ -667,7 +679,9 @@ class GoogleSignInFlowTests(PostgresTestCase):
         [authorization, _] = self.fake.authorizations
         exchange = self.fake.token_requests[0]
         session_token = browser.cookies[INSECURE_SESSION_COOKIE][0]
+        refresh_token = browser.cookies[INSECURE_REFRESH_COOKIE][0]
         for secret in (
+            refresh_token,
             authorization["state"],
             authorization["nonce"],
             exchange["code"],
