@@ -19,7 +19,7 @@ from uuid import UUID
 from .._logging import get_logger
 from ._transaction import as_uuid, transaction
 from .connection import Database
-from .identity import IdentityStore, Session, UserNotActiveError
+from .identity import IdentityStore, Session, UserNotActiveError, lock_session_family
 from .sessions import SessionStore
 
 logger = get_logger("nest.db.cli_logins")
@@ -36,6 +36,11 @@ _COLUMNS = (
 
 class TooManyPendingCLILoginsError(Exception):
     """Too many CLI sign-ins are waiting for approval; try again later."""
+
+
+class DecidingSessionNotActiveError(Exception):
+    """The browser session deciding a CLI sign-in is no longer an active browser
+    session of that User (logged out, revoked, expired, or another User's)."""
 
 
 class UserCodeCollisionError(Exception):
@@ -185,19 +190,46 @@ class CLILoginStore:
         User. Returns the decided request, or `None` when it is no longer pending
         (already decided, expired or unknown), so a request is decided once.
 
+        The deciding session is re-checked in the same transaction: it must still be
+        an unrevoked, unexpired `browser` session of `user_id`, whose User is
+        active. Locks are taken in the order every revocation uses (family, User,
+        session), so a logout, revocation or disable that races the decision either
+        commits first and the decision is refused, or waits for the decision and
+        then revokes the session that made it.
+
         Raises:
-            [`db.UserNotActiveError`]: If approving for a disabled User.
+            [`db.DecidingSessionNotActiveError`]: If the deciding session is not an
+                active browser session of `user_id`. Nothing is changed.
+            [`db.UserNotActiveError`]: If the User is disabled. Nothing is changed.
         """
         rid = as_uuid(request_id, "request_id")
         uid = as_uuid(user_id, "user_id")
         sid = as_uuid(session_id, "session_id")
         with transaction(self.database, None, "decide a CLI sign-in") as cursor:
-            if approve:
-                user = cursor.execute(
-                    "SELECT status FROM users WHERE id = %s FOR SHARE", (uid,)
-                ).fetchone()
-                if user is None or user["status"] != "active":
-                    raise UserNotActiveError("The User is disabled")
+            # The family and User never change, so they can be read before locking.
+            owner = cursor.execute(
+                "SELECT family_id, user_id FROM user_sessions WHERE id = %s", (sid,)
+            ).fetchone()
+            if owner is None or owner["user_id"] != uid:
+                raise DecidingSessionNotActiveError("The deciding session is not this User's")
+            # The family lock serializes this with revoke_session(); the User lock
+            # (FOR SHARE) with revoke_user_sessions() and a disable; the session
+            # lock with any other change to the session row.
+            lock_session_family(cursor, owner["family_id"])
+            user = cursor.execute(
+                "SELECT status FROM users WHERE id = %s FOR SHARE", (uid,)
+            ).fetchone()
+            if user is None or user["status"] != "active":
+                raise UserNotActiveError("The User is disabled")
+            # A new statement after the locks: it sees any revocation committed first.
+            session = cursor.execute(
+                "SELECT id FROM user_sessions WHERE id = %s AND user_id = %s "
+                "AND kind = 'browser' AND revoked_at IS NULL AND expires_at > now() "
+                "FOR UPDATE",
+                (sid, uid),
+            ).fetchone()
+            if session is None:
+                raise DecidingSessionNotActiveError("The deciding session is not active")
             row = cursor.execute(
                 "UPDATE cli_login_requests SET status = %s, user_id = %s, "
                 "decided_by_session_id = %s, decided_at = now() "

@@ -56,7 +56,15 @@ from nest.config import (
     load_controller_config,
     load_database_config,
 )
-from nest.db import CLILoginStore, Database, IdentityStore, hash_token, upgrade
+from nest.db import (
+    CLILoginStore,
+    Database,
+    DecidingSessionNotActiveError,
+    IdentityStore,
+    UserNotActiveError,
+    hash_token,
+    upgrade,
+)
 from nest.login import (
     CredentialsFileError,
     CredentialStore,
@@ -581,6 +589,113 @@ class CLISignInFlowTests(_Flow):
         # The real form works once; a second decision is refused.
         self.assertEqual(self.submit(browser, fields)[0], 200)
         self.assertEqual(self.submit(browser, {**fields, "decision": "deny"})[0], 404)
+
+    def browser_session(self, browser: Browser):
+        token = browser.cookies["nest_session"][0]
+        grant = self.sign_in.session_store.authenticate(hash_token(token))
+        assert grant is not None
+        return grant.session
+
+    def test_session_revoked_between_authentication_and_decision(self):
+        """A logout between the page's session check and the decision approves nothing."""
+        started = self.start()
+        browser = self.browser()
+        session = self.browser_session(browser)
+        _, _, page = self.approval_page(browser, started["user_code"])
+        csrf = re.search(r'name="csrf" value="([0-9a-f]+)"', page)
+        assert csrf is not None
+        real_decide = self.cli.store.decide
+
+        def revoke_then_decide(*args, **kwargs):
+            # Runs after _cli_decide() authenticated the browser session.
+            self.identities.revoke_session(session.id, reason="logout")
+            return real_decide(*args, **kwargs)
+
+        fields = {"code": started["user_code"], "csrf": csrf.group(1), "decision": "approve"}
+        with unittest.mock.patch.object(self.cli.store, "decide", revoke_then_decide):
+            status, body = self.submit(browser, fields)
+        self.assertEqual(status, 401, body)
+        self.assertIn("Your Nest session has ended", body)
+        self.assertEqual(self.sql("SELECT status FROM cli_login_requests"), [("pending",)])
+        self.assertEqual(
+            self.poll(started["device_code"]), (400, {"error": "authorization_pending"})
+        )
+
+    def test_decision_waits_for_a_concurrent_revocation(self):
+        """A revocation in progress holds the family lock; the decision waits for it
+        and then refuses, instead of approving with the revoked session."""
+        started = self.start()
+        session = self.browser_session(self.browser())
+        request = self.cli.find(started["user_code"])
+        assert request is not None
+        outcome: dict[str, object] = {}
+        with self.db.connection() as held:
+            self.identities.revoke_session(session.id, reason="admin_revoked", conn=held)
+
+            def decide():
+                try:
+                    outcome["value"] = self.cli.store.decide(
+                        request.id, approve=True, user_id=session.user_id, session_id=session.id
+                    )
+                except Exception as exc:  # noqa: BLE001 - checked below
+                    outcome["error"] = exc
+
+            thread = threading.Thread(target=decide, daemon=True)
+            thread.start()
+            thread.join(1.0)
+            self.assertTrue(thread.is_alive(), "the decision did not wait for the revocation")
+        # Leaving the block commits the revocation.
+        thread.join(10)
+        self.assertIsInstance(outcome.get("error"), DecidingSessionNotActiveError, outcome)
+        self.assertEqual(self.sql("SELECT status FROM cli_login_requests"), [("pending",)])
+
+    def test_decision_needs_an_active_browser_session_of_the_user(self):
+        started = self.start()
+        browser = self.browser()
+        session = self.browser_session(browser)
+        request = self.cli.find(started["user_code"])
+        assert request is not None
+        store = self.cli.store
+        other, _, _ = self.identities.sign_in(
+            issuer="https://accounts.google.com",
+            subject="someone-else",
+            email="else@example.org",
+            email_verified=True,
+        )
+        now = datetime.now(UTC)
+        cli_session = self.identities.create_session(
+            session.user_id,
+            kind="cli",
+            token_hash=hash_token("cli-session-secret"),
+            expires_at=now + timedelta(hours=1),
+            scope="jobs:run",
+        )
+        for label, user_id, session_id in [
+            ("another User's session", other.id, session.id),
+            ("a CLI session", session.user_id, cli_session.id),
+            ("an unknown session", session.user_id, uuid.uuid4()),
+        ]:
+            with self.subTest(label), self.assertRaises(DecidingSessionNotActiveError):
+                store.decide(request.id, approve=True, user_id=user_id, session_id=session_id)
+        self.sql(
+            "UPDATE user_sessions SET expires_at = created_at + interval '1 microsecond' "
+            "WHERE id = %s",
+            session.id,
+        )
+        with self.assertRaises(DecidingSessionNotActiveError):
+            store.decide(request.id, approve=False, user_id=session.user_id, session_id=session.id)
+        self.assertEqual(self.sql("SELECT status FROM cli_login_requests"), [("pending",)])
+
+    def test_decision_for_a_disabled_user_is_refused(self):
+        started = self.start()
+        session = self.browser_session(self.browser())
+        request = self.cli.find(started["user_code"])
+        assert request is not None
+        self.identities.set_user_status(session.user_id, "disabled")
+        with self.assertRaises(UserNotActiveError):
+            self.cli.store.decide(
+                request.id, approve=True, user_id=session.user_id, session_id=session.id
+            )
 
     def test_device_code_is_redeemed_once_and_polls_are_paced(self):
         started = self.start()

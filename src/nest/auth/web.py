@@ -38,7 +38,15 @@ from urllib.parse import parse_qs, quote, urlsplit
 
 from .._logging import get_logger
 from ..config import AUTH_CLI_PREFIX, AUTH_SESSION_PATHS, CLI_SCOPES, GoogleAuthConfig
-from ..db import AccessGrant, Database, DatabaseError, Session, SessionRefreshError, hash_token
+from ..db import (
+    AccessGrant,
+    Database,
+    DatabaseError,
+    DecidingSessionNotActiveError,
+    Session,
+    SessionRefreshError,
+    hash_token,
+)
 from .cli import (
     CLI_LOGIN_TTL,
     CLISignIn,
@@ -589,9 +597,22 @@ class _Handler(BaseHTTPRequestHandler):
             )
             return
         approve = decision == "approve"
-        decided = self.app.cli.decide(
-            request, approve=approve, user_id=grant.session.user_id, session_id=grant.session.id
-        )
+        try:
+            decided = self.app.cli.decide(
+                request,
+                approve=approve,
+                user_id=grant.session.user_id,
+                session_id=grant.session.id,
+            )
+        except DecidingSessionNotActiveError:
+            # Signed out, revoked or disabled since the session was checked above.
+            logger.warning("CLI approval refused reason=session_ended request_id=%s", request.id)
+            self._page(
+                HTTPStatus.UNAUTHORIZED,
+                "Not signed in",
+                "Your Nest session has ended. Sign in again, then open the approval link.",
+            )
+            return
         if decided is None:
             self._page(
                 HTTPStatus.CONFLICT,

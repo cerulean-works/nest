@@ -19,6 +19,7 @@ from .cli_logins import (
     CLILoginRequest,
     CLILoginStore,
     CLIPoll,
+    DecidingSessionNotActiveError,
     TooManyPendingCLILoginsError,
     UserCodeCollisionError,
 )
@@ -73,6 +74,7 @@ __all__ = [
     "CLIPoll",
     "Database",
     "DatabaseError",
+    "DecidingSessionNotActiveError",
     "DeliveryStatus",
     "DuplicateMemberError",
     "EmailOutbox",

@@ -120,6 +120,8 @@ See [Sign in from the command line](../cli-login). The client side is
 
 [[autodoc]] db.TooManyPendingCLILoginsError
 
+[[autodoc]] db.DecidingSessionNotActiveError
+
 ## Pending sign-ins
 
 [[autodoc]] db.LoginFlowStore

@@ -127,7 +127,10 @@ CLI                               Nest auth listener                   Browser
    page shows the code, the client name the CLI reported (escaped, and labelled as
    reported, never trusted) and the scopes. The form posts back with a CSRF token
    bound to the browser's access token and this request, and the post is refused
-   without the browser's same-site `Origin`. A request is approved or denied once.
+   without the browser's same-site `Origin`. The decision re-checks the browser
+   session in its own transaction, under the same locks as logout and revocation,
+   so a session that ended a moment earlier approves nothing. A request is approved
+   or denied once.
 3. **Redeem.** The CLI polls `POST /auth/cli/token` with `{"device_code": ...}`.
    The answer is `400` with the RFC 8628 `error` `authorization_pending`,
    `slow_down` (polled too fast), `access_denied`, `expired_token`, or

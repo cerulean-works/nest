@@ -28,6 +28,7 @@ from ..db import (
     CLILoginStore,
     CLIPoll,
     Database,
+    DecidingSessionNotActiveError,
     TooManyPendingCLILoginsError,
     UserCodeCollisionError,
     UserNotActiveError,
@@ -221,13 +222,20 @@ class CLISignIn:
     def decide(
         self, request: CLILoginRequest, *, approve: bool, user_id, session_id
     ) -> CLILoginRequest | None:
-        """Approves or denies a request; `None` when it is no longer pending."""
+        """
+        Approves or denies a request; `None` when it is no longer pending.
+
+        Raises:
+            [`db.DecidingSessionNotActiveError`]: If the browser session making the
+                decision has ended since it was authenticated, or the User is
+                disabled. Nothing is changed.
+        """
         try:
             return self.store.decide(
                 request.id, approve=approve, user_id=user_id, session_id=session_id
             )
         except UserNotActiveError:
-            return None
+            raise DecidingSessionNotActiveError("The User is disabled") from None
 
     def redeem(self, device_code: object) -> CLITokens:
         """Answers a poll; [`auth.CLITokens.poll`] says whether a session was issued."""
