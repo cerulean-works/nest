@@ -6,11 +6,11 @@ and keeps the session. See [Sign in from the command line](../cli-login).
 ```python
 from nest.login import NotSignedInError, ensure_session
 
-session = ensure_session()              # signs in inline when needed
+session = ensure_session()  # signs in inline when needed
 try:
     session = ensure_session(interactive=False)
 except NotSignedInError:
-    ...                                 # ask the user to run nest login
+    ...  # ask the user to run nest login
 ```
 
 A [`login.NestSession`] is a Nest identity only, never an HPC credential.
