@@ -114,13 +114,15 @@ class DefaultsTests(unittest.TestCase):
         )
         self.assertEqual(load_controller_config(settings), load_controller_config({}))
 
-    def test_client_defaults_to_localhost_not_a_tailnet(self):
+    def test_client_without_settings_connects_only_to_loopback(self):
         config = load_client_config({})
         self.assertEqual(config.address, DEFAULT_CONTROLLER_ADDRESS)
         self.assertEqual(config.address, "127.0.0.1:50051")
-        self.assertNotIn("ts.net", config.address)
         self.assertFalse(config.tls)
         self.assertEqual(config.rpc_timeout, 900)
+        with mock.patch.object(grpc, "insecure_channel") as insecure_channel:
+            _channel(config)
+        insecure_channel.assert_called_once_with("127.0.0.1:50051")
 
 
 class ValidationTests(unittest.TestCase):
@@ -271,12 +273,37 @@ class ValidationTests(unittest.TestCase):
 
     def test_client_tls_settings(self):
         files = Files(self)
-        config = load_client_config({"NEST_CONTROLLER_TLS_CA_FILE": files.known_hosts})
+        config = load_client_config(
+            {
+                "NEST_CONTROLLER_ADDRESS": "controller.example.edu:50051",
+                "NEST_CONTROLLER_TLS_CA_FILE": files.known_hosts,
+            }
+        )
         self.assertTrue(config.tls)
         self.assertTrue(load_client_config({"NEST_CONTROLLER_TLS": "yes"}).tls)
         for bad in ({"NEST_CONTROLLER_TLS": "maybe"}, {"NEST_CONTROLLER_ADDRESS": "host"}):
             with self.subTest(bad=bad), self.assertRaises(ConfigError):
                 load_client_config(bad)
+
+    def test_non_loopback_client_requires_an_explicit_tls_choice(self):
+        settings = {"NEST_CONTROLLER_ADDRESS": "nest.cerulean.works:50051"}
+        for override in ({}, {"NEST_CONTROLLER_TLS": " "}):
+            with (
+                self.subTest(override=override),
+                self.assertRaisesRegex(ConfigError, "requires an explicit NEST_CONTROLLER_TLS"),
+            ):
+                load_client_config({**settings, **override})
+        secured = load_client_config({**settings, "NEST_CONTROLLER_TLS": "true"})
+        self.assertTrue(secured.tls)
+        self.assertIsNone(secured.tls_ca_file)
+        self.assertFalse(load_client_config({**settings, "NEST_CONTROLLER_TLS": "false"}).tls)
+
+    def test_loopback_client_accepts_an_address_without_a_tls_choice(self):
+        for address in ("localhost:50051", "127.0.0.2:50051", "[::1]:50051"):
+            with self.subTest(address=address):
+                config = load_client_config({"NEST_CONTROLLER_ADDRESS": address})
+                self.assertEqual(config.address, address)
+                self.assertFalse(config.tls)
 
     def test_public_url_is_validated(self):
         load_controller_config({"NEST_PUBLIC_URL": "grpcs://nest.example.edu:443"})
@@ -454,7 +481,7 @@ class TLSTests(unittest.TestCase):
         key.chmod(0o600)
         config = load_controller_config(
             {
-                "NEST_CONTROLLER_BIND": "localhost:0",
+                "NEST_CONTROLLER_BIND": "127.0.0.1:0",
                 "NEST_TLS_CERT_FILE": str(cert),
                 "NEST_TLS_KEY_FILE": str(key),
             }
@@ -480,6 +507,18 @@ class TLSTests(unittest.TestCase):
             self.assertEqual(
                 cast(grpc.Call, caught.exception).code(), grpc.StatusCode.INVALID_ARGUMENT
             )
+
+        mismatched_hostname = load_client_config(
+            {
+                "NEST_CONTROLLER_ADDRESS": f"127.0.0.1:{port}",
+                "NEST_CONTROLLER_TLS_CA_FILE": str(cert),
+            }
+        )
+        with _channel(mismatched_hostname) as channel:
+            stub = execution_pb2_grpc.ExecutionServiceStub(channel)
+            with self.assertRaises(grpc.RpcError) as caught:
+                stub.Execute(execution_pb2.ExecuteRequest(gpu=-1), timeout=5)
+            self.assertEqual(cast(grpc.Call, caught.exception).code(), grpc.StatusCode.UNAVAILABLE)
 
         tls_env = {"NEST_CONTROLLER_BIND": f"0.0.0.0:{port}", "NEST_TLS_CERT_FILE": str(cert)}
         with mock.patch.dict(os.environ, tls_env):

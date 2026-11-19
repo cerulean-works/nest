@@ -86,6 +86,8 @@ already exist; starting the Controller does not deploy them.
 Review the batch scripts for your cluster's partition, account, time, memory,
 and container requirements before use. From a trusted client, run the
 [quickstart](quickstart) with `NEST_CONTROLLER_ADDRESS` set to this Controller.
+Set `NEST_CONTROLLER_TLS=false` for the plaintext Tailnet example above, or
+configure the client [TLS settings](configuration#client) for a TLS deployment.
 
 The Controller uses partition `dev` and a `00:05:00` time limit unless
 `NEST_SLURM_PARTITION` and `NEST_SLURM_TIME` override them. Environment builds

@@ -85,8 +85,10 @@ changes and bootstrap events are kept in an append-only audit log. See
 
 ## Execution behavior
 
-The client connects through an insecure gRPC channel. The current deployment
-relies on the trusted network and host configuration to restrict access.
+The client defaults to loopback and requires an explicit transport choice for
+non-loopback addresses. TLS verifies the Controller's certificate and hostname.
+The team deployment uses plaintext gRPC within its authorized Tailnet, with
+access restricted by Tailscale and the host configuration.
 
 Project dependency installation applies to the Slurm backend; a local Controller
 uses its own environment.

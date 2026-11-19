@@ -119,10 +119,12 @@ healthy until the first call fails. Options:
 - A standard `grpc.health.v1` service. `scripts/verify-grpc.py` then would not
   need to rely on rejecting an empty environment.
 
-### Remove the Tailnet-specific client default (done)
+### Keep the SDK's implicit connection on loopback (done)
 
-The SDK's default `NEST_CONTROLLER_ADDRESS` is now `127.0.0.1:50051`. Team users set
-the Tailnet address explicitly; nothing in the SDK or Mode B depends on Tailscale.
+The SDK defaults to `127.0.0.1:50051`. To connect to a non-loopback Controller,
+set `NEST_CONTROLLER_ADDRESS` and select the transport with `NEST_CONTROLLER_TLS`
+or `NEST_CONTROLLER_TLS_CA_FILE`. The [quickstart](quickstart) shows the team
+deployment settings.
 
 ### Check sidecar preferences in both modes
 

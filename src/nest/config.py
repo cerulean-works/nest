@@ -44,6 +44,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from email.headerregistry import Address
 from email.utils import parseaddr
+from ipaddress import ip_address
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 from ._logging import LOG_LEVELS, parse_log_level
@@ -611,7 +612,7 @@ class ClientConfig:
         address (`str`): Controller `host:port`.
         rpc_timeout (`float`): `Execute` deadline in seconds.
         tls (`bool`): Whether to use a TLS channel.
-        tls_ca_file (`str | None`): PEM roots for TLS. `None` uses the system roots.
+        tls_ca_file (`str | None`): PEM roots for TLS. `None` uses gRPC's default roots.
     """
 
     address: str = DEFAULT_CONTROLLER_ADDRESS
@@ -1404,6 +1405,16 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
     )
 
 
+def _is_loopback_address(address: str) -> bool:
+    host, _, _ = address.rpartition(":")
+    if host.lower().removesuffix(".") == "localhost":
+        return True
+    try:
+        return ip_address(host.removeprefix("[").removesuffix("]")).is_loopback
+    except ValueError:
+        return False
+
+
 def load_client_config(environ: Mapping[str, str] | None = None) -> ClientConfig:
     """
     Reads and validates the SDK client settings.
@@ -1419,9 +1430,20 @@ def load_client_config(environ: Mapping[str, str] | None = None) -> ClientConfig
     """
     reader = _Reader(environ)
     address = reader.address("NEST_CONTROLLER_ADDRESS", DEFAULT_CONTROLLER_ADDRESS)
+    address_is_valid = not reader.problems
     timeout = reader.seconds("NEST_RPC_TIMEOUT", DEFAULT_RPC_TIMEOUT)
     ca_file = reader.readable_file("NEST_CONTROLLER_TLS_CA_FILE")
     tls = reader.boolean("NEST_CONTROLLER_TLS", default=ca_file is not None)
+    if (
+        address_is_valid
+        and ca_file is None
+        and reader.get("NEST_CONTROLLER_TLS") is None
+        and not _is_loopback_address(address)
+    ):
+        reader.fail(
+            "Non-loopback NEST_CONTROLLER_ADDRESS requires an explicit NEST_CONTROLLER_TLS "
+            "setting (true or false) or NEST_CONTROLLER_TLS_CA_FILE"
+        )
     if ca_file and not tls:
         reader.fail("NEST_CONTROLLER_TLS_CA_FILE is set but NEST_CONTROLLER_TLS is false")
     if reader.problems:

@@ -7,7 +7,7 @@ import cloudpickle
 import grpc
 
 from ._logging import current_request_id, get_logger, operation, request_context
-from .config import ClientConfig, load_client_config
+from .config import DEFAULT_CONTROLLER_ADDRESS, ClientConfig, load_client_config
 from .errors import (
     ERROR_KIND_METADATA,
     INFRASTRUCTURE_ERRORS,
@@ -71,7 +71,8 @@ def _controller_error(exc: grpc.RpcError, address: str, timeout: float) -> Excep
         return ConnectionError(
             f"Cannot connect to Nest Controller at {address}.\n\n"
             "Please check:\n"
-            "  - NEST_CONTROLLER_ADDRESS names the Controller (default 127.0.0.1:50051).\n"
+            "  - NEST_CONTROLLER_ADDRESS names the Controller "
+            f"(default {DEFAULT_CONTROLLER_ADDRESS}).\n"
             "  - Your network can reach it, for example through a VPN or Tailnet.\n"
             "  - NEST_CONTROLLER_TLS matches the Controller's TLS setting.\n"
             "  - The Controller is running."
@@ -96,10 +97,11 @@ def execute_remote(
     """
     Serializes a function call and executes it through the controller.
 
-    Reads its settings with [`config.load_client_config`]: the Controller is
-    `NEST_CONTROLLER_ADDRESS` (default `127.0.0.1:50051`), the call has a 900-second
-    deadline unless `NEST_RPC_TIMEOUT` sets another positive number of seconds, and
-    `NEST_CONTROLLER_TLS` or `NEST_CONTROLLER_TLS_CA_FILE` selects a TLS channel.
+    Reads its settings with [`config.load_client_config`]. `NEST_CONTROLLER_ADDRESS`
+    overrides [`config.DEFAULT_CONTROLLER_ADDRESS`]. The call has a 900-second
+    deadline unless `NEST_RPC_TIMEOUT` sets another positive number of seconds.
+    Non-loopback addresses require an explicit `NEST_CONTROLLER_TLS` setting or
+    `NEST_CONTROLLER_TLS_CA_FILE`.
     The call is never retried. Only send trusted functions and accept results from
     trusted hosts: deserializing Python objects can execute code.
 
