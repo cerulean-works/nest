@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=nest-worker
-#SBATCH --partition=dev
+#SBATCH --partition=8gpus
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=1G

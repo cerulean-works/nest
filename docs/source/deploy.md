@@ -22,6 +22,7 @@ export NEST_CONTROLLER_BIND="$(tailscale ip -4):50051"
 
 export NEST_SLURM_HOST="<ssh-host>"
 export NEST_SLURM_ACCOUNT="<slurm-account>"
+export NEST_SLURM_PARTITION="8gpus"
 export NEST_SLURM_WORKDIR="/home/your-user/nest"
 ```
 
@@ -89,7 +90,7 @@ and container requirements before use. From a trusted client, run the
 Set `NEST_CONTROLLER_TLS=false` for the plaintext Tailnet example above, or
 configure the client [TLS settings](configuration#client) for a TLS deployment.
 
-The Controller uses partition `dev` and a `00:05:00` time limit unless
+The Controller uses partition `8gpus` and a `00:05:00` time limit unless
 `NEST_SLURM_PARTITION` and `NEST_SLURM_TIME` override them. Environment builds
 keep the `00:10:00` limit in `scripts/environment-smoke.sbatch`. See [Environment variables and defaults](configuration) for all settings and
 [Slurm backend](api/slurm) for direct backend configuration.

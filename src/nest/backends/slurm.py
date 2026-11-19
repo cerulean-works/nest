@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .._logging import current_request_id, get_logger, operation
-from ..config import load_log_level
+from ..config import DEFAULT_PARTITION, load_log_level
 from ..errors import (
     ExecutionTimeoutError,
     InfrastructureError,
@@ -66,7 +66,7 @@ class SlurmConfig:
     Attributes:
         ssh_host (`str`): SSH host name or configured SSH alias.
         account (`str`): Default Slurm account.
-        partition (`str`, *optional*, defaults to `"dev"`): Default Slurm partition.
+        partition (`str`, *optional*, defaults to `"8gpus"`): Default Slurm partition.
         time (`str`, *optional*): Default `sbatch --time` value. Omits the flag if unset.
         work_root (`str`, *optional*): Absolute directory for staged execution payloads.
         worker_workdir (`str`, *optional*): Remote Nest directory containing the
@@ -93,7 +93,7 @@ class SlurmConfig:
 
     ssh_host: str
     account: str
-    partition: str = "dev"
+    partition: str = DEFAULT_PARTITION
     time: str | None = None
     work_root: str | None = None
     worker_workdir: str | None = None

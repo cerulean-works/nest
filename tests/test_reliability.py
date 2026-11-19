@@ -61,19 +61,19 @@ class SubmitTests(unittest.TestCase):
         job_id, command = self.submit_command(completed(stdout=b"42;cluster\n"), gpu=0, cpu=6)
         self.assertEqual(job_id, 42)
         self.assertIn(
-            "sbatch --parsable --account=acct --partition=dev --cpus-per-task=6 "
+            "sbatch --parsable --account=acct --partition=8gpus --cpus-per-task=6 "
             "--time=00:05:00 job.sbatch",
             command,
         )
 
     def test_inherit_time_false_omits_only_the_default_time(self):
         _, command = self.submit_command(completed(stdout=b"42\n"), gpu=0, inherit_time=False)
-        self.assertIn("sbatch --parsable --account=acct --partition=dev job.sbatch", command)
+        self.assertIn("sbatch --parsable --account=acct --partition=8gpus job.sbatch", command)
 
         _, command = self.submit_command(
             completed(stdout=b"42\n"), gpu=0, time="00:20:00", inherit_time=False
         )
-        self.assertIn("--partition=dev --time=00:20:00 job.sbatch", command)
+        self.assertIn("--partition=8gpus --time=00:20:00 job.sbatch", command)
 
     def test_zero_cpu_omits_the_flag(self):
         _, command = self.submit_command(completed(stdout=b"42\n"), gpu=1, cpu=0)

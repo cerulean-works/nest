@@ -359,7 +359,7 @@ def test_controller_ssh_and_sbatch_commands_are_stable(slurm_controller, hpc, pr
 
     (build,) = _build_jobs(hpc)
     gpu_job, cpu_job = _worker_jobs(hpc)
-    common = ["--parsable", "--account=test-account", "--partition=dev"]
+    common = ["--parsable", "--account=test-account", "--partition=8gpus"]
     resources = ["--gpus-per-node=1", "--cpus-per-task=1"]
     # The build reads its resources and time limit from its script.
     assert build["flags"] == common
@@ -419,7 +419,7 @@ def test_batch_job_rpcs_submit_query_and_cancel(slurm_controller, hpc, tmp_path)
     assert hpc.calls("sbatch")[-1]["flags"] == [
         "--parsable",
         "--account=test-account",
-        "--partition=dev",
+        "--partition=8gpus",
         "--time=00:05:00",
     ]
     assert hpc.calls("sbatch")[-1]["args"] == []
@@ -456,7 +456,7 @@ def test_submit_job_passes_script_args_verbatim_and_cpu(slurm_controller, hpc, t
     assert hpc.calls("sbatch")[-1]["flags"] == [
         "--parsable",
         "--account=test-account",
-        "--partition=dev",
+        "--partition=8gpus",
         "--cpus-per-task=4",
         "--time=00:05:00",
     ]

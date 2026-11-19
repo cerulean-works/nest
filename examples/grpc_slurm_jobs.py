@@ -23,7 +23,6 @@ def main():
                 script="cancel-test.sbatch",
                 gpu=1,
                 account="ACD115198",
-                partition="dev",
                 time="00:02:00",
             ),
             timeout=30,
