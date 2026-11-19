@@ -2,8 +2,9 @@
 #SBATCH --job-name=nest-env-test
 #SBATCH --account=ACD115198
 #SBATCH --partition=dev
-#SBATCH --gpus-per-node=1
-#SBATCH --cpus-per-task=1
+#SBATCH --nodes=2
+#SBATCH --gpus-per-node=8
+#SBATCH --cpus-per-task=12
 #SBATCH --mem=2G
 #SBATCH --time=00:10:00
 #SBATCH --output=env-%j.out
