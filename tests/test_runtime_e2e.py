@@ -339,7 +339,7 @@ def test_failed_environment_build_aborts_without_running_worker(slurm_controller
 
 
 def test_controller_ssh_and_sbatch_commands_are_stable(slurm_controller, hpc, project):
-    @nest.remote(gpu=2, project=project)
+    @nest.remote(gpu=1, project=project)
     def ping():
         return "pong"
 
@@ -360,9 +360,9 @@ def test_controller_ssh_and_sbatch_commands_are_stable(slurm_controller, hpc, pr
     (build,) = _build_jobs(hpc)
     gpu_job, cpu_job = _worker_jobs(hpc)
     common = ["--parsable", "--account=test-account", "--partition=dev"]
-    resources = ["--gpus-per-node=2", "--cpus-per-task=1"]
-    # The build keeps its script's own time limit instead of the worker job default.
-    assert build["flags"] == [*common, *resources]
+    resources = ["--gpus-per-node=1", "--cpus-per-task=1"]
+    # The build reads its resources and time limit from its script.
+    assert build["flags"] == common
     assert gpu_job["flags"] == [*common, *resources, "--time=00:05:00"]
     # cpu=0 and gpu=0 leave both counts to the deployed worker script.
     assert cpu_job["flags"] == [*common, "--time=00:05:00"]
@@ -486,7 +486,7 @@ def test_submit_job_passes_script_args_verbatim_and_cpu(slurm_controller, hpc, t
 # CPU resource forwarding
 
 
-def test_cpu_request_is_forwarded_to_worker_and_build(slurm_controller, hpc, project):
+def test_cpu_request_is_forwarded_to_worker(slurm_controller, hpc, project):
     @nest.remote(cpu=8, project=project)
     def threads():
         return "ok"
@@ -499,7 +499,7 @@ def test_cpu_request_is_forwarded_to_worker_and_build(slurm_controller, hpc, pro
     assert plain.remote() == "ok"
     (build,) = _build_jobs(hpc)
     with_env, without_env = _worker_jobs(hpc)
-    assert "--cpus-per-task=8" in build["flags"]
+    assert "--cpus-per-task=8" not in build["flags"]
     assert "--cpus-per-task=8" in with_env["flags"]
     assert "--cpus-per-task=3" in without_env["flags"]
     # GPU defaults to zero, so no GPU flag accompanies a CPU-only request.

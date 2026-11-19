@@ -311,11 +311,12 @@ call again.
 ### Resources
 
 `@nest.remote(gpu=..., cpu=...)` defaults to `gpu=0`, `cpu=1`. The Slurm
-Controller passes both counts to the worker job and to any environment build job:
-`gpu` as `--gpus-per-node` and `cpu` as `--cpus-per-task`. A count of `0` omits
-the flag, so the batch script's `#SBATCH` directive applies (one CPU in
-`scripts/worker.sbatch`). Negative counts are rejected before anything is
-submitted. The local Controller does not allocate resources.
+Controller passes `gpu` to the worker job as `--gpus-per-node` and `cpu` as
+`--cpus-per-task`. A count of `0` uses the worker script's `#SBATCH` directive
+(one CPU in `scripts/worker.sbatch`). Environment builds use the resource
+counts and time limit in the deployed `scripts/environment-smoke.sbatch`.
+Negative counts are rejected before anything is submitted. The local Controller
+does not allocate resources.
 
 For deployment steps, see [Deploy a Slurm Controller](deploy); for local
 execution, see [Run a local Controller](local-controller).

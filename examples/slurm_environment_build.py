@@ -24,11 +24,10 @@ def main():
 
     project = Path("examples/uv_demo")
 
-    env1 = backend.prepare_environment(str(project), gpu=1)
+    env1 = backend.prepare_environment(str(project))
     env2 = backend.prepare_environment_bytes(
         pyproject_toml=(project / "pyproject.toml").read_bytes(),
         uv_lock=(project / "uv.lock").read_bytes(),
-        gpu=1,
     )
 
     assert env1 == env2

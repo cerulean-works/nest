@@ -304,8 +304,6 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                     env_dir = backend.prepare_environment_bytes(
                         pyproject_toml=env.pyproject_toml,
                         uv_lock=env.uv_lock,
-                        gpu=request.gpu,
-                        cpu=request.cpu,
                     )
 
                     environment_id = env_dir.rsplit("/", 1)[-1]
