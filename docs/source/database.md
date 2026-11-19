@@ -72,9 +72,10 @@ back.
 
 Migration `0003_identity_and_projects` adds the records that authentication and
 shared Projects build on. [Google sign-in](authentication) creates Users,
-identities and browser sessions; no RPC uses them yet, and the authorization
-policy and invitation flows are separate features. The data model and its rules are
-already enforced by the database.
+identities and browser sessions, and the Projects API applies the authorization
+policy to Projects and memberships (see
+[Share Projects and manage roles](projects)); invitation flows are a separate
+feature. The data model and its rules are enforced by the database.
 
 **Separate identities.** Each kind of identity has its own key, and none is
 derived from another:
@@ -154,6 +155,12 @@ only (their `granted_by_user_id` is cleared only by the foreign key when the
 granting User is deleted; the audit log keeps the grantor), audits every change in `platform_audit_events`, and adds the one-time
 `platform_bootstrap` record (see
 [Bootstrap and recover platform administration](platform-admin)).
+
+**Project audit history.** Migration `0008_project_audit` adds the append-only
+`project_audit_events`, written by triggers on every Project creation, rename and
+deletion and every membership addition, role change and removal, whoever makes
+it. It also keeps a deleted Project deleted. See
+[Audit history](projects#audit-history).
 
 ## Configure the connection
 

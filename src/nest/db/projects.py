@@ -46,6 +46,10 @@ _PROJECT_COLUMNS = (
     "p.deleted_at, p.deleted_by_user_id, o.user_id AS owner_user_id"
 )
 _PROJECT_FROM = "projects p JOIN project_memberships o ON o.project_id = p.id AND o.role = 'owner'"
+_AUDIT_COLUMNS = (
+    "id, occurred_at, project_id, event, target_user_id, old_role, new_role, "
+    "actor_user_id, actor_operator, database_role, reason"
+)
 _MEMBERSHIP_COLUMNS = "project_id, user_id, role, added_by_user_id, created_at, updated_at"
 
 
@@ -103,6 +107,38 @@ class Project:
     updated_at: datetime
     deleted_at: datetime | None
     deleted_by_user_id: UUID | None
+
+
+@dataclass(frozen=True)
+class ProjectAuditEvent:
+    """
+    One entry of a Project's audit history. Entries are never changed or deleted.
+
+    Attributes:
+        id (`int`): Increasing entry number.
+        occurred_at (`datetime`): When the change committed its row.
+        project_id (`UUID`): The Project.
+        event (`str`): `project_created`, `project_renamed`, `project_deleted`,
+            `member_added`, `member_role_changed` or `member_removed`.
+        target_user_id (`UUID | None`): The member a membership event is about.
+        old_role, new_role (`str | None`): The member's role before and after.
+        actor_user_id (`UUID | None`): The User who made the change, when known.
+        actor_operator (`str | None`): The operator who made it, when one did.
+        database_role (`str`): The PostgreSQL role that wrote the change.
+        reason (`str | None`): Reason given for the change.
+    """
+
+    id: int
+    occurred_at: datetime
+    project_id: UUID
+    event: str
+    target_user_id: UUID | None
+    old_role: str | None
+    new_role: str | None
+    actor_user_id: UUID | None
+    actor_operator: str | None
+    database_role: str
+    reason: str | None
 
 
 @dataclass(frozen=True)
@@ -283,6 +319,29 @@ class ProjectStore:
             )
             project = self._project(cursor, pid)
         logger.info("Project deleted project_id=%s", pid)
+        return project
+
+    def rename_project(
+        self, project_id: UUID | str, name: str, *, conn: psycopg.Connection | None = None
+    ) -> Project:
+        """
+        Changes a Project's display name. Its ID never changes.
+
+        Raises:
+            [`db.ProjectNotFoundError`]: If it does not exist or was deleted.
+            `ValueError`: If the name is empty or too long.
+        """
+        pid = as_uuid(project_id, "project_id")
+        if not 1 <= len(name.strip()) <= 200:
+            raise ValueError("The Project name must be 1 to 200 characters")
+        with transaction(self.database, conn, "rename a Project") as cursor:
+            self._lock(cursor, pid)
+            cursor.execute(
+                "UPDATE projects SET name = %s, updated_at = now() WHERE id = %s",
+                (name.strip(), pid),
+            )
+            project = self._project(cursor, pid)
+        logger.info("Project renamed project_id=%s", pid)
         return project
 
     # Memberships ---------------------------------------------------------------
@@ -483,3 +542,24 @@ class ProjectStore:
             (Project(**{k: v for k, v in r.items() if k != "member_role"}), r["member_role"])
             for r in rows
         ]
+
+    def audit_history(
+        self, project_id: UUID | str, *, limit: int = 100, before_id: int | None = None
+    ) -> list[ProjectAuditEvent]:
+        """
+        Returns a Project's audit history, newest first, including after deletion.
+
+        Args:
+            limit (`int`, *optional*, defaults to 100): At most this many, 1 to 1000.
+            before_id (`int`, *optional*): Only entries older than this one, to page.
+        """
+        pid = as_uuid(project_id, "project_id")
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit must be 1 to 1000")
+        with transaction(self.database, None, "read a Project's audit history") as cursor:
+            rows = cursor.execute(
+                f"SELECT {_AUDIT_COLUMNS} FROM project_audit_events WHERE project_id = %s "
+                "AND (%s::bigint IS NULL OR id < %s::bigint) ORDER BY id DESC LIMIT %s",
+                (pid, before_id, before_id, limit),
+            ).fetchall()
+        return [ProjectAuditEvent(**row) for row in rows]

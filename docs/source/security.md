@@ -17,6 +17,12 @@ accepted, policy-authorized recipients. All callers still submit work as the
 Controller's single HPC SSH user. Node Sharing and Grants restrict network
 reachability; they do not authenticate callers inside Nest or isolate jobs.
 
+Project roles (see [Share Projects and manage roles](projects)) are enforced by
+one server-side, deny-by-default policy on the Projects API. They grant no HPC
+authority: Run actions also need the Provider's permission, which no Project role
+or Platform Admin role implies. The gRPC execution service does not yet
+authenticate callers, so the limits above still apply to it.
+
 ## Deployment credentials
 
 Keep SSH keys, `known_hosts`, and the Tailscale Auth Key in the ignored `ssh/` and

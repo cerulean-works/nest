@@ -16,6 +16,8 @@ It serves these routes and nothing else:
   CLI's JSON routes `POST /auth/cli/start`, `/auth/cli/token`, `/auth/cli/refresh`
   and `/auth/cli/logout` and `GET /auth/cli/session`, and the browser's approval
   page `GET`/`POST /auth/cli/approve`.
+- `/api/projects` and below serve the Projects API (see *Share Projects and manage
+  roles*). Every request is authorized by [`authz.ProjectService`].
 
 The listener speaks plain HTTP. Put it behind a TLS-terminating reverse proxy that
 serves `NEST_GOOGLE_REDIRECT_URL` and forwards paths unchanged.
@@ -35,17 +37,33 @@ from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import cast
 from urllib.parse import parse_qs, quote, urlsplit
+from uuid import UUID
 
 from .._logging import get_logger
-from ..config import AUTH_CLI_PREFIX, AUTH_SESSION_PATHS, CLI_SCOPES, GoogleAuthConfig
+from ..authz import AccessDeniedError, Principal, ProjectService
+from ..config import (
+    AUTH_CLI_PREFIX,
+    AUTH_SESSION_PATHS,
+    CLI_SCOPES,
+    PROJECTS_API_PATH,
+    GoogleAuthConfig,
+)
 from ..db import (
     AccessGrant,
     Database,
     DatabaseError,
     DecidingSessionNotActiveError,
+    DuplicateMemberError,
+    MemberNotFoundError,
+    Membership,
+    OwnerRuleError,
+    Project,
+    ProjectAuditEvent,
+    ProjectNotFoundError,
     Session,
     SessionRefreshError,
     UserNotActiveError,
+    UserNotFoundError,
     hash_token,
 )
 from .cli import (
@@ -223,7 +241,12 @@ class _Handler(BaseHTTPRequestHandler):
     def _fail(self, status: int, title: str, message: str):
         """Answers an error in the route's format: JSON for session routes."""
         path = urlsplit(self.path).path
-        if path in AUTH_SESSION_PATHS or path in CLI_API_PATHS or path == CLI_SESSION_PATH:
+        if (
+            path in AUTH_SESSION_PATHS
+            or path in CLI_API_PATHS
+            or path == CLI_SESSION_PATH
+            or _is_api(path)
+        ):
             self._json(status, {"error": title.lower().replace(" ", "_")})
         else:
             self._page(status, title, message)
@@ -262,6 +285,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._dispatch(self._cli_approve_page)
         elif path == CLI_SESSION_PATH:
             self._dispatch(self._cli_describe)
+        elif _is_api(path):
+            self._dispatch(lambda: self._api("GET", path))
         else:
             self._dispatch(
                 lambda: self._fail(HTTPStatus.NOT_FOUND, "Not found", "There is nothing here.")
@@ -277,6 +302,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._dispatch(lambda: self._cli_api(path))
         elif path == CLI_APPROVE_PATH:
             self._dispatch(lambda: self._same_origin(require_origin=True) and self._cli_decide())
+        elif _is_api(path):
+            self._dispatch(lambda: self._api("POST", path))
         else:
             self.do_HEAD()
 
@@ -284,7 +311,7 @@ class _Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path in (REFRESH_PATH, LOGOUT_PATH) or path in CLI_API_PATHS:
             allow = "POST"
-        elif path == CLI_APPROVE_PATH:
+        elif path == CLI_APPROVE_PATH or _is_api(path):
             allow = "GET, POST"
         else:
             allow = "GET"
@@ -804,6 +831,139 @@ class _Handler(BaseHTTPRequestHandler):
             return
         self._json(HTTPStatus.OK, self._cli_session_payload(grant.session, grant.access_expires_at))
 
+    # Projects API ------------------------------------------------------------
+
+    def _principal(self) -> Principal | None:
+        """
+        The caller: a CLI session by its bearer token when the request carries an
+        `Authorization` header, otherwise the browser session cookie.
+        """
+        if self.headers.get("Authorization") is not None:
+            grant = self._bearer_grant()
+        else:
+            grant = self._browser_grant()
+        return Principal.from_session(grant.session) if grant else None
+
+    def _api(self, method: str, path: str):
+        """Authenticates, parses and routes a Projects API request."""
+        principal = self._principal()
+        if principal is None:
+            self._json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "unauthenticated"},
+                headers={"WWW-Authenticate": 'Bearer realm="nest"'},
+            )
+            return
+        payload: dict = {}
+        if method == "POST":
+            # A browser session's change must come from Nest's own pages.
+            if principal.session_kind == "browser" and not self._same_origin(require_origin=True):
+                return
+            content_type = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if content_type != "application/json":
+                self._json(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, {"error": "invalid_request"})
+                return
+            body = self._read_body()
+            if body is None:
+                return
+            try:
+                parsed = json.loads(body or b"{}")
+            except ValueError:
+                parsed = None
+            if not isinstance(parsed, dict):
+                self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+                return
+            payload = parsed
+        try:
+            self._api_call(method, path, principal, payload)
+        except AccessDeniedError as exc:
+            if exc.reason == "member_not_found":
+                self._json(HTTPStatus.NOT_FOUND, {"error": "member_not_found"})
+            elif exc.visible:
+                self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden", "reason": exc.reason})
+            else:
+                self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+        except ProjectNotFoundError:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+        except MemberNotFoundError:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "member_not_found"})
+        except UserNotFoundError:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "user_not_found"})
+        except DuplicateMemberError:
+            self._json(HTTPStatus.CONFLICT, {"error": "already_member"})
+        except OwnerRuleError:
+            self._json(HTTPStatus.CONFLICT, {"error": "owner_rule"})
+        except ValueError, TypeError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+
+    def _api_call(self, method: str, path: str, who: Principal, body: dict):
+        """Runs one Projects API route. Authorization happens in the service."""
+        service = self.app.projects
+        rest = path[len(PROJECTS_API_PATH) :].strip("/")
+        parts = rest.split("/") if rest else []
+        ids = [_parse_uuid(part) for part in parts[0:1] + parts[2:3]]
+        pid, uid = (ids + [None, None])[:2]
+        if None in ids:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        shape = tuple("{id}" if i in (0, 2) else part for i, part in enumerate(parts))
+        allowed = _API_ROUTES.get(shape)
+        if allowed is None:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        if method not in allowed:
+            self._not_allowed(", ".join(allowed))
+            return
+        if not parts:
+            if method == "GET":
+                projects = [_project_json(p, r) for p, r in service.list_projects(who)]
+                self._json(HTTPStatus.OK, {"projects": projects})
+            else:
+                organization = body.get("organization_id")
+                if organization is not None and not isinstance(organization, str):
+                    raise TypeError("organization_id must be a string")
+                project = service.create_project(
+                    who, _string(body, "name"), organization_id=organization
+                )
+                self._json(HTTPStatus.CREATED, _project_json(project, "owner"))
+            return
+        assert pid is not None
+        action = parts[-1] if len(parts) > 1 else ""
+        if shape == ("{id}",):
+            self._json(HTTPStatus.OK, _project_json(*service.get_project(who, pid)))
+        elif action == "rename":
+            project = service.rename_project(who, pid, _string(body, "name"))
+            self._json(HTTPStatus.OK, _project_json(project, None))
+        elif action == "delete":
+            self._json(HTTPStatus.OK, _project_json(service.delete_project(who, pid), None))
+        elif action == "transfer":
+            previous = body.get("previous_owner_role", "admin")
+            if not isinstance(previous, str):
+                raise TypeError("previous_owner_role must be a string")
+            project = service.transfer_ownership(
+                who, pid, _string(body, "user_id"), previous_owner_role=previous
+            )
+            self._json(HTTPStatus.OK, _project_json(project, None))
+        elif action == "members" and method == "GET":
+            members = [_member_json(m) for m in service.members(who, pid)]
+            self._json(HTTPStatus.OK, {"members": members})
+        elif action == "members":
+            member = service.add_member(who, pid, _string(body, "user_id"), _string(body, "role"))
+            self._json(HTTPStatus.CREATED, _member_json(member))
+        elif action == "audit":
+            limit = int(self._query_value("limit") or 100)
+            before = _optional_int(self._query_value("before"))
+            events = service.audit_history(who, pid, limit=limit, before_id=before)
+            self._json(HTTPStatus.OK, {"events": [_audit_json(e) for e in events]})
+        else:
+            assert uid is not None
+            if action == "role":
+                member = service.change_role(who, pid, uid, _string(body, "role"))
+                self._json(HTTPStatus.OK, _member_json(member))
+            else:
+                service.remove_member(who, pid, uid)
+                self._json(HTTPStatus.OK, {"removed": True})
+
     def _read_cookie(self, name: str) -> str | None:
         raw = self.headers.get_all("Cookie") or []
         jar: SimpleCookie = SimpleCookie()
@@ -816,6 +976,87 @@ class _Handler(BaseHTTPRequestHandler):
         return morsel.value if morsel is not None and morsel.value else None
 
 
+_API_ROUTES: dict[tuple[str, ...], tuple[str, ...]] = {
+    (): ("GET", "POST"),
+    ("{id}",): ("GET",),
+    ("{id}", "rename"): ("POST",),
+    ("{id}", "delete"): ("POST",),
+    ("{id}", "transfer"): ("POST",),
+    ("{id}", "members"): ("GET", "POST"),
+    ("{id}", "members", "{id}", "role"): ("POST",),
+    ("{id}", "members", "{id}", "remove"): ("POST",),
+    ("{id}", "audit"): ("GET",),
+}
+"""Projects API routes under `PROJECTS_API_PATH` and their methods."""
+
+
+def _is_api(path: str) -> bool:
+    return path == PROJECTS_API_PATH or path.startswith(PROJECTS_API_PATH + "/")
+
+
+def _parse_uuid(value: str) -> UUID | None:
+    try:
+        return UUID(value) if len(value) == 36 else None
+    except ValueError:
+        return None
+
+
+def _string(body: dict, name: str) -> str:
+    value = body.get(name)
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a string")
+    return value
+
+
+def _optional_int(value: str | None) -> int | None:
+    return int(value) if value else None
+
+
+def _iso(value: datetime | None) -> str | None:
+    return value.isoformat() if value else None
+
+
+def _id(value: UUID | None) -> str | None:
+    return str(value) if value else None
+
+
+def _project_json(project: Project, role: str | None) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "id": str(project.id),
+        "name": project.name,
+        "organization_id": _id(project.organization_id),
+        "owner_user_id": str(project.owner_user_id),
+        "created_by_user_id": str(project.created_by_user_id),
+        "created_at": _iso(project.created_at),
+        "deleted_at": _iso(project.deleted_at),
+    }
+    if role is not None:
+        payload["role"] = role
+    return payload
+
+
+def _member_json(member: Membership) -> dict[str, object]:
+    return {
+        "user_id": str(member.user_id),
+        "role": member.role,
+        "added_by_user_id": _id(member.added_by_user_id),
+        "created_at": _iso(member.created_at),
+    }
+
+
+def _audit_json(event: ProjectAuditEvent) -> dict[str, object]:
+    return {
+        "id": event.id,
+        "occurred_at": _iso(event.occurred_at),
+        "event": event.event,
+        "target_user_id": _id(event.target_user_id),
+        "old_role": event.old_role,
+        "new_role": event.new_role,
+        "actor_user_id": _id(event.actor_user_id),
+        "actor_operator": event.actor_operator,
+    }
+
+
 class AuthHTTPServer(ThreadingHTTPServer):
     """
     HTTP server for the sign-in routes. Each request runs in its own daemon thread.
@@ -825,6 +1066,8 @@ class AuthHTTPServer(ThreadingHTTPServer):
         address (`tuple[str, int]`): Host and port to listen on.
         cli ([`auth.CLISignIn`], *optional*): CLI sign-in service. Defaults to one
             on the sign-in's database and session lifetimes.
+        projects ([`authz.ProjectService`], *optional*): Projects API service.
+            Defaults to one on the sign-in's database.
     """
 
     daemon_threads = True
@@ -836,6 +1079,7 @@ class AuthHTTPServer(ThreadingHTTPServer):
         address: tuple[str, int],
         *,
         cli: CLISignIn | None = None,
+        projects: ProjectService | None = None,
     ):
         self.sign_in = sign_in
         self.cli = cli or CLISignIn(sign_in.database, sign_in.sessions)
@@ -847,6 +1091,7 @@ class AuthHTTPServer(ThreadingHTTPServer):
         redirect = urlsplit(config.redirect_url)
         self.origin = f"{redirect.scheme}://{redirect.netloc}"
         self.sessions = sign_in.session_store
+        self.projects = projects or ProjectService(sign_in.database)
         super().__init__(address, _Handler)
 
 
