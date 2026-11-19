@@ -139,6 +139,21 @@ MAX_SESSION_LIFETIME = 7_776_000.0
 AUTH_SESSION_PATHS = ("/auth/session", "/auth/session/refresh", "/auth/session/logout")
 """Browser session routes served by the auth listener."""
 
+AUTH_CLI_PREFIX = "/auth/cli/"
+"""Prefix of the CLI sign-in and CLI session routes served by the auth listener."""
+
+CLI_SCOPES: dict[str, str] = {
+    "jobs:run": "Run and manage jobs in your Projects",
+    "projects:read": "See your Projects and their members",
+}
+"""Scopes a CLI session can be granted, with the description shown on approval."""
+
+DEFAULT_CLI_SCOPE = "jobs:run projects:read"
+"""Scope `nest login` asks for."""
+
+CLIENT_AUTH_SETTINGS = ("NEST_AUTH_URL", "NEST_CLI_CREDENTIALS_FILE")
+"""CLI sign-in settings, read by [`config.load_cli_auth_config`]."""
+
 GOOGLE_SETTINGS = (
     "NEST_GOOGLE_CLIENT_ID",
     "NEST_GOOGLE_CLIENT_SECRET",
@@ -1247,6 +1262,12 @@ def _google_redirect_url(reader: _Reader) -> str | None:
             f"sign-in; use a callback path such as {_REDIRECT_EXAMPLE!r}"
         )
         return None
+    if parts.path.startswith(AUTH_CLI_PREFIX):
+        reader.fail(
+            f"NEST_GOOGLE_REDIRECT_URL must not use {parts.path}, a CLI sign-in route; "
+            f"use a callback path such as {_REDIRECT_EXAMPLE!r}"
+        )
+        return None
     if parts.path in AUTH_SESSION_PATHS:
         reader.fail(
             f"NEST_GOOGLE_REDIRECT_URL must not use {parts.path}, a browser session route; "
@@ -1544,6 +1565,95 @@ def load_client_config(environ: Mapping[str, str] | None = None) -> ClientConfig
     if reader.problems:
         raise ConfigError(reader.problems)
     return ClientConfig(address=address, rpc_timeout=timeout, tls=tls, tls_ca_file=ca_file)
+
+
+@dataclass(frozen=True)
+class CLIAuthConfig:
+    """
+    Where `nest login` signs in and keeps its Nest session.
+
+    Attributes:
+        url (`str`): `NEST_AUTH_URL`, the origin serving Nest's sign-in, such as
+            `https://nest.example.com`: the origin of `NEST_GOOGLE_REDIRECT_URL`.
+        credentials_file (`str`): `NEST_CLI_CREDENTIALS_FILE`, where the CLI session
+            is kept, readable only by its owner. Defaults to
+            `$XDG_CONFIG_HOME/nest/credentials.json` (`~/.config/nest/...`).
+    """
+
+    url: str
+    credentials_file: str
+
+
+def default_credentials_file(environ: Mapping[str, str] | None = None) -> str:
+    """Returns `$XDG_CONFIG_HOME/nest/credentials.json`, or under `~/.config`."""
+    environ = os.environ if environ is None else environ
+    base = environ.get("XDG_CONFIG_HOME", "").strip()
+    if not base or not os.path.isabs(base):
+        base = os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "nest", "credentials.json")
+
+
+def normalize_auth_url(raw: str) -> str:
+    """
+    Returns the origin of a Nest sign-in URL, such as `https://nest.example.com`.
+
+    Raises:
+        `ValueError`: If it is not `https://` (or `http://` for localhost), names no
+            host, or carries credentials, a query or a fragment.
+    """
+    try:
+        parts = urlsplit(raw.strip())
+        port = parts.port
+    except ValueError:
+        raise ValueError("must be a URL, such as 'https://nest.example.com'") from None
+    host = parts.hostname or ""
+    if parts.scheme != "https" and not (parts.scheme == "http" and _loopback_host(host)):
+        raise ValueError(
+            "must be an https:// URL (http:// only for localhost), because Nest sessions "
+            "are sent to it"
+        )
+    if not host or parts.username or parts.password:
+        raise ValueError("must name a host and contain no credentials")
+    if parts.query or parts.fragment or parts.path not in ("", "/"):
+        raise ValueError("must be an origin, such as 'https://nest.example.com', with no path")
+    netloc = f"[{host}]" if ":" in host else host
+    if port is not None:
+        netloc = f"{netloc}:{port}"
+    return f"{parts.scheme}://{netloc.lower()}"
+
+
+def load_cli_auth_config(
+    environ: Mapping[str, str] | None = None, *, url: str | None = None
+) -> CLIAuthConfig:
+    """
+    Reads and validates the CLI sign-in settings.
+
+    Args:
+        environ (`Mapping[str, str]`, *optional*): Environment. Defaults to `os.environ`.
+        url (`str`, *optional*): Replaces `NEST_AUTH_URL`, such as from `--url`.
+
+    Raises:
+        [`config.ConfigError`]: Listing every invalid setting.
+    """
+    reader = _Reader(environ)
+    raw = url.strip() if url and url.strip() else reader.get("NEST_AUTH_URL")
+    origin = ""
+    if raw is None:
+        reader.fail(
+            "NEST_AUTH_URL is required to sign in: set it to your Nest's address, such as "
+            "'https://nest.example.com'"
+        )
+    else:
+        try:
+            origin = normalize_auth_url(raw)
+        except ValueError as exc:
+            reader.fail(f"NEST_AUTH_URL {exc}; got {raw!r}")
+    path = reader.get("NEST_CLI_CREDENTIALS_FILE") or default_credentials_file(reader.environ)
+    if not os.path.isabs(path):
+        reader.fail(f"NEST_CLI_CREDENTIALS_FILE must be an absolute path, got {path!r}")
+    if reader.problems:
+        raise ConfigError(reader.problems)
+    return CLIAuthConfig(url=origin, credentials_file=path)
 
 
 def materialize_ssh_credentials(policy: SSHPolicy) -> tuple[str | None, str | None]:

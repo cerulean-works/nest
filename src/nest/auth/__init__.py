@@ -5,8 +5,20 @@ Google sign-in uses the OAuth 2.0 authorization code flow with PKCE (`S256`) and
 OpenID Connect ID-token verification, following Flock's server-run flow. Users are
 linked by Google's stable `sub` under its issuer, never by email address. It is
 enabled by `NEST_GOOGLE_CLIENT_ID` (see *Sign in with Google*).
+
+CLI sign-in is approved in a browser signed in with Google, following the OAuth 2.0
+device authorization grant (see *Sign in from the command line*).
 """
 
+from .cli import (
+    CLI_LOGIN_TTL,
+    CLI_POLL_INTERVAL,
+    CLISignIn,
+    CLISignInError,
+    CLISignInStart,
+    CLITokens,
+    normalize_user_code,
+)
 from .google import (
     CLOCK_SKEW,
     GOOGLE_ENDPOINTS,
@@ -25,6 +37,13 @@ from .google import (
     pkce_challenge,
 )
 from .web import (
+    CLI_APPROVE_PATH,
+    CLI_LOGOUT_PATH,
+    CLI_REFRESH_PATH,
+    CLI_RETURN_COOKIE,
+    CLI_SESSION_PATH,
+    CLI_START_PATH,
+    CLI_TOKEN_PATH,
     INSECURE_REFRESH_COOKIE,
     INSECURE_SESSION_COOKIE,
     LOGIN_PATH,
@@ -40,6 +59,15 @@ from .web import (
 )
 
 __all__ = [
+    "CLI_APPROVE_PATH",
+    "CLI_LOGIN_TTL",
+    "CLI_LOGOUT_PATH",
+    "CLI_POLL_INTERVAL",
+    "CLI_REFRESH_PATH",
+    "CLI_RETURN_COOKIE",
+    "CLI_SESSION_PATH",
+    "CLI_START_PATH",
+    "CLI_TOKEN_PATH",
     "CLOCK_SKEW",
     "GOOGLE_ENDPOINTS",
     "GOOGLE_ISSUER",
@@ -57,6 +85,10 @@ __all__ = [
     "SIGN_IN_TTL",
     "AuthHTTPServer",
     "AuthService",
+    "CLISignIn",
+    "CLISignInError",
+    "CLISignInStart",
+    "CLITokens",
     "GoogleSignIn",
     "IDTokenVerifier",
     "OIDCEndpoints",
@@ -65,6 +97,7 @@ __all__ = [
     "SignInStart",
     "VerifiedIdentity",
     "derive_flow_secrets",
+    "normalize_user_code",
     "pkce_challenge",
     "start_auth_service",
 ]

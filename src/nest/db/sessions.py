@@ -134,11 +134,16 @@ class SessionStore:
             raise LookupError("The session is not active")
         return row["expires_at"]
 
-    def authenticate(self, token_hash: bytes) -> AccessGrant | None:
+    def authenticate(self, token_hash: bytes, *, kind: str | None = None) -> AccessGrant | None:
         """
         Returns the session for an access token's hash if the token is accepted
         now: unexpired, its session unrevoked and unexpired, and its User active.
         Otherwise `None`.
+
+        Args:
+            kind (`str`, *optional*): Accept only a session of this kind, `browser`
+                or `cli`, so a CLI token never works as a browser session or the
+                reverse.
         """
         if len(token_hash) != 32:
             return None
@@ -149,8 +154,9 @@ class SessionStore:
                 "JOIN user_sessions s ON s.id = a.session_id "
                 "JOIN users u ON u.id = s.user_id "
                 "WHERE a.token_hash = %s AND a.expires_at > now() AND s.revoked_at IS NULL "
-                "AND s.expires_at > now() AND u.status = 'active'",
-                (token_hash,),
+                "AND s.expires_at > now() AND u.status = 'active' "
+                "AND (%s::text IS NULL OR s.kind = %s::text)",
+                (token_hash, kind, kind),
             ).fetchone()
         if row is None:
             return None
@@ -164,6 +170,7 @@ class SessionStore:
         new_access_hash: bytes,
         refresh_ttl: float,
         access_ttl: float,
+        kind: str | None = None,
         conn: psycopg.Connection | None = None,
     ) -> Rotation:
         """
@@ -176,6 +183,8 @@ class SessionStore:
         the others see a rotated secret.
 
         Args:
+            kind (`str`, *optional*): Accept only a refresh secret of this kind of
+                session; another kind's is refused as `unknown`, and nothing changes.
             conn (`psycopg.Connection`, *optional*): Transaction to join. The caller
                 then commits, including the family revocation of a `reused` secret.
 
@@ -194,8 +203,9 @@ class SessionStore:
         with transaction(self.database, conn, "refresh a session") as cursor:
             # The family and User never change, so they can be read before locking.
             owner = cursor.execute(
-                "SELECT family_id, user_id FROM user_sessions WHERE token_hash = %s",
-                (refresh_hash,),
+                "SELECT family_id, user_id FROM user_sessions WHERE token_hash = %s "
+                "AND (%s::text IS NULL OR kind = %s::text)",
+                (refresh_hash, kind, kind),
             ).fetchone()
             row = None
             if owner is not None:
@@ -235,8 +245,8 @@ class SessionStore:
             else:
                 new = cursor.execute(
                     "INSERT INTO user_sessions (user_id, kind, token_hash, expires_at, "
-                    "family_id, family_expires_at) VALUES (%s, %s, %s, "
-                    "LEAST(now() + make_interval(secs => %s), %s), %s, %s) "
+                    "family_id, family_expires_at, scope) VALUES (%s, %s, %s, "
+                    "LEAST(now() + make_interval(secs => %s), %s), %s, %s, %s) "
                     f"RETURNING {_SESSION_COLUMNS}",
                     (
                         row["user_id"],
@@ -246,6 +256,7 @@ class SessionStore:
                         row["family_expires_at"],
                         row["family_id"],
                         row["family_expires_at"],
+                        row["scope"],
                     ),
                 ).fetchone()
                 assert new is not None
@@ -293,14 +304,18 @@ class SessionStore:
         )
         return rotation
 
-    def find_by_refresh(self, refresh_hash: bytes) -> Session | None:
-        """Returns the session for a refresh secret's hash, whatever its state."""
+    def find_by_refresh(self, refresh_hash: bytes, *, kind: str | None = None) -> Session | None:
+        """
+        Returns the session for a refresh secret's hash, whatever its state, or
+        only of `kind` when given.
+        """
         if len(refresh_hash) != 32:
             return None
         with transaction(self.database, None, "look up a session") as cursor:
             row = cursor.execute(
-                f"SELECT {_SESSION_COLUMNS} FROM user_sessions WHERE token_hash = %s",
-                (refresh_hash,),
+                f"SELECT {_SESSION_COLUMNS} FROM user_sessions WHERE token_hash = %s "
+                "AND (%s::text IS NULL OR kind = %s::text)",
+                (refresh_hash, kind, kind),
             ).fetchone()
         return Session(**row) if row else None
 

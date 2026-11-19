@@ -18,6 +18,7 @@ dependencies = [
 ]
 
 [project.scripts]
+nest = "nest.cli:main"
 nest-db = "nest.db.cli:main"
 
 [build-system]

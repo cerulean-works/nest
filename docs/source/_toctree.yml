@@ -31,6 +31,8 @@ guide:
         title: Send email with SMTP
       - local: authentication
         title: Sign in with Google
+      - local: cli-login
+        title: Sign in from the command line
       - local: platform-admin
         title: Bootstrap and recover platform administration
       - local: deployment-architecture
@@ -48,6 +50,8 @@ reference:
         title: Client execution
       - local: api/errors
         title: Errors
+      - local: api/login
+        title: Command-line sign-in
   - title: Controller and runtime
     sections:
       - local: api/controller
