@@ -358,7 +358,7 @@ class ControllerTests(unittest.TestCase):
                 result = None
         return result, context
 
-    def test_cpu_and_gpu_are_forwarded(self):
+    def test_cpu_and_gpu_are_forwarded_to_worker_only(self):
         calls = {}
 
         def submit_payload(payload, **kwargs):
@@ -379,7 +379,7 @@ class ControllerTests(unittest.TestCase):
         assert result is not None
         self.assertEqual(result.result, b"result")
         self.assertEqual((calls["submit"]["gpu"], calls["submit"]["cpu"]), (2, 4))
-        self.assertEqual((calls["prepare"]["gpu"], calls["prepare"]["cpu"]), (2, 4))
+        self.assertEqual(calls["prepare"], {"pyproject_toml": b"p", "uv_lock": b"l"})
 
     def test_negative_resources_are_invalid_arguments(self):
         fake = SimpleNamespace(submit_payload=mock.Mock())

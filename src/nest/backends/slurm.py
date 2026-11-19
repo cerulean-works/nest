@@ -851,18 +851,18 @@ class SlurmBackend:
 
         return env_dir
 
-    def build_environment(self, env_dir: str, gpu: int = 1, *, cpu: int = 0) -> int:
+    def build_environment(self, env_dir: str, gpu: int = 0, *, cpu: int = 0) -> int:
         """
         Submits the environment build script for a staged environment directory.
 
-        Omits `--time`, so the build keeps the script's own limit (10 minutes in
-        `scripts/environment-smoke.sbatch`) instead of the configured job limit.
+        By default, the build uses the resource counts and time limit in
+        `scripts/environment-smoke.sbatch`.
 
         Args:
             env_dir (`str`): Directory under `worker_workdir/environments` whose name
                 is a 64-character lowercase hexadecimal environment ID.
-            gpu (`int`, *optional*, defaults to `1`): GPU count passed to
-                [`backends.slurm.SlurmBackend.submit`].
+            gpu (`int`, *optional*, defaults to `0`): GPUs per node for the build.
+                `0` keeps the script's value.
             cpu (`int`, *optional*, defaults to `0`): CPUs per task passed to
                 [`backends.slurm.SlurmBackend.submit`]; `0` keeps the script's value.
 
@@ -1011,13 +1011,14 @@ class SlurmBackend:
         )
         return ready
 
-    def prepare_environment(self, project_dir: str, gpu: int = 1, *, cpu: int = 0) -> str:
+    def prepare_environment(self, project_dir: str, gpu: int = 0, *, cpu: int = 0) -> str:
         """
         Stages a local project's dependency files and prepares its cached runtime.
 
         Args:
             project_dir (`str`): Local directory containing `pyproject.toml` and `uv.lock`.
-            gpu (`int`, *optional*, defaults to `1`): GPU count for a required build job.
+            gpu (`int`, *optional*, defaults to `0`): GPUs per node for a required
+                build job. `0` keeps the script's value.
             cpu (`int`, *optional*, defaults to `0`): CPUs per task for a required
                 build job; `0` keeps the script's value.
 
@@ -1046,7 +1047,7 @@ class SlurmBackend:
         *,
         pyproject_toml: bytes,
         uv_lock: bytes,
-        gpu: int = 1,
+        gpu: int = 0,
         cpu: int = 0,
     ) -> str:
         """
@@ -1059,7 +1060,8 @@ class SlurmBackend:
         Args:
             pyproject_toml (`bytes`): Contents of the project's `pyproject.toml`.
             uv_lock (`bytes`): Contents of the project's `uv.lock`.
-            gpu (`int`, *optional*, defaults to `1`): GPU count for a required build job.
+            gpu (`int`, *optional*, defaults to `0`): GPUs per node for a required
+                build job. `0` keeps the script's value.
             cpu (`int`, *optional*, defaults to `0`): CPUs per task for a required
                 build job; `0` keeps the script's value.
 

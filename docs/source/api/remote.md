@@ -38,10 +38,10 @@ failures, `grpc.RpcError` for other RPC failures, or
 
 ## Resource requests
 
-The client sends both resource counts. The Slurm Controller requests `gpu` with
-`sbatch --gpus-per-node` and `cpu` with `--cpus-per-task`, for both the worker
-and any environment build. A count of `0` omits the flag, so the batch script's
-own directive applies. The local Controller does not allocate Slurm resources.
+The Slurm Controller requests `gpu` with `sbatch --gpus-per-node` and `cpu` with
+`--cpus-per-task` for the worker job. A count of `0` uses the worker script's
+own directive. Environment builds use the resources in the deployed build
+script. The local Controller does not allocate Slurm resources.
 
 `nest.remote.Resources(gpu=0, cpu=1)` is a frozen dataclass with integer `gpu` and
 `cpu` fields. It raises `TypeError` for non-integer counts and `ValueError` for
