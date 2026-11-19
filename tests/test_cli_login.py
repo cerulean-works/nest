@@ -621,6 +621,47 @@ class CLISignInFlowTests(_Flow):
             self.poll(started["device_code"]), (400, {"error": "authorization_pending"})
         )
 
+    def test_user_disabled_between_authentication_and_decision(self):
+        """Disabling the User after the page's session check is an authentication
+        failure (401), not a server error, and approves nothing."""
+        started = self.start()
+        browser = self.browser()
+        session = self.browser_session(browser)
+        _, _, page = self.approval_page(browser, started["user_code"])
+        csrf = re.search(r'name="csrf" value="([0-9a-f]+)"', page)
+        assert csrf is not None
+        real_decide = self.cli.store.decide
+
+        def disable_then_decide(*args, **kwargs):
+            # Runs after _cli_decide() authenticated the browser session. Only the
+            # User is disabled here; the store sees it under its User lock.
+            self.sql(
+                "UPDATE users SET status = 'disabled', disabled_at = now() WHERE id = %s",
+                session.user_id,
+            )
+            return real_decide(*args, **kwargs)
+
+        fields = {"code": started["user_code"], "csrf": csrf.group(1), "decision": "approve"}
+        for service in ("default", "raising UserNotActiveError"):
+            with self.subTest(service=service):
+                if service == "default":
+                    patch = unittest.mock.patch.object(
+                        self.cli.store, "decide", disable_then_decide
+                    )
+                else:
+                    patch = unittest.mock.patch.object(
+                        self.cli, "decide", side_effect=UserNotActiveError("disabled")
+                    )
+                with patch:
+                    status, body = self.submit(browser, fields)
+                self.assertEqual(status, 401, body)
+                self.assertIn("Your Nest session has ended", body)
+                self.assertEqual(self.sql("SELECT status FROM cli_login_requests"), [("pending",)])
+                self.sql("UPDATE users SET status = 'active', disabled_at = NULL")
+        self.assertEqual(
+            self.poll(started["device_code"]), (400, {"error": "authorization_pending"})
+        )
+
     def test_decision_waits_for_a_concurrent_revocation(self):
         """A revocation in progress holds the family lock; the decision waits for it
         and then refuses, instead of approving with the revoked session."""

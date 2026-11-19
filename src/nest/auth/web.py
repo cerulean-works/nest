@@ -45,6 +45,7 @@ from ..db import (
     DecidingSessionNotActiveError,
     Session,
     SessionRefreshError,
+    UserNotActiveError,
     hash_token,
 )
 from .cli import (
@@ -604,8 +605,10 @@ class _Handler(BaseHTTPRequestHandler):
                 user_id=grant.session.user_id,
                 session_id=grant.session.id,
             )
-        except DecidingSessionNotActiveError:
+        except DecidingSessionNotActiveError, UserNotActiveError:
             # Signed out, revoked or disabled since the session was checked above.
+            # CLISignIn already reports a disabled User as DecidingSessionNotActiveError;
+            # UserNotActiveError is caught too for a replacement `cli` service.
             logger.warning("CLI approval refused reason=session_ended request_id=%s", request.id)
             self._page(
                 HTTPStatus.UNAUTHORIZED,
