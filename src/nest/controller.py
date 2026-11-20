@@ -768,13 +768,21 @@ def open_database(config: ControllerConfig) -> Database | None:
     return database
 
 
-def environment_platform_id(database: Database, provider_id: str) -> UUID | None:
+def environment_platform_id(database: Database, provider_id: str) -> UUID:
     """
-    The immutable ID of the HPC Platform a Provider Profile is mirrored as, or
-    `None` when an operator-managed Platform already uses that slug.
+    The immutable ID of the HPC Platform a Platform Profile is mirrored as.
+
+    Raises:
+        [`db.DatabaseError`]: If the profile has no environment Platform, so jobs
+            are never recorded without one.
     """
     platform = PlatformStore(database).get_platform(provider_id)
-    return platform.id if platform is not None and platform.source == "env" else None
+    if platform is None or platform.source != "env" or not platform.active:
+        raise DatabaseError(
+            f"Platform Profile {provider_id!r} has no environment Platform in the catalog; "
+            "restart the Controller to record it"
+        )
+    return platform.id
 
 
 def build_access(config: ControllerConfig, database: Database | None) -> ExecutionAccess | None:
@@ -878,19 +886,19 @@ def main():
 
     try:
         database = open_database(config)
+        jobs = (
+            JobStore(
+                database,
+                config.platform.id,
+                platform_id=environment_platform_id(database, config.platform.id),
+            )
+            if database is not None and config.platform is not None
+            else None
+        )
     except DatabaseError as exc:
         logger.error("%s", exc)
         raise SystemExit(3) from None
     email = start_email_service(config.email, database)
-    jobs = (
-        JobStore(
-            database,
-            config.platform.id,
-            platform_id=environment_platform_id(database, config.platform.id),
-        )
-        if database is not None and config.platform is not None
-        else None
-    )
 
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=4),

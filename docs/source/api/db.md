@@ -93,6 +93,8 @@ platforms.grant_project(nano4.id, project_id, **ops)
 
 [[autodoc]] db.EnvironmentManagedError
 
+[[autodoc]] db.PlatformSlugConflictError
+
 [[autodoc]] db.NoLoginNodeError
 
 [[autodoc]] db.EndpointNotApprovedError

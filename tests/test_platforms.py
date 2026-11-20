@@ -43,6 +43,7 @@ from nest.config import (
 )
 from nest.db import (
     Database,
+    DatabaseError,
     DuplicateLoginNodeError,
     DuplicatePlatformError,
     EndpointNotApprovedError,
@@ -54,6 +55,7 @@ from nest.db import (
     PlatformError,
     PlatformLoginNode,
     PlatformNotFoundError,
+    PlatformSlugConflictError,
     PlatformStore,
     ProjectStore,
     SessionStore,
@@ -512,7 +514,7 @@ class EnvironmentSyncTests(_Base):
         self.assertEqual(self.store.sync_environment(self.profiles("ln01")), first)
         self.assertTrue(self.get("nano4").active)
 
-    def test_env_platforms_are_not_changed_by_hand_and_operator_slugs_win(self):
+    def test_env_platforms_are_not_changed_by_hand(self):
         mirrored = self.store.sync_environment(self.profiles("ln01"))
         with self.assertRaises(EnvironmentManagedError):
             self.store.add_login_node("nano4", "evil", transport_modes=["A"], **OPS)
@@ -521,13 +523,47 @@ class EnvironmentSyncTests(_Base):
         # Grants stay operator decisions for env Platforms too.
         self.assertTrue(self.store.grant_project("nano4", self.project(self.user()), **OPS))
 
+        self.assertIn("nano4", mirrored)
+
+    def test_a_slug_collision_with_an_operator_platform_refuses_startup(self):
+        from nest.controller import environment_platform_id, main, open_database
+
+        mirrored = self.store.sync_environment(self.profiles("ln01"))
         self.store.create_platform("f1", "F1", **OPS)
-        profiles = {"f1": ProviderProfile("f1", "A", (LoginNode("ln09"),), account="acct")}
-        self.assertEqual(self.store.sync_environment(profiles), {})
+        before = self.conn.execute("SELECT count(*) FROM security_audit_events").fetchone()
+        profiles = {
+            **self.profiles("ln01"),
+            "f1": ProviderProfile("f1", "A", (LoginNode("ln09"),), account="acct"),
+        }
+        with self.assertRaises(PlatformSlugConflictError):
+            self.store.sync_environment(profiles)
+        # Nothing was written: no nodes on the operator Platform, nano4 untouched.
         self.assertEqual(self.store.login_nodes("f1"), [])
         self.assertEqual(self.get("f1").source, "operator")
-        self.assertEqual(self.get("nano4").status, "disabled")
-        self.assertIn("nano4", mirrored)
+        self.assertTrue(self.get("nano4").active)
+        self.assertEqual(
+            self.conn.execute("SELECT count(*) FROM security_audit_events").fetchone(), before
+        )
+        # Nor can a job be attributed to the operator Platform's slug.
+        with self.assertRaises(DatabaseError):
+            environment_platform_id(self.db, "f1")
+        self.assertEqual(environment_platform_id(self.db, "nano4"), mirrored["nano4"])
+
+        environ = {
+            "NEST_DATABASE_URL": self.url,
+            "NEST_CONTROLLER_AUTH": "none",
+            "NEST_PLATFORMS": "f1",
+            "NEST_PLATFORM_F1_LOGIN_NODES": "ln09.example.org",
+            "NEST_PLATFORM_F1_ACCOUNT": "acct",
+        }
+        with self.assertRaises(PlatformSlugConflictError):
+            open_database(load_controller_config(environ))
+        with (
+            mock.patch.dict(os.environ, environ, clear=True),
+            self.assertRaises(SystemExit) as caught,
+        ):
+            main()
+        self.assertEqual(caught.exception.code, 3)
 
     def test_controller_mirrors_and_records_jobs_on_the_env_platform(self):
         from nest.controller import environment_platform_id, open_database

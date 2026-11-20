@@ -72,6 +72,7 @@ from .platforms import (
     PlatformError,
     PlatformLoginNode,
     PlatformNotFoundError,
+    PlatformSlugConflictError,
     PlatformStore,
     order_login_nodes,
 )
@@ -145,6 +146,7 @@ __all__ = [
     "PlatformIdentityError",
     "PlatformLoginNode",
     "PlatformNotFoundError",
+    "PlatformSlugConflictError",
     "PlatformStore",
     "Project",
     "ProjectAuditEvent",

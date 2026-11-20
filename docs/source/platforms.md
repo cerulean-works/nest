@@ -94,8 +94,10 @@ These changes are audited with the operator `nest-controller:environment`.
 Environment Platforms are changed by editing the environment, not by
 `nest-db platform`. Grants and the default Platform are never set from the
 environment: grant Projects to an environment Platform with `nest-db platform
-grant` like any other. If an operator-managed Platform already has the profile's
-slug, the profile is not mirrored and the Controller logs a warning.
+grant` like any other. If an operator-managed Platform already has a profile's
+slug, the Controller refuses to start and writes nothing (exit status 3), so no job
+is ever recorded without a Platform. Rename the profile, or remove it from the
+environment.
 
 ## Discover Platforms
 

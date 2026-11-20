@@ -31,7 +31,7 @@ from psycopg import errors as pg_errors
 from .._logging import get_logger
 from ..config import PlatformProfile
 from ._transaction import as_uuid, audit_context, transaction
-from .connection import Database
+from .connection import Database, DatabaseError
 
 logger = get_logger("nest.db.platforms")
 
@@ -83,6 +83,16 @@ class PlatformNotFoundError(PlatformError, LookupError):
 
 class DuplicatePlatformError(PlatformError):
     """The slug is already used by another Platform (slugs are never reused)."""
+
+
+class PlatformSlugConflictError(PlatformError, DatabaseError):
+    """
+    A Platform Profile in the environment has the slug of an operator-managed
+    Platform, so it cannot be mirrored and its jobs would have no Platform.
+
+    The Controller refuses to start, writing nothing. Give the profile another ID,
+    or stop managing that Platform from the environment.
+    """
 
 
 class LoginNodeNotFoundError(PlatformError, LookupError):
@@ -834,12 +844,15 @@ class PlatformStore:
         nodes are rewritten to the profile's, in order of priority, approved for the
         profile's SSH mode; a Mode B node's host-key pin reference is the
         operator-vetted `NEST_SSH_KNOWN_HOSTS` (`env:NEST_SSH_KNOWN_HOSTS`).
-        Platforms of profiles no longer configured are disabled. An operator-managed
-        Platform with the same slug is left untouched and the profile is skipped.
-        Project grants and the default Platform are never changed here.
+        Platforms of profiles no longer configured are disabled. Project grants and
+        the default Platform are never changed here.
 
         Returns:
-            `dict[str, UUID]`: Platform ID of each mirrored profile, by profile ID.
+            `dict[str, UUID]`: Platform ID of each profile, by profile ID.
+
+        Raises:
+            [`db.PlatformSlugConflictError`]: If an operator-managed Platform has a
+                profile's slug. Nothing is written.
         """
         mirrored: dict[str, UUID] = {}
         with (
@@ -849,9 +862,7 @@ class PlatformStore:
             ),
         ):
             for profile in providers.values():
-                platform_id = self._sync_profile(cursor, profile)
-                if platform_id is not None:
-                    mirrored[profile.id] = platform_id
+                mirrored[profile.id] = self._sync_profile(cursor, profile)
             cursor.execute(
                 "UPDATE hpc_platforms SET status = 'disabled', disabled_at = now(), "
                 "is_default = false, updated_at = now() "
@@ -863,17 +874,18 @@ class PlatformStore:
 
     def _sync_profile(
         self, cursor: psycopg.Cursor[dict[str, Any]], profile: PlatformProfile
-    ) -> UUID | None:
+    ) -> UUID:
         row = cursor.execute(
             "SELECT id, source FROM hpc_platforms WHERE slug = %s FOR NO KEY UPDATE",
             (profile.id,),
         ).fetchone()
         if row is not None and row["source"] != "env":
-            logger.warning(
-                "Provider Profile %s not mirrored: an operator-managed Platform has that slug",
-                profile.id,
+            raise PlatformSlugConflictError(
+                f"Platform Profile {profile.id!r} cannot be mirrored: an operator-managed "
+                "Platform already has that slug, so its jobs would have no Platform. Rename "
+                "the profile in NEST_PLATFORMS, or remove it and submit to the operator's "
+                "Platform"
             )
-            return None
         display_name = profile.display_name or profile.id
         if row is None:
             row = cursor.execute(
