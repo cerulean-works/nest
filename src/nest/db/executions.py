@@ -20,8 +20,10 @@ every lookup by one also names the Platform. Who may read an execution is decide
 by the authorization layer; the read methods here take the caller's Project so a
 lookup can never cross a Project boundary.
 
-The Platform catalog and login-node registry (D07) are not part of this module:
-`platform_id` and `login_node_ref` are opaque identifiers validated only by form.
+Platforms and login nodes come from the HPC Platform Catalog (D07): an attempt
+takes the [`db.LoginEndpoint`] the server selected, and is recorded only while that
+Platform is active and granted to the execution's Project and the node is still
+approved for the transport mode, checked in the same transaction.
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ from .._logging import get_logger
 from ..backends.slurm import new_execution_id
 from ._transaction import as_uuid, transaction
 from .connection import Database
+from .platforms import DEFAULT_SSH_PORT, EndpointNotApprovedError, LoginEndpoint
 
 logger = get_logger("nest.db.executions")
 
@@ -76,13 +79,15 @@ _EXECUTION_COLUMNS = (
     "requested_options, status, created_at, updated_at, finished_at"
 )
 _ATTEMPT_COLUMNS = (
-    "a.id, a.execution_id, a.attempt_number, a.platform_id, a.login_node_ref, "
-    "a.login_node_host, a.login_node_port, a.transport_mode, a.hpc_binding_id, "
+    "a.id, a.execution_id, a.attempt_number, a.platform_id, p.slug AS platform_slug, "
+    "a.login_node_id, a.login_node_host, a.login_node_port, a.transport_mode, "
+    "a.host_key_pin_ref, a.hpc_binding_id, "
     "a.hpc_binding_version, a.unix_user, a.unix_uid, a.slurm_account, a.source_digest, "
     "a.environment_digest, a.runtime_digest, a.status, a.slurm_job_id, a.slurm_state, "
     "a.output_ref, a.usage_ref, a.error_kind, a.error_message, a.created_at, a.updated_at, "
     "a.submitted_at, a.finished_at"
 )
+_ATTEMPT_FROM = "execution_attempts a JOIN hpc_platforms p ON p.id = a.platform_id"
 
 
 class ExecutionRegistryError(Exception):
@@ -109,24 +114,8 @@ class InvalidTransitionError(ExecutionRegistryError):
     """The attempt cannot move to the requested status from its current one."""
 
 
-@dataclass(frozen=True)
-class LoginNodeSnapshot:
-    """
-    The login-node endpoint an attempt used, copied at submission time.
-
-    Attributes:
-        host (`str`): Host name or address connected to.
-        port (`int`): SSH port.
-        transport_mode (`str`): How the Controller reached it, such as `ssh` or
-            `tailscale`.
-        ref (`str`, *optional*): The login node's registry identifier, when the
-            Platform catalog provides one.
-    """
-
-    host: str
-    port: int
-    transport_mode: str
-    ref: str | None = None
+class PlatformNotGrantedError(ExecutionRegistryError):
+    """The Platform is unknown, disabled, or not granted to the execution's Project."""
 
 
 @dataclass(frozen=True)
@@ -222,8 +211,8 @@ class Attempt:
         id (`int`): Attempt record ID.
         execution_id (`str`): The execution.
         attempt_number (`int`): 1 for the first attempt, then increasing.
-        platform_id (`str`): The Platform it targeted.
-        login_node (`LoginNodeSnapshot`): The endpoint used.
+        platform_id (`UUID`): The Platform (Slurm namespace) it targeted.
+        endpoint (`LoginEndpoint`): Snapshot of the login-node endpoint used.
         principal (`HPCPrincipal`): The HPC identity used.
         slurm_account (`str`): The Slurm account, meaningful only with `platform_id`.
         source_digest, environment_digest, runtime_digest (`str | None`): Digests.
@@ -240,8 +229,8 @@ class Attempt:
     id: int
     execution_id: str
     attempt_number: int
-    platform_id: str
-    login_node: LoginNodeSnapshot
+    platform_id: UUID
+    endpoint: LoginEndpoint
     principal: HPCPrincipal
     slurm_account: str
     source_digest: str | None
@@ -298,11 +287,14 @@ def _attempt(
         execution_id=row["execution_id"],
         attempt_number=row["attempt_number"],
         platform_id=row["platform_id"],
-        login_node=LoginNodeSnapshot(
+        endpoint=LoginEndpoint(
+            platform_id=row["platform_id"],
+            platform_slug=row["platform_slug"],
+            node_id=row["login_node_id"],
             host=row["login_node_host"],
             port=row["login_node_port"],
-            transport_mode=row["transport_mode"],
-            ref=row["login_node_ref"],
+            mode=row["transport_mode"],
+            host_key_pin_ref=row["host_key_pin_ref"],
         ),
         principal=HPCPrincipal(
             unix_user=row["unix_user"],
@@ -328,6 +320,37 @@ def _attempt(
         nodes=tuple(sorted(nodes)),
         options=dict(options),
     )
+
+
+def _check_endpoint(cursor: Any, endpoint: LoginEndpoint, project_id: UUID) -> None:
+    """Re-checks a selected endpoint against the catalog, share-locking what it read."""
+    platform = cursor.execute(
+        "SELECT p.slug FROM hpc_platforms p "
+        "JOIN hpc_platform_project_grants g ON g.platform_id = p.id AND g.project_id = %s "
+        "WHERE p.id = %s AND p.status = 'active' FOR SHARE",
+        (project_id, endpoint.platform_id),
+    ).fetchone()
+    if platform is None:
+        raise PlatformNotGrantedError("The Platform is not available to this Project")
+    node = cursor.execute(
+        "SELECT host, port, transport_modes, host_key_pin_ref FROM hpc_login_nodes "
+        "WHERE id = %s AND platform_id = %s AND status = 'active' FOR SHARE",
+        (endpoint.node_id, endpoint.platform_id),
+    ).fetchone()
+    expected_port = node and (
+        node["port"] if node["port"] is not None or endpoint.mode == "A" else DEFAULT_SSH_PORT
+    )
+    if (
+        node is None
+        or endpoint.mode not in node["transport_modes"]
+        or node["host"] != endpoint.host
+        or expected_port != endpoint.port
+        or node["host_key_pin_ref"] != endpoint.host_key_pin_ref
+        or platform["slug"] != endpoint.platform_slug
+    ):
+        raise EndpointNotApprovedError(
+            "The login node is not an approved endpoint of the Platform for this transport mode"
+        )
 
 
 def _jsonb(value: Any) -> Jsonb:
@@ -442,8 +465,7 @@ class ExecutionRegistry:
         self,
         execution_id: str,
         *,
-        platform_id: str,
-        login_node: LoginNodeSnapshot,
+        endpoint: LoginEndpoint,
         principal: HPCPrincipal,
         slurm_account: str,
         options: Mapping[str, ResolvedOption],
@@ -456,20 +478,38 @@ class ExecutionRegistry:
 
         The attempt, its resolved options and the execution's `active` status are
         committed together before this returns, so the caller may then run the
-        irreversible submission.
+        irreversible submission. In the same transaction, the endpoint's Platform
+        must be active and granted to the execution's Project, and its login node
+        must still be approved for the transport mode with the same host, port and
+        host-key pin reference. Those rows are share-locked until commit, so a
+        concurrent revocation or disablement either waits or wins outright.
+
+        Args:
+            execution_id (`str`): The registered execution.
+            endpoint ([`db.LoginEndpoint`]): The login node the server selected,
+                such as from [`authz.PlatformCatalog.select_login_node`].
+            principal (`HPCPrincipal`): The HPC identity it will run as.
+            slurm_account (`str`): The Slurm account on the endpoint's Platform.
+            options (`Mapping[str, ResolvedOption]`): Every resolved option.
+            source_digest, environment_digest, runtime_digest (`str`, *optional*):
+                `sha256:<hex>` digests of what is submitted.
 
         Raises:
             [`db.executions.ExecutionNotFoundError`]: If the execution does not exist.
             [`db.executions.ExecutionClosedError`]: If it succeeded or was cancelled.
             [`db.executions.AttemptInFlightError`]: If an attempt is still in flight
                 or has an unknown outcome.
+            [`db.executions.PlatformNotGrantedError`]: If the Platform is unknown,
+                disabled or not granted to the execution's Project.
+            [`db.EndpointNotApprovedError`]: If the login node no longer matches an
+                approved endpoint of the Platform.
             [`db.DatabaseError`]: If the database refuses a row.
         """
         if (principal.binding_id is None) != (principal.binding_version is None):
             raise ValueError("binding_id and binding_version must be given together")
         with transaction(self.database, None, "record an execution attempt") as cursor:
             execution = cursor.execute(
-                "SELECT status FROM executions WHERE execution_id = %s FOR UPDATE",
+                "SELECT status, project_id FROM executions WHERE execution_id = %s FOR UPDATE",
                 (execution_id,),
             ).fetchone()
             if execution is None:
@@ -485,24 +525,26 @@ class ExecutionRegistry:
                 raise AttemptInFlightError(
                     f"Attempt {live['attempt_number']} is still {live['status']}"
                 )
+            _check_endpoint(cursor, endpoint, execution["project_id"])
             row = cursor.execute(
-                f"""
-                INSERT INTO execution_attempts AS a (execution_id, attempt_number, platform_id,
-                    login_node_ref, login_node_host, login_node_port, transport_mode,
-                    hpc_binding_id, hpc_binding_version, unix_user, unix_uid, slurm_account,
-                    source_digest, environment_digest, runtime_digest)
+                """
+                INSERT INTO execution_attempts (execution_id, attempt_number, platform_id,
+                    login_node_id, login_node_host, login_node_port, transport_mode,
+                    host_key_pin_ref, hpc_binding_id, hpc_binding_version, unix_user, unix_uid,
+                    slurm_account, source_digest, environment_digest, runtime_digest)
                 SELECT %s, COALESCE(max(attempt_number), 0) + 1, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s
                 FROM execution_attempts WHERE execution_id = %s
-                RETURNING {_ATTEMPT_COLUMNS}
+                RETURNING id
                 """,
                 (
                     execution_id,
-                    platform_id,
-                    login_node.ref,
-                    login_node.host,
-                    login_node.port,
-                    login_node.transport_mode,
+                    endpoint.platform_id,
+                    endpoint.node_id,
+                    endpoint.host,
+                    endpoint.port,
+                    endpoint.mode,
+                    endpoint.host_key_pin_ref,
                     principal.binding_id,
                     principal.binding_version,
                     principal.unix_user,
@@ -537,12 +579,13 @@ class ExecutionRegistry:
                 "WHERE execution_id = %s",
                 (execution_id,),
             )
-        attempt = _attempt(row, (), options)
+            attempt = self._load(cursor, row["id"])
         logger.info(
-            "Execution attempt recorded execution_id=%s attempt=%s platform_id=%s",
+            "Execution attempt recorded execution_id=%s attempt=%s platform=%s node_id=%s",
             execution_id,
             attempt.attempt_number,
-            platform_id,
+            endpoint.platform_slug,
+            endpoint.node_id,
         )
         return attempt
 
@@ -634,7 +677,7 @@ class ExecutionRegistry:
                 )
             row = cursor.execute(
                 f"UPDATE execution_attempts a SET status = %s, updated_at = now(), "
-                f"{assignments} WHERE a.id = %s RETURNING {_ATTEMPT_COLUMNS}",
+                f"{assignments} WHERE a.id = %s RETURNING a.id",
                 (status, *params, attempt_id),
             ).fetchone()
             assert row is not None
@@ -652,22 +695,23 @@ class ExecutionRegistry:
                     "finished_at = CASE WHEN %s THEN now() END WHERE execution_id = %s",
                     (final, final in ("succeeded", "cancelled"), current["execution_id"]),
                 )
-            attempt = self._load_attempt(cursor, row)
+            attempt = self._load(cursor, row["id"])
         return attempt
 
     # Recovery -----------------------------------------------------------------
 
-    def live_attempts(self, platform_id: str | None = None) -> list[Attempt]:
+    def live_attempts(self, platform_id: UUID | str | None = None) -> list[Attempt]:
         """
         Returns every attempt still in flight, oldest first, for reconciliation
         after a restart. With `platform_id`, only that Platform's.
         """
+        pid = as_uuid(platform_id, "platform_id") if platform_id is not None else None
         with transaction(self.database, None, "list live execution attempts") as cursor:
             rows = cursor.execute(
-                f"SELECT {_ATTEMPT_COLUMNS} FROM execution_attempts a "
-                "WHERE a.status = ANY(%s) AND (%s::text IS NULL OR a.platform_id = %s) "
+                f"SELECT {_ATTEMPT_COLUMNS} FROM {_ATTEMPT_FROM} "
+                "WHERE a.status = ANY(%s) AND (%s::uuid IS NULL OR a.platform_id = %s::uuid) "
                 "ORDER BY a.id",
-                (list(LIVE_ATTEMPT_STATUSES), platform_id, platform_id),
+                (list(LIVE_ATTEMPT_STATUSES), pid, pid),
             ).fetchall()
             return [self._load_attempt(cursor, row) for row in rows]
 
@@ -687,13 +731,13 @@ class ExecutionRegistry:
             raise ValueError("older_than must be positive")
         with transaction(self.database, None, "mark interrupted execution attempts") as cursor:
             rows = cursor.execute(
-                f"UPDATE execution_attempts a SET status = 'unknown', updated_at = now(), "
-                f"error_kind = 'controller_interrupted' "
-                f"WHERE a.status = 'submitting' AND a.updated_at < now() - %s "
-                f"RETURNING {_ATTEMPT_COLUMNS}",
+                "UPDATE execution_attempts a SET status = 'unknown', updated_at = now(), "
+                "error_kind = 'controller_interrupted' "
+                "WHERE a.status = 'submitting' AND a.updated_at < now() - %s "
+                "RETURNING a.id",
                 (older_than,),
             ).fetchall()
-            attempts = [self._load_attempt(cursor, row) for row in rows]
+            attempts = [self._load(cursor, row["id"]) for row in rows]
         for attempt in attempts:
             logger.warning(
                 "Execution attempt interrupted before a Slurm job ID arrived "
@@ -722,7 +766,7 @@ class ExecutionRegistry:
         project = as_uuid(project_id, "project_id")
         with transaction(self.database, None, "read execution attempts") as cursor:
             rows = cursor.execute(
-                f"SELECT {_ATTEMPT_COLUMNS} FROM execution_attempts a "
+                f"SELECT {_ATTEMPT_COLUMNS} FROM {_ATTEMPT_FROM} "
                 "JOIN executions e USING (execution_id) "
                 "WHERE a.execution_id = %s AND e.project_id = %s ORDER BY a.attempt_number",
                 (execution_id, project),
@@ -740,7 +784,7 @@ class ExecutionRegistry:
             ).fetchall()
         return [_execution(row) for row in rows]
 
-    def find_by_slurm_job(self, platform_id: str, slurm_job_id: int) -> Attempt | None:
+    def find_by_slurm_job(self, platform_id: UUID | str, slurm_job_id: int) -> Attempt | None:
         """
         Returns the latest attempt that received `slurm_job_id` on `platform_id`.
 
@@ -749,37 +793,45 @@ class ExecutionRegistry:
         """
         with transaction(self.database, None, "find an execution attempt") as cursor:
             row = cursor.execute(
-                f"SELECT {_ATTEMPT_COLUMNS} FROM execution_attempts a "
+                f"SELECT {_ATTEMPT_COLUMNS} FROM {_ATTEMPT_FROM} "
                 "WHERE a.platform_id = %s AND a.slurm_job_id = %s ORDER BY a.id DESC LIMIT 1",
-                (platform_id, slurm_job_id),
+                (as_uuid(platform_id, "platform_id"), slurm_job_id),
             ).fetchone()
             return self._load_attempt(cursor, row) if row else None
 
     def attempts_on_node(
-        self, platform_id: str, node_name: str, *, limit: int = 100
+        self, platform_id: UUID | str, node_name: str, *, limit: int = 100
     ) -> list[Attempt]:
         """Returns the attempts allocated `node_name` on `platform_id`, newest first."""
         with transaction(self.database, None, "find attempts on a node") as cursor:
             rows = cursor.execute(
-                f"SELECT {_ATTEMPT_COLUMNS} FROM execution_attempts a "
+                f"SELECT {_ATTEMPT_COLUMNS} FROM {_ATTEMPT_FROM} "
                 "JOIN execution_attempt_nodes n ON n.attempt_id = a.id "
                 "WHERE a.platform_id = %s AND n.node_name = %s ORDER BY a.id DESC LIMIT %s",
-                (platform_id, node_name, limit),
+                (as_uuid(platform_id, "platform_id"), node_name, limit),
             ).fetchall()
             return [self._load_attempt(cursor, row) for row in rows]
 
     def attempts_for_account(
-        self, platform_id: str, slurm_account: str, *, limit: int = 100
+        self, platform_id: UUID | str, slurm_account: str, *, limit: int = 100
     ) -> list[Attempt]:
         """Returns the attempts charged to `slurm_account` on `platform_id`, newest first."""
         with transaction(self.database, None, "find attempts for an account") as cursor:
             rows = cursor.execute(
-                f"SELECT {_ATTEMPT_COLUMNS} FROM execution_attempts a "
+                f"SELECT {_ATTEMPT_COLUMNS} FROM {_ATTEMPT_FROM} "
                 "WHERE a.platform_id = %s AND a.slurm_account = %s "
                 "ORDER BY a.created_at DESC, a.id DESC LIMIT %s",
-                (platform_id, slurm_account, limit),
+                (as_uuid(platform_id, "platform_id"), slurm_account, limit),
             ).fetchall()
             return [self._load_attempt(cursor, row) for row in rows]
+
+    @classmethod
+    def _load(cls, cursor: Any, attempt_id: int) -> Attempt:
+        row = cursor.execute(
+            f"SELECT {_ATTEMPT_COLUMNS} FROM {_ATTEMPT_FROM} WHERE a.id = %s", (attempt_id,)
+        ).fetchone()
+        assert row is not None
+        return cls._load_attempt(cursor, row)
 
     @staticmethod
     def _load_attempt(cursor: Any, row: dict[str, Any]) -> Attempt:

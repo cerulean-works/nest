@@ -25,7 +25,7 @@ The database is **externally managed** and **opt-in**:
 
 | Table | Contents |
 | --- | --- |
-| `provider_profiles` | One row per Provider Profile (login nodes, SSH mode and user, Slurm defaults). The environment stays the source of truth: the Controller rewrites these rows at every start, marks the default, and marks profiles that were removed from the environment `active = false`. Rows are never deleted, so job records keep their provider. |
+| `provider_profiles` | One row per HPC Platform Profile, keyed by Platform ID (operator label and display name, login nodes, SSH mode and user, Slurm defaults). The environment stays the source of truth: the Controller rewrites these rows at every start, marks the default, and marks Platforms that were removed from the environment `active = false`. Rows are never deleted, so job records keep their Platform. A Platform ID is a permanent identity: the Controller refuses to start, and writes nothing, if the environment gives a recorded Platform a different operator label. If the recorded label is wrong, clear it with `UPDATE provider_profiles SET operator = NULL WHERE id = '<id>'`. |
 | `jobs` | One row per `Execute` (kind `execution`) or `SubmitJob` (kind `batch`) request that reached Slurm: its Execution ID, provider, Slurm job ID, request ID, script and directories, resources, Nest's `status`, the last observed Slurm state, and the error kind and message on failure. |
 | `email_outbox` | Messages queued for optional email delivery and their delivery status (see [Send email with SMTP](email)). Empty unless `NEST_EMAIL_ENABLED=true`. Each row keeps its recipient address; the body is cleared once the message is sent. |
 | `users`, `user_identities`, `user_sessions`, `platform_role_assignments` | Nest Users, the external sign-in identities linked to them, signed-in sessions (stored as SHA-256 hashes of their secrets) and service-wide roles. See [Users, Projects and memberships](#users-projects-and-memberships). |
@@ -87,7 +87,7 @@ derived from another:
 | Nest User | `users.id`, a generated UUID | Never an email address. A User row exists only once a person has signed in or an operator has created it. |
 | External sign-in identity | `user_identities (issuer, subject)` | The identity provider's stable subject ID (Google's `sub`) under its issuer, linked to one User. A changed email keeps the same User; a reused address on another subject is a different identity. These identity providers are unrelated to Compute Providers. |
 | Nest Project | `projects.id`, a generated UUID | Independent of its name, Owner and Provider Accounts. Two Projects may share a name. |
-| Provider and Provider Account | `provider_profiles.id` and the Provider's account name | No identity or Project table references them. |
+| HPC Platform and its Slurm account | `provider_profiles.id` (the Platform ID) and the account name within that Platform | The Platform ID namespaces the account: the same account name on two Platforms is two accounts. The operator label is metadata, not part of the key. No identity or Project table references them. |
 
 **Membership.** Users and Projects are many-to-many through `project_memberships`,
 one row per (Project, User) (`UNIQUE (project_id, user_id)`), with a role of
@@ -180,7 +180,23 @@ security audit triggers for the invitation flows (see
 Link's last use is taken, and `invitation.email_failed` when the outbox gives up on
 an invitation email. The invitation tables themselves are unchanged.
 
-**Execution registry.** Migration `0011_execution_registry` adds the
+**HPC Platform metadata.** Migration `0011_platform_metadata` adds the nullable
+`operator` and `display_name` columns to `provider_profiles`, filled from
+`NEST_PLATFORM_<ID>_OPERATOR` and `_NAME` (see
+[HPC Platforms](configuration#hpc-platforms)). Existing rows keep their IDs and job
+records; their new columns stay `NULL` until a Platform with an operator label is
+configured. A Platform without a label keeps any label already recorded. Run
+`nest-db upgrade` before starting a Controller of this release.
+
+**HPC Platform Catalog.** Migration `0012_hpc_platform_catalog` adds
+`hpc_platforms` (immutable Platform IDs and slugs, optional operator metadata),
+`hpc_login_nodes` (approved endpoints, transport modes, priority, health and
+host-key pin references) and `hpc_platform_project_grants`, and records each
+job's Platform in `jobs.platform_id`. Changes to all three tables must name an
+operator and are recorded in the security audit log. Platforms are never deleted.
+See [Register HPC Platforms and login nodes](platforms).
+
+**Execution registry.** Migration `0013_execution_registry` adds the
 Platform-aware execution registry described below. The Controller does not write
 to it yet; `jobs` remains the record of today's submissions.
 
@@ -195,8 +211,9 @@ that restarts finds every execution and its in-flight attempt again.
   the requested options and the optional idempotency key never change. A repeated
   registration with the same key, Project and owner returns the same execution;
   the same key with a different request is refused.
-- **Attempts** record the `platform_id`, a snapshot of the login node used
-  (`login_node_host`, `login_node_port`, `transport_mode`, `login_node_ref`), the
+- **Attempts** record the `platform_id` (an `hpc_platforms` ID), the selected
+  `login_node_id` and a snapshot of its endpoint (`login_node_host`,
+  `login_node_port`, `transport_mode` `A` or `B`, `host_key_pin_ref`), the
   HPC binding and its version, the effective UNIX user and UID, the Slurm account,
   and the source, environment and runtime digests. These columns never change.
   At most one attempt per execution is in flight (`submitting`, `submitted`,
@@ -229,9 +246,12 @@ FROM execution_attempts a JOIN executions e USING (execution_id)
 WHERE a.status IN ('submitting', 'submitted', 'running', 'unknown');
 ```
 
-`platform_id` and `login_node_ref` are validated only by form until the Platform
-catalog and login-node registry exist; each attempt's snapshot keeps its history
-correct when the catalog changes.
+An attempt is recorded only while its Platform is active and granted to the
+execution's Project, and its login node is still approved for the transport mode
+with the same host, port and host-key pin reference (see
+[Register HPC Platforms and login nodes](platforms)). `login_node_id` is not a
+foreign key: an operator may later remove the node, and the attempt's snapshot
+keeps its history correct.
 
 ## Configure the connection
 

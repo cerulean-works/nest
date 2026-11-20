@@ -1,16 +1,17 @@
-"""Control-plane records: Provider Profiles and Slurm job records."""
+"""Control-plane records: HPC Platform Profiles and Slurm job records."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any, LiteralString
+from uuid import UUID
 
 import psycopg
 from psycopg import sql
 from psycopg.rows import dict_row
 
 from .._logging import get_logger
-from ..config import ProviderProfile
+from ..config import PlatformProfile
 from ..errors import DatabaseUnavailableError
 from .connection import Database, DatabaseError
 
@@ -32,41 +33,85 @@ _BEGIN_FIELDS = (
 )
 
 
-def sync_providers(
-    database: Database, providers: Mapping[str, ProviderProfile], default_id: str | None
+class PlatformIdentityError(DatabaseError):
+    """
+    The environment would move a recorded Platform ID to a different operator.
+
+    A Platform ID is an immutable identity: its job records and Slurm account
+    namespace stay attached to it. Use a new Platform ID for another operator's
+    cluster, or, if the recorded operator label is a mistake, clear it with
+    `UPDATE provider_profiles SET operator = NULL WHERE id = '<id>'` and restart.
+    """
+
+
+def sync_platforms(
+    database: Database, platforms: Mapping[str, PlatformProfile], default_id: str | None
 ) -> None:
     """
-    Writes the environment's Provider Profiles to `provider_profiles`.
+    Writes the environment's HPC Platform Profiles to `provider_profiles`.
 
     The environment stays the source of truth: each profile's row is created or
-    overwritten, and rows for profiles no longer configured are marked inactive
-    rather than deleted, so their job records keep a provider. Runs in one
+    overwritten, and rows for Platforms no longer configured are marked inactive
+    rather than deleted, so their job records keep a Platform. Runs in one
     transaction.
+
+    The Platform ID is an immutable identity, so a row whose recorded operator
+    differs from the configured one is not overwritten: nothing is written and
+    [`db.PlatformIdentityError`] is raised. A profile without an operator (such as
+    one from `NEST_PROVIDERS`) keeps the recorded operator.
 
     Args:
         database ([`db.Database`]): Open database.
-        providers (`Mapping[str, ProviderProfile]`): Validated profiles by ID.
-        default_id (`str`, *optional*): The default profile's ID.
+        platforms (`Mapping[str, PlatformProfile]`): Validated profiles by ID.
+        default_id (`str`, *optional*): The default Platform's ID.
 
     Raises:
+        [`db.PlatformIdentityError`]: If a Platform ID would change operator.
         [`db.DatabaseError`]: If the rows cannot be written.
     """
     try:
         with database.connection() as conn:
+            recorded = dict(
+                conn.execute(
+                    "SELECT id, operator FROM provider_profiles "
+                    "WHERE id = ANY(%s) AND operator IS NOT NULL FOR UPDATE",
+                    (list(platforms),),
+                ).fetchall()
+            )
+            moved = sorted(
+                pid
+                for pid, operator in recorded.items()
+                if platforms[pid].operator is not None and platforms[pid].operator != operator
+            )
+            if moved:
+                raise PlatformIdentityError(
+                    "Platform IDs are immutable identities, but the environment assigns "
+                    + ", ".join(
+                        f"{pid!r} (recorded operator {recorded[pid]!r}) to operator "
+                        f"{platforms[pid].operator!r}"
+                        for pid in moved
+                    )
+                    + "; use a new Platform ID, or restore NEST_PLATFORM_<ID>_OPERATOR"
+                )
             conn.execute("UPDATE provider_profiles SET is_default = false WHERE is_default")
-            for profile in providers.values():
+            for profile in platforms.values():
                 conn.execute(
                     """
                     INSERT INTO provider_profiles (id, source, ssh_mode, login_nodes, ssh_user,
-                        account, partition, time_limit, workdir, is_default, active)
+                        account, partition, time_limit, workdir, is_default, active,
+                        operator, display_name)
                     VALUES (%(id)s, 'env', %(ssh_mode)s, %(login_nodes)s, %(ssh_user)s,
-                        %(account)s, %(partition)s, %(time)s, %(workdir)s, %(is_default)s, true)
+                        %(account)s, %(partition)s, %(time)s, %(workdir)s, %(is_default)s, true,
+                        %(operator)s, %(display_name)s)
                     ON CONFLICT (id) DO UPDATE SET
                         source = EXCLUDED.source, ssh_mode = EXCLUDED.ssh_mode,
                         login_nodes = EXCLUDED.login_nodes, ssh_user = EXCLUDED.ssh_user,
                         account = EXCLUDED.account, partition = EXCLUDED.partition,
                         time_limit = EXCLUDED.time_limit, workdir = EXCLUDED.workdir,
-                        is_default = EXCLUDED.is_default, active = true, updated_at = now()
+                        is_default = EXCLUDED.is_default, active = true,
+                        operator = COALESCE(EXCLUDED.operator, provider_profiles.operator),
+                        display_name = EXCLUDED.display_name,
+                        updated_at = now()
                     """,
                     {
                         "id": profile.id,
@@ -78,18 +123,24 @@ def sync_providers(
                         "time": profile.time,
                         "workdir": profile.workdir,
                         "is_default": profile.id == default_id,
+                        "operator": profile.operator,
+                        "display_name": profile.display_name,
                     },
                 )
             conn.execute(
                 "UPDATE provider_profiles SET active = false, updated_at = now() "
                 "WHERE active AND NOT (id = ANY(%s))",
-                (list(providers),),
+                (list(platforms),),
             )
     except psycopg.Error as exc:
         raise DatabaseError(
-            f"Cannot record Provider Profiles in {database.describe()}: " + database.scrub(str(exc))
+            f"Cannot record Platform Profiles in {database.describe()}: " + database.scrub(str(exc))
         ) from None
-    logger.info("Provider Profiles recorded providers=%s", ",".join(providers) or "-")
+    logger.info("Platform Profiles recorded platforms=%s", ",".join(platforms) or "-")
+
+
+sync_providers = sync_platforms
+"""Deprecated alias of [`db.sync_platforms`]."""
 
 
 class JobStore:
@@ -104,11 +155,16 @@ class JobStore:
     Args:
         database ([`db.Database`]): Open database.
         provider_id (`str`): Provider Profile the Controller submits to.
+        platform_id (`UUID`, *optional*): The HPC Platform (Slurm namespace) the
+            Provider Profile is mirrored as (see [`db.PlatformStore.sync_environment`]).
+            Recorded with each new job and never changed afterwards, whichever login
+            node submits it.
     """
 
-    def __init__(self, database: Database, provider_id: str):
+    def __init__(self, database: Database, provider_id: str, *, platform_id: UUID | None = None):
         self.database = database
         self.provider_id = provider_id
+        self.platform_id = platform_id
 
     def begin(
         self, kind: str, execution_id: str, *, request_id: str | None = None, **fields: Any
@@ -137,6 +193,9 @@ class JobStore:
             raise ValueError(f"Unknown job fields: {sorted(unknown)}")
         columns = ["execution_id", "provider_id", "kind", "request_id", *fields]
         values = [execution_id, self.provider_id, kind, request_id, *fields.values()]
+        if self.platform_id is not None:
+            columns.append("platform_id")
+            values.append(self.platform_id)
         query = sql.SQL("INSERT INTO jobs ({}) VALUES ({}) RETURNING id").format(
             sql.SQL(", ").join(map(sql.Identifier, columns)),
             sql.SQL(", ").join(sql.Placeholder() * len(values)),

@@ -15,6 +15,7 @@ wheels/
 .env
 .env.*
 !.env.example
+platforms.env
 ssh/
 secrets/
 tailscale-state/

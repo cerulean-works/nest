@@ -46,11 +46,110 @@ Settings are read by [`config.load_database_config`] into a [`config.DatabaseCon
 
 ## Records
 
-[[autodoc]] db.sync_providers
+[[autodoc]] db.sync_platforms
+
+[[autodoc]] db.PlatformIdentityError
 
 [[autodoc]] db.JobStore
 
 The email outbox ([`db.EmailOutbox`]) is documented with [Email delivery](mail).
+
+## HPC Platforms and login nodes
+
+See [Register HPC Platforms and login nodes](../platforms). `PlatformStore` is the
+operator-side API; users discover Platforms through [`authz.PlatformCatalog`].
+
+```python
+from nest.db import PlatformStore
+
+platforms = PlatformStore(database)
+ops = {"operator": "ops-alice", "reason": "onboard nano4"}
+nano4 = platforms.create_platform("nano4", "Nano 4", operator_name="NCHC", **ops)
+platforms.add_login_node(
+    nano4.id, "ln01.nano4.example", transport_modes=["B"], host_key_pin_ref=pin, **ops
+)
+platforms.grant_project(nano4.id, project_id, **ops)
+```
+
+[[autodoc]] db.PlatformStore
+
+[[autodoc]] db.Platform
+
+[[autodoc]] db.PlatformLoginNode
+
+[[autodoc]] db.LoginEndpoint
+
+[[autodoc]] db.order_login_nodes
+
+[[autodoc]] db.PlatformError
+
+[[autodoc]] db.PlatformNotFoundError
+
+[[autodoc]] db.DuplicatePlatformError
+
+[[autodoc]] db.LoginNodeNotFoundError
+
+[[autodoc]] db.DuplicateLoginNodeError
+
+[[autodoc]] db.EnvironmentManagedError
+
+[[autodoc]] db.PlatformSlugConflictError
+
+[[autodoc]] db.NoLoginNodeError
+
+[[autodoc]] db.EndpointNotApprovedError
+
+## Execution registry
+
+See [Execution registry](../database#execution-registry). Register a logical
+execution, then record each attempt before submitting it, on the endpoint the
+server selected from the Platform catalog:
+
+```python
+from nest.db import ExecutionRegistry, HPCPrincipal, ResolvedOption
+
+registry = ExecutionRegistry(database)
+execution, created = registry.register(
+    project_id, user_id, "execution", {"gpu": 1}, idempotency_key=request_key
+)
+endpoint = catalog.select_login_node(principal, "nano4", mode="B", project_id=project_id)
+attempt = registry.begin_attempt(
+    execution.execution_id,
+    endpoint=endpoint,
+    principal=HPCPrincipal("alice", 1001),
+    slurm_account="proj01",
+    options={
+        "gpu": ResolvedOption.requested(1, default=0, default_source="platform"),
+        "partition": ResolvedOption.defaulted("gpu", "platform"),
+    },
+)
+# Committed: now run sbatch.
+registry.record_submission(attempt.id, slurm_job_id)
+```
+
+[[autodoc]] db.ExecutionRegistry
+
+[[autodoc]] db.Execution
+
+[[autodoc]] db.Attempt
+
+[[autodoc]] db.HPCPrincipal
+
+[[autodoc]] db.ResolvedOption
+
+[[autodoc]] db.ExecutionRegistryError
+
+[[autodoc]] db.ExecutionNotFoundError
+
+[[autodoc]] db.IdempotencyConflictError
+
+[[autodoc]] db.AttemptInFlightError
+
+[[autodoc]] db.ExecutionClosedError
+
+[[autodoc]] db.InvalidTransitionError
+
+[[autodoc]] db.PlatformNotGrantedError
 
 ## Users and identities
 

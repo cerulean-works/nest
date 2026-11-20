@@ -6,7 +6,10 @@ opening a new one on the same database, so only what was committed survives.
 """
 
 import threading
+import uuid
+from dataclasses import replace
 from datetime import timedelta
+from typing import Any
 
 import psycopg
 from postgres_fixture import PostgresTestCase, connect
@@ -16,6 +19,7 @@ from nest.db import (
     AttemptInFlightError,
     Database,
     DatabaseError,
+    EndpointNotApprovedError,
     ExecutionClosedError,
     ExecutionNotFoundError,
     ExecutionRegistry,
@@ -23,16 +27,17 @@ from nest.db import (
     IdempotencyConflictError,
     IdentityStore,
     InvalidTransitionError,
-    LoginNodeSnapshot,
+    PlatformNotGrantedError,
+    PlatformStore,
     ProjectStore,
     ResolvedOption,
     upgrade,
 )
+from nest.db.platforms import endpoint_for
 
 DIGEST = "sha256:" + "ab" * 32
-LOGIN_A1 = LoginNodeSnapshot("login1.alpha.example", 22, "ssh", ref="alpha/login1")
-LOGIN_A2 = LoginNodeSnapshot("login2.alpha.example", 2222, "ssh", ref="alpha/login2")
-LOGIN_B1 = LoginNodeSnapshot("login.beta.example", 22, "tailscale")
+PIN = "SHA256:abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"
+OPS: dict[str, Any] = {"operator": "ops-test", "reason": "execution registry tests"}
 ALICE = HPCPrincipal("alice", 1001, binding_id="binding-1", binding_version=3)
 
 
@@ -50,6 +55,30 @@ class _Base(PostgresTestCase):
         self.other_user = identities.create_user(display_name="other").id
         self.project = projects.create_project("p", created_by_user_id=self.owner).id
         self.other_project = projects.create_project("q", created_by_user_id=self.owner).id
+        # Two Platforms of the D07 catalog, both granted to self.project.
+        platforms = PlatformStore(self.db)
+        self.platforms = platforms
+        self.alpha = platforms.create_platform("alpha", "Alpha", **OPS)
+        self.beta = platforms.create_platform("beta", "Beta", **OPS)
+        a1 = platforms.add_login_node(
+            self.alpha.id, "login1.alpha.example", transport_modes=["A"], **OPS
+        )
+        a2 = platforms.add_login_node(
+            self.alpha.id,
+            "login2.alpha.example",
+            port=2222,
+            transport_modes=["A", "B"],
+            host_key_pin_ref=PIN,
+            **OPS,
+        )
+        b1 = platforms.add_login_node(
+            self.beta.id, "login.beta.example", transport_modes=["B"], host_key_pin_ref=PIN, **OPS
+        )
+        for platform in (self.alpha, self.beta):
+            platforms.grant_project(platform.id, self.project, **OPS)
+        self.A1 = endpoint_for(self.alpha, a1, "A")
+        self.A2 = endpoint_for(self.alpha, a2, "B")
+        self.B1 = endpoint_for(self.beta, b1, "B")
         self.conn = connect(self.url)
         self.conn.autocommit = True
         self.addCleanup(self.conn.close)
@@ -73,11 +102,10 @@ class _Base(PostgresTestCase):
             idempotency_key=key,
         )
 
-    def begin(self, execution_id, platform="alpha", login=LOGIN_A1, account="proj", **kw):
+    def begin(self, execution_id, endpoint=None, account="proj", **kw):
         return self.registry.begin_attempt(
             execution_id,
-            platform_id=platform,
-            login_node=login,
+            endpoint=endpoint or self.A1,
             principal=kw.pop("principal", ALICE),
             slurm_account=account,
             options=kw.pop(
@@ -176,7 +204,7 @@ class AttemptTests(_Base):
         # Committed: visible from an unrelated connection before any submission.
         row = self.conn.execute(
             "SELECT status, platform_id, login_node_host, login_node_port, transport_mode, "
-            "login_node_ref, unix_user, unix_uid, hpc_binding_id, hpc_binding_version, "
+            "login_node_id, unix_user, unix_uid, hpc_binding_id, hpc_binding_version, "
             "slurm_account FROM execution_attempts WHERE id = %s",
             (attempt.id,),
         ).fetchone()
@@ -184,11 +212,11 @@ class AttemptTests(_Base):
             row,
             (
                 "submitting",
-                "alpha",
+                self.alpha.id,
                 "login1.alpha.example",
-                22,
-                "ssh",
-                "alpha/login1",
+                None,
+                "A",
+                self.A1.node_id,
                 "alice",
                 1001,
                 "binding-1",
@@ -197,7 +225,8 @@ class AttemptTests(_Base):
             ),
         )
         self.assertEqual(attempt.attempt_number, 1)
-        self.assertEqual(attempt.login_node, LOGIN_A1)
+        self.assertEqual(attempt.endpoint, self.A1)
+        self.assertEqual(attempt.platform_id, self.alpha.id)
         self.assertEqual(attempt.principal, ALICE)
 
     def test_resolved_options_keep_value_and_provenance(self):
@@ -235,16 +264,16 @@ class AttemptTests(_Base):
         execution, _ = self.register()
         first = self.begin(execution.execution_id)
         with self.assertRaises(AttemptInFlightError):
-            self.begin(execution.execution_id, login=LOGIN_A2)
+            self.begin(execution.execution_id, endpoint=self.A2)
         self.registry.finish_attempt(first.id, "failed", error_kind="ssh_unreachable")
         failed = self.registry.get(execution.execution_id, project_id=self.project)
         assert failed is not None
         self.assertEqual(failed.status, "failed")
-        second = self.begin(execution.execution_id, login=LOGIN_A2)
+        second = self.begin(execution.execution_id, endpoint=self.A2)
         self.assertEqual(second.attempt_number, 2)
         attempts = self.registry.attempts(execution.execution_id, project_id=self.project)
         self.assertEqual(
-            [(a.attempt_number, a.status, a.login_node.host) for a in attempts],
+            [(a.attempt_number, a.status, a.endpoint.host) for a in attempts],
             [(1, "failed", "login1.alpha.example"), (2, "submitting", "login2.alpha.example")],
         )
         self.assertEqual(attempts[0].error_kind, "ssh_unreachable")
@@ -286,7 +315,10 @@ class AttemptTests(_Base):
         attempt = self.begin(execution.execution_id)
         self.registry.record_submission(attempt.id, 7)
         for statement, params in (
-            ("UPDATE execution_attempts SET platform_id = 'beta' WHERE id = %s", (attempt.id,)),
+            (
+                "UPDATE execution_attempts SET platform_id = %s WHERE id = %s",
+                (self.beta.id, attempt.id),
+            ),
             ("UPDATE execution_attempts SET slurm_account = 'x' WHERE id = %s", (attempt.id,)),
             ("UPDATE execution_attempts SET unix_user = 'root' WHERE id = %s", (attempt.id,)),
             ("UPDATE execution_attempts SET login_node_host = 'h' WHERE id = %s", (attempt.id,)),
@@ -314,9 +346,9 @@ class AttemptTests(_Base):
         with self.assertRaises(psycopg.errors.UniqueViolation):
             self.conn.execute(
                 "INSERT INTO execution_attempts (execution_id, attempt_number, platform_id, "
-                "login_node_host, login_node_port, transport_mode, unix_user, slurm_account) "
-                "VALUES (%s, 2, 'alpha', 'h', 22, 'ssh', 'alice', 'proj')",
-                (execution.execution_id,),
+                "login_node_id, login_node_host, transport_mode, unix_user, slurm_account) "
+                "VALUES (%s, 2, %s, %s, 'h', 'A', 'alice', 'proj')",
+                (execution.execution_id, self.alpha.id, self.A1.node_id),
             )
         self.assertEqual(len(self.registry.live_attempts()), 1)
         self.assertEqual(self.registry.live_attempts()[0].id, attempt.id)
@@ -351,7 +383,7 @@ class AttemptTests(_Base):
                 principal=HPCPrincipal("alice", binding_id="b"),
             )
         with self.assertRaises(DatabaseError):
-            self.begin(self.register()[0].execution_id, platform="Not A Platform!")
+            self.begin(self.register()[0].execution_id, account="")
 
 
 class RecoveryTests(_Base):
@@ -373,8 +405,7 @@ class RecoveryTests(_Base):
         with self.assertRaises(AttemptInFlightError):
             restarted.begin_attempt(
                 execution.execution_id,
-                platform_id="alpha",
-                login_node=LOGIN_A2,
+                endpoint=self.A2,
                 principal=ALICE,
                 slurm_account="proj",
                 options={},
@@ -382,8 +413,8 @@ class RecoveryTests(_Base):
         # Reconciliation found the job after all.
         found = restarted.record_submission(attempt.id, 99)
         self.assertEqual(found.status, "submitted")
-        self.assertEqual([a.id for a in restarted.live_attempts("alpha")], [attempt.id])
-        self.assertEqual(restarted.live_attempts("beta"), [])
+        self.assertEqual([a.id for a in restarted.live_attempts(self.alpha.id)], [attempt.id])
+        self.assertEqual(restarted.live_attempts(self.beta.id), [])
 
     def test_mark_interrupted_needs_a_positive_age(self):
         with self.assertRaises(ValueError):
@@ -394,32 +425,33 @@ class PlatformNamespaceTests(_Base):
     def test_same_account_and_job_id_on_two_platforms_stay_distinct(self):
         a, _ = self.register()
         b, _ = self.register()
-        on_alpha = self.begin(a.execution_id, platform="alpha", account="shared")
-        on_beta = self.begin(b.execution_id, platform="beta", login=LOGIN_B1, account="shared")
+        on_alpha = self.begin(a.execution_id, account="shared")
+        on_beta = self.begin(b.execution_id, self.B1, account="shared")
         self.registry.record_submission(on_alpha.id, 1000)
         self.registry.record_submission(on_beta.id, 1000)
         self.registry.record_running(on_alpha.id, ["node01"])
         self.registry.record_running(on_beta.id, ["node01"])
-        alpha_job = self.registry.find_by_slurm_job("alpha", 1000)
-        beta_job = self.registry.find_by_slurm_job("beta", 1000)
+        alpha_job = self.registry.find_by_slurm_job(self.alpha.id, 1000)
+        beta_job = self.registry.find_by_slurm_job(self.beta.id, 1000)
         assert alpha_job is not None and beta_job is not None
         self.assertEqual(
             (alpha_job.execution_id, beta_job.execution_id), (a.execution_id, b.execution_id)
         )
-        self.assertIsNone(self.registry.find_by_slurm_job("gamma", 1000))
+        self.assertIsNone(self.registry.find_by_slurm_job(uuid.uuid4(), 1000))
         self.assertEqual(
-            [x.id for x in self.registry.attempts_for_account("alpha", "shared")], [on_alpha.id]
+            [x.id for x in self.registry.attempts_for_account(self.alpha.id, "shared")],
+            [on_alpha.id],
         )
         self.assertEqual(
-            [x.id for x in self.registry.attempts_for_account("beta", "shared")], [on_beta.id]
+            [x.id for x in self.registry.attempts_for_account(self.beta.id, "shared")], [on_beta.id]
         )
         self.assertEqual(
-            [x.id for x in self.registry.attempts_on_node("alpha", "node01")], [on_alpha.id]
+            [x.id for x in self.registry.attempts_on_node(self.alpha.id, "node01")], [on_alpha.id]
         )
         self.assertEqual(
-            [x.id for x in self.registry.attempts_on_node("beta", "node01")], [on_beta.id]
+            [x.id for x in self.registry.attempts_on_node(self.beta.id, "node01")], [on_beta.id]
         )
-        self.assertEqual(beta_job.login_node, LOGIN_B1)
+        self.assertEqual(beta_job.endpoint, self.B1)
 
     def test_a_reused_slurm_job_id_finds_the_latest_attempt(self):
         old, _ = self.register()
@@ -429,6 +461,53 @@ class PlatformNamespaceTests(_Base):
         self.registry.finish_attempt(first.id, "succeeded")
         second = self.begin(new.execution_id)
         self.registry.record_submission(second.id, 5)
-        found = self.registry.find_by_slurm_job("alpha", 5)
+        found = self.registry.find_by_slurm_job(self.alpha.id, 5)
         assert found is not None
         self.assertEqual(found.id, second.id)
+
+
+class PlatformCatalogTests(_Base):
+    """Attempts are recorded only on endpoints the D07 catalog still approves."""
+
+    def test_an_ungranted_platform_is_refused(self):
+        execution, _ = self.register(project=self.other_project)
+        with self.assertRaises(PlatformNotGrantedError):
+            self.begin(execution.execution_id)
+        execution2, _ = self.register()
+        self.platforms.revoke_project(self.beta.id, self.project, **OPS)
+        with self.assertRaises(PlatformNotGrantedError):
+            self.begin(execution2.execution_id, self.B1)
+        # Nothing was recorded and the execution can still start elsewhere.
+        self.assertEqual(
+            self.conn.execute("SELECT count(*) FROM execution_attempts").fetchone(), (0,)
+        )
+        self.assertEqual(self.begin(execution2.execution_id).attempt_number, 1)
+
+    def test_a_disabled_platform_is_refused(self):
+        execution, _ = self.register()
+        self.platforms.set_status(self.beta.id, "disabled", **OPS)
+        with self.assertRaises(PlatformNotGrantedError):
+            self.begin(execution.execution_id, self.B1)
+
+    def test_an_endpoint_that_no_longer_matches_the_registry_is_refused(self):
+        execution, _ = self.register()
+        for endpoint in (
+            replace(self.A1, host="evil.example"),
+            replace(self.A2, port=22),
+            replace(self.A2, host_key_pin_ref="SHA256:other"),
+            replace(self.A1, mode="B", port=22, host_key_pin_ref=PIN),
+            replace(self.B1, platform_id=self.alpha.id, platform_slug="alpha"),
+        ):
+            with self.subTest(endpoint=endpoint), self.assertRaises(EndpointNotApprovedError):
+                self.begin(execution.execution_id, endpoint)
+        self.platforms.update_login_node(self.A1.node_id, status="disabled", **OPS)
+        with self.assertRaises(EndpointNotApprovedError):
+            self.begin(execution.execution_id)
+
+    def test_history_outlives_a_removed_login_node(self):
+        execution, _ = self.register()
+        attempt = self.begin(execution.execution_id)
+        self.registry.finish_attempt(attempt.id, "failed")
+        self.platforms.remove_login_node(self.A1.node_id, **OPS)
+        [kept] = self.registry.attempts(execution.execution_id, project_id=self.project)
+        self.assertEqual(kept.endpoint, self.A1)

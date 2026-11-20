@@ -1,4 +1,4 @@
--- 0011: Platform-aware durable execution registry (C01).
+-- 0013: Platform-aware durable execution registry (C01).
 --
 -- Applied migrations are immutable: never edit this file. Change the schema by
 -- adding the next numbered file (see "Database migrations" in the docs).
@@ -14,10 +14,11 @@
 -- Slurm job ID or account name is only meaningful together with its platform_id,
 -- so neither is unique on its own and every lookup by one is scoped by the other.
 --
--- platform_id and login_node_ref are opaque identifiers, not foreign keys: the
--- Platform catalog and login-node registry (D07) do not exist yet. Each attempt
--- keeps a snapshot of the endpoint it used, so history stays correct when the
--- catalog later changes; a later migration may add the foreign keys.
+-- platform_id refers to the HPC Platform Catalog (0012). login_node_id names the
+-- hpc_login_nodes row the server selected, but is not a foreign key: an operator
+-- may remove a login node, and the attempt keeps a snapshot of the endpoint it
+-- used (host, port, transport mode and host-key pin reference), so its history
+-- stays correct whatever later happens to the registry.
 
 CREATE TABLE executions (
     execution_id     text PRIMARY KEY CHECK (execution_id ~ '^[0-9a-f]{32}$'),
@@ -64,12 +65,15 @@ CREATE TABLE execution_attempts (
     id                  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     execution_id        text NOT NULL REFERENCES executions (execution_id),
     attempt_number      integer NOT NULL CHECK (attempt_number >= 1),
-    -- Platform and its selected login-node endpoint, as used by this attempt.
-    platform_id         text NOT NULL CHECK (platform_id ~ '^[a-z][a-z0-9_-]{0,62}$'),
-    login_node_ref      text CHECK (length(login_node_ref) BETWEEN 1 AND 200),
-    login_node_host     text NOT NULL CHECK (length(login_node_host) BETWEEN 1 AND 253),
-    login_node_port     integer NOT NULL CHECK (login_node_port BETWEEN 1 AND 65535),
-    transport_mode      text NOT NULL CHECK (transport_mode ~ '^[a-z][a-z0-9_-]{0,31}$'),
+    -- Platform (Slurm namespace) and the login-node endpoint selected for it.
+    platform_id         uuid NOT NULL REFERENCES hpc_platforms (id) ON DELETE RESTRICT,
+    login_node_id       bigint NOT NULL,
+    login_node_host     text NOT NULL
+                        CHECK (login_node_host ~ '^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$'),
+    -- NULL only in Mode A, where SSH's own default applies.
+    login_node_port     integer CHECK (login_node_port BETWEEN 1 AND 65535),
+    transport_mode      text NOT NULL CHECK (transport_mode IN ('A', 'B')),
+    host_key_pin_ref    text CHECK (host_key_pin_ref ~ '^[A-Za-z0-9_.:/+=@-]{1,200}$'),
     -- HPC binding (the Nest-to-HPC identity mapping) and its version at submission.
     hpc_binding_id      text CHECK (length(hpc_binding_id) BETWEEN 1 AND 200),
     hpc_binding_version integer CHECK (hpc_binding_version >= 1),
@@ -100,6 +104,7 @@ CREATE TABLE execution_attempts (
     finished_at         timestamptz,
     UNIQUE (execution_id, attempt_number),
     CHECK ((hpc_binding_id IS NULL) = (hpc_binding_version IS NULL)),
+    CHECK (transport_mode = 'A' OR (login_node_port IS NOT NULL AND host_key_pin_ref IS NOT NULL)),
     CHECK ((status IN ('succeeded', 'failed', 'cancelled')) = (finished_at IS NOT NULL))
 );
 
@@ -146,8 +151,9 @@ CREATE TRIGGER execution_attempts_transition BEFORE UPDATE ON execution_attempts
     FOR EACH ROW EXECUTE FUNCTION nest_execution_attempt_transition();
 CREATE TRIGGER execution_attempts_identity_immutable BEFORE UPDATE ON execution_attempts
     FOR EACH ROW EXECUTE FUNCTION nest_forbid_column_change(
-        'id', 'execution_id', 'attempt_number', 'platform_id', 'login_node_ref',
-        'login_node_host', 'login_node_port', 'transport_mode', 'hpc_binding_id',
+        'id', 'execution_id', 'attempt_number', 'platform_id', 'login_node_id',
+        'login_node_host', 'login_node_port', 'transport_mode', 'host_key_pin_ref',
+        'hpc_binding_id',
         'hpc_binding_version', 'unix_user', 'unix_uid', 'slurm_account', 'source_digest',
         'environment_digest', 'runtime_digest', 'created_at');
 CREATE TRIGGER execution_attempts_no_delete BEFORE DELETE ON execution_attempts

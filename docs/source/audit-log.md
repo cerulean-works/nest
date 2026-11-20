@@ -26,6 +26,10 @@ platform role history in `platform_audit_events` (see
 | `invite_link.created`, `.redeemed`, `.revoked`, `.exhausted` | Trigger | Each step of an Invite Link, with its role and use limit; `exhausted` when its last use is taken. |
 | `invitation.accept`, `.decline`, `.manage`, `.list`, `.preview`, `invite_link.redeem` | Controller | A refused invitation action (outcome `denied`), with the reason, such as `email_mismatch`, `expired` or `not_found`. |
 | `provider.profile_changed` | Trigger | A Provider Profile is created or a setting changes (the names of the changed columns). |
+| `platform.changed` | Trigger | An HPC Platform is registered or its name, operator metadata, status or default changes (the names of the changed columns). |
+| `platform.login_node.changed` | Trigger | A login node is approved, changed or removed, with its endpoint, modes, priority, status and host-key pin reference. Health observations are not recorded. |
+| `platform.grant.added`, `platform.grant.removed` | Trigger | A Project is granted a Platform or loses the grant. |
+| `platform.list`, `platform.resolve`, `platform.endpoint.select` | Controller | A refused Platform discovery, an unauthorized Platform, or an unapproved login node (outcome `denied`). See [Register HPC Platforms and login nodes](platforms). |
 
 Calls with no accepted Nest session (`auth.failed`) are logged only, never written
 to the database, so an unauthenticated caller cannot fill it.
