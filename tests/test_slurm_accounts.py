@@ -202,6 +202,28 @@ class ResolutionTests(unittest.TestCase):
         self.refused(self.mapping(link(self.chem, "A")), "no_account", mode="B",
                      identity=self.user)  # fmt: skip
 
+    def test_native_default_respects_entitlements(self):
+        # Restricted to chem with no verified default: Slurm's native default
+        # (perhaps physics) could fall outside the entitlement boundary.
+        mapping = self.mapping(link(self.chem, "A"), native=True)
+        pid = self.nano4.id
+        restricted = HPCIdentity.user(pid, USER, entitled_accounts={"chem"})
+        self.refused(mapping, "not_entitled", mode="B", identity=restricted)
+        outside = HPCIdentity.user(
+            pid, USER, entitled_accounts={"chem"}, verified_default_account="physics"
+        )
+        self.refused(mapping, "not_entitled", mode="B", identity=outside)
+        inside = HPCIdentity.user(
+            pid, USER, entitled_accounts={"chem"}, verified_default_account="chem"
+        )
+        self.assertEqual(
+            resolve_account(mapping, mode="B", identity=inside).origin, "native_default"
+        )
+        unrestricted = HPCIdentity.user(pid, USER)
+        self.assertEqual(
+            resolve_account(mapping, mode="B", identity=unrestricted).origin, "native_default"
+        )
+
     def test_missing_grant_and_bad_input(self):
         self.refused(self.mapping(link(self.chem), granted=False), "not_granted", mode="A",
                      identity=self.controller, requested="chem")  # fmt: skip

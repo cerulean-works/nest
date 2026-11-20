@@ -81,7 +81,7 @@ wins:
 | 1 | The account the caller asked for | The account the caller asked for | `explicit` |
 | 2 | The Project x Platform default | The Project x Platform default | `project_default` |
 | 3 | The Platform's operator default | The identity's verified default account | `mode_a_operator_default` / `mode_b_user_default` |
-| 4 | Never | Omit `--account` and let Slurm charge the User's default, if the Project's policy allows it | `native_default` |
+| 4 | Never | Omit `--account` and let Slurm charge the User's default, if the Project's policy allows it and, when the identity lists entitlements, the server verified that default and it is entitled | `native_default` |
 
 Anything else is refused with [`authz.AccountResolutionError`], whose `reason` is
 machine-readable:

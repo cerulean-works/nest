@@ -12,7 +12,8 @@ applies wins:
 3. Mode B: the verified default account of the User's own HPC identity.
    Mode A: the Platform's operator-controlled default.
 4. Mode B only, when the Project's policy allows it: no `--account`, so Slurm
-   charges the User's own default.
+   charges the User's own default. When the binding lists entitlements, only if
+   the server verified that default and it is among them.
 
 Otherwise the request is refused. The Controller's HPC identity and Mode A
 chargeback accounts are never a Mode B fallback: Mode B never uses step 3 of Mode
@@ -60,7 +61,8 @@ class AccountResolutionError(SlurmAccountError):
         reason (`str`): Machine-readable: `not_permitted` (the requested account is
             not linked to the Project on this Platform, or does not exist there),
             `mode_not_permitted`, `not_entitled` (not among the HPC identity's
-            Slurm entitlements), `account_disabled`, `identity_not_allowed` (the
+            Slurm entitlements, including an unverified or unentitled native
+            default), `account_disabled`, `identity_not_allowed` (the
             Controller identity for Mode B, or a User identity for Mode A),
             `wrong_platform` (the identity belongs to another Platform),
             `not_granted` or `no_account`.
@@ -284,6 +286,17 @@ def resolve_account(
             return chosen(user_default, "mode_b_user_default")
 
     if mode == "B" and mapping.allow_native_default:
+        # Omitting --account lets Slurm charge the identity's own default. With
+        # an entitlement set, that is allowed only when the server verified the
+        # default and it is entitled; otherwise Slurm could charge an account
+        # outside the binding's boundary.
+        entitled = identity.entitled_accounts
+        if entitled is not None and identity.verified_default_account not in entitled:
+            raise AccountResolutionError(
+                "not_entitled",
+                "The native Slurm default is not a verified account the HPC identity is "
+                f"entitled to on {platform.slug!r}; name a permitted account",
+            )
         return AccountResolution(
             mapping.project_id,
             platform.id,
