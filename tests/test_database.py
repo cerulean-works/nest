@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 
 import cloudpickle
 import grpc
+import psycopg
 from postgres_fixture import (
     ADMIN_URL,
     PG_BIN,
@@ -43,8 +44,10 @@ from nest.db import (
     DatabaseError,
     JobStore,
     MigrationError,
+    PlatformIdentityError,
     load_migrations,
     schema_status,
+    sync_platforms,
     sync_providers,
     upgrade,
     verify,
@@ -549,6 +552,106 @@ class StoreTests(PostgresTestCase):
                 "SELECT id, is_default, active FROM provider_profiles ORDER BY id"
             ).fetchall()
         self.assertEqual(rows, [("gpu", False, False), ("hpc", True, True)])
+
+    def platform_config(self, **extra: str):
+        return load_controller_config(
+            {
+                "NEST_PLATFORMS": "campus,lab",
+                "NEST_DEFAULT_PLATFORM": "lab",
+                "NEST_PLATFORM_CAMPUS_OPERATOR": "example-university",
+                "NEST_PLATFORM_CAMPUS_NAME": "Campus GPU cluster",
+                "NEST_PLATFORM_CAMPUS_LOGIN_NODES": "login1,login2:2222",
+                "NEST_PLATFORM_CAMPUS_ACCOUNT": "physics",
+                "NEST_PLATFORM_CAMPUS_PARTITION": "gpu",
+                "NEST_PLATFORM_LAB_OPERATOR": "example-university",
+                "NEST_PLATFORM_LAB_LOGIN_NODES": "lab-login",
+                "NEST_PLATFORM_LAB_ACCOUNT": "physics",
+                **extra,
+            }
+        )
+
+    def platform_rows(self):
+        with self.db.connection() as conn:
+            return conn.execute(
+                "SELECT id, operator, display_name, login_nodes, account, partition, "
+                "is_default, active FROM provider_profiles ORDER BY id"
+            ).fetchall()
+
+    def test_two_platforms_under_one_operator_are_recorded(self):
+        config = self.platform_config()
+        sync_platforms(self.db, config.platforms, config.default_platform)
+        self.assertEqual(
+            self.platform_rows(),
+            [
+                (
+                    "campus",
+                    "example-university",
+                    "Campus GPU cluster",
+                    ["login1", "login2:2222"],
+                    "physics",
+                    "gpu",
+                    False,
+                    True,
+                ),
+                ("lab", "example-university", None, ["lab-login"], "physics", "h200_256gpu")
+                + (True, True),
+            ],
+        )
+        # Login nodes, names and defaults may change; the Platform ID stays.
+        moved = self.platform_config(
+            NEST_PLATFORM_LAB_LOGIN_NODES="lab-login2", NEST_PLATFORM_LAB_NAME="Lab"
+        )
+        sync_platforms(self.db, moved.platforms, moved.default_platform)
+        self.assertEqual(
+            self.platform_rows()[1][:4], ("lab", "example-university", "Lab", ["lab-login2"])
+        )
+
+    def test_platform_id_cannot_move_to_another_operator(self):
+        config = self.platform_config()
+        sync_platforms(self.db, config.platforms, config.default_platform)
+        before = self.platform_rows()
+        other = self.platform_config(NEST_PLATFORM_LAB_OPERATOR="other-centre")
+        with self.assertRaisesRegex(PlatformIdentityError, "'lab' \\(recorded operator") as caught:
+            sync_platforms(self.db, other.platforms, other.default_platform)
+        self.assertIn("other-centre", str(caught.exception))
+        self.assertEqual(self.platform_rows(), before, "nothing is written")
+        # A profile that states no operator, such as one from NEST_PROVIDERS, keeps it.
+        unstated = self.platform_config(NEST_PLATFORM_LAB_OPERATOR="")
+        sync_platforms(self.db, unstated.platforms, unstated.default_platform)
+        self.assertEqual(self.platform_rows()[1][1], "example-university")
+
+    def test_provider_rows_upgrade_in_place_to_platforms(self):
+        legacy = load_controller_config(
+            {
+                "NEST_PROVIDERS": "lab",
+                "NEST_PROVIDER_LAB_LOGIN_NODES": "lab-login",
+                "NEST_PROVIDER_LAB_ACCOUNT": "physics",
+            }
+        )
+        sync_providers(self.db, legacy.providers, legacy.default_provider)
+        self.assertEqual(self.platform_rows()[0][:3], ("lab", None, None))
+        config = self.platform_config()
+        sync_platforms(self.db, config.platforms, config.default_platform)
+        self.assertEqual(
+            [row[:2] for row in self.platform_rows()],
+            [("campus", "example-university"), ("lab", "example-university")],
+        )
+
+    def test_operator_labels_are_checked_by_the_schema(self):
+        config = self.platform_config()
+        sync_platforms(self.db, config.platforms, config.default_platform)
+        for column, value in (("operator", "Not A Label"), ("display_name", "")):
+            with (
+                self.subTest(column=column),
+                self.assertRaises(psycopg.errors.CheckViolation),
+                self.db.connection() as conn,
+            ):
+                conn.execute(
+                    sql.SQL("UPDATE provider_profiles SET {} = %s WHERE id = 'lab'").format(
+                        sql.Identifier(column)
+                    ),
+                    (value,),
+                )
 
     def test_job_lifecycle_is_recorded(self):
         config = load_controller_config(

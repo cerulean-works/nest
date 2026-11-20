@@ -19,6 +19,10 @@ It serves these routes and nothing else:
 - `/api/projects` and below serve the Projects API (see *Share Projects and manage
   roles*). Every request is authorized by [`authz.ProjectService`], and its
   invitation routes by [`authz.InvitationService`].
+- `GET /api/platforms` lists the HPC Platforms the signed-in User may use, with the
+  server's default for them, and `GET /api/platforms/<id or slug>` describes one
+  (see [`authz.PlatformCatalog`]). Platforms the User is not authorized for are
+  answered as not found. No host, port or host key is ever returned.
 - `/api/invitations` and below serve the signed-in User's own invitations, and
   `GET`/`POST /invitations/accept` is the browser page that reviews and accepts an
   invitation link (see *Invite people to a Project*).
@@ -47,13 +51,22 @@ from uuid import UUID
 
 from .._logging import get_logger
 from ..audit import audit_interface
-from ..authz import AccessDeniedError, InvitationService, Principal, ProjectService
+from ..authz import (
+    AccessDeniedError,
+    InvitationService,
+    PlatformCatalog,
+    PlatformResolutionError,
+    PlatformSummary,
+    Principal,
+    ProjectService,
+)
 from ..config import (
     AUTH_CLI_PREFIX,
     AUTH_SESSION_PATHS,
     CLI_SCOPES,
     INVITATION_PAGE_PATH,
     INVITATIONS_API_PATH,
+    PLATFORMS_API_PATH,
     PROJECTS_API_PATH,
     GoogleAuthConfig,
 )
@@ -75,6 +88,7 @@ from ..db import (
     Membership,
     OwnerRuleError,
     PendingInvitation,
+    PlatformNotFoundError,
     Project,
     ProjectAuditEvent,
     ProjectNotFoundError,
@@ -1124,7 +1138,7 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden", "reason": exc.reason})
             else:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
-        except ProjectNotFoundError:
+        except ProjectNotFoundError, PlatformNotFoundError:
             self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
         except MemberNotFoundError:
             self._json(HTTPStatus.NOT_FOUND, {"error": "member_not_found"})
@@ -1152,6 +1166,9 @@ class _Handler(BaseHTTPRequestHandler):
         """Runs one Projects API route. Authorization happens in the service."""
         if path == INVITATIONS_API_PATH or path.startswith(INVITATIONS_API_PATH + "/"):
             self._own_invitations_api(method, path, who, body)
+            return
+        if path == PLATFORMS_API_PATH or path.startswith(PLATFORMS_API_PATH + "/"):
+            self._platforms_api(method, path, who)
             return
         service = self.app.projects
         rest = path[len(PROJECTS_API_PATH) :].strip("/")
@@ -1221,6 +1238,43 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 service.remove_member(who, pid, uid)
                 self._json(HTTPStatus.OK, {"removed": True})
+
+    def _platforms_api(self, method: str, path: str, who: Principal):
+        """`/api/platforms`: discovery of the caller's authorized HPC Platforms."""
+        rest = path[len(PLATFORMS_API_PATH) :].strip("/")
+        parts = rest.split("/") if rest else []
+        if len(parts) > 1:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        if not self._route(method, ("GET",)):
+            return
+        catalog = self.app.platforms
+        project_id = self._query_value("project_id")
+        if project_id is not None and _parse_uuid(project_id) is None:
+            raise ValueError("project_id is not a valid UUID")
+        if parts:
+            platform = catalog.resolve_platform(who, parts[0], project_id=project_id)
+            summary = next(
+                (
+                    s
+                    for s in catalog.list_platforms(who, project_id=project_id)
+                    if s.platform.id == platform.id
+                ),
+                None,
+            )
+            if summary is None:  # Access ended between the two reads.
+                raise PlatformNotFoundError("No such Platform")
+            self._json(HTTPStatus.OK, _platform_json(summary))
+            return
+        summaries = catalog.list_platforms(who, project_id=project_id)
+        try:
+            default = str(catalog.resolve_platform(who, project_id=project_id).id)
+        except PlatformResolutionError:
+            default = None
+        self._json(
+            HTTPStatus.OK,
+            {"platforms": [_platform_json(s) for s in summaries], "default_platform_id": default},
+        )
 
     def _route(self, method: str, allowed: tuple[str, ...] | None) -> bool:
         """Whether a route exists and takes `method`, answering when not."""
@@ -1388,7 +1442,7 @@ _UNAVAILABLE = {
 def _is_api(path: str) -> bool:
     return any(
         path == root or path.startswith(root + "/")
-        for root in (PROJECTS_API_PATH, INVITATIONS_API_PATH)
+        for root in (PROJECTS_API_PATH, INVITATIONS_API_PATH, PLATFORMS_API_PATH)
     )
 
 
@@ -1451,6 +1505,20 @@ def _project_json(project: Project, role: str | None) -> dict[str, object]:
     if role is not None:
         payload["role"] = role
     return payload
+
+
+def _platform_json(summary: PlatformSummary) -> dict[str, object]:
+    platform = summary.platform
+    return {
+        "id": str(platform.id),
+        "slug": platform.slug,
+        "display_name": platform.display_name,
+        "operator_name": platform.operator_name,
+        "scheduler": platform.scheduler,
+        "is_default": platform.is_default,
+        "transport_modes": list(summary.transport_modes),
+        "login_node_count": summary.login_node_count,
+    }
 
 
 def _member_json(member: Membership) -> dict[str, object]:
@@ -1572,6 +1640,8 @@ class AuthHTTPServer(ThreadingHTTPServer):
             on the sign-in's database and session lifetimes.
         projects ([`authz.ProjectService`], *optional*): Projects API service.
             Defaults to one on the sign-in's database.
+        platforms ([`authz.PlatformCatalog`], *optional*): Platforms API service.
+            Defaults to one on the sign-in's database.
         invitations ([`authz.InvitationService`], *optional*): Invitation service.
             Defaults to one on the Projects service and `email`, whose links use
             `NEST_PUBLIC_URL` with email enabled and this listener's origin otherwise.
@@ -1589,6 +1659,7 @@ class AuthHTTPServer(ThreadingHTTPServer):
         cli: CLISignIn | None = None,
         projects: ProjectService | None = None,
         invitations: InvitationService | None = None,
+        platforms: PlatformCatalog | None = None,
         email: EmailService | None = None,
     ):
         self.sign_in = sign_in
@@ -1602,6 +1673,7 @@ class AuthHTTPServer(ThreadingHTTPServer):
         self.origin = f"{redirect.scheme}://{redirect.netloc}"
         self.sessions = sign_in.session_store
         self.projects = projects or ProjectService(sign_in.database)
+        self.platforms = platforms or PlatformCatalog(sign_in.database)
         self.invitations = invitations or InvitationService(
             sign_in.database, self.projects, email, link_base_url=self.origin
         )

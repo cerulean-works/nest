@@ -4,6 +4,7 @@ import signal
 import time
 from concurrent import futures
 from functools import wraps
+from uuid import UUID
 
 import cloudpickle
 import grpc
@@ -35,7 +36,15 @@ from .config import (
     load_executor,
     materialize_ssh_credentials,
 )
-from .db import Database, DatabaseError, JobStore, bootstrap_state, sync_providers, verify
+from .db import (
+    Database,
+    DatabaseError,
+    JobStore,
+    PlatformStore,
+    bootstrap_state,
+    sync_platforms,
+    verify,
+)
 from .errors import (
     ERROR_KIND_METADATA,
     JOB_ID_METADATA,
@@ -664,9 +673,9 @@ def build_backend(config: ControllerConfig) -> SlurmBackend | None:
         config ([`config.ControllerConfig`]): Validated Controller configuration.
 
     Returns:
-        [`backends.slurm.SlurmBackend`] or `None`: `None` when no provider is set.
+        [`backends.slurm.SlurmBackend`] or `None`: `None` when no Platform is set.
     """
-    profile = config.provider
+    profile = config.platform
     if profile is None:
         return None
     identity = known_hosts = None
@@ -724,7 +733,8 @@ def open_database(config: ControllerConfig) -> Database | None:
     Connects to the configured database and checks it before the Controller serves.
 
     Verifies connectivity, the schema version, and every applied migration's
-    checksum, then records the environment's Provider Profiles. Never applies
+    checksum, then records the environment's HPC Platform Profiles and mirrors them
+    in the HPC Platform Catalog (see [`db.PlatformStore.sync_environment`]). Never applies
     migrations; run `nest-db upgrade` first.
 
     Args:
@@ -744,7 +754,8 @@ def open_database(config: ControllerConfig) -> Database | None:
         database.open()
         with database.connection() as conn:
             verify(conn)
-        sync_providers(database, config.providers, config.default_provider)
+        sync_platforms(database, config.platforms, config.default_platform)
+        PlatformStore(database).sync_environment(config.platforms)
         _log_bootstrap(database, config)
     except psycopg.Error as exc:
         database.close()
@@ -755,6 +766,23 @@ def open_database(config: ControllerConfig) -> Database | None:
         database.close()
         raise
     return database
+
+
+def environment_platform_id(database: Database, provider_id: str) -> UUID:
+    """
+    The immutable ID of the HPC Platform a Platform Profile is mirrored as.
+
+    Raises:
+        [`db.DatabaseError`]: If the profile has no environment Platform, so jobs
+            are never recorded without one.
+    """
+    platform = PlatformStore(database).get_platform(provider_id)
+    if platform is None or platform.source != "env" or not platform.active:
+        raise DatabaseError(
+            f"Platform Profile {provider_id!r} has no environment Platform in the catalog; "
+            "restart the Controller to record it"
+        )
+    return platform.id
 
 
 def build_access(config: ControllerConfig, database: Database | None) -> ExecutionAccess | None:
@@ -786,7 +814,7 @@ def build_access(config: ControllerConfig, database: Database | None) -> Executi
     return ExecutionAccess(
         database,
         AllowedProjects(config.allowed_projects),
-        provider_id=config.default_provider or config.executor,
+        provider_id=config.default_platform or config.executor,
     )
 
 
@@ -807,7 +835,9 @@ def record_start(config: ControllerConfig, database: Database | None) -> None:
                 "*" if "*" in config.allowed_projects else len(config.allowed_projects)
             ),
             "executor": config.executor,
-            "default_provider": config.default_provider,
+            "default_platform": config.default_platform,
+            # Kept for audit consumers written before HPC Platforms; same value.
+            "default_provider": config.default_platform,
             "ssh_modes_allowed": ",".join(config.ssh.allowed_modes),
             "ssh_identity_inline": config.ssh.private_key is not None,
             "database_sslmode": (config.database.effective_sslmode if config.database else None),
@@ -851,18 +881,24 @@ def main():
     except ConfigError as exc:
         logger.error("%s", exc)
         raise SystemExit(2) from None
+    for message in config.warnings:
+        logger.warning("Configuration warning: %s", message)
 
     try:
         database = open_database(config)
+        jobs = (
+            JobStore(
+                database,
+                config.platform.id,
+                platform_id=environment_platform_id(database, config.platform.id),
+            )
+            if database is not None and config.platform is not None
+            else None
+        )
     except DatabaseError as exc:
         logger.error("%s", exc)
         raise SystemExit(3) from None
     email = start_email_service(config.email, database)
-    jobs = (
-        JobStore(database, config.provider.id)
-        if database is not None and config.provider is not None
-        else None
-    )
 
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=4),

@@ -18,14 +18,29 @@ Usage:
     nest-db sessions list   --user-id UUID
     nest-db sessions revoke --user-id UUID | --session-id UUID
 
+    # The HPC Platform Catalog and Login-Node Registry (see "HPC Platforms"):
+    nest-db platform list
+    nest-db platform show     PLATFORM
+    nest-db platform create   --slug SLUG --name NAME [--operated-by NAME] [--default]
+    nest-db platform update   PLATFORM [--name NAME] [--operated-by NAME | --clear-operated-by]
+    nest-db platform disable | enable PLATFORM
+    nest-db platform set-default PLATFORM | --none
+    nest-db platform add-node PLATFORM --host HOST [--port N] --modes A,B
+                              [--priority N] [--host-key-pin REF]
+    nest-db platform update-node NODE_ID [--modes A,B] [--priority N] [--port N]
+                              [--host-key-pin REF] [--status active|disabled]
+    nest-db platform remove-node NODE_ID
+    nest-db platform grant | revoke PLATFORM --project-id UUID
+    (every change also takes --operator NAME --reason TEXT)
+
     # The security audit log (see "Security audit log"):
     nest-db audit list   [--user-id UUID] [--project-id UUID] [--event NAME] [--limit N]
     nest-db audit verify # seal new records, then check the hash chain
 
 Reads the same `NEST_DATABASE_*` settings as the Controller. Exit status: 0 on
 success, 1 when the schema is not current, a migration failed or an admin change
-or revocation was not made or the audit chain is broken, 2 for invalid configuration or
-arguments, 3 when the database is unreachable.
+or revocation or Platform change was not made or the audit chain is broken, 2 for
+invalid configuration or arguments, 3 when the database is unreachable.
 """
 
 from __future__ import annotations
@@ -33,6 +48,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from typing import Any
 from uuid import UUID
 
 import psycopg
@@ -44,6 +60,15 @@ from .bootstrap import audit_events, bootstrap_state
 from .connection import Database, DatabaseError
 from .identity import IdentityStore
 from .migrate import MigrationError, schema_status, upgrade, verify
+from .platforms import (
+    LoginNodeNotFoundError,
+    Platform,
+    PlatformError,
+    PlatformLoginNode,
+    PlatformNotFoundError,
+    PlatformStore,
+)
+from .projects import ProjectNotFoundError
 from .sessions import SessionStore
 
 
@@ -110,6 +135,8 @@ def _parser() -> argparse.ArgumentParser:
         help="this session and every session rotated from the same sign-in",
     )
 
+    _platform_parser(commands)
+
     security = commands.add_parser(
         "audit",
         help="read and verify the security audit log",
@@ -126,6 +153,192 @@ def _parser() -> argparse.ArgumentParser:
     events.add_argument("--limit", type=int, default=50)
     audit_actions.add_parser("verify", help="seal new records, then check the hash chain")
     return parser
+
+
+def _platform_parser(commands) -> None:
+    platform = commands.add_parser(
+        "platform",
+        help="manage HPC Platforms, their login nodes and Project grants",
+        description=(
+            "The HPC Platform Catalog and Login-Node Registry. Authenticated by the "
+            "database credentials in NEST_DATABASE_*; every change is audited with the "
+            "operator name, the reason and the PostgreSQL role. PLATFORM is a slug or ID."
+        ),
+    )
+    actions = platform.add_subparsers(dest="action", required=True)
+    change = argparse.ArgumentParser(add_help=False)
+    change.add_argument(
+        "--operator", required=True, help="who is making the change, for the audit log"
+    )
+    change.add_argument("--reason", required=True, help="why, for the audit log")
+    actions.add_parser("list", help="list every Platform")
+    show = actions.add_parser("show", help="show a Platform, its login nodes and grants")
+    show.add_argument("platform", metavar="PLATFORM")
+    create = actions.add_parser("create", parents=[change], help="register a Platform")
+    create.add_argument("--slug", required=True, help="unique, permanent name such as nano4")
+    create.add_argument("--name", required=True, help="display name")
+    create.add_argument("--operated-by", metavar="NAME", help="operator metadata, such as NCHC")
+    create.add_argument("--default", action="store_true", help="make it the default Platform")
+    update = actions.add_parser("update", parents=[change], help="change a Platform's metadata")
+    update.add_argument("platform", metavar="PLATFORM")
+    update.add_argument("--name", help="display name")
+    operated = update.add_mutually_exclusive_group()
+    operated.add_argument("--operated-by", metavar="NAME", help="operator metadata")
+    operated.add_argument("--clear-operated-by", action="store_true")
+    for name, verb in (("disable", "disable"), ("enable", "re-enable")):
+        status = actions.add_parser(name, parents=[change], help=f"{verb} a Platform")
+        status.add_argument("platform", metavar="PLATFORM")
+    default = actions.add_parser(
+        "set-default", parents=[change], help="set or clear the default Platform"
+    )
+    target = default.add_mutually_exclusive_group(required=True)
+    target.add_argument("platform", metavar="PLATFORM", nargs="?")
+    target.add_argument("--none", action="store_true", help="clear the default")
+    node = actions.add_parser("add-node", parents=[change], help="approve a login node")
+    node.add_argument("platform", metavar="PLATFORM")
+    node.add_argument("--host", required=True)
+    node.add_argument("--port", type=int)
+    node.add_argument("--modes", required=True, help="approved transport modes: A, B or A,B")
+    node.add_argument("--priority", type=int, default=100, help="lower is tried first")
+    node.add_argument(
+        "--host-key-pin", metavar="REF", help="vetted host-key reference; required for Mode B"
+    )
+    edit = actions.add_parser("update-node", parents=[change], help="change a login node")
+    edit.add_argument("node_id", type=int, metavar="NODE_ID")
+    edit.add_argument("--modes")
+    edit.add_argument("--priority", type=int)
+    edit.add_argument("--port", type=int)
+    edit.add_argument("--host-key-pin", metavar="REF")
+    edit.add_argument("--status", choices=("active", "disabled"))
+    remove = actions.add_parser("remove-node", parents=[change], help="remove a login node")
+    remove.add_argument("node_id", type=int, metavar="NODE_ID")
+    for name, verb in (("grant", "let a Project use"), ("revoke", "stop a Project using")):
+        grant = actions.add_parser(name, parents=[change], help=f"{verb} a Platform")
+        grant.add_argument("platform", metavar="PLATFORM")
+        grant.add_argument("--project-id", required=True, type=UUID, metavar="UUID")
+
+
+def _print_platform(platform: Platform) -> None:
+    print(
+        f"{platform.slug} id={platform.id} status={platform.status} source={platform.source}"
+        f" default={'yes' if platform.is_default else 'no'}"
+        f" operated_by={json.dumps(platform.operator_name) if platform.operator_name else '-'}"
+        f" name={json.dumps(platform.display_name)}"
+    )
+
+
+def _print_node(node: PlatformLoginNode) -> None:
+    print(
+        f"  node {node.id} {node} modes={','.join(node.transport_modes)} "
+        f"priority={node.priority} status={node.status} health={node.health} "
+        f"host_key_pin={node.host_key_pin_ref or '-'}"
+    )
+
+
+def _platform(database: Database, args: argparse.Namespace) -> int:
+    """Runs one `nest-db platform` action on an open, verified database."""
+    store = PlatformStore(database)
+    audit: dict[str, Any] = {
+        "operator": getattr(args, "operator", None),
+        "reason": getattr(args, "reason", None),
+    }
+    try:
+        if args.action == "list":
+            for platform in store.list_platforms():
+                _print_platform(platform)
+            return 0
+        if args.action == "show":
+            platform = store.get_platform(args.platform)
+            if platform is None:
+                print("No such Platform", file=sys.stderr)
+                return 1
+            _print_platform(platform)
+            for node in store.login_nodes(platform.id):
+                _print_node(node)
+            for project_id in store.granted_projects(platform.id):
+                print(f"  grant project={project_id}")
+            return 0
+        if args.action == "create":
+            _print_platform(
+                store.create_platform(
+                    args.slug,
+                    args.name,
+                    operator_name=args.operated_by,
+                    default=args.default,
+                    **audit,
+                )
+            )
+        elif args.action == "update":
+            options: dict[str, Any] = {}
+            if args.operated_by is not None or args.clear_operated_by:
+                options["operator_name"] = args.operated_by
+            _print_platform(
+                store.update_platform(args.platform, display_name=args.name, **options, **audit)
+            )
+        elif args.action in ("disable", "enable"):
+            status = "disabled" if args.action == "disable" else "active"
+            _print_platform(store.set_status(args.platform, status, **audit))
+        elif args.action == "set-default":
+            platform = store.set_default(None if args.none else args.platform, **audit)
+            if platform is None:
+                print("No default Platform")
+            else:
+                _print_platform(platform)
+        elif args.action == "add-node":
+            _print_node(
+                store.add_login_node(
+                    args.platform,
+                    args.host,
+                    port=args.port,
+                    transport_modes=args.modes.split(","),
+                    priority=args.priority,
+                    host_key_pin_ref=args.host_key_pin,
+                    **audit,
+                )
+            )
+        elif args.action == "update-node":
+            options = {}
+            if args.port is not None:
+                options["port"] = args.port
+            if args.host_key_pin is not None:
+                options["host_key_pin_ref"] = args.host_key_pin
+            _print_node(
+                store.update_login_node(
+                    args.node_id,
+                    transport_modes=args.modes.split(",") if args.modes else None,
+                    priority=args.priority,
+                    status=args.status,
+                    **options,
+                    **audit,
+                )
+            )
+        elif args.action == "remove-node":
+            store.remove_login_node(args.node_id, **audit)
+            print(f"Removed login node {args.node_id}")
+        else:
+            change = store.grant_project if args.action == "grant" else store.revoke_project
+            if not change(args.platform, args.project_id, **audit):
+                print(
+                    "No change: the Project "
+                    + ("is already granted" if args.action == "grant" else "has no grant"),
+                    file=sys.stderr,
+                )
+                return 1
+            print(
+                f"Project {args.project_id} "
+                + ("granted" if args.action == "grant" else "no longer granted")
+                + f" Platform {args.platform}"
+            )
+        return 0
+    except (PlatformNotFoundError, LoginNodeNotFoundError, ProjectNotFoundError) as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    except PlatformError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 2
 
 
 def _audit(database: Database, args: argparse.Namespace) -> int:
@@ -286,7 +499,7 @@ def main(argv: list[str] | None = None) -> int:
         print(exc, file=sys.stderr)
         return 2
     database = Database(config, application_name="nest-db")
-    if args.command in ("admin", "sessions", "audit"):
+    if args.command in ("admin", "sessions", "audit", "platform"):
         try:
             database.open()
         except DatabaseError as exc:
@@ -295,7 +508,12 @@ def main(argv: list[str] | None = None) -> int:
         try:
             with database.connection() as conn:
                 verify(conn)
-            action = {"admin": _admin, "sessions": _sessions, "audit": _audit}[args.command]
+            action = {
+                "admin": _admin,
+                "sessions": _sessions,
+                "audit": _audit,
+                "platform": _platform,
+            }[args.command]
             return action(database, args)
         except MigrationError as exc:
             print(f"{exc}; run nest-db upgrade first", file=sys.stderr)

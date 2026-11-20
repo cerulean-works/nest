@@ -14,7 +14,7 @@ configured database is unreachable or not migrated):
 ```text
 ERROR nest.controller pid=7 request_id=- Invalid Nest configuration:
   - NEST_SSH_TIMEOUT must be a positive number of seconds, got '0'
-  - Slurm execution requires: NEST_SLURM_HOST, NEST_SLURM_WORKDIR (or define Provider Profiles with NEST_PROVIDERS)
+  - Slurm execution requires: NEST_SLURM_HOST, NEST_SLURM_WORKDIR (or define HPC Platforms with NEST_PLATFORMS)
 ```
 
 An empty value means unset. Error messages never repeat secret values
@@ -73,16 +73,84 @@ on a trusted private network such as an authorized Tailnet.
 
 The four timing settings accept positive numbers, including fractions.
 
-### Provider Profiles
+### HPC Platforms
 
-A **Compute Provider** is a Slurm cluster. A **Provider Profile** is the operator's
-record for one provider: its approved login nodes, SSH mode and user, and Slurm
-defaults. Profiles are bootstrapped from environment variables alone; users never
-supply SSH configuration. The Controller connects only to a profile's login nodes,
-using the first one.
+An **HPC Platform** is one Slurm cluster that the operator connects Nest to. Its
+**Platform Profile** is the operator's record for it: a permanent Platform ID, the
+operator's label, the approved login nodes, the SSH mode and user, and the
+Platform's Slurm defaults. Profiles are bootstrapped from environment variables
+alone; users never supply SSH configuration. The Controller connects only to a
+Platform's approved login nodes, using the first one.
 
-**One provider** uses the `NEST_SLURM_*` variables, which define the profile
-`default`. This is the form Compose passes through:
+These are kept apart on purpose:
+
+- The **Platform ID** is the Platform's identity. It namespaces Slurm accounts and
+  job records: the account `physics` on Platform `campus` and the account `physics`
+  on Platform `lab` are different accounts. Never reuse an ID for a different
+  cluster; with a database, the Controller refuses to start if a recorded Platform
+  ID is given a different operator label.
+- The **operator** label (`NEST_PLATFORM_<ID>_OPERATOR`) says who runs the cluster.
+  It is metadata only, so several Platforms can share one operator.
+- **Login nodes** are endpoints. Each `host[:port]` may be approved for only one
+  Platform. Host names are compared without case, and an omitted port counts as
+  22, so `login.example.edu` and `login.example.edu:22` are the same endpoint.
+- The **Slurm account**, partition and time limit are per-Platform defaults.
+
+**Several Platforms** use `NEST_PLATFORMS`, a comma-separated list of Platform IDs
+(lowercase letters, digits and `_`, starting with a letter, at most 32), and
+`NEST_PLATFORM_<ID>_*` settings with the ID in upper case:
+
+| Variable | Default | Behavior |
+| --- | --- | --- |
+| `NEST_PLATFORMS` | Unset | Platform IDs, comma-separated. |
+| `NEST_DEFAULT_PLATFORM` | The first ID | The Platform the Controller uses for execution. Must be listed in `NEST_PLATFORMS`. |
+| `NEST_PLATFORM_<ID>_LOGIN_NODES` | Required | Approved login nodes, comma-separated `host[:port]`. |
+| `NEST_PLATFORM_<ID>_ACCOUNT` | Required | Default Slurm account on this Platform. |
+| `NEST_PLATFORM_<ID>_WORKDIR` | Required with `NEST_EXECUTOR=slurm` | Absolute shared HPC directory. |
+| `NEST_PLATFORM_<ID>_SSH_MODE` | `A` | `A` (trusted operator SSH) or `B` (managed SSH); see below. |
+| `NEST_PLATFORM_<ID>_SSH_USER` | Unset | Remote user. Required in Mode B. |
+| `NEST_PLATFORM_<ID>_PARTITION` | `h200_256gpu` | Default Slurm partition. |
+| `NEST_PLATFORM_<ID>_TIME` | `00:05:00` | Default `sbatch --time`. |
+| `NEST_PLATFORM_<ID>_OPERATOR` | Unset | Operator label: lowercase letters, digits, `.`, `-` and `_`, at most 64. Input is lowercased. |
+| `NEST_PLATFORM_<ID>_NAME` | Unset | Display name, 1 to 100 printable characters. |
+
+```bash
+NEST_EXECUTOR=slurm
+NEST_PLATFORMS=campus,lab
+NEST_DEFAULT_PLATFORM=campus
+NEST_PLATFORM_CAMPUS_OPERATOR=example-university
+NEST_PLATFORM_CAMPUS_NAME=Campus GPU cluster
+NEST_PLATFORM_CAMPUS_SSH_MODE=B
+NEST_PLATFORM_CAMPUS_LOGIN_NODES=login1.example.edu,login2.example.edu:2222
+NEST_PLATFORM_CAMPUS_SSH_USER=svc-nest
+NEST_PLATFORM_CAMPUS_ACCOUNT=physics
+NEST_PLATFORM_CAMPUS_PARTITION=gpu
+NEST_PLATFORM_CAMPUS_TIME=02:00:00
+NEST_PLATFORM_CAMPUS_WORKDIR=/scratch/svc-nest/nest
+NEST_PLATFORM_LAB_OPERATOR=example-university
+NEST_PLATFORM_LAB_LOGIN_NODES=lab-hpc
+NEST_PLATFORM_LAB_ACCOUNT=physics
+NEST_PLATFORM_LAB_WORKDIR=/home/svc-nest/nest
+NEST_SSH_KNOWN_HOSTS=/run/secrets/nest_known_hosts
+NEST_SSH_IDENTITY_FILE=/run/secrets/nest_ssh_key
+```
+
+Validation is strict, so a typo cannot silently drop a setting: a
+`NEST_PLATFORM_*` variable that names no listed Platform or no field above is an
+error, as is any `NEST_PLATFORM_*` or `NEST_DEFAULT_PLATFORM` without
+`NEST_PLATFORMS`. `NEST_PLATFORMS` cannot be combined with `NEST_PROVIDERS`,
+`NEST_PROVIDER_<ID>_*` or `NEST_SLURM_*`. The one exception is
+`NEST_SLURM_SSH_MODE=B` on its own, which `compose.managed-ssh.yaml` always sets:
+it is ignored, with a startup warning, because each Platform sets its own mode.
+SSH credentials (`NEST_SSH_*`) are Controller-wide and are not per-Platform
+settings.
+
+With Docker Compose, put the Platform settings in an env file; see
+[Deploy with Docker Compose](docker-compose#several-hpc-platforms). The RPC API has
+no Platform field yet, so every call uses the default Platform.
+
+**One cluster** can still use the `NEST_SLURM_*` variables, which define the
+Platform `default`. This is the form Compose passes through from `.env`:
 
 | Variable | Default | Behavior |
 | --- | --- | --- |
@@ -99,31 +167,34 @@ With `NEST_EXECUTOR=slurm`, a login node, account and work directory are require
 In local mode a login node and account are enough to enable the job status and
 cancel RPCs.
 
-**Several providers** use `NEST_PROVIDERS`, a comma-separated list of lowercase IDs,
-and the same fields under `NEST_PROVIDER_<ID>_`, for example
-`NEST_PROVIDER_CAMPUS_LOGIN_NODES`. Here `LOGIN_NODES` and `ACCOUNT` are required, and
-so is `WORKDIR` in Slurm mode. `NEST_DEFAULT_PROVIDER` selects the profile used for
-execution (default: the first ID). `NEST_PROVIDERS` and the `NEST_SLURM_*` variables
-cannot be combined.
+#### Migrating from Compute Provider settings
 
-```bash
-NEST_EXECUTOR=slurm
-NEST_PROVIDERS=campus,lab
-NEST_DEFAULT_PROVIDER=campus
-NEST_PROVIDER_CAMPUS_SSH_MODE=B
-NEST_PROVIDER_CAMPUS_LOGIN_NODES=login1.example.edu,login2.example.edu:2222
-NEST_PROVIDER_CAMPUS_SSH_USER=svc-nest
-NEST_PROVIDER_CAMPUS_ACCOUNT=physics
-NEST_PROVIDER_CAMPUS_PARTITION=gpu
-NEST_PROVIDER_CAMPUS_TIME=02:00:00
-NEST_PROVIDER_CAMPUS_WORKDIR=/scratch/svc-nest/nest
-NEST_PROVIDER_LAB_LOGIN_NODES=lab-hpc
-NEST_PROVIDER_LAB_ACCOUNT=lab
-NEST_SSH_KNOWN_HOSTS=/run/secrets/nest_known_hosts
-NEST_SSH_IDENTITY_FILE=/run/secrets/nest_ssh_key
-```
+Earlier releases called a Platform a **Compute Provider** and used
+`NEST_PROVIDERS`, `NEST_DEFAULT_PROVIDER` and `NEST_PROVIDER_<ID>_*`. These still
+work unchanged and define the same Platform Profiles, with the same IDs, so job
+records and database rows carry over. They are **deprecated**: the Controller logs
+a warning at startup. To migrate, rename the variables, keeping every ID:
 
-The RPC API has no provider field yet, so every call uses the default profile.
+| Deprecated | Replacement |
+| --- | --- |
+| `NEST_PROVIDERS` | `NEST_PLATFORMS` |
+| `NEST_DEFAULT_PROVIDER` | `NEST_DEFAULT_PLATFORM` |
+| `NEST_PROVIDER_<ID>_<FIELD>` | `NEST_PLATFORM_<ID>_<FIELD>` |
+
+Then optionally add `NEST_PLATFORM_<ID>_OPERATOR` and `_NAME`; the deprecated form
+does not read them. `NEST_PROVIDER_ALLOWED_PROJECTS` is unrelated and keeps its
+name. Single-cluster `NEST_SLURM_*` settings are not deprecated. With a database,
+run `nest-db upgrade` first: migration `0011_platform_metadata` adds the operator and
+display-name columns (see [Store Controller records in PostgreSQL](database)).
+
+In Python, `nest.config.ProviderProfile` is an alias of
+[`config.PlatformProfile`], `ControllerConfig.providers`, `default_provider` and
+`provider` are aliases of `platforms`, `default_platform` and `platform`, and
+`nest.db.sync_providers` is an alias of `nest.db.sync_platforms`. The startup
+configuration summary reports `platforms` and `default_platform` (with each
+Platform's `operator` and `name`) in place of `providers` and `default_provider`;
+the `controller.started` audit record adds `default_platform` and keeps
+`default_provider` with the same value.
 
 ### SSH modes
 
@@ -145,10 +216,11 @@ ssh -F none -o BatchMode=yes -o StrictHostKeyChecking=yes
 `-F none` skips every SSH configuration file, so no alias, proxy, or weakened
 host-key setting can change the connection. Mode B never reads a `NEST_TAILSCALE_*`
 setting. The login node must be reachable from the Controller's network directly.
+This holds for every Platform in Mode B, whichever form defines it.
 
 | Variable | Default | Behavior |
 | --- | --- | --- |
-| `NEST_SSH_MODES_ALLOWED` | `A,B` | Modes profiles may use. `B` forbids Mode A profiles. |
+| `NEST_SSH_MODES_ALLOWED` | `A,B` | Modes Platforms may use. `B` forbids Mode A Platforms. |
 | `NEST_SSH_KNOWN_HOSTS` | Unset | Absolute path to verified host keys (Mode B). |
 | `NEST_SSH_KNOWN_HOSTS_DATA` | Unset | The same host keys inline, one `known_hosts` line per line or separated by `\n`. Host keys are public. |
 | `NEST_SSH_IDENTITY_FILE` | Unset | Absolute path to the private key (Mode B). Must not be readable by group or others. |

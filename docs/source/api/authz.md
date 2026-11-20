@@ -70,6 +70,30 @@ invitations.accept(invitee, issued.invitation.id)
 
 [[autodoc]] authz.IssuedInviteLink
 
+## HPC Platforms
+
+See [Register HPC Platforms and login nodes](../platforms).
+
+```python
+from nest.authz import PlatformCatalog
+
+catalog = PlatformCatalog(database)
+catalog.list_platforms(principal)  # only Platforms granted to the caller's Projects
+endpoint = catalog.select_login_node(principal, mode="B")  # the server's default Platform
+try:
+    connect(endpoint.host, endpoint.port, endpoint.host_key_pin_ref)
+except OSError:
+    endpoint = catalog.failover(principal, endpoint)  # same Platform ID, next node
+```
+
+[[autodoc]] authz.PlatformCatalog
+
+[[autodoc]] authz.PlatformSummary
+
+[[autodoc]] authz.PlatformResolutionError
+
+[[autodoc]] authz.select_endpoint
+
 ## Provider authority
 
 [[autodoc]] authz.ProviderAuthority

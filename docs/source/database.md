@@ -25,7 +25,7 @@ The database is **externally managed** and **opt-in**:
 
 | Table | Contents |
 | --- | --- |
-| `provider_profiles` | One row per Provider Profile (login nodes, SSH mode and user, Slurm defaults). The environment stays the source of truth: the Controller rewrites these rows at every start, marks the default, and marks profiles that were removed from the environment `active = false`. Rows are never deleted, so job records keep their provider. |
+| `provider_profiles` | One row per HPC Platform Profile, keyed by Platform ID (operator label and display name, login nodes, SSH mode and user, Slurm defaults). The environment stays the source of truth: the Controller rewrites these rows at every start, marks the default, and marks Platforms that were removed from the environment `active = false`. Rows are never deleted, so job records keep their Platform. A Platform ID is a permanent identity: the Controller refuses to start, and writes nothing, if the environment gives a recorded Platform a different operator label. If the recorded label is wrong, clear it with `UPDATE provider_profiles SET operator = NULL WHERE id = '<id>'`. |
 | `jobs` | One row per `Execute` (kind `execution`) or `SubmitJob` (kind `batch`) request that reached Slurm: its Execution ID, provider, Slurm job ID, request ID, script and directories, resources, Nest's `status`, the last observed Slurm state, and the error kind and message on failure. |
 | `email_outbox` | Messages queued for optional email delivery and their delivery status (see [Send email with SMTP](email)). Empty unless `NEST_EMAIL_ENABLED=true`. Each row keeps its recipient address; the body is cleared once the message is sent. |
 | `users`, `user_identities`, `user_sessions`, `platform_role_assignments` | Nest Users, the external sign-in identities linked to them, signed-in sessions (stored as SHA-256 hashes of their secrets) and service-wide roles. See [Users, Projects and memberships](#users-projects-and-memberships). |
@@ -86,7 +86,7 @@ derived from another:
 | Nest User | `users.id`, a generated UUID | Never an email address. A User row exists only once a person has signed in or an operator has created it. |
 | External sign-in identity | `user_identities (issuer, subject)` | The identity provider's stable subject ID (Google's `sub`) under its issuer, linked to one User. A changed email keeps the same User; a reused address on another subject is a different identity. These identity providers are unrelated to Compute Providers. |
 | Nest Project | `projects.id`, a generated UUID | Independent of its name, Owner and Provider Accounts. Two Projects may share a name. |
-| Provider and Provider Account | `provider_profiles.id` and the Provider's account name | No identity or Project table references them. |
+| HPC Platform and its Slurm account | `provider_profiles.id` (the Platform ID) and the account name within that Platform | The Platform ID namespaces the account: the same account name on two Platforms is two accounts. The operator label is metadata, not part of the key. No identity or Project table references them. |
 
 **Membership.** Users and Projects are many-to-many through `project_memberships`,
 one row per (Project, User) (`UNIQUE (project_id, user_id)`), with a role of
@@ -178,6 +178,22 @@ security audit triggers for the invitation flows (see
 [Invite people to a Project](invitations)): `invite_link.exhausted` when an Invite
 Link's last use is taken, and `invitation.email_failed` when the outbox gives up on
 an invitation email. The invitation tables themselves are unchanged.
+
+**HPC Platform metadata.** Migration `0011_platform_metadata` adds the nullable
+`operator` and `display_name` columns to `provider_profiles`, filled from
+`NEST_PLATFORM_<ID>_OPERATOR` and `_NAME` (see
+[HPC Platforms](configuration#hpc-platforms)). Existing rows keep their IDs and job
+records; their new columns stay `NULL` until a Platform with an operator label is
+configured. A Platform without a label keeps any label already recorded. Run
+`nest-db upgrade` before starting a Controller of this release.
+
+**HPC Platform Catalog.** Migration `0012_hpc_platform_catalog` adds
+`hpc_platforms` (immutable Platform IDs and slugs, optional operator metadata),
+`hpc_login_nodes` (approved endpoints, transport modes, priority, health and
+host-key pin references) and `hpc_platform_project_grants`, and records each
+job's Platform in `jobs.platform_id`. Changes to all three tables must name an
+operator and are recorded in the security audit log. Platforms are never deleted.
+See [Register HPC Platforms and login nodes](platforms).
 
 ## Configure the connection
 
