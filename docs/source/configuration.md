@@ -60,6 +60,9 @@ on a trusted private network such as an authorized Tailnet.
 | `NEST_RESULT_TIMEOUT` | `600` | Seconds the Controller polls a worker job. When it expires, the call raises `QueueTimeoutError` or `ExecutionTimeoutError`. |
 | `NEST_ENVIRONMENT_TIMEOUT` | `1800` | Seconds the Controller polls an environment build job. When it expires, the same timeout classes are raised. |
 | `NEST_POLL_INTERVAL` | `5` | Seconds between Slurm status queries. |
+| `NEST_PENDING_BLOCKED_TIMEOUT` | `120` | Seconds a job may stay pending for a reason it cannot outwait, such as `PartitionConfig`, `InvalidQOS`, a per-job limit, or a hold, before the call raises `JobBlockedError`. Set it above `NEST_RESULT_TIMEOUT` to wait for the full deadline instead. |
+| `NEST_PENDING_LIMIT_TIMEOUT` | Unset | Seconds a job may stay pending on a QoS or association usage limit, such as `MaxGRESPerAccount`, before the call raises `JobBlockedError`. Unset waits until `NEST_RESULT_TIMEOUT`, since such limits clear as the account's other jobs finish. |
+| `NEST_CANCEL_BLOCKED_JOBS` | `false` | Whether to `scancel` a job when the call raises `JobBlockedError`. The job is never resubmitted. |
 | `NEST_TLS_CERT_FILE` | Unset | Absolute path to the PEM certificate chain. Set with `NEST_TLS_KEY_FILE` to serve TLS. |
 | `NEST_TLS_KEY_FILE` | Unset | Absolute path to the PEM private key. Both TLS files, or neither. |
 | `NEST_PUBLIC_URL` | Unset | Advertised `grpc://`, `grpcs://`, `http://` or `https://` URL, logged at startup. Must not contain credentials or a query string. With email enabled it is also the base of links in messages, so it is required and must be `https://` (`http://` only for `localhost`). |
@@ -306,6 +309,8 @@ The image healthcheck runs `python -m nest.healthcheck`, which reads the same
 | SSH commands and file transfers | 60 seconds | `NEST_SSH_TIMEOUT` | `SSHTimeoutError`; `SubmissionUnknownError` during `sbatch` |
 | Worker job polling | 600 seconds | `NEST_RESULT_TIMEOUT` | `QueueTimeoutError` if the job never started, otherwise `ExecutionTimeoutError` |
 | Environment build polling | 1,800 seconds | `NEST_ENVIRONMENT_TIMEOUT` | `QueueTimeoutError` or `ExecutionTimeoutError` |
+| Job pending for a reason it cannot outwait | 120 seconds | `NEST_PENDING_BLOCKED_TIMEOUT` | `JobBlockedError` |
+| Job pending on a QoS or association limit | Polling deadline | `NEST_PENDING_LIMIT_TIMEOUT` | `JobBlockedError` |
 | Slurm job time limit | `00:05:00` | `NEST_SLURM_TIME` or `NEST_PROVIDER_<ID>_TIME` | `ExecutionTimeoutError` (Slurm state `TIMEOUT`) |
 | Environment build time limit | `00:10:00` | `#SBATCH --time` in `scripts/environment-smoke.sbatch` | `ExecutionTimeoutError` (Slurm state `TIMEOUT`) |
 
@@ -318,6 +323,7 @@ Controller error. Status queries and downloads can extend each polling deadline 
 up to one SSH timeout.
 
 No timeout cancels a submitted Slurm job, and Nest never retries a submission.
+`JobBlockedError` cancels the job only when `NEST_CANCEL_BLOCKED_JOBS` is `true`.
 [Handle remote errors](remote-errors) describes each error and when it is safe to
 call again.
 

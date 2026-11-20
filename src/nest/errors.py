@@ -8,6 +8,9 @@ ERROR_KIND_METADATA = "nest-error-kind"
 JOB_ID_METADATA = "nest-job-id"
 """Trailing-metadata key carrying the Slurm job ID related to an error, if any."""
 
+PENDING_REASON_METADATA = "nest-pending-reason"
+"""Trailing-metadata key carrying the last Slurm pending reason of a job that never started."""
+
 
 class RemoteExecutionError(RuntimeError):
     """An exception raised by a remotely executed function."""
@@ -146,9 +149,45 @@ class SSHTimeoutError(NestTimeoutError):
 
 
 class QueueTimeoutError(NestTimeoutError):
-    """The job was submitted but never started running before the polling deadline."""
+    """
+    The job was submitted but never started running before the polling deadline.
+
+    Attributes:
+        pending_reason (`str`, *optional*): Last Slurm pending reason observed, such
+            as `Priority` or `MaxGRESPerAccount`, when Slurm reported one.
+    """
 
     kind = "queue_timeout"
+
+    def __init__(
+        self, message: str, *, job_id: int | None = None, pending_reason: str | None = None
+    ):
+        """
+        Stores the message, optional job ID, and last pending reason.
+
+        Args:
+            message (`str`): Human-readable description.
+            job_id (`int`, *optional*): Related Slurm job ID.
+            pending_reason (`str`, *optional*): Last Slurm pending reason observed.
+        """
+        super().__init__(message, job_id=job_id)
+        self.pending_reason = pending_reason
+
+
+class JobBlockedError(QueueTimeoutError):
+    """
+    The job stayed pending for a reason that it cannot outwait, so Nest stopped waiting.
+
+    Raised before the polling deadline when Slurm keeps reporting a pending reason
+    that needs a change to the request or to the cluster's configuration, such as
+    `PartitionConfig`, `InvalidQOS`, or a held job. The message names the reason,
+    the job's partition, QoS, and account, and a suggested fix. The job is left
+    queued unless the Controller is configured to cancel it. Also a
+    [`errors.QueueTimeoutError`].
+    """
+
+    kind = "job_blocked"
+    status = grpc.StatusCode.FAILED_PRECONDITION
 
 
 class ExecutionTimeoutError(NestTimeoutError):
@@ -189,6 +228,7 @@ INFRASTRUCTURE_ERRORS: dict[str, type[InfrastructureError]] = {
         SSHTimeoutError,
         SubmissionUnknownError,
         QueueTimeoutError,
+        JobBlockedError,
         ExecutionTimeoutError,
         RpcTimeoutError,
         DatabaseUnavailableError,

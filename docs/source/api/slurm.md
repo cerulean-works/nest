@@ -25,6 +25,20 @@ started, the timeout raises [`errors.QueueTimeoutError`]; if it started, it rais
 [`errors.ExecutionTimeoutError`]. A timeout does not cancel the Slurm job;
 inspect its status before submitting another execution.
 
+While a job is pending, Nest reads Slurm's pending reason and the job's
+partition, QoS, and account from `squeue`, and logs each change. Reasons that
+need attention, such as a QoS or association limit (`MaxGRESPerAccount`) or a
+request the partition cannot run (`PartitionConfig`), are logged as warnings
+with the requested resources from `scontrol show job` and a suggested fix. The
+last reason is kept in the timeout message and in `QueueTimeoutError.pending_reason`.
+A job pending for a reason it cannot outwait for `blocked_timeout` seconds raises
+[`errors.JobBlockedError`] before the deadline; see
+[Pending jobs](../remote-errors#pending-jobs).
+
 [[autodoc]] backends.slurm.SlurmBackend
+
+[[autodoc]] backends.slurm.SlurmJobInfo
+
+[[autodoc]] backends.slurm.classify_pending_reason
 
 [[autodoc]] backends.slurm.new_execution_id

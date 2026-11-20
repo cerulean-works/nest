@@ -1,4 +1,5 @@
 import json
+import re
 import signal
 import time
 from concurrent import futures
@@ -28,8 +29,10 @@ from .db import Database, DatabaseError, JobStore, bootstrap_state, sync_provide
 from .errors import (
     ERROR_KIND_METADATA,
     JOB_ID_METADATA,
+    PENDING_REASON_METADATA,
     DatabaseUnavailableError,
     InfrastructureError,
+    QueueTimeoutError,
     RemoteCommandError,
     SubmissionUnknownError,
 )
@@ -137,9 +140,13 @@ def _status_details(message: str) -> str:
     return head + marker.format(omitted) + tail
 
 
+_METADATA_VALUE = re.compile(r"[\x21-\x7e]{1,200}")
+"""Pending reasons sent as metadata: short and printable ASCII, as gRPC requires."""
+
+
 def _abort_infrastructure(context, exc: InfrastructureError, status=None):
     """
-    Aborts an RPC with an infrastructure error's status, kind, and job ID.
+    Aborts an RPC with an infrastructure error's status, kind, job ID, and pending reason.
 
     Args:
         context (`grpc.ServicerContext`): RPC context to abort.
@@ -149,6 +156,9 @@ def _abort_infrastructure(context, exc: InfrastructureError, status=None):
     metadata = [(ERROR_KIND_METADATA, exc.kind)]
     if exc.job_id is not None:
         metadata.append((JOB_ID_METADATA, str(exc.job_id)))
+    reason = exc.pending_reason if isinstance(exc, QueueTimeoutError) else None
+    if reason and _METADATA_VALUE.fullmatch(reason):
+        metadata.append((PENDING_REASON_METADATA, reason))
     context.set_trailing_metadata(tuple(metadata))
     context.abort(status or exc.status, _status_details(str(exc)))
 
@@ -530,6 +540,9 @@ def build_backend(config: ControllerConfig) -> SlurmBackend | None:
             result_timeout=config.result_timeout,
             environment_timeout=config.environment_timeout,
             poll_interval=config.poll_interval,
+            blocked_timeout=config.pending_blocked_timeout,
+            limit_timeout=config.pending_limit_timeout,
+            cancel_blocked=config.cancel_blocked_jobs,
         )
     )
 

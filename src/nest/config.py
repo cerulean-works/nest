@@ -60,6 +60,7 @@ DEFAULT_SSH_TIMEOUT = 60.0
 DEFAULT_RESULT_TIMEOUT = 600.0
 DEFAULT_ENVIRONMENT_TIMEOUT = 1800.0
 DEFAULT_POLL_INTERVAL = 5.0
+DEFAULT_PENDING_BLOCKED_TIMEOUT = 120.0
 DEFAULT_PARTITION = "h200_256gpu"
 DEFAULT_TIME = "00:05:00"
 LEGACY_PROVIDER_ID = "default"
@@ -601,6 +602,13 @@ class ControllerConfig:
         log_level (`str`): Logging level name.
         ssh_timeout, result_timeout, environment_timeout, poll_interval (`float`):
             Deadlines in seconds.
+        pending_blocked_timeout (`float`): Seconds a job may stay pending for a
+            reason it cannot outwait before the Controller stops waiting.
+        pending_limit_timeout (`float | None`): Seconds a job may stay pending on a
+            QoS or association limit before the Controller stops waiting. `None`
+            waits until the polling deadline.
+        cancel_blocked_jobs (`bool`): Whether to cancel a job the Controller stopped
+            waiting for because of its pending reason.
         providers (`dict[str, ProviderProfile]`): Profiles by ID.
         default_provider (`str | None`): Profile used for Slurm calls.
         ssh (`SSHPolicy`): SSH policy and Mode B credentials.
@@ -625,6 +633,9 @@ class ControllerConfig:
     result_timeout: float = DEFAULT_RESULT_TIMEOUT
     environment_timeout: float = DEFAULT_ENVIRONMENT_TIMEOUT
     poll_interval: float = DEFAULT_POLL_INTERVAL
+    pending_blocked_timeout: float = DEFAULT_PENDING_BLOCKED_TIMEOUT
+    pending_limit_timeout: float | None = None
+    cancel_blocked_jobs: bool = False
     providers: dict[str, ProviderProfile] = field(default_factory=dict)
     default_provider: str | None = None
     ssh: SSHPolicy = field(default_factory=SSHPolicy)
@@ -1452,6 +1463,15 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
             "NEST_ENVIRONMENT_TIMEOUT", DEFAULT_ENVIRONMENT_TIMEOUT
         ),
         "poll_interval": reader.seconds("NEST_POLL_INTERVAL", DEFAULT_POLL_INTERVAL),
+        "pending_blocked_timeout": reader.seconds(
+            "NEST_PENDING_BLOCKED_TIMEOUT", DEFAULT_PENDING_BLOCKED_TIMEOUT
+        ),
+        "pending_limit_timeout": (
+            reader.seconds("NEST_PENDING_LIMIT_TIMEOUT", 0)
+            if reader.get("NEST_PENDING_LIMIT_TIMEOUT") is not None
+            else None
+        ),
+        "cancel_blocked_jobs": reader.boolean("NEST_CANCEL_BLOCKED_JOBS"),
     }
 
     providers: dict[str, ProviderProfile] = {}

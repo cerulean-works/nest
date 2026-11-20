@@ -4,7 +4,7 @@ import shlex
 import subprocess
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .._logging import current_request_id, get_logger, operation
@@ -12,6 +12,7 @@ from ..config import DEFAULT_PARTITION, load_log_level
 from ..errors import (
     ExecutionTimeoutError,
     InfrastructureError,
+    JobBlockedError,
     QueueTimeoutError,
     RemoteCommandError,
     SlurmJobError,
@@ -57,6 +58,210 @@ def new_execution_id() -> str:
 _SUBMIT_MARKER = "nest-sbatch-started"
 """Printed before `sbatch` so an SSH failure can show whether submission began."""
 
+_SQUEUE_FORMAT = "%T|%r|%P|%q|%a"
+"""`squeue` fields: state, reason, partition, QoS, and account, separated by `|`."""
+
+_REQ_TRES = re.compile(r"(?:^|\s)ReqTRES=(\S+)")
+"""Requested trackable resources in `scontrol show job --oneliner` output."""
+
+PENDING_QUEUED = "queued"
+"""Pending reason category: normal queue congestion that clears on its own."""
+
+PENDING_LIMIT = "limit"
+"""Pending reason category: a QoS or association usage limit that clears as usage drops."""
+
+PENDING_BLOCKED = "blocked"
+"""Pending reason category: the job cannot start until its request or the cluster changes."""
+
+_BLOCKED_REASONS = {
+    "PartitionConfig": (
+        "The request does not fit partition {partition}; check the GPU and CPU counts, the "
+        "time limit, and the partition."
+    ),
+    "PartitionNodeLimit": (
+        "The request needs more nodes than partition {partition} allows; request fewer "
+        "resources or use another partition."
+    ),
+    "PartitionTimeLimit": (
+        "The time limit exceeds the maximum of partition {partition}; request a shorter time "
+        "limit or use another partition."
+    ),
+    "BadConstraints": (
+        "No node in partition {partition} satisfies the requested constraints or resources; "
+        "check the GPU and CPU counts and the partition."
+    ),
+    "InvalidAccount": (
+        "Account {account} is invalid or not allowed here; check the Slurm account for "
+        "partition {partition}."
+    ),
+    "InvalidQOS": (
+        "QoS {qos} is invalid for account {account} or partition {partition}; check the "
+        "account and partition."
+    ),
+    "AccountNotAllowed": (
+        "Account {account} may not use partition {partition}; use another account or partition."
+    ),
+    "QOSNotAllowed": "QoS {qos} may not use partition {partition}; use another partition.",
+    "DependencyNeverSatisfied": (
+        "A job this one depends on failed, so it can never start; cancel it."
+    ),
+    "JobHeldUser": "The job is held; release it with `scontrol release {job_id}` or cancel it.",
+    "JobHeldAdmin": "An administrator held the job; ask them to release it, or cancel it.",
+}
+"""Pending reasons that never clear on their own, with a suggested fix for each."""
+
+_LIMIT_HINT = (
+    "Slurm is enforcing a QoS or association limit ({reason}) for account {account} and "
+    "QoS {qos}, for example on GPUs already in use. The job starts once usage drops below "
+    "the limit. To start sooner, request fewer resources, use another account or QoS, or "
+    "ask an administrator to raise the limit."
+)
+_PER_JOB_LIMIT_HINT = (
+    "The job alone exceeds a per-job QoS or association limit ({reason}) for account "
+    "{account} and QoS {qos}, so it can never start; request fewer resources or a shorter "
+    "time limit."
+)
+_QUEUED_HINT = "The job is waiting in the queue ({reason}); this is normal congestion."
+
+
+def _is_limit_reason(reason: str) -> bool:
+    """Returns whether a pending reason names a QoS or association limit."""
+    return reason.startswith(("QOS", "Assoc", "Max"))
+
+
+def _is_per_job_limit(reason: str) -> bool:
+    """Returns whether a limit reason concerns the job's own size, not shared usage."""
+    return "PerJob" in reason or reason.startswith(("QOSMin", "AssocMin"))
+
+
+def classify_pending_reason(reason: str | None) -> str:
+    """
+    Classifies a Slurm pending reason by whether waiting can clear it.
+
+    Unknown reasons count as normal queueing, so an unfamiliar reason never stops
+    Nest from waiting early.
+
+    Args:
+        reason (`str`, *optional*): Reason reported by `squeue`, such as `Priority`,
+            `MaxGRESPerAccount`, or `PartitionConfig`.
+
+    Returns:
+        `str`: [`backends.slurm.PENDING_BLOCKED`] for reasons that need a change to the
+            request or the cluster, including per-job limits the job alone exceeds;
+            [`backends.slurm.PENDING_LIMIT`] for QoS and association usage limits; and
+            [`backends.slurm.PENDING_QUEUED`] otherwise.
+    """
+    if not reason:
+        return PENDING_QUEUED
+    if reason in _BLOCKED_REASONS:
+        return PENDING_BLOCKED
+    if _is_limit_reason(reason):
+        if _is_per_job_limit(reason):
+            return PENDING_BLOCKED
+        return PENDING_LIMIT
+    return PENDING_QUEUED
+
+
+@dataclass(frozen=True)
+class SlurmJobInfo:
+    """
+    A job's Slurm state and, while it is queued, why it has not started.
+
+    Attributes:
+        job_id (`int`): Slurm job ID.
+        state (`str`): State such as `PENDING`, `RUNNING`, or `COMPLETED`.
+        reason (`str`, *optional*): Slurm's reason for the state, such as `Priority`
+            or `MaxGRESPerAccount`. `None` when Slurm reports none.
+        partition (`str`, *optional*): Partition or partitions the job was submitted to.
+        qos (`str`, *optional*): Quality of service.
+        account (`str`, *optional*): Slurm account.
+        requested (`str`, *optional*): Requested resources (`ReqTRES` from
+            `scontrol show job`), when Nest looked them up.
+    """
+
+    job_id: int
+    state: str
+    reason: str | None = None
+    partition: str | None = None
+    qos: str | None = None
+    account: str | None = None
+    requested: str | None = None
+
+    @property
+    def pending_category(self) -> str | None:
+        """[`backends.slurm.classify_pending_reason`] of a `PENDING` job, else `None`."""
+        if self.state != "PENDING":
+            return None
+        return classify_pending_reason(self.reason)
+
+    def hint(self) -> str | None:
+        """Returns a suggested action for a `PENDING` job's reason, or `None`."""
+        category = self.pending_category
+        if category is None or not self.reason:
+            return None
+        fields = {
+            "reason": self.reason,
+            "job_id": self.job_id,
+            "partition": self.partition or "?",
+            "qos": self.qos or "?",
+            "account": self.account or "?",
+        }
+        if self.reason in _BLOCKED_REASONS:
+            template = _BLOCKED_REASONS[self.reason]
+        elif category == PENDING_BLOCKED:
+            template = _PER_JOB_LIMIT_HINT
+        elif category == PENDING_LIMIT:
+            template = _LIMIT_HINT
+        else:
+            template = _QUEUED_HINT
+        return template.format(**fields)
+
+    def describe(self) -> str:
+        """Returns `key=value` diagnostics for logs and error messages."""
+        fields = {
+            "job_id": self.job_id,
+            "state": self.state,
+            "reason": self.reason,
+            "partition": self.partition,
+            "qos": self.qos,
+            "account": self.account,
+            "requested": self.requested,
+        }
+        return " ".join(f"{key}={value}" for key, value in fields.items() if value is not None)
+
+
+def _pending_detail(info: SlurmJobInfo) -> str:
+    """Returns a message fragment naming a pending job's reason, context, and fix."""
+    if info.state != "PENDING" or not info.reason:
+        return ""
+    context = " ".join(
+        f"{key}={value}"
+        for key, value in (
+            ("partition", info.partition),
+            ("qos", info.qos),
+            ("account", info.account),
+            ("requested", info.requested),
+        )
+        if value is not None
+    )
+    detail = f" Pending reason: {info.reason}"
+    if context:
+        detail += f" ({context})"
+    return f"{detail}. {info.hint()}"
+
+
+def _pending_history(reasons: list[str]) -> str:
+    """Returns a message fragment listing the pending reasons seen, oldest first."""
+    if not reasons:
+        return ""
+    return f" Pending reasons seen: {', '.join(reasons)}."
+
+
+def _field(value: str | None) -> str | None:
+    """Returns a stripped `squeue` field, or `None` when Slurm left it unset."""
+    value = (value or "").strip()
+    return None if value in ("", "None", "(null)", "n/a") else value
+
 
 @dataclass(frozen=True)
 class SlurmConfig:
@@ -79,6 +284,17 @@ class SlurmConfig:
             deadline for an environment build job, in seconds.
         poll_interval (`float`, *optional*, defaults to `5`): Default seconds between
             Slurm status queries.
+        blocked_timeout (`float`, *optional*, defaults to `120`): Seconds a job may stay
+            pending for a reason it cannot outwait, such as `PartitionConfig`, before
+            Nest stops waiting with [`errors.JobBlockedError`]. `0` stops at the first
+            such observation.
+        limit_timeout (`float`, *optional*): Seconds a job may stay pending on a QoS or
+            association usage limit, such as `MaxGRESPerAccount`, before Nest stops
+            waiting with [`errors.JobBlockedError`]. Unset waits until the polling
+            deadline, since such limits clear as other jobs finish.
+        cancel_blocked (`bool`, *optional*, defaults to `False`): Whether to `scancel`
+            a job when Nest stops waiting with [`errors.JobBlockedError`]. The job is
+            never resubmitted.
         ssh_mode (`str`, *optional*, defaults to `"A"`): `"A"` resolves `ssh_host`
             through the local user's SSH configuration. `"B"` (managed SSH) ignores
             every SSH configuration file and requires `ssh_user`, `identity_file`,
@@ -101,6 +317,9 @@ class SlurmConfig:
     result_timeout: float = 600
     environment_timeout: float = 1800
     poll_interval: float = 5
+    blocked_timeout: float = 120
+    limit_timeout: float | None = None
+    cancel_blocked: bool = False
     ssh_mode: str = "A"
     ssh_user: str | None = None
     ssh_port: int | None = None
@@ -109,6 +328,8 @@ class SlurmConfig:
     allowed_hosts: tuple[str, ...] = ()
 
     def __post_init__(self):
+        if self.blocked_timeout < 0 or (self.limit_timeout is not None and self.limit_timeout < 0):
+            raise ValueError("Pending timeouts cannot be negative")
         if self.ssh_mode not in ("A", "B"):
             raise ValueError(f"Unknown SSH mode {self.ssh_mode!r}")
         if self.allowed_hosts and self.ssh_host not in self.allowed_hosts:
@@ -407,26 +628,77 @@ class SlurmBackend:
             [`errors.SSHError`]: If SSH cannot reach the host.
             [`errors.SSHTimeoutError`]: If an SSH command exceeds `ssh_timeout`.
         """
+        return self.job_info(job_id).state
+
+    def job_info(self, job_id: int) -> SlurmJobInfo:
+        """
+        Looks up a job's state and pending reason with `squeue`, then `sacct`.
+
+        Args:
+            job_id (`int`): Slurm job ID.
+
+        Returns:
+            [`backends.slurm.SlurmJobInfo`]: State, reason, partition, QoS, and account
+                from `squeue` while the job is active. Only the state, from `sacct`,
+                once it has left the queue, or `"UNKNOWN"` when neither knows the job.
+
+        Raises:
+            [`errors.RemoteCommandError`]: If a remote query fails, except an invalid
+                job ID from `squeue`.
+            [`errors.SSHError`]: If SSH cannot reach the host.
+            [`errors.SSHTimeoutError`]: If an SSH command exceeds `ssh_timeout`.
+        """
         job_id = int(job_id)
 
         # Check active jobs
         try:
-            output = self._run_remote(f"squeue --noheader --jobs={job_id} --format=%T")
+            output = self._run_remote(
+                f"squeue --noheader --jobs={job_id} --format={shlex.quote(_SQUEUE_FORMAT)}"
+            )
         except RemoteCommandError as exc:
             if "Invalid job id specified" not in str(exc):
                 raise
             output = ""
 
         if output:
-            return output.splitlines()[0].strip()
+            fields = [*output.splitlines()[0].split("|"), "", "", "", ""]
+            return SlurmJobInfo(
+                job_id=job_id,
+                state=fields[0].strip(),
+                reason=_field(fields[1]),
+                partition=_field(fields[2]),
+                qos=_field(fields[3]),
+                account=_field(fields[4]),
+            )
 
-        # Check job accouting histroy
+        # Check job accounting history
         output = self._run_remote(f"sacct -X -n -P --jobs={job_id} --format=State")
 
         if output:
-            return output.splitlines()[0].strip()
+            return SlurmJobInfo(job_id=job_id, state=output.splitlines()[0].strip())
 
-        return "UNKNOWN"
+        return SlurmJobInfo(job_id=job_id, state="UNKNOWN")
+
+    def _with_details(self, info: SlurmJobInfo) -> SlurmJobInfo:
+        """
+        Adds the requested resources from `scontrol show job`, when available.
+
+        The lookup only enriches diagnostics, so any failure is logged and ignored.
+
+        Args:
+            info ([`backends.slurm.SlurmJobInfo`]): Job to enrich.
+
+        Returns:
+            [`backends.slurm.SlurmJobInfo`]: `info` with `requested` set when
+                `scontrol` reported `ReqTRES`, otherwise `info` unchanged.
+        """
+        try:
+            output = self._run_remote(f"scontrol show job --oneliner {int(info.job_id)}")
+        except InfrastructureError as exc:
+            logger.debug("scontrol lookup failed job_id=%s error=%s", info.job_id, exc)
+            return info
+        match = _REQ_TRES.search(output)
+        return replace(info, requested=match.group(1)) if match else info
 
     @operation(logger, "Slurm cancel")
     def cancel(self, job_id: int) -> None:
@@ -592,7 +864,14 @@ class SlurmBackend:
 
     def _wait_job(self, job_id: int, label: str, timeout: float, poll_interval: float) -> None:
         """
-        Polls a job until it completes, classifying failures and timeouts.
+        Polls a job until it completes, classifying failures, timeouts, and blockers.
+
+        Every change of state or pending reason is logged. A QoS or association
+        limit, or a reason the job cannot outwait, is logged as a warning with the
+        job's partition, QoS, account, and requested resources, plus a suggested fix.
+        Pending reasons seen while polling are kept in timeout messages. Normal
+        congestion, such as `Priority` or `Resources`, only ever ends in the
+        polling deadline.
 
         Args:
             job_id (`int`): Slurm job ID to poll.
@@ -605,6 +884,10 @@ class SlurmBackend:
             [`errors.SlurmJobError`]: If the job enters a failure state.
             [`errors.ExecutionTimeoutError`]: If Slurm reports `TIMEOUT`, or the job
                 started but did not finish before the deadline.
+            [`errors.JobBlockedError`]: If the job stayed pending for longer than
+                `blocked_timeout` for a reason it cannot outwait, or longer than
+                `limit_timeout` on a usage limit. Cancels the job first only when
+                `cancel_blocked` is set.
             [`errors.QueueTimeoutError`]: If the job never started before the deadline.
             [`errors.InfrastructureError`]: If a status query fails over SSH. Its
                 `job_id` is set to the polled job.
@@ -613,49 +896,126 @@ class SlurmBackend:
             raise ValueError("Timeout cannot be negative and poll interval must be positive")
 
         deadline = time.monotonic() + timeout
-        previous_state = None
+        previous: tuple[str, str | None] | None = None
+        requested: str | None = None
         started = False
+        reasons: list[str] = []
+        category: str | None = None
+        category_since = 0.0
         logger.info("Waiting for Slurm job job_id=%s timeout_s=%s", job_id, timeout)
 
         while True:
             try:
-                state = self.status(job_id)
+                info = self.job_info(job_id)
             except InfrastructureError as exc:
                 # The job exists; let callers find it before calling again.
                 exc.job_id = job_id
                 raise
 
-            if state != previous_state:
-                logger.info("Slurm state changed job_id=%s state=%s", job_id, state)
-                previous_state = state
+            state = info.state
+            actionable = info.pending_category in (PENDING_LIMIT, PENDING_BLOCKED)
+            if (state, info.reason) != previous:
+                previous = (state, info.reason)
+                requested = None
+                if actionable:
+                    info = self._with_details(info)
+                    requested = info.requested
+                    logger.warning(
+                        "Slurm job pending on %s %s hint=%s",
+                        info.pending_category,
+                        info.describe(),
+                        info.hint(),
+                    )
+                else:
+                    logger.info("Slurm state changed %s", info.describe())
+            elif actionable and requested:
+                # Reuse the resources looked up when the reason first appeared.
+                info = replace(info, requested=requested)
 
             if state == "COMPLETED":
                 return
 
+            pending_category = info.pending_category
+            if info.reason and pending_category is not None and info.reason not in reasons:
+                reasons.append(info.reason)
+            history = _pending_history(reasons)
+
             if state.startswith("TIMEOUT"):
                 raise ExecutionTimeoutError(
-                    f"{label} {job_id} exceeded its Slurm time limit: {state}", job_id=job_id
+                    f"{label} {job_id} exceeded its Slurm time limit: {state}{history}",
+                    job_id=job_id,
                 )
 
             if state.startswith(_FAILED_STATES):
-                raise SlurmJobError(f"{label} {job_id} failed: {state}", job_id=job_id)
+                raise SlurmJobError(f"{label} {job_id} failed: {state}{history}", job_id=job_id)
 
             started = started or state.startswith(_STARTED_STATES)
+            now = time.monotonic()
 
-            if time.monotonic() >= deadline:
+            if pending_category != category:
+                category, category_since = pending_category, now
+            limit = {
+                PENDING_BLOCKED: self.config.blocked_timeout,
+                PENDING_LIMIT: self.config.limit_timeout,
+            }.get(category or "")
+            if limit is not None and now - category_since >= limit:
+                raise self._blocked(label, info, now - category_since)
+
+            if now >= deadline:
                 if started:
                     raise ExecutionTimeoutError(
                         f"{label} {job_id} did not finish within {timeout:g} seconds. "
-                        f"Last state: {state}. The job was not cancelled.",
+                        f"Last state: {state}.{history} The job was not cancelled.",
                         job_id=job_id,
                     )
                 raise QueueTimeoutError(
                     f"{label} {job_id} did not start within {timeout:g} seconds. "
-                    f"Last state: {state}. The job was not cancelled.",
+                    f"Last state: {state}.{_pending_detail(info)}{history} "
+                    "The job was not cancelled.",
                     job_id=job_id,
+                    pending_reason=info.reason,
                 )
 
             time.sleep(poll_interval)
+
+    def _blocked(self, label: str, info: SlurmJobInfo, waited: float) -> JobBlockedError:
+        """
+        Builds the error for a job Nest stopped waiting for, cancelling it if configured.
+
+        A job is never resubmitted. A failed cancellation is reported in the message
+        rather than replacing the diagnostic.
+
+        Args:
+            label (`str`): Job description used in messages, such as `"Slurm job"`.
+            info ([`backends.slurm.SlurmJobInfo`]): Last observation of the pending job.
+            waited (`float`): Seconds the job has been pending for this kind of reason.
+
+        Returns:
+            [`errors.JobBlockedError`]: The error to raise.
+        """
+        job_id = info.job_id
+        if self.config.cancel_blocked:
+            try:
+                self.cancel(job_id)
+                outcome = "Nest requested its cancellation and will not resubmit it."
+            except InfrastructureError as exc:
+                logger.error("Cancelling blocked job failed job_id=%s error=%s", job_id, exc)
+                outcome = f"Cancelling it failed, so it may still be queued: {exc}"
+        else:
+            outcome = (
+                f"The job was not cancelled; cancel it with `scancel {job_id}` or fix the cause."
+            )
+        logger.error("Stopped waiting for pending job %s waited_s=%.1f", info.describe(), waited)
+        if info.pending_category == PENDING_LIMIT:
+            why = "on a QoS or association limit"
+        else:
+            why = "for a reason it cannot outwait"
+        return JobBlockedError(
+            f"{label} {job_id} stopped waiting after {waited:g} seconds pending {why}: "
+            f"{info.reason}.{_pending_detail(info)} {outcome}",
+            job_id=job_id,
+            pending_reason=info.reason,
+        )
 
     @operation(logger, "Slurm wait_result")
     def wait_result(

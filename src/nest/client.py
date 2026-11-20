@@ -12,6 +12,8 @@ from .errors import (
     ERROR_KIND_METADATA,
     INFRASTRUCTURE_ERRORS,
     JOB_ID_METADATA,
+    PENDING_REASON_METADATA,
+    QueueTimeoutError,
     RemoteExecutionError,
     RpcTimeoutError,
 )
@@ -57,7 +59,12 @@ def _controller_error(exc: grpc.RpcError, address: str, timeout: float) -> Excep
 
     if error_class is not None:
         job_id = str(metadata.get(JOB_ID_METADATA, ""))
-        return error_class(call.details() or "", job_id=int(job_id) if job_id.isdecimal() else None)
+        message = call.details() or ""
+        parsed_id = int(job_id) if job_id.isdecimal() else None
+        if issubclass(error_class, QueueTimeoutError):
+            reason = str(metadata.get(PENDING_REASON_METADATA, "")) or None
+            return error_class(message, job_id=parsed_id, pending_reason=reason)
+        return error_class(message, job_id=parsed_id)
 
     status = call.code()
     if status == grpc.StatusCode.DEADLINE_EXCEEDED:

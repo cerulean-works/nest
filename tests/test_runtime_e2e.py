@@ -21,6 +21,7 @@ from nest.controller import MAX_STATUS_DETAILS_BYTES, _encoded_size
 from nest.errors import (
     ERROR_KIND_METADATA,
     ExecutionTimeoutError,
+    JobBlockedError,
     NestTimeoutError,
     QueueTimeoutError,
     RemoteCommandError,
@@ -557,6 +558,73 @@ def test_queue_timeout_when_job_never_starts(start_slurm_controller, hpc):
     # A timeout never cancels the job.
     assert hpc.calls("scancel") == []
     assert hpc.job_state(job["job_id"]) == "PENDING"
+
+
+def test_queue_timeout_names_the_gpu_limit_pending_reason(start_slurm_controller, hpc):
+    start_slurm_controller(NEST_RESULT_TIMEOUT="0.5", **FAST_POLLING)
+    hpc.hold_jobs("PENDING", reason="MaxGRESPerAccount")
+
+    @nest.remote(gpu=8)
+    def train():
+        return None
+
+    with pytest.raises(QueueTimeoutError) as caught:
+        train.remote()
+    error = caught.value
+    [job] = _worker_jobs(hpc)
+    # A usage limit can clear as other jobs finish, so it waits for the deadline.
+    assert not isinstance(error, JobBlockedError)
+    assert error.code() == grpc.StatusCode.DEADLINE_EXCEEDED
+    assert (error.job_id, error.pending_reason) == (job["job_id"], "MaxGRESPerAccount")
+    details = error.details()
+    assert "Last state: PENDING. Pending reason: MaxGRESPerAccount" in details
+    assert "account=test-account" in details
+    assert "partition=h200_256gpu" in details
+    assert "gres/gpu=8" in details
+    assert hpc.calls("scancel") == []
+    assert hpc.job_state(job["job_id"]) == "PENDING"
+
+
+def test_incompatible_partition_stops_waiting_early(start_slurm_controller, hpc):
+    start_slurm_controller(
+        NEST_RESULT_TIMEOUT="30", NEST_PENDING_BLOCKED_TIMEOUT="0.3", **FAST_POLLING
+    )
+    hpc.hold_jobs("PENDING", reason="PartitionConfig")
+
+    @nest.remote()
+    def noop():
+        return None
+
+    with pytest.raises(JobBlockedError) as caught:
+        noop.remote()
+    error = caught.value
+    [job] = _worker_jobs(hpc)
+    assert isinstance(error, QueueTimeoutError)
+    assert error.code() == grpc.StatusCode.FAILED_PRECONDITION
+    assert (error.job_id, error.pending_reason) == (job["job_id"], "PartitionConfig")
+    assert "does not fit partition h200_256gpu" in error.details()
+    # Without NEST_CANCEL_BLOCKED_JOBS the job is left queued.
+    assert hpc.calls("scancel") == []
+    assert hpc.job_state(job["job_id"]) == "PENDING"
+
+
+def test_blocked_job_is_cancelled_when_configured(start_slurm_controller, hpc):
+    start_slurm_controller(
+        NEST_PENDING_BLOCKED_TIMEOUT="0.1", NEST_CANCEL_BLOCKED_JOBS="true", **FAST_POLLING
+    )
+    hpc.hold_jobs("PENDING", reason="InvalidQOS")
+
+    @nest.remote()
+    def noop():
+        return None
+
+    with pytest.raises(JobBlockedError) as caught:
+        noop.remote()
+    [job] = _worker_jobs(hpc)
+    assert "requested its cancellation and will not resubmit it" in caught.value.details()
+    assert [call["job_id"] for call in hpc.calls("scancel")] == [str(job["job_id"])]
+    # Never resubmitted.
+    assert len(hpc.calls("sbatch")) == 1
 
 
 def test_execution_timeout_when_running_job_does_not_finish(start_slurm_controller, hpc):

@@ -21,7 +21,7 @@ from nest._logging import (
     get_logger,
     request_context,
 )
-from nest.backends.slurm import SlurmBackend, SlurmConfig
+from nest.backends.slurm import SlurmBackend, SlurmConfig, SlurmJobInfo
 from nest.client import execute_remote
 from nest.controller import ExecutionService
 from nest.errors import ExecutionTimeoutError, RemoteExecutionError, SlurmJobError
@@ -216,7 +216,7 @@ def test_isolated_user_interpreter_uses_bootstrap_and_request_id(tmp_path, faile
 def test_slurm_polls_log_only_state_transitions(backend, monkeypatch, caplog, wait):
     caplog.set_level(logging.INFO, logger="nest")
     states = iter(["PENDING", "PENDING", "RUNNING", "RUNNING", "COMPLETED"])
-    monkeypatch.setattr(backend, "status", lambda job_id: next(states))
+    monkeypatch.setattr(backend, "job_info", lambda job_id: SlurmJobInfo(job_id, next(states)))
     monkeypatch.setattr("nest.backends.slurm.time.sleep", lambda _: None)
     monkeypatch.setattr(
         "nest.backends.slurm.subprocess.run",
@@ -241,7 +241,7 @@ def test_slurm_failure_and_timeout_preserve_exception(
     backend, monkeypatch, caplog, state, timeout, exception
 ):
     caplog.set_level(logging.INFO, logger="nest")
-    monkeypatch.setattr(backend, "status", lambda _: state)
+    monkeypatch.setattr(backend, "job_info", lambda job_id: SlurmJobInfo(job_id, state))
     with pytest.raises(exception):
         backend.wait_result(456, "/nest/jobs/execution", timeout=timeout)
     assert "job_id=456" in caplog.text
