@@ -66,10 +66,9 @@ CREATE TABLE project_platform_accounts (
     slurm_account_id  bigint NOT NULL,
     -- The modes the account may be charged under for this Project: 'A' (the
     -- Controller's operator HPC identity) and/or 'B' (the User's own HPC identity).
+    -- A set in canonical order, so duplicates such as {A,A} are refused.
     modes             text[] NOT NULL
-                      CHECK (cardinality(modes) BETWEEN 1 AND 2
-                             AND modes <@ ARRAY['A', 'B']::text[]
-                             AND array_position(modes, NULL) IS NULL),
+                      CHECK (modes IN ('{A}'::text[], '{B}'::text[], '{A,B}'::text[])),
     -- The Project x Platform default (step 2 of the account selection).
     is_default        boolean NOT NULL DEFAULT false,
     created_at        timestamptz NOT NULL DEFAULT now(),

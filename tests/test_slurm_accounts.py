@@ -360,10 +360,11 @@ class SchemaTests(_AccountBase):
         )
         with self.assertRaises(psycopg.errors.CheckViolation):
             self.conn.execute(insert, (self.lab, self.nano4.id, ops.id, "{A,B}", False))
-        for modes in ("{}", "{C}", "{A,A,B}"):
-            with self.subTest(modes=modes), self.assertRaises(psycopg.errors.CheckViolation):
-                self.conn.execute(insert, (self.lab, self.nano4.id, ops.id, modes, False))
         chem = self.ids("chem")["nano4"]
+        # Modes are a canonical set: no duplicates, no NULL, no other mode.
+        for modes in ("{}", "{C}", "{A,A}", "{B,B}", "{B,A}", "{A,A,B}", "{A,NULL}"):
+            with self.subTest(modes=modes), self.assertRaises(psycopg.errors.CheckViolation):
+                self.conn.execute(insert, (self.lab, self.nano4.id, chem, modes, False))
         self.conn.execute(insert, (self.lab, self.nano4.id, chem, "{A}", True))
         with self.assertRaises(psycopg.errors.UniqueViolation):
             self.conn.execute(insert, (self.lab, self.nano4.id, ops.id, "{A}", True))
