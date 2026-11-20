@@ -24,6 +24,7 @@ from datetime import UTC, datetime, timedelta
 
 import cloudpickle
 import grpc
+import psycopg
 from postgres_fixture import PostgresTestCase, connect
 
 from nest import _logging
@@ -46,7 +47,11 @@ from nest.config import (
 from nest.controller import ExecutionService, build_access, record_start
 from nest.db import Database, IdentityStore, JobStore, SessionStore, hash_token, upgrade
 from nest.db.cli import main as nest_db
-from nest.errors import AuthenticationRequiredError, RemoteAccessDeniedError
+from nest.errors import (
+    AuthenticationRequiredError,
+    DatabaseUnavailableError,
+    RemoteAccessDeniedError,
+)
 from nest.login import CredentialStore, NestSession
 from nest.proto import execution_pb2, execution_pb2_grpc
 
@@ -502,6 +507,34 @@ class ExecutionAccessTests(_DatabaseCase):
         [event] = [e for e in self.events("run.submit") if e.outcome == "succeeded"]
         self.assertEqual((event.actor_user_id, event.project_id), (self.member, self.project))
 
+    def test_submission_is_refused_when_its_record_cannot_be_sealed(self):
+        token, _ = self.token(self.member)
+        ran = os.path.join(tempfile.mkdtemp(), "ran")
+
+        def touch():
+            open(ran, "w").close()
+
+        failure = psycopg.OperationalError("sealing failed")
+        with unittest.mock.patch.object(AuditLog, "_seal_or_raise", side_effect=failure):
+            payload = cloudpickle.dumps((touch, (), {}))
+            with self.assertRaises(grpc.RpcError) as caught:
+                self.stub.Execute(
+                    execution_pb2.ExecuteRequest(payload=payload),
+                    timeout=10,
+                    metadata=[
+                        ("authorization", f"Bearer {token}"),
+                        ("x-nest-project-id", str(self.project)),
+                    ],
+                )
+        self.assertEqual(caught.exception.code(), grpc.StatusCode.UNAVAILABLE)  # ty: ignore[missing-attribute]
+        self.assertFalse(os.path.exists(ran))
+        # The unsealed record is kept, and sealed by the next seal.
+        [event] = self.events("run.submit")
+        self.assertIsNone(event.chain_seq)
+        self.assertGreaterEqual(self.audit.seal(), 1)
+        status = self.audit.verify()
+        self.assertEqual((status.intact, status.unsealed), (True, 0))
+
     def test_build_access_follows_the_configuration(self):
         settings = {"NEST_DATABASE_URL": self.url}
         self.assertIsInstance(
@@ -698,6 +731,26 @@ class AuditChainTests(_DatabaseCase):
         ):
             status = nest_db(list(argv))
         return status, out.getvalue(), err.getvalue()
+
+    def test_required_records_are_sealed_or_refused(self):
+        row = self.audit.record("run.submit", "succeeded", required=True)
+        self.assertIsNotNone(self.audit.events(limit=1)[0].chain_seq)
+        self.assertEqual(self.audit.events(limit=1)[0].id, row)
+        failure = psycopg.OperationalError("sealing failed")
+        with unittest.mock.patch.object(AuditLog, "_seal_or_raise", side_effect=failure):
+            # Not required: logged and left for the next seal.
+            self.assertIsNotNone(self.audit.record("run.read", "denied"))
+            with self.assertRaises(DatabaseUnavailableError):
+                self.audit.record("run.cancel", "succeeded", required=True)
+        # Sealing that succeeds without sealing the row (it was not committed in
+        # time, say) is refused too.
+        with (
+            unittest.mock.patch.object(AuditLog, "_seal_or_raise", return_value=0),
+            self.assertRaises(DatabaseUnavailableError),
+        ):
+            self.audit.record("run.cancel", "succeeded", required=True)
+        self.assertEqual(self.audit.seal(), 3)
+        self.assertTrue(self.audit.verify().intact)
 
     def test_records_are_append_only(self):
         self.fill(1)

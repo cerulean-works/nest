@@ -237,16 +237,17 @@ class AuditLog:
             details (`Mapping`, *optional*): Passed through [`audit.redact_details`].
             interface (`str`, *optional*): Defaults to the one set by
                 [`audit.audit_interface`], or `controller`.
-            required (`bool`): Raise when the row cannot be written, so a
-                sensitive action is refused rather than done without its record.
-                Otherwise a failed write is logged as an error.
+            required (`bool`): Raise unless the row is written and sealed into
+                the hash chain, so a sensitive action is refused rather than done
+                without a tamper-evident record. Otherwise a failed write or seal
+                is logged as an error, and the row is sealed by a later seal.
 
         Returns:
             `int | None`: The row ID, or `None` without a database or on failure.
 
         Raises:
             [`errors.DatabaseUnavailableError`]: If `required` and the row cannot
-                be written.
+                be written or sealed.
         """
         if not _EVENT.fullmatch(event):
             raise ValueError(f"Invalid audit event name {event!r}")
@@ -301,22 +302,55 @@ class AuditLog:
                     "Nothing was submitted; retry later."
                 ) from None
             return None
-        self.seal()
-        return found[0] if found else None
+        row_id = found[0] if found else None
+        if not required:
+            self.seal()
+            return row_id
+        # A protected action may proceed only once its record is sealed: an unsealed
+        # row could still be changed or removed without breaking the chain.
+        try:
+            self._seal_or_raise()
+            with self.database.connection() as conn:
+                sealed = conn.execute(
+                    "SELECT chain_seq IS NOT NULL FROM security_audit_events WHERE id = %s",
+                    (row_id,),
+                ).fetchone()
+        except (psycopg.Error, DatabaseError) as exc:
+            logger.error(
+                "Audit record could not be sealed event=%s: %s",
+                event,
+                self.database.scrub(str(exc)),
+            )
+            sealed = None
+        if not (sealed and sealed[0]):
+            raise DatabaseUnavailableError(
+                "The Controller database could not seal the audit record, so the request "
+                "was not run. Nothing was submitted; retry later."
+            )
+        return row_id
 
     def seal(self) -> int:
         """
         Seals every committed, unsealed row onto the hash chain, in its own
-        transaction. Returns how many rows it sealed; `0` when it cannot.
+        transaction. Returns how many rows it sealed; `0` when it cannot, after
+        logging why. Rows it could not seal are sealed by the next seal.
         """
         if self.database is None:
             return 0
         try:
-            with self.database.connection() as conn:
-                found = conn.execute("SELECT nest_seal_security_audit()").fetchone()
+            return self._seal_or_raise()
         except (psycopg.Error, DatabaseError) as exc:
             logger.error("Audit log could not be sealed: %s", self.database.scrub(str(exc)))
             return 0
+
+    def _seal_or_raise(self) -> int:
+        """
+        Like [`audit.AuditLog.seal`], but raises on failure. Sealing takes the
+        chain's advisory lock first, so when it returns, every row committed
+        before it was called is sealed, by it or by a concurrent sealer.
+        """
+        with self._require_database().connection() as conn:
+            found = conn.execute("SELECT nest_seal_security_audit()").fetchone()
         return int(found[0]) if found else 0
 
     def _require_database(self) -> Database:

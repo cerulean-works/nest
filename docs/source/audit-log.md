@@ -11,8 +11,8 @@ platform role history in `platform_audit_events` (see
 
 | Event | Written by | When |
 | --- | --- | --- |
-| `run.submit` | Controller | Every `Execute` and `SubmitJob` call by an authenticated caller, allowed or refused. An allowed one is recorded before anything runs, and refused if its record cannot be written. |
-| `run.cancel` | Controller | Every `CancelJob` call, allowed or refused; recorded before Slurm is asked. |
+| `run.submit` | Controller | Every `Execute` and `SubmitJob` call by an authenticated caller, allowed or refused. An allowed one is recorded and sealed into the hash chain before anything runs, and refused if its record cannot be written or sealed. |
+| `run.cancel` | Controller | Every `CancelJob` call, allowed or refused; an allowed one is recorded and sealed before Slurm is asked. |
 | `run.read` | Controller | A refused `GetJobStatus` call. Allowed reads are not recorded. |
 | `project.*`, `member.*` | Controller | A refused Projects API action, such as `project.update` or `member.invite`. Allowed changes are in `project_audit_events`. |
 | `controller.started` | Controller | Each start: which protections are on (`auth`, `tls`, `allow_plaintext`, the number of approved Projects), the executor, the default Provider, and whether an inline SSH key is used. Never a value. |
