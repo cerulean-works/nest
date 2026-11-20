@@ -21,6 +21,7 @@ Owner.
 | See the Project, its members, Runs and ordinary artifacts | yes | yes | yes | yes |
 | Change settings (the name), read the audit history | yes | yes | no | no |
 | Invite or add an `admin`, `member` or `viewer` | yes | yes | no | no |
+| List, resend and revoke invitations and Invite Links | yes | yes | no | no |
 | Change a non-Owner member's role among those three | yes | yes | no | no |
 | Remove a non-Owner member | yes | yes | no | no |
 | Leave the Project | no, transfer first | yes | yes | yes |
@@ -130,8 +131,9 @@ Errors are JSON `{"error": ...}`:
 | `409` | `already_member`, `owner_rule` | The User is already a member, or the change would break the one-Owner rule |
 | `400` | `invalid_request` | A malformed body or value |
 
-Email invitations, Invite Links and onboarding are separate; they check
-[`authz.ProjectService.authorize_invitation`] before creating an invitation.
+Email invitations and Invite Links have their own routes under
+`/api/projects/<id>/invitations` and `/api/projects/<id>/invite-links`; see
+[Invite people to a Project](invitations).
 
 The gRPC execution service does not yet authenticate callers (see
 [Security](security)), so it does not apply Project permissions. When it does, it

@@ -35,6 +35,8 @@ guide:
         title: Sign in from the command line
       - local: projects
         title: Share Projects and manage roles
+      - local: invitations
+        title: Invite people to a Project
       - local: platform-admin
         title: Bootstrap and recover platform administration
       - local: audit-log

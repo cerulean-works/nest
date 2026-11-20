@@ -153,6 +153,12 @@ AUTH_CLI_PREFIX = "/auth/cli/"
 PROJECTS_API_PATH = "/api/projects"
 """Root of the Projects API served by the auth listener."""
 
+INVITATIONS_API_PATH = "/api/invitations"
+"""Root of the signed-in User's own invitations API served by the auth listener."""
+
+INVITATION_PAGE_PATH = "/invitations/accept"
+"""Browser page where a signed-in User reviews and accepts an invitation link."""
+
 CLI_SCOPES: dict[str, str] = {
     "jobs:run": "Run and manage jobs in your Projects",
     "projects:read": "See your Projects and their members",
@@ -1331,6 +1337,14 @@ def _google_redirect_url(reader: _Reader) -> str | None:
     if parts.path == PROJECTS_API_PATH or parts.path.startswith(PROJECTS_API_PATH + "/"):
         reader.fail(
             f"NEST_GOOGLE_REDIRECT_URL must not use {parts.path}, a Projects API route; "
+            f"use a callback path such as {_REDIRECT_EXAMPLE!r}"
+        )
+        return None
+    if parts.path in (INVITATIONS_API_PATH, INVITATION_PAGE_PATH) or parts.path.startswith(
+        INVITATIONS_API_PATH + "/"
+    ):
+        reader.fail(
+            f"NEST_GOOGLE_REDIRECT_URL must not use {parts.path}, an invitation route; "
             f"use a callback path such as {_REDIRECT_EXAMPLE!r}"
         )
         return None

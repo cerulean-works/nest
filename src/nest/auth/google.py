@@ -29,9 +29,11 @@ import jwt
 from .._logging import get_logger, register_secret
 from ..config import GoogleAuthConfig, SessionPolicy
 from ..db import (
+    Acceptance,
     Database,
     Identity,
     IdentityStore,
+    InvitationStore,
     LoginFlowStore,
     PlatformAdminBootstrap,
     Session,
@@ -175,6 +177,8 @@ class SignInResult:
         access_token (`str`): The short-lived access token for the browser's session
             cookie. Only its hash is stored. Never log it.
         access_expires_at (`datetime`): When the access token stops being accepted.
+        joined (`tuple[db.Acceptance, ...]`): Email invitations redeemed by this
+            first sign-in; empty for a returning User.
     """
 
     user: User
@@ -184,6 +188,7 @@ class SignInResult:
     refresh_token: str
     access_token: str
     access_expires_at: datetime
+    joined: tuple[Acceptance, ...] = ()
 
 
 def _b64url(data: bytes) -> str:
@@ -347,6 +352,7 @@ class GoogleSignIn:
         self.session_store = SessionStore(database)
         self.database = database
         self.bootstrap = PlatformAdminBootstrap(database, bootstrap_admin_email)
+        self.invitations = InvitationStore(database)
         self.verifier = IDTokenVerifier(config.client_id, endpoints, timeout=timeout)
         if config.client_secret is not None:
             register_secret(config.client_secret.reveal())
@@ -459,15 +465,24 @@ class GoogleSignIn:
                 )
                 # Committed with the sign-in, or not at all.
                 self.bootstrap.claim(linked, conn=conn)
+                # A first verified sign-in redeems the email invitations addressed
+                # to it, in the same transaction, so the new User sees those
+                # Projects at once. Returning Users accept or decline explicitly.
+                joined = (
+                    tuple(self.invitations.redeem_for_new_user(user.id, conn=conn))
+                    if created
+                    else ()
+                )
         except UserNotActiveError:
             logger.warning("Sign-in refused for a disabled User")
             raise SignInError("user_disabled") from None
         logger.info(
-            "Signed in user_id=%s provider=%s created=%s session_id=%s",
+            "Signed in user_id=%s provider=%s created=%s session_id=%s invitations_redeemed=%s",
             user.id,
             self.provider,
             created,
             session.id,
+            len(joined),
         )
         return SignInResult(
             user=user,
@@ -477,6 +492,7 @@ class GoogleSignIn:
             refresh_token=refresh_token,
             access_token=access_token,
             access_expires_at=access_expires_at,
+            joined=joined,
         )
 
     def _exchange(self, code: str, verifier: str) -> str:

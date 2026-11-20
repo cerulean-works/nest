@@ -50,6 +50,26 @@ except AccessDeniedError as exc:
 
 [[autodoc]] authz.AccessDeniedError
 
+## Invitations
+
+See [Invite people to a Project](../invitations).
+
+```python
+from nest.authz import InvitationService
+
+invitations = InvitationService(database, projects, email_service)
+issued = invitations.invite(principal, project_id, "ada@example.org", "member")
+share(issued.link)  # returned once; only its hash is stored
+invitations.pending(invitee)  # the invitee's own pending invitations
+invitations.accept(invitee, issued.invitation.id)
+```
+
+[[autodoc]] authz.InvitationService
+
+[[autodoc]] authz.IssuedInvitation
+
+[[autodoc]] authz.IssuedInviteLink
+
 ## Provider authority
 
 [[autodoc]] authz.ProviderAuthority

@@ -17,7 +17,11 @@ It serves these routes and nothing else:
   and `/auth/cli/logout` and `GET /auth/cli/session`, and the browser's approval
   page `GET`/`POST /auth/cli/approve`.
 - `/api/projects` and below serve the Projects API (see *Share Projects and manage
-  roles*). Every request is authorized by [`authz.ProjectService`].
+  roles*). Every request is authorized by [`authz.ProjectService`], and its
+  invitation routes by [`authz.InvitationService`].
+- `/api/invitations` and below serve the signed-in User's own invitations, and
+  `GET`/`POST /invitations/accept` is the browser page that reviews and accepts an
+  invitation link (see *Invite people to a Project*).
 
 The listener speaks plain HTTP. Put it behind a TLS-terminating reverse proxy that
 serves `NEST_GOOGLE_REDIRECT_URL` and forwards paths unchanged.
@@ -25,6 +29,8 @@ serves `NEST_GOOGLE_REDIRECT_URL` and forwards paths unchanged.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import hmac
 import html
 import json
@@ -35,29 +41,40 @@ from datetime import UTC, datetime
 from http import HTTPStatus
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from urllib.parse import parse_qs, quote, urlsplit
 from uuid import UUID
 
 from .._logging import get_logger
 from ..audit import audit_interface
-from ..authz import AccessDeniedError, Principal, ProjectService
+from ..authz import AccessDeniedError, InvitationService, Principal, ProjectService
 from ..config import (
     AUTH_CLI_PREFIX,
     AUTH_SESSION_PATHS,
     CLI_SCOPES,
+    INVITATION_PAGE_PATH,
+    INVITATIONS_API_PATH,
     PROJECTS_API_PATH,
     GoogleAuthConfig,
 )
 from ..db import (
+    Acceptance,
     AccessGrant,
+    AlreadyInvitedError,
     Database,
     DatabaseError,
     DecidingSessionNotActiveError,
     DuplicateMemberError,
+    EmailInvitation,
+    EmailMismatchError,
+    InvitationNotFoundError,
+    InvitationPreview,
+    InvitationUnavailableError,
+    InviteLink,
     MemberNotFoundError,
     Membership,
     OwnerRuleError,
+    PendingInvitation,
     Project,
     ProjectAuditEvent,
     ProjectNotFoundError,
@@ -76,6 +93,9 @@ from .cli import (
     normalize_user_code,
 )
 from .google import SIGN_IN_TTL, GoogleSignIn, SignInError
+
+if TYPE_CHECKING:
+    from ..mail import EmailService
 
 logger = get_logger("nest.auth.web")
 
@@ -128,6 +148,10 @@ CLI_RETURN_COOKIE = "nest_cli_approval"
 """Cookie holding the user code of a CLI approval that sent the browser to sign in
 first, so the callback returns to that approval."""
 
+INVITATION_RETURN_COOKIE = "nest_invitation_return"
+"""Cookie set when the invitation page sent the browser to sign in first, so the
+callback returns to that page."""
+
 MAX_BODY_BYTES = 4096
 """Largest request body accepted."""
 
@@ -176,6 +200,44 @@ _CODE_PAGE = (
     'autocapitalize="characters" maxlength="16" required></label> '
     '<button type="submit">Continue</button></form></body></html>'
 )
+
+
+# The invitation page's only script. The token travels in the URL fragment, which
+# browsers never send to a server; this moves it into the form (and, across a
+# sign-in, into sessionStorage), and drops it from the address bar.
+_INVITATION_SCRIPT = (
+    "(function(){var k='nest_invitation',v=null,"
+    "m=/(?:^|&)token=([^&]*)/.exec(location.hash.slice(1));"
+    "if(m){try{v=decodeURIComponent(m[1]);}catch(e){v=null;}"
+    "history.replaceState(null,'',location.pathname);}"
+    "try{if(v){sessionStorage.setItem(k,v);}else{v=sessionStorage.getItem(k);}"
+    "if(document.documentElement.hasAttribute('data-done')){sessionStorage.removeItem(k);}"
+    "}catch(e){}"
+    "var t=document.getElementById('token');if(t&&v&&!t.value){t.value=v;}})();"
+)
+
+_INVITATION_CSP = (
+    "default-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'sha256-"
+    + base64.b64encode(hashlib.sha256(_INVITATION_SCRIPT.encode()).digest()).decode()
+    + "'"
+)
+
+_INVITATION_PAGE = (
+    '<!doctype html><html lang="en"{done}><head><meta charset="utf-8">'
+    '<meta name="viewport" content="width=device-width, initial-scale=1">'
+    "<title>{title}</title></head><body><h1>{title}</h1>{content}"
+    "<script>"
+    + _INVITATION_SCRIPT.replace("{", "{{").replace("}", "}}")
+    + "</script></body></html>"
+)
+
+
+def _invitation_csrf(access_token: str, token: str) -> str:
+    """The invitation form's CSRF token: bound to the browser's access token and the
+    invitation token, so it is useless to another browser or for another invitation."""
+    return hmac.new(
+        access_token.encode(), b"nest invitation " + hash_token(token), "sha256"
+    ).hexdigest()
 
 
 def _approval_csrf(access_token: str, request_id: object) -> str:
@@ -287,6 +349,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._dispatch(self._cli_approve_page)
         elif path == CLI_SESSION_PATH:
             self._dispatch(self._cli_describe)
+        elif path == INVITATION_PAGE_PATH:
+            self._dispatch(self._invitation_page)
         elif _is_api(path):
             self._dispatch(lambda: self._api("GET", path))
         else:
@@ -304,6 +368,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._dispatch(lambda: self._cli_api(path))
         elif path == CLI_APPROVE_PATH:
             self._dispatch(lambda: self._same_origin(require_origin=True) and self._cli_decide())
+        elif path == INVITATION_PAGE_PATH:
+            self._dispatch(
+                lambda: self._same_origin(require_origin=True) and self._invitation_decide()
+            )
         elif _is_api(path):
             self._dispatch(lambda: self._api("POST", path))
         else:
@@ -313,7 +381,7 @@ class _Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path in (REFRESH_PATH, LOGOUT_PATH) or path in CLI_API_PATHS:
             allow = "POST"
-        elif path == CLI_APPROVE_PATH or _is_api(path):
+        elif path in (CLI_APPROVE_PATH, INVITATION_PAGE_PATH) or _is_api(path):
             allow = "GET, POST"
         else:
             allow = "GET"
@@ -347,6 +415,16 @@ class _Handler(BaseHTTPRequestHandler):
                 _cookie(
                     CLI_RETURN_COOKIE,
                     cli_code,
+                    path=self.app.callback_path,
+                    max_age=int(SIGN_IN_TTL),
+                    secure=self.app.secure,
+                )
+            )
+        elif self._query_value("next") == "invitation":
+            self._set_cookies.append(
+                _cookie(
+                    INVITATION_RETURN_COOKIE,
+                    "1",
                     path=self.app.callback_path,
                     max_age=int(SIGN_IN_TTL),
                     secure=self.app.secure,
@@ -387,6 +465,17 @@ class _Handler(BaseHTTPRequestHandler):
                     secure=self.app.secure,
                 )
             )
+        to_invitation = self._read_cookie(INVITATION_RETURN_COOKIE) == "1"
+        if to_invitation:
+            self._set_cookies.append(
+                _cookie(
+                    INVITATION_RETURN_COOKIE,
+                    "",
+                    path=self.app.callback_path,
+                    max_age=0,
+                    secure=self.app.secure,
+                )
+            )
         try:
             result = self.app.sign_in.finish(
                 state=one("state"),
@@ -409,11 +498,15 @@ class _Handler(BaseHTTPRequestHandler):
             location = f"{CLI_APPROVE_PATH}?code={quote(format_user_code(cli_code))}"
             self._send(HTTPStatus.SEE_OTHER, headers={"Location": location})
             return
-        self._page(
-            HTTPStatus.OK,
-            "Signed in",
-            f"You are signed in to Nest as {result.identity.email}. You can close this page.",
-        )
+        if to_invitation:
+            self._send(HTTPStatus.SEE_OTHER, headers={"Location": INVITATION_PAGE_PATH})
+            return
+        joined = getattr(result, "joined", ())
+        message = f"You are signed in to Nest as {result.identity.email}."
+        if joined:
+            count = len(joined)
+            message += f" Your invitations added you to {count} Project{'s' * (count != 1)}."
+        self._page(HTTPStatus.OK, "Signed in", message + " You can close this page.")
 
     # Browser sessions --------------------------------------------------------
 
@@ -683,6 +776,152 @@ class _Handler(BaseHTTPRequestHandler):
             return {}
         return {name: values[0] for name, values in fields.items() if len(values) == 1}
 
+    # Invitations: the browser's review and accept page ----------------------
+
+    def _invitation_send(self, status: int, title: str, content: str, *, done: bool = False):
+        self._send(
+            status,
+            _INVITATION_PAGE.format(
+                title=html.escape(title), content=content, done=" data-done" if done else ""
+            ),
+            # A form POST from a `no-referrer` page carries `Origin: null`, which
+            # the same-origin check refuses. `same-origin` keeps referrers off
+            # every other site; the token is only ever in the fragment, which
+            # browsers never put in a referrer.
+            headers={"Content-Security-Policy": _INVITATION_CSP, "Referrer-Policy": "same-origin"},
+        )
+
+    def _invitation_message(self, status: int, title: str, message: str, *, done: bool = False):
+        self._invitation_send(status, title, f"<p>{html.escape(message)}</p>", done=done)
+
+    def _invitation_page(self):
+        """
+        The page an invitation link opens. It only shows a form: opening a link
+        never joins a Project. Without a session it offers sign-in and keeps the
+        token in this tab's sessionStorage for the way back.
+        """
+        if self._browser_grant() is None:
+            login = html.escape(LOGIN_PATH + "?next=invitation")
+            self._invitation_send(
+                HTTPStatus.OK,
+                "Nest invitation",
+                "<p>Sign in to Nest to see this invitation. Use the Google account of "
+                "the address the invitation was sent to.</p>"
+                f'<p><a href="{login}">Sign in with Google</a></p>',
+            )
+            return
+        self._invitation_send(
+            HTTPStatus.OK,
+            "Nest invitation",
+            f'<form method="post" action="{INVITATION_PAGE_PATH}">'
+            '<p><label>Invitation code: <input id="token" name="token" autocomplete="off" '
+            'maxlength="200" required></label></p>'
+            '<input type="hidden" name="step" value="review">'
+            '<button type="submit">Review the invitation</button></form>',
+        )
+
+    def _invitation_decide(self):
+        form = self._read_form()
+        grant = self._browser_grant()
+        if grant is None:
+            self._invitation_message(
+                HTTPStatus.UNAUTHORIZED,
+                "Not signed in",
+                "Sign in to Nest, then open the invitation link again.",
+            )
+            return
+        principal = Principal.from_session(grant.session)
+        access = self._read_cookie(self.app.session_cookie) or ""
+        token = (form.get("token") or "").strip()
+        step = form.get("step")
+        if not token or len(token) > 200 or step not in ("review", "accept", "decline"):
+            self._invitation_message(
+                HTTPStatus.BAD_REQUEST, "Invitation not found", "Check the invitation link."
+            )
+            return
+        service = self.app.invitations
+        try:
+            if step == "review":
+                self._invitation_review(service.preview(principal, token), token, access)
+                return
+            csrf = form.get("csrf") or ""
+            if not hmac.compare_digest(csrf.encode(), _invitation_csrf(access, token).encode()):
+                logger.warning("Invitation decision refused reason=csrf")
+                self._invitation_message(
+                    HTTPStatus.FORBIDDEN,
+                    "Not accepted",
+                    "This decision did not come from Nest's page. Open the invitation again.",
+                )
+                return
+            outcome = service.redeem(principal, token, accept=step == "accept")
+        except InvitationNotFoundError:
+            self._invitation_message(
+                HTTPStatus.NOT_FOUND,
+                "Invitation not found",
+                "This invitation link is unknown or was replaced by a newer one.",
+            )
+            return
+        except EmailMismatchError:
+            self._invitation_message(
+                HTTPStatus.FORBIDDEN,
+                "Wrong account",
+                "This invitation is for another email address. Sign in with the Google "
+                "account of the address it was sent to.",
+            )
+            return
+        except InvitationUnavailableError as exc:
+            self._invitation_message(
+                HTTPStatus.GONE,
+                "Invitation not available",
+                _UNAVAILABLE.get(exc.reason, "This invitation can no longer be used."),
+            )
+            return
+        except DuplicateMemberError:
+            self._invitation_message(
+                HTTPStatus.CONFLICT, "Already a member", "You are already in this Project."
+            )
+            return
+        if isinstance(outcome, Acceptance):
+            role = outcome.role.capitalize()
+            message = (
+                f"You were already in this Project; your role is still {role}."
+                if outcome.already_member
+                else f"You joined the Project as {role}."
+            )
+            self._invitation_message(HTTPStatus.OK, "Invitation accepted", message, done=True)
+        else:
+            self._invitation_message(
+                HTTPStatus.OK, "Invitation declined", "You did not join the Project.", done=True
+            )
+
+    def _invitation_review(self, preview: InvitationPreview, token: str, access: str):
+        if preview.status not in ("pending", "active"):
+            self._invitation_message(
+                HTTPStatus.GONE,
+                "Invitation not available",
+                _UNAVAILABLE.get(preview.status, "This invitation can no longer be used."),
+            )
+            return
+        decline = (
+            ' <button type="submit" name="step" value="decline">Decline</button>'
+            if preview.kind == "email"
+            else ""
+        )
+        self._invitation_send(
+            HTTPStatus.OK,
+            "Join a Nest Project",
+            f"<p>You are invited to join <strong>{html.escape(preview.project_name)}</strong> "
+            f"as <strong>{html.escape(preview.role.capitalize())}</strong>.</p>"
+            f"<p>The invitation expires {html.escape(preview.expires_at.isoformat())}.</p>"
+            "<p>Joining gives you this Project role only. It grants no HPC, Slurm or "
+            "Provider account.</p>"
+            f'<form method="post" action="{INVITATION_PAGE_PATH}">'
+            f'<input type="hidden" name="token" value="{html.escape(token)}">'
+            f'<input type="hidden" name="csrf" value="{_invitation_csrf(access, token)}">'
+            '<button type="submit" name="step" value="accept">Accept</button>'
+            f"{decline}</form>",
+        )
+
     # CLI sign-in: the CLI's JSON routes ---------------------------------------
 
     def _cli_api(self, path: str):
@@ -893,6 +1132,17 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.NOT_FOUND, {"error": "user_not_found"})
         except DuplicateMemberError:
             self._json(HTTPStatus.CONFLICT, {"error": "already_member"})
+        except AlreadyInvitedError as exc:
+            self._json(
+                HTTPStatus.CONFLICT,
+                {"error": "already_invited", "invitation_id": exc.invitation_id},
+            )
+        except InvitationNotFoundError:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "invitation_not_found"})
+        except EmailMismatchError:
+            self._json(HTTPStatus.FORBIDDEN, {"error": "email_mismatch"})
+        except InvitationUnavailableError as exc:
+            self._json(HTTPStatus.GONE, {"error": "invitation_unavailable", "reason": exc.reason})
         except OwnerRuleError:
             self._json(HTTPStatus.CONFLICT, {"error": "owner_rule"})
         except ValueError, TypeError:
@@ -900,9 +1150,15 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _api_call(self, method: str, path: str, who: Principal, body: dict):
         """Runs one Projects API route. Authorization happens in the service."""
+        if path == INVITATIONS_API_PATH or path.startswith(INVITATIONS_API_PATH + "/"):
+            self._own_invitations_api(method, path, who, body)
+            return
         service = self.app.projects
         rest = path[len(PROJECTS_API_PATH) :].strip("/")
         parts = rest.split("/") if rest else []
+        if len(parts) >= 2 and parts[1] in ("invitations", "invite-links"):
+            self._project_invitations_api(method, parts, who, body)
+            return
         ids = [_parse_uuid(part) for part in parts[0:1] + parts[2:3]]
         pid, uid = (ids + [None, None])[:2]
         if None in ids:
@@ -966,6 +1222,111 @@ class _Handler(BaseHTTPRequestHandler):
                 service.remove_member(who, pid, uid)
                 self._json(HTTPStatus.OK, {"removed": True})
 
+    def _route(self, method: str, allowed: tuple[str, ...] | None) -> bool:
+        """Whether a route exists and takes `method`, answering when not."""
+        if allowed is None:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return False
+        if method not in allowed:
+            self._not_allowed(", ".join(allowed))
+            return False
+        return True
+
+    def _project_invitations_api(self, method: str, parts: list[str], who: Principal, body: dict):
+        """`/api/projects/<id>/invitations` and `/invite-links`, for Owners and Admins."""
+        pid = _parse_uuid(parts[0])
+        item = _parse_int_id(parts[2]) if len(parts) > 2 else None
+        if pid is None or (len(parts) > 2 and item is None):
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        shape = tuple("{n}" if i == 2 else part for i, part in enumerate(parts[1:], 1))
+        if not self._route(method, _INVITATION_ROUTES.get(shape)):
+            return
+        service = self.app.invitations
+        include_closed = self._query_value("include_closed") == "true"
+        if shape == ("invitations",) and method == "GET":
+            found = service.invitations(who, pid, include_closed=include_closed)
+            self._json(HTTPStatus.OK, {"invitations": [_invitation_json(i) for i in found]})
+        elif shape == ("invitations",):
+            issued = service.invite(
+                who,
+                pid,
+                _string(body, "email"),
+                _string(body, "role"),
+                ttl_seconds=_optional_number(body, "ttl_seconds"),
+                send_email=_optional_bool(body, "send_email", True),
+            )
+            self._json(
+                HTTPStatus.CREATED, _issued_json(issued.invitation, issued.link, issued.emailed)
+            )
+        elif shape == ("invitations", "{n}", "resend"):
+            assert item is not None
+            issued = service.resend(
+                who, pid, item, send_email=_optional_bool(body, "send_email", True)
+            )
+            self._json(HTTPStatus.OK, _issued_json(issued.invitation, issued.link, issued.emailed))
+        elif shape == ("invitations", "{n}", "revoke"):
+            assert item is not None
+            self._json(
+                HTTPStatus.OK, {"invitation": _invitation_json(service.revoke(who, pid, item))}
+            )
+        elif shape == ("invite-links",) and method == "GET":
+            links = service.links(who, pid, include_closed=include_closed)
+            self._json(HTTPStatus.OK, {"invite_links": [_link_json(link) for link in links]})
+        elif shape == ("invite-links",):
+            max_uses = body.get("max_uses", 1)
+            if not isinstance(max_uses, int) or isinstance(max_uses, bool):
+                raise TypeError("max_uses must be an integer")
+            created = service.create_link(
+                who,
+                pid,
+                _string(body, "role"),
+                max_uses=max_uses,
+                ttl_seconds=_optional_number(body, "ttl_seconds"),
+            )
+            self._json(
+                HTTPStatus.CREATED,
+                {"invite_link": _link_json(created.invite_link), "link": created.link},
+            )
+        else:
+            assert item is not None
+            revoked = service.revoke_link(who, pid, item)
+            self._json(HTTPStatus.OK, {"invite_link": _link_json(revoked)})
+
+    def _own_invitations_api(self, method: str, path: str, who: Principal, body: dict):
+        """`/api/invitations`: the caller's own pending invitations and redemption."""
+        rest = path[len(INVITATIONS_API_PATH) :].strip("/")
+        parts = rest.split("/") if rest else []
+        item = _parse_int_id(parts[0]) if len(parts) == 2 else None
+        if len(parts) == 2 and item is None:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        shape = tuple("{n}" if i == 0 and len(parts) == 2 else p for i, p in enumerate(parts))
+        if not self._route(method, _OWN_INVITATION_ROUTES.get(shape)):
+            return
+        service = self.app.invitations
+        if not parts:
+            pending = [_pending_json(p) for p in service.pending(who)]
+            self._json(HTTPStatus.OK, {"invitations": pending})
+        elif shape == ("preview",):
+            self._json(HTTPStatus.OK, _preview_json(service.preview(who, _string(body, "token"))))
+        elif shape == ("redeem",):
+            decision = body.get("decision", "accept")
+            if decision not in ("accept", "decline"):
+                raise ValueError("decision must be accept or decline")
+            outcome = service.redeem(who, _string(body, "token"), accept=decision == "accept")
+            if isinstance(outcome, Acceptance):
+                self._json(HTTPStatus.OK, _acceptance_json(outcome))
+            else:
+                self._json(HTTPStatus.OK, {"invitation_id": outcome.id, "status": outcome.status})
+        elif shape == ("{n}", "accept"):
+            assert item is not None
+            self._json(HTTPStatus.OK, _acceptance_json(service.accept(who, item)))
+        else:
+            assert item is not None
+            declined = service.decline(who, item)
+            self._json(HTTPStatus.OK, {"invitation_id": declined.id, "status": declined.status})
+
     def _read_cookie(self, name: str) -> str | None:
         raw = self.headers.get_all("Cookie") or []
         jar: SimpleCookie = SimpleCookie()
@@ -992,8 +1353,63 @@ _API_ROUTES: dict[tuple[str, ...], tuple[str, ...]] = {
 """Projects API routes under `PROJECTS_API_PATH` and their methods."""
 
 
+_INVITATION_ROUTES: dict[tuple[str, ...], tuple[str, ...]] = {
+    ("invitations",): ("GET", "POST"),
+    ("invitations", "{n}", "resend"): ("POST",),
+    ("invitations", "{n}", "revoke"): ("POST",),
+    ("invite-links",): ("GET", "POST"),
+    ("invite-links", "{n}", "revoke"): ("POST",),
+}
+"""Invitation routes under `PROJECTS_API_PATH/<id>/` and their methods."""
+
+_OWN_INVITATION_ROUTES: dict[tuple[str, ...], tuple[str, ...]] = {
+    (): ("GET",),
+    ("preview",): ("POST",),
+    ("redeem",): ("POST",),
+    ("{n}", "accept"): ("POST",),
+    ("{n}", "decline"): ("POST",),
+}
+"""Routes under `INVITATIONS_API_PATH` and their methods."""
+
+_UNAVAILABLE = {
+    "expired": "This invitation has expired. Ask a Project administrator for a new one.",
+    "revoked": "This invitation was revoked.",
+    "accepted": "This invitation was already accepted.",
+    "declined": "This invitation was declined.",
+    "exhausted": "This invite link has been used as many times as it allows.",
+    "already_redeemed": "You have already used this invite link.",
+    "issuer_not_authorized": "The person who invited you can no longer invite members.",
+    "project_deleted": "This Project no longer exists.",
+    "user_disabled": "Your Nest account is disabled.",
+}
+"""What the invitation page says for each [`db.InvitationUnavailableError`] reason."""
+
+
 def _is_api(path: str) -> bool:
-    return path == PROJECTS_API_PATH or path.startswith(PROJECTS_API_PATH + "/")
+    return any(
+        path == root or path.startswith(root + "/")
+        for root in (PROJECTS_API_PATH, INVITATIONS_API_PATH)
+    )
+
+
+def _parse_int_id(value: str) -> int | None:
+    return int(value) if value.isdecimal() and value.isascii() and len(value) <= 18 else None
+
+
+def _optional_number(body: dict, name: str) -> float | None:
+    value = body.get(name)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise TypeError(f"{name} must be a number")
+    return float(value)
+
+
+def _optional_bool(body: dict, name: str, default: bool) -> bool:
+    value = body.get(name, default)
+    if not isinstance(value, bool):
+        raise TypeError(f"{name} must be true or false")
+    return value
 
 
 def _parse_uuid(value: str) -> UUID | None:
@@ -1059,6 +1475,92 @@ def _audit_json(event: ProjectAuditEvent) -> dict[str, object]:
     }
 
 
+def _delivery_json(invitation: EmailInvitation) -> dict[str, object] | None:
+    d = invitation.delivery
+    if d is None:
+        return None
+    return {
+        "status": d.status,
+        "attempts": d.attempts,
+        "max_attempts": d.max_attempts,
+        "last_error": d.last_error,
+        "last_error_kind": d.last_error_kind,
+        "next_attempt_at": _iso(d.next_attempt_at),
+        "sent_at": _iso(d.sent_at),
+    }
+
+
+def _invitation_json(invitation: EmailInvitation) -> dict[str, object]:
+    return {
+        "id": invitation.id,
+        "project_id": str(invitation.project_id),
+        "email": invitation.email,
+        "role": invitation.role,
+        "status": invitation.status,
+        "invited_by_user_id": str(invitation.invited_by_user_id),
+        "created_at": _iso(invitation.created_at),
+        "expires_at": _iso(invitation.expires_at),
+        "accepted_at": _iso(invitation.accepted_at),
+        "accepted_by_user_id": _id(invitation.accepted_by_user_id),
+        "declined_at": _iso(invitation.declined_at),
+        "revoked_at": _iso(invitation.revoked_at),
+        "delivery": _delivery_json(invitation),
+    }
+
+
+def _issued_json(invitation: EmailInvitation, link: str, emailed: bool) -> dict[str, object]:
+    return {"invitation": _invitation_json(invitation), "link": link, "emailed": emailed}
+
+
+def _link_json(link: InviteLink) -> dict[str, object]:
+    return {
+        "id": link.id,
+        "project_id": str(link.project_id),
+        "role": link.role,
+        "status": link.status,
+        "max_uses": link.max_uses,
+        "use_count": link.use_count,
+        "created_by_user_id": str(link.created_by_user_id),
+        "created_at": _iso(link.created_at),
+        "expires_at": _iso(link.expires_at),
+        "revoked_at": _iso(link.revoked_at),
+    }
+
+
+def _pending_json(pending: PendingInvitation) -> dict[str, object]:
+    return {
+        "id": pending.id,
+        "project_id": str(pending.project_id),
+        "project_name": pending.project_name,
+        "role": pending.role,
+        "invited_by_name": pending.invited_by_name,
+        "created_at": _iso(pending.created_at),
+        "expires_at": _iso(pending.expires_at),
+    }
+
+
+def _preview_json(preview: InvitationPreview) -> dict[str, object]:
+    return {
+        "kind": preview.kind,
+        "id": preview.id,
+        "project_id": str(preview.project_id),
+        "project_name": preview.project_name,
+        "role": preview.role,
+        "status": preview.status,
+        "expires_at": _iso(preview.expires_at),
+    }
+
+
+def _acceptance_json(acceptance: Acceptance) -> dict[str, object]:
+    return {
+        "kind": acceptance.kind,
+        "id": acceptance.invitation_id,
+        "project_id": str(acceptance.project_id),
+        "role": acceptance.role,
+        "already_member": acceptance.already_member,
+    }
+
+
 class AuthHTTPServer(ThreadingHTTPServer):
     """
     HTTP server for the sign-in routes. Each request runs in its own daemon thread.
@@ -1070,6 +1572,10 @@ class AuthHTTPServer(ThreadingHTTPServer):
             on the sign-in's database and session lifetimes.
         projects ([`authz.ProjectService`], *optional*): Projects API service.
             Defaults to one on the sign-in's database.
+        invitations ([`authz.InvitationService`], *optional*): Invitation service.
+            Defaults to one on the Projects service and `email`, whose links use
+            `NEST_PUBLIC_URL` with email enabled and this listener's origin otherwise.
+        email ([`mail.EmailService`], *optional*): Email delivery for invitations.
     """
 
     daemon_threads = True
@@ -1082,6 +1588,8 @@ class AuthHTTPServer(ThreadingHTTPServer):
         *,
         cli: CLISignIn | None = None,
         projects: ProjectService | None = None,
+        invitations: InvitationService | None = None,
+        email: EmailService | None = None,
     ):
         self.sign_in = sign_in
         self.cli = cli or CLISignIn(sign_in.database, sign_in.sessions)
@@ -1094,6 +1602,9 @@ class AuthHTTPServer(ThreadingHTTPServer):
         self.origin = f"{redirect.scheme}://{redirect.netloc}"
         self.sessions = sign_in.session_store
         self.projects = projects or ProjectService(sign_in.database)
+        self.invitations = invitations or InvitationService(
+            sign_in.database, self.projects, email, link_base_url=self.origin
+        )
         super().__init__(address, _Handler)
 
 
@@ -1144,6 +1655,7 @@ def start_auth_service(
     sign_in=None,
     cli: CLISignIn | None = None,
     bootstrap_admin_email: str | None = None,
+    email: EmailService | None = None,
 ) -> AuthService:
     """
     Starts the auth listener when Google sign-in is configured.
@@ -1159,6 +1671,8 @@ def start_auth_service(
             service, for tests with a shorter poll interval.
         bootstrap_admin_email (`str`, *optional*): `NEST_BOOTSTRAP_ADMIN_GOOGLE_EMAIL`,
             passed to the default [`auth.GoogleSignIn`].
+        email ([`mail.EmailService`], *optional*): Email delivery for invitations;
+            invitations are shared by link only without it.
 
     Raises:
         `OSError`: If `NEST_AUTH_HTTP_BIND` cannot be bound.
@@ -1169,7 +1683,7 @@ def start_auth_service(
     if database is None:
         raise RuntimeError("Google sign-in needs the database")
     sign_in = sign_in or GoogleSignIn(config, database, bootstrap_admin_email=bootstrap_admin_email)
-    server = AuthHTTPServer(sign_in, _split_bind(config.http_bind), cli=cli)
+    server = AuthHTTPServer(sign_in, _split_bind(config.http_bind), cli=cli, email=email)
     thread = threading.Thread(target=server.serve_forever, name="nest-auth-http", daemon=True)
     thread.start()
     service = AuthService(server, thread)

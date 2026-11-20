@@ -147,3 +147,33 @@ it; interfaces go through [`authz.ProjectService`] instead (see
 [[autodoc]] db.DuplicateMemberError
 
 [[autodoc]] db.OwnerRuleError
+
+## Invitations and Invite Links
+
+`InvitationStore` keeps invitation records, memberships and delivery state apart
+and makes every redemption transactional; interfaces go through
+[`authz.InvitationService`] instead (see [Authorization](authz)).
+
+[[autodoc]] db.InvitationStore
+
+[[autodoc]] db.EmailInvitation
+
+[[autodoc]] db.InviteLink
+
+[[autodoc]] db.PendingInvitation
+
+[[autodoc]] db.InvitationPreview
+
+[[autodoc]] db.Acceptance
+
+[[autodoc]] db.normalize_invited_email
+
+[[autodoc]] db.InvitationError
+
+[[autodoc]] db.InvitationNotFoundError
+
+[[autodoc]] db.InvitationUnavailableError
+
+[[autodoc]] db.EmailMismatchError
+
+[[autodoc]] db.AlreadyInvitedError

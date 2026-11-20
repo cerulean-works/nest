@@ -74,8 +74,9 @@ Migration `0003_identity_and_projects` adds the records that authentication and
 shared Projects build on. [Google sign-in](authentication) creates Users,
 identities and browser sessions, and the Projects API applies the authorization
 policy to Projects and memberships (see
-[Share Projects and manage roles](projects)); invitation flows are a separate
-feature. The data model and its rules are enforced by the database.
+[Share Projects and manage roles](projects)), including invitations (see
+[Invite people to a Project](invitations)). The data model and its rules are
+enforced by the database.
 
 **Separate identities.** Each kind of identity has its own key, and none is
 derived from another:
@@ -171,6 +172,12 @@ sign-in, session revocation, User status change, CLI sign-in decision, invitatio
 and Invite Link event and Provider Profile change. It holds no token, code, email
 address, message body or credential, and its rows are sealed into a SHA-256 hash
 chain. See [Review the security audit log](audit-log).
+
+**Invitation onboarding.** Migration `0010_invitation_onboarding` adds two
+security audit triggers for the invitation flows (see
+[Invite people to a Project](invitations)): `invite_link.exhausted` when an Invite
+Link's last use is taken, and `invitation.email_failed` when the outbox gives up on
+an invitation email. The invitation tables themselves are unchanged.
 
 ## Configure the connection
 

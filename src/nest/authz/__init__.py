@@ -3,7 +3,8 @@ Centralized, deny-by-default authorization for Nest Projects.
 
 The fixed Owner/Admin/Member/Viewer matrix is [`authz.decide`]; [`authz.Authorizer`]
 and [`authz.ProjectService`] enforce it on the server for every interface, and
-[`authz.ExecutionAccess`] applies the same checks to the gRPC execution service.
+[`authz.ExecutionAccess`] applies the same checks to the gRPC execution service,
+and [`authz.InvitationService`] to email invitations and Invite Links.
 See *Share Projects and manage roles* and *Security and limitations*.
 """
 
@@ -12,6 +13,13 @@ from .execution import (
     ExecutionAccess,
     ProjectRequiredError,
     UnauthenticatedError,
+)
+from .invitations import (
+    DEFAULT_INVITATION_TTL,
+    DEFAULT_LINK_MAX_USES,
+    InvitationService,
+    IssuedInvitation,
+    IssuedInviteLink,
 )
 from .policy import (
     CLI_ACTION_SCOPES,
@@ -35,6 +43,8 @@ from .service import (
 
 __all__ = [
     "CLI_ACTION_SCOPES",
+    "DEFAULT_INVITATION_TTL",
+    "DEFAULT_LINK_MAX_USES",
     "PROVIDER_ACTIONS",
     "READ_ACTIONS",
     "AccessDeniedError",
@@ -44,6 +54,9 @@ __all__ = [
     "Decision",
     "DenyAllProviders",
     "ExecutionAccess",
+    "InvitationService",
+    "IssuedInvitation",
+    "IssuedInviteLink",
     "Principal",
     "ProjectRequiredError",
     "ProjectService",

@@ -893,7 +893,10 @@ def main():
         server.start()
         record_start(config, database)
         auth = start_auth_service(
-            config.google, database, bootstrap_admin_email=config.bootstrap_admin_email
+            config.google,
+            database,
+            bootstrap_admin_email=config.bootstrap_admin_email,
+            email=email,
         )
         logger.info(
             "Controller listening address=%s executor=%s slurm_configured=%s tls=%s auth=%s "
