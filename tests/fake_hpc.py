@@ -1,7 +1,7 @@
 """A local stand-in for an HPC login node used by end-to-end runtime tests.
 
 `FakeHpc` writes shim executables for `ssh`, `sbatch`, `squeue`, `sacct`,
-`scancel`, `apptainer`, `uv`, and `flock` into a directory that is placed first
+`scancel`, `scontrol`, `apptainer`, `uv`, and `flock` into a directory that is placed first
 on `PATH`. The real Controller, `SlurmBackend`, and `scripts/*.sbatch` files
 then run unmodified:
 
@@ -21,8 +21,9 @@ Failure injection, for timeout and ambiguity regressions:
   took effect, but the caller never hears back).
 - `FakeHpc.drop_ssh(match)` runs the command, then exits with status 255 as if the
   connection dropped.
-- `FakeHpc.hold_jobs(state)` makes `sbatch` record `state` (for example `PENDING`,
-  `RUNNING`, or `TIMEOUT`) instead of running the batch script.
+- `FakeHpc.hold_jobs(state, reason)` makes `sbatch` record `state` (for example
+  `PENDING`, `RUNNING`, or `TIMEOUT`) instead of running the batch script, and
+  `squeue` report `reason` (for example `Priority` or `MaxGRESPerAccount`).
 """
 
 import json
@@ -55,6 +56,11 @@ def job_flag(args):
 
 def state_file(job_id):
     return STATE / f"job-{job_id}.state"
+
+
+def meta(job_id):
+    path = STATE / f"job-{job_id}.json"
+    return json.loads(path.read_text()) if path.exists() else {}
 """
 
 _SHIMS = {
@@ -96,6 +102,14 @@ job_id = int(counter.read_text()) if counter.exists() else 1000
 counter.write_text(str(job_id + 1))
 log("sbatch", cwd=os.getcwd(), flags=flags, script=script, args=script_args, job_id=job_id)
 hold = STATE / "hold-state"
+options = dict(flag[2:].split("=", 1) for flag in flags if "=" in flag)
+hold_reason = STATE / "hold-reason"
+(STATE / f"job-{job_id}.json").write_text(json.dumps({
+    "partition": options.get("partition", ""),
+    "account": options.get("account", ""),
+    "reason": hold_reason.read_text() if hold_reason.exists() else "None",
+    "gpus": options.get("gpus-per-node", "0"),
+}))
 if hold.exists():
     state_file(job_id).write_text(hold.read_text())
 elif Path(script).name.startswith("pending"):
@@ -116,7 +130,17 @@ job_id = job_flag(sys.argv[1:])
 path = state_file(job_id)
 state = path.read_text() if path.exists() else None
 if state in ("PENDING", "RUNNING", "CONFIGURING", "COMPLETING"):
-    print(state)
+    fmt = next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--format=")), "%T")
+    info = meta(job_id)
+    reason = info.get("reason", "None") if state == "PENDING" else "None"
+    fields = {
+        "%T": state,
+        "%r": reason,
+        "%P": info.get("partition", ""),
+        "%q": "normal",
+        "%a": info.get("account", ""),
+    }
+    print("|".join(fields[field] for field in fmt.split("|")))
 else:
     # Real Slurm forgets finished jobs after MinJobAge.
     print("slurm_load_jobs error: Invalid job id specified", file=sys.stderr)
@@ -135,6 +159,23 @@ if not path.exists():
     print(f"scancel: error: Invalid job id {job_id}", file=sys.stderr)
     sys.exit(1)
 path.write_text("CANCELLED by 0")
+""",
+    "scontrol": """
+args = sys.argv[1:]
+log("scontrol", argv=args)
+if args[:3] != ["show", "job", "--oneliner"]:
+    sys.exit("fake scontrol supports only show job --oneliner")
+job_id = args[3]
+path = state_file(job_id)
+if not path.exists():
+    print("slurm_load_jobs error: Invalid job id specified", file=sys.stderr)
+    sys.exit(1)
+info = meta(job_id)
+print(
+    f"JobId={job_id} JobState={path.read_text()} Reason={info.get('reason')} "
+    f"Partition={info.get('partition')} Account={info.get('account')} "
+    f"ReqTRES=cpu=1,node=1,gres/gpu={info.get('gpus')}"
+)
 """,
     "apptainer": """
 args = sys.argv[1:]
@@ -249,9 +290,17 @@ class FakeHpc:
         """Runs SSH commands containing `match`, then fails with SSH's exit status 255."""
         (self.state / "ssh-fault.json").write_text(json.dumps({"match": match, "mode": "drop"}))
 
-    def hold_jobs(self, state: str) -> None:
-        """Makes later `sbatch` calls record `state` without running their script."""
+    def hold_jobs(self, state: str, reason: str | None = None) -> None:
+        """Makes later `sbatch` calls record `state` without running their script.
+
+        Args:
+            state (`str`): Slurm state to record, such as `PENDING`.
+            reason (`str`, *optional*): Pending reason `squeue` reports, such as
+                `MaxGRESPerAccount`. Unset reports `None`, as Slurm does.
+        """
         (self.state / "hold-state").write_text(state)
+        if reason is not None:
+            (self.state / "hold-reason").write_text(reason)
 
     def job_state(self, job_id: int) -> str | None:
         """Returns the recorded state of a job, or `None` if it was never submitted."""

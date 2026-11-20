@@ -10,7 +10,15 @@ from unittest import mock
 
 import grpc
 
-from nest.backends.slurm import SlurmBackend, SlurmConfig
+from nest.backends.slurm import (
+    PENDING_BLOCKED,
+    PENDING_LIMIT,
+    PENDING_QUEUED,
+    SlurmBackend,
+    SlurmConfig,
+    SlurmJobInfo,
+    classify_pending_reason,
+)
 from nest.client import _controller_error
 from nest.config import load_client_config, load_controller_config
 from nest.controller import ExecutionService
@@ -18,8 +26,10 @@ from nest.errors import (
     ERROR_KIND_METADATA,
     INFRASTRUCTURE_ERRORS,
     JOB_ID_METADATA,
+    PENDING_REASON_METADATA,
     ExecutionTimeoutError,
     InfrastructureError,
+    JobBlockedError,
     QueueTimeoutError,
     RemoteCommandError,
     RpcTimeoutError,
@@ -220,17 +230,29 @@ class SshClassificationTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["timeout"], 12.5)
 
 
-class WaitTests(unittest.TestCase):
-    def wait(self, states, timeout=1.0):
-        slurm = backend()
+def job(state, reason=None, **fields):
+    return SlurmJobInfo(job_id=9, state=state, reason=reason, **fields)
+
+
+class Polling:
+    remote: mock.Mock
+
+    def wait(self, states, timeout=1.0, scontrol="", **config):
+        """Polls job 9 through `states`; each poll advances the clock by one second."""
+        slurm = backend(**config)
         clock = iter(range(1000))
+        if isinstance(states, list):
+            states = [job(state) if isinstance(state, str) else state for state in states]
         with (
-            mock.patch.object(slurm, "status", side_effect=states),
+            mock.patch.object(slurm, "job_info", side_effect=states),
+            mock.patch.object(slurm, "_run_remote", return_value=scontrol) as self.remote,
             mock.patch("nest.backends.slurm.time.sleep"),
             mock.patch("nest.backends.slurm.time.monotonic", side_effect=lambda: next(clock)),
         ):
             slurm._wait_job(9, "Slurm job", timeout, 0.1)
 
+
+class WaitTests(Polling, unittest.TestCase):
     def test_job_that_never_starts_is_a_queue_timeout(self):
         with self.assertRaises(QueueTimeoutError) as caught:
             self.wait(["PENDING"] * 5, timeout=2)
@@ -270,6 +292,205 @@ class WaitTests(unittest.TestCase):
         wait.assert_called_once_with(4, "Slurm job", 11, 0.5)
 
 
+class PendingReasonTests(unittest.TestCase):
+    def test_reasons_are_classified_by_whether_waiting_clears_them(self):
+        cases = {
+            None: PENDING_QUEUED,
+            "Priority": PENDING_QUEUED,
+            "Resources": PENDING_QUEUED,
+            "Dependency": PENDING_QUEUED,
+            "SomethingNew": PENDING_QUEUED,
+            "MaxGRESPerAccount": PENDING_LIMIT,
+            "QOSMaxGRESPerUser": PENDING_LIMIT,
+            "AssocGrpGRES": PENDING_LIMIT,
+            "AssocGrpCPUMinutesLimit": PENDING_LIMIT,
+            "QOSMaxWallDurationPerJobLimit": PENDING_BLOCKED,
+            "QOSMinGRES": PENDING_BLOCKED,
+            "PartitionConfig": PENDING_BLOCKED,
+            "InvalidQOS": PENDING_BLOCKED,
+            "JobHeldUser": PENDING_BLOCKED,
+        }
+        for reason, category in cases.items():
+            with self.subTest(reason=reason):
+                self.assertEqual(classify_pending_reason(reason), category)
+
+    def test_job_info_parses_squeue_fields(self):
+        slurm = backend()
+        with mock.patch.object(
+            slurm, "_run_remote", return_value="PENDING|MaxGRESPerAccount|gpu|normal|acct"
+        ) as remote:
+            info = slurm.job_info(9)
+        self.assertEqual(
+            info, job("PENDING", "MaxGRESPerAccount", partition="gpu", qos="normal", account="acct")
+        )
+        self.assertIn("--format='%T|%r|%P|%q|%a'", remote.call_args.args[0])
+        self.assertEqual(info.pending_category, PENDING_LIMIT)
+
+    def test_job_info_treats_none_as_no_reason(self):
+        slurm = backend()
+        with mock.patch.object(slurm, "_run_remote", return_value="RUNNING|None|gpu|normal|acct"):
+            info = slurm.job_info(9)
+        self.assertIsNone(info.reason)
+        self.assertIsNone(info.pending_category)
+        with mock.patch.object(slurm, "_run_remote", return_value="RUNNING|None|gpu|normal|acct"):
+            self.assertEqual(slurm.status(9), "RUNNING")
+
+    def test_job_info_falls_back_to_sacct_state(self):
+        slurm = backend()
+        with mock.patch.object(slurm, "_run_remote", side_effect=["", "COMPLETED"]):
+            self.assertEqual(slurm.job_info(9), job("COMPLETED"))
+
+
+class PendingWaitTests(Polling, unittest.TestCase):
+    gpu_limit = job("PENDING", "MaxGRESPerAccount", partition="gpu", qos="normal", account="acct")
+    bad_partition = job("PENDING", "PartitionConfig", partition="gpu", qos="normal", account="a")
+
+    def test_normal_congestion_only_ends_in_the_queue_deadline(self):
+        with self.assertRaises(QueueTimeoutError) as caught:
+            self.wait([job("PENDING", "Priority")] * 3 + [job("PENDING", "Resources")] * 3, 4)
+        error = caught.exception
+        self.assertNotIsInstance(error, JobBlockedError)
+        self.assertEqual(error.pending_reason, "Resources")
+        self.assertIn("did not start within 4 seconds. Last state: PENDING.", str(error))
+        self.assertIn("Pending reason: Resources", str(error))
+        self.assertIn("Pending reasons seen: Priority, Resources.", str(error))
+
+    def test_congestion_shorter_than_the_deadline_completes(self):
+        self.wait([job("PENDING", "Priority")] * 3 + [job("RUNNING"), job("COMPLETED")], 10)
+
+    def test_gpu_limit_waits_until_the_deadline_and_explains_why(self):
+        with (
+            self.assertLogs("nest.backends.slurm", "WARNING") as logs,
+            self.assertRaises(QueueTimeoutError) as caught,
+        ):
+            self.wait([self.gpu_limit] * 5, 3, scontrol="JobId=9 ReqTRES=cpu=1,gres/gpu=8")
+        error = caught.exception
+        self.assertNotIsInstance(error, JobBlockedError)
+        self.assertEqual((error.job_id, error.pending_reason), (9, "MaxGRESPerAccount"))
+        message = str(error)
+        self.assertIn(
+            "Pending reason: MaxGRESPerAccount (partition=gpu qos=normal account=acct "
+            "requested=cpu=1,gres/gpu=8)",
+            message,
+        )
+        self.assertIn("QoS or association limit", message)
+        self.assertIn("The job was not cancelled.", message)
+        # Warned once, when the reason first appeared, with the job's context.
+        [warning] = logs.output
+        self.assertIn("reason=MaxGRESPerAccount", warning)
+        self.assertIn("requested=cpu=1,gres/gpu=8", warning)
+
+    def test_scontrol_is_queried_once_per_reason(self):
+        with self.assertRaises(QueueTimeoutError):
+            self.wait([self.gpu_limit] * 5, 3, scontrol="ReqTRES=gres/gpu=8")
+        self.remote.assert_called_once_with("scontrol show job --oneliner 9")
+
+    def test_scontrol_failure_does_not_hide_the_reason(self):
+        slurm = backend()
+        clock = iter(range(1000))
+        with (
+            mock.patch.object(slurm, "job_info", side_effect=[self.gpu_limit] * 3),
+            mock.patch.object(slurm, "_run_remote", side_effect=RemoteCommandError("no")),
+            mock.patch("nest.backends.slurm.time.sleep"),
+            mock.patch("nest.backends.slurm.time.monotonic", side_effect=lambda: next(clock)),
+            self.assertRaises(QueueTimeoutError) as caught,
+        ):
+            slurm._wait_job(9, "Slurm job", 2, 0.1)
+        self.assertEqual(caught.exception.pending_reason, "MaxGRESPerAccount")
+        self.assertNotIn("requested=", str(caught.exception))
+
+    def test_gpu_limit_stops_early_when_a_limit_timeout_is_set(self):
+        with self.assertRaises(JobBlockedError) as caught:
+            self.wait([self.gpu_limit] * 10, 100, limit_timeout=2)
+        error = caught.exception
+        self.assertIsInstance(error, QueueTimeoutError)
+        self.assertEqual(error.pending_reason, "MaxGRESPerAccount")
+        self.assertIn("after 2 seconds pending on a QoS or association limit", str(error))
+        self.assertIn("scancel 9", str(error))
+
+    def test_incompatible_partition_stops_before_the_deadline(self):
+        with self.assertRaises(JobBlockedError) as caught:
+            self.wait(
+                [job("PENDING", "Priority")] + [self.bad_partition] * 10, 600, blocked_timeout=3
+            )
+        error = caught.exception
+        self.assertEqual(error.job_id, 9)
+        self.assertEqual(error.pending_reason, "PartitionConfig")
+        self.assertEqual(error.code(), grpc.StatusCode.FAILED_PRECONDITION)
+        message = str(error)
+        self.assertIn(
+            "after 3 seconds pending for a reason it cannot outwait: PartitionConfig", message
+        )
+        self.assertIn("does not fit partition gpu", message)
+        self.assertIn("The job was not cancelled", message)
+
+    def test_blocked_timer_restarts_when_the_job_moves_on(self):
+        states = [self.bad_partition, self.bad_partition, job("PENDING", "Priority")]
+        states += [self.bad_partition, self.bad_partition, job("RUNNING"), job("COMPLETED")]
+        self.wait(states, 100, blocked_timeout=2)
+
+    def test_blocked_job_is_cancelled_only_when_configured(self):
+        slurm = backend(blocked_timeout=0, cancel_blocked=True)
+        with (
+            mock.patch.object(slurm, "job_info", return_value=self.bad_partition),
+            mock.patch.object(slurm, "_run_remote", return_value="") as remote,
+            self.assertRaises(JobBlockedError) as caught,
+        ):
+            slurm._wait_job(9, "Slurm job", 100, 0.1)
+        remote.assert_any_call("scancel 9")
+        self.assertIn("requested its cancellation and will not resubmit it", str(caught.exception))
+
+    def test_failed_cancellation_keeps_the_diagnostic(self):
+        slurm = backend(blocked_timeout=0, cancel_blocked=True)
+        with (
+            mock.patch.object(slurm, "job_info", return_value=self.bad_partition),
+            mock.patch.object(slurm, "_with_details", side_effect=lambda info: info),
+            mock.patch.object(slurm, "cancel", side_effect=SSHError("unreachable")),
+            self.assertRaises(JobBlockedError) as caught,
+        ):
+            slurm._wait_job(9, "Slurm job", 100, 0.1)
+        self.assertEqual(caught.exception.pending_reason, "PartitionConfig")
+        self.assertIn("Cancelling it failed, so it may still be queued", str(caught.exception))
+
+    def test_pending_reasons_are_kept_when_execution_times_out(self):
+        with self.assertRaises(ExecutionTimeoutError) as caught:
+            self.wait([self.gpu_limit, job("RUNNING"), job("RUNNING"), job("RUNNING")], 3)
+        self.assertIn("Pending reasons seen: MaxGRESPerAccount.", str(caught.exception))
+
+    def test_zero_timeouts_from_the_environment_stop_at_the_first_observation(self):
+        from nest.controller import build_backend
+
+        config = load_controller_config(
+            {
+                "NEST_EXECUTOR": "slurm",
+                "NEST_SLURM_HOST": "hpc",
+                "NEST_SLURM_ACCOUNT": "acct",
+                "NEST_SLURM_WORKDIR": "/nest",
+                "NEST_PENDING_BLOCKED_TIMEOUT": "0",
+                "NEST_PENDING_LIMIT_TIMEOUT": "0",
+            }
+        )
+        slurm = build_backend(config)
+        assert slurm is not None
+        self.assertEqual((slurm.config.blocked_timeout, slurm.config.limit_timeout), (0, 0))
+        for info in (self.bad_partition, self.gpu_limit):
+            with (
+                self.subTest(reason=info.reason),
+                mock.patch.object(slurm, "job_info", return_value=info) as poll,
+                mock.patch.object(slurm, "_with_details", side_effect=lambda job: job),
+                mock.patch("nest.backends.slurm.time.sleep"),
+                self.assertRaises(JobBlockedError),
+            ):
+                slurm._wait_job(9, "Slurm job", 600, 0.1)
+            poll.assert_called_once()
+
+    def test_negative_pending_timeouts_are_rejected(self):
+        with self.assertRaises(ValueError):
+            backend(blocked_timeout=-1)
+        with self.assertRaises(ValueError):
+            backend(limit_timeout=-1)
+
+
 class FakeCall(grpc.RpcError):
     def __init__(self, code, details="", metadata=()):
         self._code, self._details, self._metadata = code, details, metadata
@@ -299,6 +520,26 @@ class ClientClassificationTests(unittest.TestCase):
                 self.assertEqual(error.job_id, 123)
                 self.assertEqual(str(error), "message")
                 self.assertEqual(error.code(), error_class.status)
+
+    def test_pending_reason_round_trips(self):
+        call = FakeCall(
+            grpc.StatusCode.FAILED_PRECONDITION,
+            "blocked",
+            (
+                (ERROR_KIND_METADATA, "job_blocked"),
+                (JOB_ID_METADATA, "5"),
+                (PENDING_REASON_METADATA, "MaxGRESPerAccount"),
+            ),
+        )
+        error = _controller_error(call, "addr", 900)
+        assert isinstance(error, JobBlockedError)
+        self.assertEqual((error.job_id, error.pending_reason), (5, "MaxGRESPerAccount"))
+        queued = FakeCall(
+            grpc.StatusCode.DEADLINE_EXCEEDED, "q", ((ERROR_KIND_METADATA, "queue_timeout"),)
+        )
+        error = _controller_error(queued, "addr", 900)
+        assert isinstance(error, QueueTimeoutError)
+        self.assertIsNone(error.pending_reason)
 
     def test_deadline_without_kind_is_an_rpc_timeout(self):
         error = _controller_error(FakeCall(grpc.StatusCode.DEADLINE_EXCEEDED), "addr", 12)
@@ -410,6 +651,48 @@ class ControllerTests(unittest.TestCase):
                 else:
                     self.assertEqual(metadata[JOB_ID_METADATA], "8")
                 fake.submit_payload.assert_called_once()
+
+    def test_pending_reason_is_sent_as_metadata(self):
+        error = JobBlockedError("blocked", job_id=8, pending_reason="PartitionConfig")
+        fake = SimpleNamespace(submit_payload=mock.Mock(side_effect=error))
+        _, context = self.execute(fake, payload=b"x")
+        self.assertEqual(context.status, grpc.StatusCode.FAILED_PRECONDITION)
+        metadata = dict(context.metadata)
+        self.assertEqual(metadata[ERROR_KIND_METADATA], "job_blocked")
+        self.assertEqual(metadata[PENDING_REASON_METADATA], "PartitionConfig")
+
+    def test_unprintable_pending_reason_is_not_sent(self):
+        error = QueueTimeoutError("queued", job_id=8, pending_reason="bad\nreason")
+        fake = SimpleNamespace(submit_payload=mock.Mock(side_effect=error))
+        _, context = self.execute(fake, payload=b"x")
+        self.assertNotIn(PENDING_REASON_METADATA, dict(context.metadata))
+
+    def test_pending_settings(self):
+        config = load_controller_config({})
+        self.assertEqual(config.pending_blocked_timeout, 120)
+        self.assertIsNone(config.pending_limit_timeout)
+        self.assertFalse(config.cancel_blocked_jobs)
+        config = load_controller_config(
+            {
+                "NEST_PENDING_BLOCKED_TIMEOUT": "30",
+                "NEST_PENDING_LIMIT_TIMEOUT": "900",
+                "NEST_CANCEL_BLOCKED_JOBS": "true",
+            }
+        )
+        self.assertEqual(config.pending_blocked_timeout, 30)
+        self.assertEqual(config.pending_limit_timeout, 900)
+        self.assertTrue(config.cancel_blocked_jobs)
+        zero = load_controller_config(
+            {"NEST_PENDING_BLOCKED_TIMEOUT": "0", "NEST_PENDING_LIMIT_TIMEOUT": "0"}
+        )
+        self.assertEqual((zero.pending_blocked_timeout, zero.pending_limit_timeout), (0, 0))
+        for name in ("NEST_PENDING_BLOCKED_TIMEOUT", "NEST_PENDING_LIMIT_TIMEOUT"):
+            for bad in ("-1", "soon", "inf", "nan"):
+                with self.subTest(name=name, value=bad), self.assertRaisesRegex(ValueError, name):
+                    load_controller_config({name: bad})
+        # Other deadlines still reject zero.
+        with self.assertRaisesRegex(ValueError, "NEST_RESULT_TIMEOUT must be a positive"):
+            load_controller_config({"NEST_RESULT_TIMEOUT": "0"})
 
     def test_timeout_settings_are_validated(self):
         def timeout(value):

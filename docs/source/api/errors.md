@@ -34,6 +34,8 @@ what each error means and when it is safe to call again.
 
 [[autodoc]] errors.QueueTimeoutError
 
+[[autodoc]] errors.JobBlockedError
+
 [[autodoc]] errors.ExecutionTimeoutError
 
 [[autodoc]] errors.RpcTimeoutError
