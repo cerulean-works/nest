@@ -10,7 +10,7 @@ from one to another never changes which Platform a job belongs to.
 
 Everything a client could use to reach a cluster (hosts, ports, transport modes,
 host-key pin references) and every Project grant is operator managed. The schema
-refuses a change that names no operator (migration `0011`), and every change is
+refuses a change that names no operator (migration `0012`), and every change is
 recorded in the security audit log. [`db.PlatformStore`] is the operator-side API,
 used by `nest-db platform` and the Controller's environment sync; users discover
 Platforms only through [`authz.PlatformCatalog`].
@@ -29,7 +29,7 @@ import psycopg
 from psycopg import errors as pg_errors
 
 from .._logging import get_logger
-from ..config import ProviderProfile
+from ..config import PlatformProfile
 from ._transaction import as_uuid, audit_context, transaction
 from .connection import Database
 
@@ -94,7 +94,7 @@ class DuplicateLoginNodeError(PlatformError):
 
 
 class EnvironmentManagedError(PlatformError):
-    """The Platform is mirrored from the environment; change `NEST_PROVIDERS` instead."""
+    """The Platform is mirrored from the environment; change `NEST_PLATFORMS` instead."""
 
 
 class NoLoginNodeError(PlatformError):
@@ -339,7 +339,7 @@ class PlatformStore:
     the security audit log with the PostgreSQL role; the schema refuses a change
     without an operator. Methods that take a Platform accept its UUID or slug.
     Platforms mirrored from the environment (`source = 'env'`) can only be granted
-    to or revoked from Projects here: their login nodes follow `NEST_PROVIDERS`.
+    to or revoked from Projects here: their login nodes follow `NEST_PLATFORMS`.
 
     Args:
         database ([`db.Database`]): Open database.
@@ -821,12 +821,16 @@ class PlatformStore:
 
     # Environment bootstrap -----------------------------------------------------
 
-    def sync_environment(self, providers: Mapping[str, ProviderProfile]) -> dict[str, UUID]:
+    def sync_environment(self, providers: Mapping[str, PlatformProfile]) -> dict[str, UUID]:
         """
-        Mirrors the environment's Provider Profiles as Platforms, in one transaction.
+        Mirrors the environment's Platform Profiles (`NEST_PLATFORMS`, or the
+        deprecated `NEST_PROVIDERS` and `NEST_SLURM_*`) in the catalog, in one
+        transaction.
 
         Each profile becomes (or stays) the `env` Platform whose slug is the
-        profile's ID, keeping its immutable Platform ID across restarts. Its login
+        profile's ID, keeping its immutable Platform ID across restarts. Its display
+        name and operator label follow `NEST_PLATFORM_<ID>_NAME` and `_OPERATOR`; a
+        profile without an operator label keeps the recorded one. Its login
         nodes are rewritten to the profile's, in order of priority, approved for the
         profile's SSH mode; a Mode B node's host-key pin reference is the
         operator-vetted `NEST_SSH_KNOWN_HOSTS` (`env:NEST_SSH_KNOWN_HOSTS`).
@@ -841,7 +845,7 @@ class PlatformStore:
         with (
             transaction(self.database, None, "record environment Platforms") as cursor,
             audit_context(
-                cursor, operator=ENVIRONMENT_OPERATOR, reason="NEST_PROVIDERS at Controller start"
+                cursor, operator=ENVIRONMENT_OPERATOR, reason="NEST_PLATFORMS at Controller start"
             ),
         ):
             for profile in providers.values():
@@ -858,7 +862,7 @@ class PlatformStore:
         return mirrored
 
     def _sync_profile(
-        self, cursor: psycopg.Cursor[dict[str, Any]], profile: ProviderProfile
+        self, cursor: psycopg.Cursor[dict[str, Any]], profile: PlatformProfile
     ) -> UUID | None:
         row = cursor.execute(
             "SELECT id, source FROM hpc_platforms WHERE slug = %s FOR NO KEY UPDATE",
@@ -870,18 +874,24 @@ class PlatformStore:
                 profile.id,
             )
             return None
+        display_name = profile.display_name or profile.id
         if row is None:
             row = cursor.execute(
-                "INSERT INTO hpc_platforms (slug, display_name, source) "
-                "VALUES (%s, %s, 'env') RETURNING id",
-                (profile.id, profile.id),
+                "INSERT INTO hpc_platforms (slug, display_name, operator_name, source) "
+                "VALUES (%s, %s, %s, 'env') RETURNING id",
+                (profile.id, display_name, profile.operator),
             ).fetchone()
             assert row is not None
         else:
+            # A profile without an operator label keeps the recorded one, as
+            # sync_platforms does for provider_profiles.
             cursor.execute(
                 "UPDATE hpc_platforms SET status = 'active', disabled_at = NULL, "
-                "updated_at = now() WHERE id = %s AND status <> 'active'",
-                (row["id"],),
+                "display_name = %s, operator_name = COALESCE(%s, operator_name), "
+                "updated_at = now() WHERE id = %s AND (status <> 'active' "
+                "OR display_name IS DISTINCT FROM %s "
+                "OR operator_name IS DISTINCT FROM COALESCE(%s, operator_name))",
+                (display_name, profile.operator, row["id"], display_name, profile.operator),
             )
         platform_id: UUID = row["id"]
         pin = ENVIRONMENT_HOST_KEY_PIN if profile.ssh_mode == "B" else None
@@ -929,6 +939,6 @@ def _platform_key(ref: UUID | str) -> tuple[LiteralString, object]:
 def _operator_owned(platform: Platform) -> None:
     if platform.source == "env":
         raise EnvironmentManagedError(
-            f"Platform {platform.slug!r} is mirrored from NEST_PROVIDERS; change the "
+            f"Platform {platform.slug!r} is mirrored from NEST_PLATFORMS; change the "
             "environment and restart the Controller instead"
         )

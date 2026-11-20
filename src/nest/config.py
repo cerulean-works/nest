@@ -3,7 +3,15 @@ Environment-variable configuration contract for the Controller, client, and work
 
 Every Nest entry point reads its settings through this module. Native processes and
 Docker Compose deployments use the same variable names; no project checkout, config
-file, or `.env` file is required. Loaders validate the whole environment at once and
+file, or `.env` file is required.
+
+HPC Platforms: the Controller bootstraps one [`config.PlatformProfile`] per HPC
+Platform listed in `NEST_PLATFORMS`, from `NEST_PLATFORM_<ID>_*` settings. The
+Platform ID is the immutable identity that namespaces Slurm accounts and job records;
+the operator label, approved login nodes, and Slurm defaults are separate fields of
+the profile. The older `NEST_PROVIDERS` / `NEST_PROVIDER_<ID>_*` (Compute Provider)
+and single-cluster `NEST_SLURM_*` forms remain supported and define the same
+profiles; `NEST_PROVIDERS` is deprecated. Loaders validate the whole environment at once and
 raise one [`config.ConfigError`] that lists every problem by variable name. Secret
 values never appear in error messages, `repr()`, or [`config.ControllerConfig.summary`].
 
@@ -33,7 +41,7 @@ session and authorizes it with the same Project policy as the Projects API
 sent only over TLS, unless `NEST_CONTROLLER_ALLOW_PLAINTEXT=true` approves an
 already-encrypted network such as a Tailnet.
 
-Persistence is opt-in: with `NEST_DATABASE_URL` set, the Controller stores Provider
+Persistence is opt-in: with `NEST_DATABASE_URL` set, the Controller stores Platform
 Profiles and job records in an externally managed PostgreSQL database (see
 [`db.Database`]). Without it the Controller is stateless, unless
 `NEST_DATABASE_REQUIRED=true` makes the database mandatory.
@@ -51,6 +59,7 @@ from dataclasses import dataclass, field
 from email.headerregistry import Address
 from email.utils import parseaddr
 from ipaddress import ip_address
+from types import MappingProxyType
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 from uuid import UUID
 
@@ -71,7 +80,21 @@ DEFAULT_PENDING_BLOCKED_TIMEOUT = 120.0
 DEFAULT_PARTITION = "h200_256gpu"
 DEFAULT_TIME = "00:05:00"
 LEGACY_PROVIDER_ID = "default"
-"""Provider Profile created from the `NEST_SLURM_*` settings."""
+"""Platform Profile created from the `NEST_SLURM_*` settings."""
+LEGACY_PLATFORM_ID = LEGACY_PROVIDER_ID
+
+PLATFORM_FIELDS = (
+    "SSH_MODE",
+    "LOGIN_NODES",
+    "SSH_USER",
+    "ACCOUNT",
+    "PARTITION",
+    "TIME",
+    "WORKDIR",
+    "OPERATOR",
+    "NAME",
+)
+"""Suffixes of the `NEST_PLATFORM_<ID>_*` settings that define one HPC Platform."""
 
 EXECUTORS = ("local", "slurm")
 SSH_MODES = ("A", "B")
@@ -222,6 +245,9 @@ SECRET_SETTINGS = (
 """Variables whose values are never echoed in errors or logs."""
 
 _PROVIDER_ID = re.compile(r"[a-z][a-z0-9_]{0,31}")
+_PLATFORM_ID = _PROVIDER_ID
+_OPERATOR = re.compile(r"[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?")
+_DISPLAY_NAME = re.compile(r"[^\x00-\x1f\x7f]{1,100}")
 _HOST = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?")
 _SLURM_TIME = re.compile(r"\d+(?::\d{1,2}){0,2}|\d+-\d+(?::\d{1,2}){0,2}")
 _SLURM_NAME = re.compile(r"[A-Za-z0-9_.-]+")
@@ -300,7 +326,7 @@ def redact_url(url: str) -> str:
 @dataclass(frozen=True)
 class LoginNode:
     """
-    Approved SSH endpoint of a Compute Provider.
+    Approved SSH endpoint of an HPC Platform.
 
     Attributes:
         host (`str`): Host name or address. In Mode A it may be an SSH alias.
@@ -316,20 +342,29 @@ class LoginNode:
 
 
 @dataclass(frozen=True)
-class ProviderProfile:
+class PlatformProfile:
     """
-    Operator-controlled settings for one Compute Provider (Slurm cluster).
+    Operator-controlled settings for one HPC Platform (a Slurm cluster).
+
+    The profile is immutable. Its `id` is the Platform's identity: it namespaces the
+    Slurm account and the job records, and does not change when the operator,
+    login nodes, or defaults do. Use a new ID for a different cluster.
 
     Attributes:
-        id (`str`): Lowercase identifier from `NEST_PROVIDERS`.
+        id (`str`): Lowercase Platform ID from `NEST_PLATFORMS` (or `NEST_PROVIDERS`,
+            or `default` for the `NEST_SLURM_*` settings).
         ssh_mode (`str`): `"A"` (trusted operator SSH) or `"B"` (managed SSH).
         login_nodes (`tuple[LoginNode, ...]`): Approved login nodes. The Controller
             connects only to these, using the first.
-        account (`str`): Default Slurm account.
+        account (`str`): Default Slurm account, within this Platform's namespace.
         partition (`str`): Default Slurm partition.
         time (`str`): Default Slurm time limit.
         workdir (`str | None`): Absolute shared HPC directory. Required for execution.
         ssh_user (`str | None`): Remote user. Required in Mode B.
+        operator (`str | None`): `NEST_PLATFORM_<ID>_OPERATOR`: label of the
+            organization that operates the Platform. Metadata only; it never selects
+            a login node or account.
+        display_name (`str | None`): `NEST_PLATFORM_<ID>_NAME`: human-readable name.
     """
 
     id: str
@@ -340,6 +375,17 @@ class ProviderProfile:
     time: str = DEFAULT_TIME
     workdir: str | None = None
     ssh_user: str | None = None
+    operator: str | None = None
+    display_name: str | None = None
+
+    @property
+    def slurm_account(self) -> tuple[str, str]:
+        """The default Slurm account qualified by its Platform: `(platform_id, account)`."""
+        return (self.id, self.account)
+
+
+ProviderProfile = PlatformProfile
+"""Deprecated alias of [`config.PlatformProfile`], kept for compatibility."""
 
 
 @dataclass(frozen=True)
@@ -641,8 +687,11 @@ class ControllerConfig:
             at the first such observation; `None` waits until the polling deadline.
         cancel_blocked_jobs (`bool`): Whether to cancel a job the Controller stopped
             waiting for because of its pending reason.
-        providers (`dict[str, ProviderProfile]`): Profiles by ID.
-        default_provider (`str | None`): Profile used for Slurm calls.
+        platforms (`Mapping[str, PlatformProfile]`): HPC Platform Profiles by
+            Platform ID, read-only.
+        default_platform (`str | None`): Platform used for Slurm calls.
+        warnings (`tuple[str, ...]`): Deprecated or ignored settings, one message
+            each, logged at startup.
         ssh (`SSHPolicy`): SSH policy and Mode B credentials.
         tls (`TLSConfig | None`): Server TLS, or `None` for plaintext.
         public_url (`str | None`): Advertised service URL, logged at startup.
@@ -664,6 +713,9 @@ class ControllerConfig:
         allowed_projects (`frozenset[str]`): `NEST_PROVIDER_ALLOWED_PROJECTS`:
             Project IDs whose members' Runs the Controller's Provider accepts, or
             `{"*"}` for every Project. Empty, the default, accepts none.
+
+    `providers`, `default_provider`, and `provider` are deprecated read-only aliases
+    of `platforms`, `default_platform`, and `platform`.
     """
 
     bind: str = DEFAULT_CONTROLLER_BIND
@@ -676,8 +728,8 @@ class ControllerConfig:
     pending_blocked_timeout: float = DEFAULT_PENDING_BLOCKED_TIMEOUT
     pending_limit_timeout: float | None = None
     cancel_blocked_jobs: bool = False
-    providers: dict[str, ProviderProfile] = field(default_factory=dict)
-    default_provider: str | None = None
+    platforms: Mapping[str, PlatformProfile] = field(default_factory=lambda: MappingProxyType({}))
+    default_platform: str | None = None
     ssh: SSHPolicy = field(default_factory=SSHPolicy)
     tls: TLSConfig | None = None
     public_url: str | None = None
@@ -688,11 +740,31 @@ class ControllerConfig:
     auth: str = "none"
     allow_plaintext: bool = False
     allowed_projects: frozenset[str] = frozenset()
+    warnings: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.platforms, MappingProxyType):
+            object.__setattr__(self, "platforms", MappingProxyType(dict(self.platforms)))
 
     @property
-    def provider(self) -> ProviderProfile | None:
-        """The default Provider Profile, or `None` when no provider is configured."""
-        return self.providers.get(self.default_provider) if self.default_provider else None
+    def platform(self) -> PlatformProfile | None:
+        """The default Platform Profile, or `None` when no Platform is configured."""
+        return self.platforms.get(self.default_platform) if self.default_platform else None
+
+    @property
+    def providers(self) -> Mapping[str, PlatformProfile]:
+        """Deprecated alias of `platforms`."""
+        return self.platforms
+
+    @property
+    def default_provider(self) -> str | None:
+        """Deprecated alias of `default_platform`."""
+        return self.default_platform
+
+    @property
+    def provider(self) -> PlatformProfile | None:
+        """Deprecated alias of `platform`."""
+        return self.platform
 
     def summary(self) -> dict[str, object]:
         """
@@ -707,9 +779,11 @@ class ControllerConfig:
             "log_level": self.log_level,
             "tls": self.tls is not None,
             "public_url": self.public_url,
-            "default_provider": self.default_provider,
-            "providers": {
+            "default_platform": self.default_platform,
+            "platforms": {
                 p.id: {
+                    "operator": p.operator,
+                    "name": p.display_name,
                     "ssh_mode": p.ssh_mode,
                     "login_nodes": [str(n) for n in p.login_nodes],
                     "account": p.account,
@@ -718,7 +792,7 @@ class ControllerConfig:
                     "workdir": p.workdir,
                     "ssh_user": p.ssh_user,
                 }
-                for p in self.providers.values()
+                for p in self.platforms.values()
             },
             "ssh_modes_allowed": list(self.ssh.allowed_modes),
             "ssh_private_key": "***" if self.ssh.private_key else None,
@@ -884,15 +958,23 @@ def _slurm_fields(reader: _Reader, *, account: str, partition: str, time: str, w
 
 
 def _profile(
-    reader: _Reader, provider_id: str, executor: str, *, legacy: bool = False
-) -> ProviderProfile | None:
+    reader: _Reader,
+    provider_id: str,
+    executor: str,
+    *,
+    legacy: bool = False,
+    prefix: str | None = None,
+) -> PlatformProfile | None:
     """
-    Reads one Provider Profile from `<prefix>*` settings.
+    Reads one Platform Profile from `<prefix>*` settings.
 
     The `default` profile uses the `NEST_SLURM_` prefix, accepts `NEST_SLURM_HOST` as
-    a one-entry login-node list, and is optional in local mode.
+    a one-entry login-node list, and is optional in local mode. Only profiles under
+    the `NEST_PLATFORM_<ID>_` prefix read the `OPERATOR` and `NAME` metadata.
     """
-    prefix = "NEST_SLURM_" if legacy else f"NEST_PROVIDER_{provider_id.upper()}_"
+    if prefix is None:
+        prefix = "NEST_SLURM_" if legacy else f"NEST_PROVIDER_{provider_id.upper()}_"
+    platform = prefix.startswith("NEST_PLATFORM_")
     before = len(reader.problems)
     mode = reader.choice(prefix + "SSH_MODE", SSH_MODES, "A", upper=True)
     nodes_name = prefix + "LOGIN_NODES"
@@ -927,7 +1009,7 @@ def _profile(
             reader.fail(
                 "Slurm execution requires: "
                 + ", ".join(missing)
-                + " (or define Provider Profiles with NEST_PROVIDERS)"
+                + " (or define HPC Platforms with NEST_PLATFORMS)"
             )
             return None
 
@@ -944,9 +1026,22 @@ def _profile(
         reader.fail(f"{prefix}SSH_USER is not a valid user name: {user!r}")
     if mode == "B" and user is None:
         reader.fail(f"{prefix}SSH_USER is required when {prefix}SSH_MODE=B")
+    operator = display_name = None
+    if platform:
+        operator = reader.get(prefix + "OPERATOR")
+        if operator is not None:
+            operator = operator.lower()
+            if not _OPERATOR.fullmatch(operator):
+                reader.fail(
+                    f"{prefix}OPERATOR must be a label of lowercase letters, digits, '.', "
+                    f"'-' and '_' (at most 64), got {operator[:70]!r}"
+                )
+        display_name = reader.get(prefix + "NAME")
+        if display_name is not None and not _DISPLAY_NAME.fullmatch(display_name):
+            reader.fail(f"{prefix}NAME must be 1 to 100 printable characters")
     if len(reader.problems) > before or account is None:
         return None
-    return ProviderProfile(
+    return PlatformProfile(
         id=provider_id,
         ssh_mode=mode,
         login_nodes=nodes,
@@ -955,10 +1050,12 @@ def _profile(
         time=time,
         workdir=workdir,
         ssh_user=user,
+        operator=operator,
+        display_name=display_name,
     )
 
 
-def _ssh_policy(reader: _Reader, profiles: list[ProviderProfile]) -> SSHPolicy:
+def _ssh_policy(reader: _Reader, profiles: list[PlatformProfile]) -> SSHPolicy:
     allowed_raw = reader.get("NEST_SSH_MODES_ALLOWED")
     allowed = SSH_MODES
     if allowed_raw is not None:
@@ -971,7 +1068,7 @@ def _ssh_policy(reader: _Reader, profiles: list[ProviderProfile]) -> SSHPolicy:
     for profile in profiles:
         if profile.ssh_mode not in allowed:
             reader.fail(
-                f"Provider {profile.id!r} uses SSH mode {profile.ssh_mode}, which "
+                f"Platform {profile.id!r} uses SSH mode {profile.ssh_mode}, which "
                 f"NEST_SSH_MODES_ALLOWED={','.join(allowed)} does not allow"
             )
 
@@ -1543,40 +1640,9 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
         "cancel_blocked_jobs": reader.boolean("NEST_CANCEL_BLOCKED_JOBS"),
     }
 
-    providers: dict[str, ProviderProfile] = {}
-    ids_raw = reader.get("NEST_PROVIDERS")
-    default_provider: str | None = None
-    if ids_raw is not None:
-        legacy = sorted(n for n in reader.environ if n.startswith("NEST_SLURM_") and reader.get(n))
-        if legacy:
-            reader.fail("NEST_PROVIDERS replaces the legacy settings; unset " + ", ".join(legacy))
-        ids = [i.strip() for i in ids_raw.split(",") if i.strip()]
-        for provider_id in ids:
-            if not _PROVIDER_ID.fullmatch(provider_id):
-                reader.fail(
-                    f"NEST_PROVIDERS has invalid ID {provider_id!r}; use lowercase letters, "
-                    "digits and _"
-                )
-            elif provider_id in providers:
-                reader.fail(f"NEST_PROVIDERS lists {provider_id!r} twice")
-            else:
-                profile = _profile(reader, provider_id, executor)
-                if profile is not None:
-                    providers[provider_id] = profile
-        if not ids:
-            reader.fail("NEST_PROVIDERS must list at least one provider ID")
-        default_provider = reader.get("NEST_DEFAULT_PROVIDER") or (ids[0] if ids else None)
-        if default_provider is not None and default_provider not in ids:
-            reader.fail(f"NEST_DEFAULT_PROVIDER {default_provider!r} is not in NEST_PROVIDERS")
-    else:
-        if reader.get("NEST_DEFAULT_PROVIDER"):
-            reader.fail("NEST_DEFAULT_PROVIDER needs NEST_PROVIDERS")
-        profile = _profile(reader, LEGACY_PROVIDER_ID, executor, legacy=True)
-        if profile is not None:
-            providers[profile.id] = profile
-            default_provider = profile.id
+    platforms, default_platform, platform_warnings = _platforms(reader, executor)
 
-    ssh = _ssh_policy(reader, list(providers.values()))
+    ssh = _ssh_policy(reader, list(platforms.values()))
 
     cert = reader.readable_file("NEST_TLS_CERT_FILE")
     key = reader.readable_file("NEST_TLS_KEY_FILE")
@@ -1607,8 +1673,9 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
         bind=bind,
         executor=executor,
         log_level=level,
-        providers=providers,
-        default_provider=default_provider,
+        platforms=platforms,
+        default_platform=default_platform,
+        warnings=platform_warnings,
         ssh=ssh,
         tls=tls,
         public_url=public_url,
@@ -1621,6 +1688,151 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
         allowed_projects=allowed_projects,
         **timeouts,
     )
+
+
+def _set_names(reader: _Reader, prefix: str, *, exclude: tuple[str, ...] = ()) -> list[str]:
+    """Names of the non-empty settings starting with `prefix`, sorted."""
+    return sorted(
+        name
+        for name in reader.environ
+        if name.startswith(prefix) and name not in exclude and reader.get(name)
+    )
+
+
+def _platforms(
+    reader: _Reader, executor: str
+) -> tuple[dict[str, PlatformProfile], str | None, tuple[str, ...]]:
+    """
+    Reads the HPC Platform Profiles and the default Platform.
+
+    Three forms are accepted, and exactly one may be used:
+
+    - `NEST_PLATFORMS` with `NEST_PLATFORM_<ID>_*` (current);
+    - `NEST_PROVIDERS` with `NEST_PROVIDER_<ID>_*` (deprecated, same fields);
+    - `NEST_SLURM_*`, which defines the Platform `default`.
+    """
+    platforms: dict[str, PlatformProfile] = {}
+    slurm = _set_names(reader, "NEST_SLURM_")
+    provider_fields = _set_names(
+        reader, "NEST_PROVIDER_", exclude=("NEST_PROVIDER_ALLOWED_PROJECTS",)
+    )
+    platform_fields = _set_names(reader, "NEST_PLATFORM_")
+    if reader.get("NEST_PLATFORMS") is not None:
+        notes: tuple[str, ...] = ()
+        mode_only = slurm == ["NEST_SLURM_SSH_MODE"]
+        if mode_only and (reader.get("NEST_SLURM_SSH_MODE") or "").upper() == "B":
+            # compose.managed-ssh.yaml always sets it; each Platform sets its own mode.
+            slurm = []
+            notes = (
+                "NEST_SLURM_SSH_MODE=B is ignored with NEST_PLATFORMS; set "
+                + "NEST_PLATFORM_<ID>_SSH_MODE for each Platform",
+            )
+        clash = [
+            name
+            for name in ("NEST_PROVIDERS", "NEST_DEFAULT_PROVIDER")
+            if reader.get(name) is not None
+        ]
+        clash += provider_fields + slurm
+        if clash:
+            reader.fail(
+                "NEST_PLATFORMS replaces the Compute Provider and single-cluster settings; "
+                "unset " + ", ".join(clash)
+            )
+        ids = _platform_ids(reader, "NEST_PLATFORMS")
+        for platform_id in ids:
+            profile = _profile(
+                reader, platform_id, executor, prefix=f"NEST_PLATFORM_{platform_id.upper()}_"
+            )
+            if profile is not None:
+                platforms[platform_id] = profile
+        _check_platform_names(reader, platform_fields, ids)
+        _check_distinct_login_nodes(reader, platforms)
+        default = _default_platform(reader, "NEST_DEFAULT_PLATFORM", "NEST_PLATFORMS", ids)
+        return platforms, default, notes
+
+    stray = platform_fields + (
+        ["NEST_DEFAULT_PLATFORM"] if reader.get("NEST_DEFAULT_PLATFORM") is not None else []
+    )
+    if stray:
+        reader.fail(", ".join(stray) + " need NEST_PLATFORMS, which lists the Platform IDs")
+    if reader.get("NEST_PROVIDERS") is not None:
+        if slurm:
+            reader.fail("NEST_PROVIDERS replaces the legacy settings; unset " + ", ".join(slurm))
+        ids = _platform_ids(reader, "NEST_PROVIDERS")
+        for provider_id in ids:
+            profile = _profile(reader, provider_id, executor)
+            if profile is not None:
+                platforms[provider_id] = profile
+        default = _default_platform(reader, "NEST_DEFAULT_PROVIDER", "NEST_PROVIDERS", ids)
+        deprecation = (
+            "NEST_PROVIDERS, NEST_DEFAULT_PROVIDER and NEST_PROVIDER_<ID>_* are deprecated: "
+            "rename them to NEST_PLATFORMS, NEST_DEFAULT_PLATFORM and NEST_PLATFORM_<ID>_*"
+        )
+        return platforms, default, (deprecation,)
+
+    if reader.get("NEST_DEFAULT_PROVIDER"):
+        reader.fail("NEST_DEFAULT_PROVIDER needs NEST_PROVIDERS")
+    profile = _profile(reader, LEGACY_PLATFORM_ID, executor, legacy=True)
+    if profile is None:
+        return platforms, None, ()
+    platforms[profile.id] = profile
+    return platforms, profile.id, ()
+
+
+def _platform_ids(reader: _Reader, name: str) -> list[str]:
+    """Reads a comma-separated list of Platform IDs, reporting invalid and repeated ones."""
+    entries = [i.strip() for i in (reader.get(name) or "").split(",") if i.strip()]
+    if not entries:
+        reader.fail(f"{name} must list at least one ID")
+    ids: list[str] = []
+    for platform_id in entries:
+        if not _PLATFORM_ID.fullmatch(platform_id):
+            reader.fail(
+                f"{name} has invalid ID {platform_id[:40]!r}; use lowercase letters, "
+                "digits and _, starting with a letter (at most 32)"
+            )
+        elif platform_id in ids:
+            reader.fail(f"{name} lists {platform_id!r} twice")
+        else:
+            ids.append(platform_id)
+    return ids
+
+
+def _default_platform(reader: _Reader, name: str, list_name: str, ids: list[str]) -> str | None:
+    default = reader.get(name)
+    if default is None:
+        return ids[0] if ids else None
+    if default not in ids:
+        reader.fail(f"{name} {default[:40]!r} is not in {list_name}")
+    return default
+
+
+def _check_platform_names(reader: _Reader, names: list[str], ids: list[str]) -> None:
+    """Reports `NEST_PLATFORM_*` settings that belong to no listed Platform or field."""
+    known = {f"NEST_PLATFORM_{i.upper()}_{f}" for i in ids for f in PLATFORM_FIELDS}
+    unknown = [name for name in names if name not in known]
+    if unknown:
+        reader.fail(
+            ", ".join(unknown)
+            + " match no Platform in NEST_PLATFORMS and field "
+            + "/".join(PLATFORM_FIELDS)
+            + "; fix the name or unset it"
+        )
+
+
+def _check_distinct_login_nodes(reader: _Reader, platforms: Mapping[str, PlatformProfile]) -> None:
+    """Reports a login-node endpoint approved for more than one Platform."""
+    owners: dict[tuple[str, int | None], str] = {}
+    for profile in platforms.values():
+        for node in profile.login_nodes:
+            # An omitted port is SSH's default, 22, so `host` and `host:22` are one endpoint.
+            key = (node.host.lower(), node.port if node.port is not None else 22)
+            owner = owners.setdefault(key, profile.id)
+            if owner != profile.id:
+                reader.fail(
+                    f"Login node {node} is approved for both Platforms {owner!r} and "
+                    f"{profile.id!r}; each endpoint belongs to one Platform"
+                )
 
 
 def _controller_auth(

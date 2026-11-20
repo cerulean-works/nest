@@ -96,6 +96,31 @@ host keys and key in the environment and add `compose.managed-ssh.yaml`, which
 drops this mount. No SSH config or Tailscale setting is used. See
 [Environment variables and defaults](configuration) for the variables.
 
+### Several HPC Platforms
+
+`.env` configures one cluster through `NEST_SLURM_*`. For several
+[HPC Platforms](configuration#hpc-platforms), put `NEST_PLATFORMS`,
+`NEST_DEFAULT_PLATFORM` and every `NEST_PLATFORM_<ID>_*` setting in
+`platforms.env` next to `compose.yaml` (ignored by Git; start from
+`platforms.env.example`), or point `NEST_PLATFORMS_ENV_FILE` at another file, and
+leave the `NEST_SLURM_*` settings unset. Their names depend on the Platform IDs, so
+Compose cannot list them one by one; every Controller definition (`compose.yaml`,
+`compose.tailscale.yaml`, `compose.tailscale-shared.yaml`) passes the file's lines
+to the Controller unchanged, and the Controller validates them exactly as a native
+process does. Without the file nothing changes.
+
+Keep everything else, including `NEST_SSH_*` credentials and `NEST_EXECUTOR`, in
+`.env` or the shell: Compose's own `environment` entries take precedence over the
+file, so a setting Compose already lists is not read from it. For Mode B Platforms,
+add `compose.managed-ssh.yaml` as usual; its `NEST_SLURM_SSH_MODE=B` is ignored
+with a warning because each Platform sets `NEST_PLATFORM_<ID>_SSH_MODE`. Check the
+result before starting:
+
+```bash
+docker compose run --rm --no-deps controller python -c \
+  'import json, nest.config as c; print(json.dumps(c.load_controller_config().summary()["platforms"], indent=2))'
+```
+
 ## Select who can connect
 
 The default host binding is `127.0.0.1:50051`. For the team's Tailscale deployment,

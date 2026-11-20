@@ -221,7 +221,7 @@ class _Base(PostgresTestCase):
 
 class SchemaTests(_Base):
     def test_migration_is_part_of_the_one_chain(self):
-        self.assertIn("0011_hpc_platform_catalog", [m.label for m in load_migrations()])
+        self.assertIn("0012_hpc_platform_catalog", [m.label for m in load_migrations()])
 
     def operator(self):
         self.conn.execute("SELECT set_config('nest.audit_operator', 'psql-ops', false)")
@@ -318,6 +318,39 @@ class SchemaTests(_Base):
         self.conn.execute("UPDATE hpc_platforms SET is_default = true WHERE id = %s", (nano4.id,))
         with self.assertRaises(psycopg.errors.UniqueViolation):
             self.conn.execute("UPDATE hpc_platforms SET is_default = true WHERE id = %s", (f1.id,))
+
+
+class UpgradePathTests(PostgresTestCase):
+    def test_upgrade_from_the_platform_metadata_migration(self):
+        """A database at 0011 (Platform metadata, A04) with records upgrades to 0012."""
+        url = self.database()
+        migrations = load_migrations()
+        labels = [m.label for m in migrations]
+        self.assertEqual(labels[-2:], ["0011_platform_metadata", "0012_hpc_platform_catalog"])
+        with connect(url) as conn:
+            self.assertEqual(len(upgrade(conn, migrations[:-1])), len(migrations) - 1)
+        db = Database(load_database_config({"NEST_DATABASE_URL": url}))
+        db.open()
+        self.addCleanup(db.close)
+        profile = ProviderProfile(
+            "nano4", "A", (LoginNode("ln01"),), account="acct", operator="nchc"
+        )
+        sync_providers(db, {"nano4": profile}, "nano4")
+        old_job = JobStore(db, "nano4").begin("batch", secrets.token_hex(16))
+        with connect(url) as conn:
+            self.assertEqual([m.label for m in upgrade(conn)], ["0012_hpc_platform_catalog"])
+            self.assertEqual(
+                conn.execute(
+                    "SELECT operator, platform_id FROM provider_profiles p "
+                    "JOIN jobs j ON j.provider_id = p.id WHERE j.id = %s",
+                    (old_job,),
+                ).fetchone(),
+                ("nchc", None),
+            )
+        mirrored = PlatformStore(db).sync_environment({"nano4": profile})
+        platform = PlatformStore(db).get_platform("nano4")
+        assert platform is not None
+        self.assertEqual((platform.id, platform.operator_name), (mirrored["nano4"], "nchc"))
 
 
 class RegistryTests(_Base):
@@ -503,9 +536,11 @@ class EnvironmentSyncTests(_Base):
             {
                 "NEST_DATABASE_URL": self.url,
                 "NEST_CONTROLLER_AUTH": "none",
-                "NEST_PROVIDERS": "nano4",
-                "NEST_PROVIDER_NANO4_LOGIN_NODES": "ln01.example.org,ln02.example.org",
-                "NEST_PROVIDER_NANO4_ACCOUNT": "acct",
+                "NEST_PLATFORMS": "nano4",
+                "NEST_PLATFORM_NANO4_LOGIN_NODES": "ln01.example.org,ln02.example.org",
+                "NEST_PLATFORM_NANO4_ACCOUNT": "acct",
+                "NEST_PLATFORM_NANO4_OPERATOR": "nchc",
+                "NEST_PLATFORM_NANO4_NAME": "Nano 4",
             }
         )
         database = open_database(config)
@@ -513,6 +548,8 @@ class EnvironmentSyncTests(_Base):
         self.addCleanup(database.close)
         platform_id = environment_platform_id(database, "nano4")
         self.assertEqual(platform_id, self.get("nano4").id)
+        mirrored = self.get("nano4")
+        self.assertEqual((mirrored.display_name, mirrored.operator_name), ("Nano 4", "nchc"))
         self.assertEqual(len(self.store.login_nodes("nano4")), 2)
 
 

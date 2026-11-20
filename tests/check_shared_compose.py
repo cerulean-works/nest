@@ -150,6 +150,32 @@ def main():
         assert service["volumes"][0]["target"] == "/run/nest-ssh", name
         assert service["volumes"][0]["read_only"], name
     assert not controllers["compose-nop.yaml"].get("ports")
+    # HPC Platform Profiles reach every Controller definition from one optional env
+    # file, unchanged, so native and Docker deployments read the same settings. No
+    # `environment` entry may shadow them with an empty value.
+    with tempfile.TemporaryDirectory() as temporary:
+        platforms_file = Path(temporary) / "platforms.env"
+        platforms = {
+            "NEST_PLATFORMS": "campus,lab",
+            "NEST_DEFAULT_PLATFORM": "lab",
+            "NEST_PLATFORM_CAMPUS_LOGIN_NODES": "login1.example.edu",
+            "NEST_PLATFORM_CAMPUS_ACCOUNT": "physics",
+            "NEST_PLATFORM_LAB_LOGIN_NODES": "lab-login:2222",
+            "NEST_PLATFORM_LAB_ACCOUNT": "lab",
+        }
+        platforms_file.write_text("".join(f"{k}={v}\n" for k, v in platforms.items()))
+        for name in (*controllers, "compose.managed-ssh.yaml"):
+            overrides = ("compose.managed-ssh.yaml",) if name == "compose.managed-ssh.yaml" else ()
+            service = render(
+                "compose.yaml" if overrides else name,
+                overrides=overrides,
+                NEST_PLATFORMS_ENV_FILE=str(platforms_file),
+            )["services"]["controller"]
+            assert set(service["environment"]) == CONTROLLER_SETTINGS | set(platforms), name
+            for key, value in platforms.items():
+                assert service["environment"][key] == value, (name, key)
+        for service in controllers.values():
+            assert not any(k.startswith("NEST_PLATFORM") for k in service["environment"])
     # Mode B renders without .env (render uses --env-file /dev/null), without an SSH
     # directory, and without any Tailscale setting reaching the Controller.
     managed = render(
@@ -238,7 +264,7 @@ def main():
             files / "tailscale/serve"
         )
     print(
-        "PASS: rendered Compose isolation, Controller settings, default and local-db "
+        "PASS: rendered Compose isolation, Controller and Platform settings, default and local-db "
         "databases, state reuse, and Dokploy paths"
     )
 

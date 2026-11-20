@@ -1,4 +1,4 @@
--- 0011: HPC Platform Catalog and Login-Node Registry (D07).
+-- 0012: HPC Platform Catalog and Login-Node Registry (D07).
 --
 -- Applied migrations are immutable: never edit this file. Change the schema by
 -- adding the next numbered file (see "Database migrations" in the docs).
@@ -150,7 +150,7 @@ CREATE TRIGGER hpc_platform_project_grants_no_truncate BEFORE TRUNCATE ON hpc_pl
     FOR EACH STATEMENT EXECUTE FUNCTION nest_forbid_change();
 
 -- A job records the Platform (Slurm namespace) it was submitted to, whichever
--- login node was used. NULL for records written before 0011 or without a
+-- login node was used. NULL for records written before 0012 or without a
 -- Platform. Written with the record and never changed.
 ALTER TABLE jobs ADD COLUMN platform_id uuid REFERENCES hpc_platforms (id) ON DELETE RESTRICT;
 

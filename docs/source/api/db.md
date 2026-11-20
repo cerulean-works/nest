@@ -46,7 +46,9 @@ Settings are read by [`config.load_database_config`] into a [`config.DatabaseCon
 
 ## Records
 
-[[autodoc]] db.sync_providers
+[[autodoc]] db.sync_platforms
+
+[[autodoc]] db.PlatformIdentityError
 
 [[autodoc]] db.JobStore
 

@@ -90,7 +90,7 @@ from .projects import (
     UserNotFoundError,
 )
 from .sessions import AccessGrant, Rotation, SessionRefreshError, SessionStore
-from .store import JobStore, sync_providers
+from .store import JobStore, PlatformIdentityError, sync_platforms, sync_providers
 
 __all__ = [
     "ASSIGNABLE_ROLES",
@@ -142,6 +142,7 @@ __all__ = [
     "Platform",
     "PlatformAdminBootstrap",
     "PlatformError",
+    "PlatformIdentityError",
     "PlatformLoginNode",
     "PlatformNotFoundError",
     "PlatformStore",
@@ -170,6 +171,7 @@ __all__ = [
     "normalize_invited_email",
     "order_login_nodes",
     "schema_status",
+    "sync_platforms",
     "sync_providers",
     "upgrade",
     "verify",

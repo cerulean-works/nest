@@ -7,7 +7,7 @@ chooses which login node to connect to.
 
 The catalog needs the PostgreSQL database (see
 [Store Controller records in PostgreSQL](database)) and is added by migration
-`0011_hpc_platform_catalog`. Run `nest-db upgrade` first.
+`0012_hpc_platform_catalog`. Run `nest-db upgrade` first.
 
 ## What a Platform is
 
@@ -78,10 +78,13 @@ The schema enforces these rules for every writer, `psql` included:
 
 ### Bootstrap from the environment
 
-At every start, the Controller mirrors each Provider Profile from
-`NEST_PROVIDERS` (or the legacy `NEST_SLURM_*` settings) as a Platform with
+At every start, the Controller mirrors each Platform Profile from
+`NEST_PLATFORMS` (or the deprecated `NEST_PROVIDERS` and `NEST_SLURM_*` settings,
+see [HPC Platforms](configuration#hpc-platforms)) as a Platform with
 `source = env`. The Platform's slug is the profile ID and it keeps its Platform ID
-across restarts. Its login nodes follow the profile's `LOGIN_NODES` in order,
+across restarts. Its display name and operator metadata follow
+`NEST_PLATFORM_<ID>_NAME` and `NEST_PLATFORM_<ID>_OPERATOR`; a profile without an
+operator label keeps the recorded one. Its login nodes follow the profile's `LOGIN_NODES` in order,
 approved for the profile's SSH mode. A Mode B node's host-key pin reference is
 `env:NEST_SSH_KNOWN_HOSTS`, the operator-vetted `NEST_SSH_KNOWN_HOSTS` or
 `NEST_SSH_KNOWN_HOSTS_DATA`. When a profile is removed from the environment, its

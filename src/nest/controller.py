@@ -42,7 +42,7 @@ from .db import (
     JobStore,
     PlatformStore,
     bootstrap_state,
-    sync_providers,
+    sync_platforms,
     verify,
 )
 from .errors import (
@@ -673,9 +673,9 @@ def build_backend(config: ControllerConfig) -> SlurmBackend | None:
         config ([`config.ControllerConfig`]): Validated Controller configuration.
 
     Returns:
-        [`backends.slurm.SlurmBackend`] or `None`: `None` when no provider is set.
+        [`backends.slurm.SlurmBackend`] or `None`: `None` when no Platform is set.
     """
-    profile = config.provider
+    profile = config.platform
     if profile is None:
         return None
     identity = known_hosts = None
@@ -733,8 +733,8 @@ def open_database(config: ControllerConfig) -> Database | None:
     Connects to the configured database and checks it before the Controller serves.
 
     Verifies connectivity, the schema version, and every applied migration's
-    checksum, then records the environment's Provider Profiles and mirrors them as
-    HPC Platforms (see [`db.PlatformStore.sync_environment`]). Never applies
+    checksum, then records the environment's HPC Platform Profiles and mirrors them
+    in the HPC Platform Catalog (see [`db.PlatformStore.sync_environment`]). Never applies
     migrations; run `nest-db upgrade` first.
 
     Args:
@@ -754,8 +754,8 @@ def open_database(config: ControllerConfig) -> Database | None:
         database.open()
         with database.connection() as conn:
             verify(conn)
-        sync_providers(database, config.providers, config.default_provider)
-        PlatformStore(database).sync_environment(config.providers)
+        sync_platforms(database, config.platforms, config.default_platform)
+        PlatformStore(database).sync_environment(config.platforms)
         _log_bootstrap(database, config)
     except psycopg.Error as exc:
         database.close()
@@ -806,7 +806,7 @@ def build_access(config: ControllerConfig, database: Database | None) -> Executi
     return ExecutionAccess(
         database,
         AllowedProjects(config.allowed_projects),
-        provider_id=config.default_provider or config.executor,
+        provider_id=config.default_platform or config.executor,
     )
 
 
@@ -827,7 +827,9 @@ def record_start(config: ControllerConfig, database: Database | None) -> None:
                 "*" if "*" in config.allowed_projects else len(config.allowed_projects)
             ),
             "executor": config.executor,
-            "default_provider": config.default_provider,
+            "default_platform": config.default_platform,
+            # Kept for audit consumers written before HPC Platforms; same value.
+            "default_provider": config.default_platform,
             "ssh_modes_allowed": ",".join(config.ssh.allowed_modes),
             "ssh_identity_inline": config.ssh.private_key is not None,
             "database_sslmode": (config.database.effective_sslmode if config.database else None),
@@ -871,6 +873,8 @@ def main():
     except ConfigError as exc:
         logger.error("%s", exc)
         raise SystemExit(2) from None
+    for message in config.warnings:
+        logger.warning("Configuration warning: %s", message)
 
     try:
         database = open_database(config)
@@ -881,10 +885,10 @@ def main():
     jobs = (
         JobStore(
             database,
-            config.provider.id,
-            platform_id=environment_platform_id(database, config.provider.id),
+            config.platform.id,
+            platform_id=environment_platform_id(database, config.platform.id),
         )
-        if database is not None and config.provider is not None
+        if database is not None and config.platform is not None
         else None
     )
 

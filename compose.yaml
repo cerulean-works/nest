@@ -8,6 +8,12 @@ services:
     init: true
     restart: unless-stopped
     stop_grace_period: 20s
+    # HPC Platform Profiles (NEST_PLATFORMS, NEST_DEFAULT_PLATFORM and
+    # NEST_PLATFORM_<ID>_*) come from this optional file, since their names depend
+    # on the Platform IDs. See docs/source/configuration.md.
+    env_file:
+      - path: ${NEST_PLATFORMS_ENV_FILE:-./platforms.env}
+        required: false
     environment:
       NEST_CONTROLLER_BIND: 0.0.0.0:50051
       NEST_EXECUTOR: ${NEST_EXECUTOR:-slurm}
