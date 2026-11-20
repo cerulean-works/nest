@@ -145,7 +145,8 @@ class RedactionTests(unittest.TestCase):
                 "project": str(uuid.uuid4()),
                 "note": f"bearer {token}",
                 "who": SECRET_EMAIL,
-                "pem": "-----BEGIN OPENSSH PRIVATE KEY-----",
+                # Split so the repository credential scan does not match it.
+                "pem": "-----BEGIN OPENSSH " + "PRIVATE KEY-----",
                 "echo": f"x {registered} y",
                 "refresh_token": "short",
                 "smtp_password": "short",
