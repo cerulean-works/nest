@@ -33,6 +33,8 @@ guide:
         title: Sign in with Google
       - local: cli-login
         title: Sign in from the command line
+      - local: projects
+        title: Share Projects and manage roles
       - local: platform-admin
         title: Bootstrap and recover platform administration
       - local: deployment-architecture
@@ -64,6 +66,8 @@ reference:
         title: Email delivery
       - local: api/auth
         title: Sign-in
+      - local: api/authz
+        title: Authorization
       - local: api/runtime
         title: Executor and workers
   - title: Operations

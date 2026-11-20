@@ -142,6 +142,9 @@ AUTH_SESSION_PATHS = ("/auth/session", "/auth/session/refresh", "/auth/session/l
 AUTH_CLI_PREFIX = "/auth/cli/"
 """Prefix of the CLI sign-in and CLI session routes served by the auth listener."""
 
+PROJECTS_API_PATH = "/api/projects"
+"""Root of the Projects API served by the auth listener."""
+
 CLI_SCOPES: dict[str, str] = {
     "jobs:run": "Run and manage jobs in your Projects",
     "projects:read": "See your Projects and their members",
@@ -1265,6 +1268,12 @@ def _google_redirect_url(reader: _Reader) -> str | None:
     if parts.path.startswith(AUTH_CLI_PREFIX):
         reader.fail(
             f"NEST_GOOGLE_REDIRECT_URL must not use {parts.path}, a CLI sign-in route; "
+            f"use a callback path such as {_REDIRECT_EXAMPLE!r}"
+        )
+        return None
+    if parts.path == PROJECTS_API_PATH or parts.path.startswith(PROJECTS_API_PATH + "/"):
+        reader.fail(
+            f"NEST_GOOGLE_REDIRECT_URL must not use {parts.path}, a Projects API route; "
             f"use a callback path such as {_REDIRECT_EXAMPLE!r}"
         )
         return None

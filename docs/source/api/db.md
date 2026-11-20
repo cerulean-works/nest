@@ -121,13 +121,20 @@ project = projects.create_project("llm-training", created_by_user_id=alice)  # A
 projects.add_member(project.id, bob, "admin", added_by_user_id=alice)
 projects.transfer_ownership(project.id, actor_user_id=alice, new_owner_user_id=bob)
 projects.role_of(project.id, alice)  # "admin"
+projects.audit_history(project.id)  # newest first
 ```
+
+`ProjectStore` applies the one-Owner rules for every caller but not who may call
+it; interfaces go through [`authz.ProjectService`] instead (see
+[Authorization](authz)).
 
 [[autodoc]] db.ProjectStore
 
 [[autodoc]] db.Project
 
 [[autodoc]] db.Membership
+
+[[autodoc]] db.ProjectAuditEvent
 
 [[autodoc]] db.ProjectError
 
