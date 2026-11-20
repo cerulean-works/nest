@@ -66,7 +66,7 @@ class SlurmConfig:
     Attributes:
         ssh_host (`str`): SSH host name or configured SSH alias.
         account (`str`): Default Slurm account.
-        partition (`str`, *optional*, defaults to `"8gpus"`): Default Slurm partition.
+        partition (`str`, *optional*, defaults to `"h200_256gpu"`): Default Slurm partition.
         time (`str`, *optional*): Default `sbatch --time` value. Omits the flag if unset.
         work_root (`str`, *optional*): Absolute directory for staged execution payloads.
         worker_workdir (`str`, *optional*): Remote Nest directory containing the

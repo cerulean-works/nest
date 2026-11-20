@@ -193,7 +193,7 @@ class ValidationTests(unittest.TestCase):
     def test_default_partition_and_time(self):
         profile = load_controller_config(LEGACY).provider
         assert profile is not None
-        self.assertEqual((profile.partition, profile.time), ("8gpus", "00:05:00"))
+        self.assertEqual((profile.partition, profile.time), ("h200_256gpu", "00:05:00"))
 
     def test_slurm_names_and_times_are_validated(self):
         text = self.problems(

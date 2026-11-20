@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=nest-env-test
 #SBATCH --account=ACD115198
-#SBATCH --partition=8gpus
+#SBATCH --partition=h200_256gpu
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=12
