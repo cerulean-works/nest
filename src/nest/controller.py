@@ -4,6 +4,7 @@ import signal
 import time
 from concurrent import futures
 from functools import wraps
+from uuid import UUID
 
 import cloudpickle
 import grpc
@@ -35,7 +36,15 @@ from .config import (
     load_executor,
     materialize_ssh_credentials,
 )
-from .db import Database, DatabaseError, JobStore, bootstrap_state, sync_providers, verify
+from .db import (
+    Database,
+    DatabaseError,
+    JobStore,
+    PlatformStore,
+    bootstrap_state,
+    sync_providers,
+    verify,
+)
 from .errors import (
     ERROR_KIND_METADATA,
     JOB_ID_METADATA,
@@ -724,7 +733,8 @@ def open_database(config: ControllerConfig) -> Database | None:
     Connects to the configured database and checks it before the Controller serves.
 
     Verifies connectivity, the schema version, and every applied migration's
-    checksum, then records the environment's Provider Profiles. Never applies
+    checksum, then records the environment's Provider Profiles and mirrors them as
+    HPC Platforms (see [`db.PlatformStore.sync_environment`]). Never applies
     migrations; run `nest-db upgrade` first.
 
     Args:
@@ -745,6 +755,7 @@ def open_database(config: ControllerConfig) -> Database | None:
         with database.connection() as conn:
             verify(conn)
         sync_providers(database, config.providers, config.default_provider)
+        PlatformStore(database).sync_environment(config.providers)
         _log_bootstrap(database, config)
     except psycopg.Error as exc:
         database.close()
@@ -755,6 +766,15 @@ def open_database(config: ControllerConfig) -> Database | None:
         database.close()
         raise
     return database
+
+
+def environment_platform_id(database: Database, provider_id: str) -> UUID | None:
+    """
+    The immutable ID of the HPC Platform a Provider Profile is mirrored as, or
+    `None` when an operator-managed Platform already uses that slug.
+    """
+    platform = PlatformStore(database).get_platform(provider_id)
+    return platform.id if platform is not None and platform.source == "env" else None
 
 
 def build_access(config: ControllerConfig, database: Database | None) -> ExecutionAccess | None:
@@ -859,7 +879,11 @@ def main():
         raise SystemExit(3) from None
     email = start_email_service(config.email, database)
     jobs = (
-        JobStore(database, config.provider.id)
+        JobStore(
+            database,
+            config.provider.id,
+            platform_id=environment_platform_id(database, config.provider.id),
+        )
         if database is not None and config.provider is not None
         else None
     )

@@ -50,3 +50,21 @@ A [`login.NestSession`] is a Nest identity only, never an HPC credential.
 [[autodoc]] login.NestUnavailableError
 
 [[autodoc]] login.CredentialsFileError
+
+## HPC Platform discovery
+
+See [Register HPC Platforms and login nodes](../platforms#discover-platforms).
+
+```python
+from nest.platforms import list_platforms
+
+platforms, default_id = list_platforms()  # only Platforms granted to your Projects
+```
+
+[[autodoc]] platforms.list_platforms
+
+[[autodoc]] platforms.get_platform
+
+[[autodoc]] platforms.PlatformInfo
+
+[[autodoc]] platforms.PlatformNotAvailableError

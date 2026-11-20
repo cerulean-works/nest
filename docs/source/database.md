@@ -179,6 +179,14 @@ security audit triggers for the invitation flows (see
 Link's last use is taken, and `invitation.email_failed` when the outbox gives up on
 an invitation email. The invitation tables themselves are unchanged.
 
+**HPC Platform Catalog.** Migration `0011_hpc_platform_catalog` adds
+`hpc_platforms` (immutable Platform IDs and slugs, optional operator metadata),
+`hpc_login_nodes` (approved endpoints, transport modes, priority, health and
+host-key pin references) and `hpc_platform_project_grants`, and records each
+job's Platform in `jobs.platform_id`. Changes to all three tables must name an
+operator and are recorded in the security audit log. Platforms are never deleted.
+See [Register HPC Platforms and login nodes](platforms).
+
 ## Configure the connection
 
 ```bash

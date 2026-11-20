@@ -52,6 +52,49 @@ Settings are read by [`config.load_database_config`] into a [`config.DatabaseCon
 
 The email outbox ([`db.EmailOutbox`]) is documented with [Email delivery](mail).
 
+## HPC Platforms and login nodes
+
+See [Register HPC Platforms and login nodes](../platforms). `PlatformStore` is the
+operator-side API; users discover Platforms through [`authz.PlatformCatalog`].
+
+```python
+from nest.db import PlatformStore
+
+platforms = PlatformStore(database)
+ops = {"operator": "ops-alice", "reason": "onboard nano4"}
+nano4 = platforms.create_platform("nano4", "Nano 4", operator_name="NCHC", **ops)
+platforms.add_login_node(
+    nano4.id, "ln01.nano4.example", transport_modes=["B"], host_key_pin_ref=pin, **ops
+)
+platforms.grant_project(nano4.id, project_id, **ops)
+```
+
+[[autodoc]] db.PlatformStore
+
+[[autodoc]] db.Platform
+
+[[autodoc]] db.PlatformLoginNode
+
+[[autodoc]] db.LoginEndpoint
+
+[[autodoc]] db.order_login_nodes
+
+[[autodoc]] db.PlatformError
+
+[[autodoc]] db.PlatformNotFoundError
+
+[[autodoc]] db.DuplicatePlatformError
+
+[[autodoc]] db.LoginNodeNotFoundError
+
+[[autodoc]] db.DuplicateLoginNodeError
+
+[[autodoc]] db.EnvironmentManagedError
+
+[[autodoc]] db.NoLoginNodeError
+
+[[autodoc]] db.EndpointNotApprovedError
+
 ## Users and identities
 
 See [Users, Projects and memberships](../database#users-projects-and-memberships)

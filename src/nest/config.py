@@ -156,6 +156,9 @@ PROJECTS_API_PATH = "/api/projects"
 INVITATIONS_API_PATH = "/api/invitations"
 """Root of the signed-in User's own invitations API served by the auth listener."""
 
+PLATFORMS_API_PATH = "/api/platforms"
+"""Root of the HPC Platform discovery API served by the auth listener."""
+
 INVITATION_PAGE_PATH = "/invitations/accept"
 """Browser page where a signed-in User reviews and accepts an invitation link."""
 
@@ -1337,6 +1340,12 @@ def _google_redirect_url(reader: _Reader) -> str | None:
     if parts.path == PROJECTS_API_PATH or parts.path.startswith(PROJECTS_API_PATH + "/"):
         reader.fail(
             f"NEST_GOOGLE_REDIRECT_URL must not use {parts.path}, a Projects API route; "
+            f"use a callback path such as {_REDIRECT_EXAMPLE!r}"
+        )
+        return None
+    if parts.path == PLATFORMS_API_PATH or parts.path.startswith(PLATFORMS_API_PATH + "/"):
+        reader.fail(
+            f"NEST_GOOGLE_REDIRECT_URL must not use {parts.path}, a Platforms API route; "
             f"use a callback path such as {_REDIRECT_EXAMPLE!r}"
         )
         return None

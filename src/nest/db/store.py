@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any, LiteralString
+from uuid import UUID
 
 import psycopg
 from psycopg import sql
@@ -104,11 +105,16 @@ class JobStore:
     Args:
         database ([`db.Database`]): Open database.
         provider_id (`str`): Provider Profile the Controller submits to.
+        platform_id (`UUID`, *optional*): The HPC Platform (Slurm namespace) the
+            Provider Profile is mirrored as (see [`db.PlatformStore.sync_environment`]).
+            Recorded with each new job and never changed afterwards, whichever login
+            node submits it.
     """
 
-    def __init__(self, database: Database, provider_id: str):
+    def __init__(self, database: Database, provider_id: str, *, platform_id: UUID | None = None):
         self.database = database
         self.provider_id = provider_id
+        self.platform_id = platform_id
 
     def begin(
         self, kind: str, execution_id: str, *, request_id: str | None = None, **fields: Any
@@ -137,6 +143,9 @@ class JobStore:
             raise ValueError(f"Unknown job fields: {sorted(unknown)}")
         columns = ["execution_id", "provider_id", "kind", "request_id", *fields]
         values = [execution_id, self.provider_id, kind, request_id, *fields.values()]
+        if self.platform_id is not None:
+            columns.append("platform_id")
+            values.append(self.platform_id)
         query = sql.SQL("INSERT INTO jobs ({}) VALUES ({}) RETURNING id").format(
             sql.SQL(", ").join(map(sql.Identifier, columns)),
             sql.SQL(", ").join(sql.Placeholder() * len(values)),
