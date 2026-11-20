@@ -1816,7 +1816,8 @@ def _check_distinct_login_nodes(reader: _Reader, platforms: Mapping[str, Platfor
     owners: dict[tuple[str, int | None], str] = {}
     for profile in platforms.values():
         for node in profile.login_nodes:
-            key = (node.host.lower(), node.port)
+            # An omitted port is SSH's default, 22, so `host` and `host:22` are one endpoint.
+            key = (node.host.lower(), node.port if node.port is not None else 22)
             owner = owners.setdefault(key, profile.id)
             if owner != profile.id:
                 reader.fail(

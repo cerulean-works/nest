@@ -636,6 +636,20 @@ class PlatformTests(unittest.TestCase):
         files = Files(self)
         shared = platforms(files, NEST_PLATFORM_LAB_LOGIN_NODES="Login2.example.edu:2222")
         self.assertIn("approved for both Platforms 'campus' and 'lab'", self.problems(shared))
+        # An omitted port is 22, so spelling the default port does not make a new endpoint.
+        for campus, lab in (
+            ("login1.example.edu", "login1.example.edu:22"),
+            ("login1.example.edu:22", "LOGIN1.example.edu"),
+        ):
+            with self.subTest(campus=campus, lab=lab):
+                text = self.problems(
+                    platforms(
+                        files,
+                        NEST_PLATFORM_CAMPUS_LOGIN_NODES=campus,
+                        NEST_PLATFORM_LAB_LOGIN_NODES=lab,
+                    )
+                )
+                self.assertIn("approved for both Platforms 'campus' and 'lab'", text)
         # A different port on the same host is a different endpoint.
         other_port = platforms(files, NEST_PLATFORM_LAB_LOGIN_NODES="login1.example.edu:2200")
         load_controller_config(other_port)

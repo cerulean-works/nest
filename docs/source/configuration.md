@@ -92,7 +92,8 @@ These are kept apart on purpose:
 - The **operator** label (`NEST_PLATFORM_<ID>_OPERATOR`) says who runs the cluster.
   It is metadata only, so several Platforms can share one operator.
 - **Login nodes** are endpoints. Each `host[:port]` may be approved for only one
-  Platform.
+  Platform. Host names are compared without case, and an omitted port counts as
+  22, so `login.example.edu` and `login.example.edu:22` are the same endpoint.
 - The **Slurm account**, partition and time limit are per-Platform defaults.
 
 **Several Platforms** use `NEST_PLATFORMS`, a comma-separated list of Platform IDs
