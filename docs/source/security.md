@@ -4,7 +4,10 @@ Nest currently uses Python object serialization for remote function execution.
 
 Deserializing untrusted Python payloads may execute arbitrary code.
 
-The current Controller does not provide application-level authentication, multi-tenant isolation, or per-user HPC identity management.
+With a database, the Controller authenticates every gRPC call with a Nest session
+and authorizes it with the Project policy (see
+[Authenticated execution](#authenticated-execution)). It does not provide per-user
+HPC identity management: every job runs as the Controller's configured HPC account.
 
 Only trusted users should be granted access to the Controller.
 
@@ -18,10 +21,48 @@ Controller's single HPC SSH user. Node Sharing and Grants restrict network
 reachability; they do not authenticate callers inside Nest or isolate jobs.
 
 Project roles (see [Share Projects and manage roles](projects)) are enforced by
-one server-side, deny-by-default policy on the Projects API. They grant no HPC
-authority: Run actions also need the Provider's permission, which no Project role
-or Platform Admin role implies. The gRPC execution service does not yet
-authenticate callers, so the limits above still apply to it.
+one server-side, deny-by-default policy on the Projects API and the gRPC execution
+service alike. They grant no HPC authority: Run actions also need the Provider's
+permission, which no Project role or Platform Admin role implies.
+
+## Authenticated execution
+
+`NEST_CONTROLLER_AUTH=session`, the default when `NEST_DATABASE_URL` is set, makes
+every gRPC call carry a Nest CLI session (`authorization: Bearer <access token>`,
+sent by the SDK when `NEST_AUTH_URL` is set; see
+[Sign in from the command line](cli-login)) and checks it with
+[`authz.ExecutionAccess`], which uses the same [`authz.Authorizer`] as the Projects
+API:
+
+| RPC | Needs | Refused as |
+| --- | --- | --- |
+| `Execute`, `SubmitJob` | `run.submit` in the Project named by `NEST_PROJECT_ID`, a `jobs:run` scope, and a Project the operator approved in `NEST_PROVIDER_ALLOWED_PROJECTS` | `NOT_FOUND` when not a member, `PERMISSION_DENIED` for the role, scope or Provider |
+| `GetJobStatus` | `run.read` in the job's recorded Project | `NOT_FOUND` |
+| `CancelJob` | `run.cancel` in the job's recorded Project, and being its submitter | `NOT_FOUND`, or `PERMISSION_DENIED` for someone else's Run |
+
+- A call without an accepted session is refused with `UNAUTHENTICATED`. Browser
+  session tokens are not accepted, and a revoked session, a disabled User or a
+  removed member is refused from the next call on: nothing is cached.
+- Each submission records its Project and submitter with the job. A job recorded
+  without a Project, such as one from before authentication, cannot be read or
+  cancelled through an authenticated Controller.
+- Unauthorized access is denied by default: with no `NEST_PROVIDER_ALLOWED_PROJECTS`
+  no Run is accepted, and without Google sign-in nobody can obtain a session.
+- Session tokens travel only over TLS (`NEST_TLS_CERT_FILE` and `NEST_TLS_KEY_FILE`)
+  or a loopback listener. On a network that is already encrypted and
+  access-controlled, such as an authorized Tailnet, the operator approves plaintext
+  gRPC explicitly with `NEST_CONTROLLER_ALLOW_PLAINTEXT=true`; the Controller
+  refuses to start otherwise.
+- Nest authorization and HPC permissions stay separate. A Nest session is never sent
+  to a login node, and Slurm and UNIX permissions on the cluster are unchanged.
+
+`NEST_CONTROLLER_AUTH=none`, the only mode without a database, serves every caller
+that can reach the listener; the network restrictions above are then the only
+access control, and the Controller logs a warning when it listens beyond loopback.
+
+Every submission and cancellation, every refusal on either API, and identity,
+session, invitation and Provider changes are recorded without secrets in the
+[security audit log](audit-log).
 
 ## Deployment credentials
 
@@ -71,7 +112,9 @@ in a signed-in browser, so no credential is typed into a terminal or passed in
 session is not an HPC credential: it is never sent to a login node, and NCHC SSH
 passwords and one-time codes are never asked for or stored by Nest sign-in.
 Approve only sign-ins you started yourself: someone who sends you an approval link
-is asking for your Nest account.
+is asking for your Nest account. With session authentication the SDK sends the CLI
+session to the Controller over TLS or an approved encrypted network only, never to
+an HPC login node.
 
 The database also holds Users' names and email addresses, invited email
 addresses, and identity-provider subject IDs (see
@@ -91,12 +134,13 @@ changes and bootstrap events are kept in an append-only audit log. See
 ## Known limitations
 
 - Experimental API with potential breaking changes.
-- No multi-tenant isolation.
+- No isolation between Projects on the HPC side: all Runs share the Controller's
+  HPC account and work directory.
 - No per-user HPC accounts.
 - No automatic project source or data synchronization.
-- No application-level authentication. `NEST_AUTH_TOKEN_FILE` is reserved and
-  rejected at startup until it is implemented. TLS is available with
-  `NEST_TLS_CERT_FILE` and `NEST_TLS_KEY_FILE`.
+- No authentication without a database (`NEST_CONTROLLER_AUTH=none`).
+  `NEST_AUTH_TOKEN_FILE` (static service tokens) is reserved and rejected at
+  startup.
 - Controller and backend deployment are managed by the host.
 
 ## Execution behavior

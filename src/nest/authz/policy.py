@@ -88,16 +88,18 @@ class Principal:
         user_id (`UUID`): The signed-in User.
         session_kind (`str`): `browser` or `cli`.
         scopes (`frozenset[str]`): A CLI session's scopes; ignored for browsers.
+        session_id (`UUID`, *optional*): The session, recorded in the audit log.
     """
 
     user_id: UUID
     session_kind: str
     scopes: frozenset[str] = frozenset()
+    session_id: UUID | None = None
 
     @classmethod
     def from_session(cls, session: Session) -> Principal:
         """The caller of an authenticated session (see [`db.AccessGrant`])."""
-        return cls(session.user_id, session.kind, session.scopes)
+        return cls(session.user_id, session.kind, session.scopes, session.id)
 
 
 @dataclass(frozen=True)

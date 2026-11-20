@@ -26,6 +26,12 @@ what each error means and when it is safe to call again.
 
 [[autodoc]] errors.DatabaseUnavailableError
 
+## Access
+
+[[autodoc]] errors.AuthenticationRequiredError
+
+[[autodoc]] errors.RemoteAccessDeniedError
+
 ## Timeouts
 
 [[autodoc]] errors.NestTimeoutError

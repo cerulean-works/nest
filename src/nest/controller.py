@@ -16,11 +16,21 @@ from ._logging import (
     register_secret,
     request_context,
 )
+from .audit import AuditLog, audit_interface
 from .auth.web import start_auth_service
+from .authz import Action, Principal
+from .authz.execution import (
+    AllowedProjects,
+    ExecutionAccess,
+    ProjectRequiredError,
+    UnauthenticatedError,
+)
+from .authz.service import AccessDeniedError
 from .backends.slurm import SlurmBackend, SlurmConfig, new_execution_id
 from .config import (
     ConfigError,
     ControllerConfig,
+    _is_loopback_address,
     load_controller_config,
     load_executor,
     materialize_ssh_credentials,
@@ -51,7 +61,7 @@ def _logged_rpc(method):
             None,
         )
         level = "debug" if method.__name__ == "GetJobStatus" else "info"
-        with request_context(incoming_id):
+        with request_context(incoming_id), audit_interface("grpc"):
             started = time.monotonic()
             getattr(logger, level)("RPC started method=%s", method.__name__)
             try:
@@ -163,11 +173,26 @@ def _abort_infrastructure(context, exc: InfrastructureError, status=None):
     context.abort(status or exc.status, _status_details(str(exc)))
 
 
+def _abort_denied(context, exc: AccessDeniedError, what: str):
+    """
+    Aborts a refused RPC without revealing what the caller may not see: a Project
+    or job they are not a member of is answered as not found.
+    """
+    if not exc.visible:
+        context.abort(grpc.StatusCode.NOT_FOUND, f"{what} not found")
+    context.abort(grpc.StatusCode.PERMISSION_DENIED, f"Not allowed to {exc.action}: {exc.reason}")
+    raise AssertionError("context.abort raises")
+
+
 class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
     """Handles execution requests and Slurm job operations for the controller."""
 
     def __init__(
-        self, slurm_backend=None, executor: str | None = None, jobs: JobStore | None = None
+        self,
+        slurm_backend=None,
+        executor: str | None = None,
+        jobs: JobStore | None = None,
+        access: ExecutionAccess | None = None,
     ):
         """
         Stores the optional Slurm backend and job store used by the RPC handlers.
@@ -179,10 +204,92 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 request reads and validates `NEST_EXECUTOR`.
             jobs ([`db.JobStore`], *optional*): Records Slurm submissions in
                 PostgreSQL. Without it the Controller is stateless.
+            access ([`authz.ExecutionAccess`], *optional*): Authenticates and
+                authorizes every RPC (`NEST_CONTROLLER_AUTH=session`). Without it
+                any caller that reaches the listener is served.
         """
         self.slurm_backend = slurm_backend
         self.executor = executor
         self.jobs = jobs
+        self.access = access
+
+    def _guarded(self, context, call):
+        """Runs an access check, turning a database failure into `UNAVAILABLE`."""
+        try:
+            return call()
+        except (DatabaseError, DatabaseUnavailableError) as exc:
+            logger.error("Access check failed: the database is unavailable")
+            error = (
+                exc
+                if isinstance(exc, DatabaseUnavailableError)
+                else DatabaseUnavailableError(
+                    "The Controller database is unavailable, so the request was not run. "
+                    "Nothing was submitted; retry later."
+                )
+            )
+            _abort_infrastructure(context, error)
+            raise AssertionError("context.abort raises") from None
+
+    def _authenticate(self, context, rpc: str) -> Principal | None:
+        """
+        Returns the caller, or `None` when authentication is off. Aborts with
+        `UNAUTHENTICATED` when no accepted Nest session was presented.
+        """
+        if self.access is None:
+            return None
+        access = self.access
+        try:
+            return self._guarded(
+                context, lambda: access.authenticate(context.invocation_metadata(), rpc)
+            )
+        except UnauthenticatedError:
+            context.abort(
+                grpc.StatusCode.UNAUTHENTICATED,
+                "This Controller needs a Nest session: run `nest login`, or set "
+                "NEST_AUTH_URL so the SDK can sign in",
+            )
+            raise AssertionError("context.abort raises") from None
+
+    def _authorize_submit(
+        self, context, principal: Principal | None, execution_id: str, details: dict
+    ) -> dict:
+        """
+        Checks `run.submit` for the Project in the call's metadata. Returns the job
+        record's attribution fields, empty when authentication is off.
+        """
+        if self.access is None or principal is None:
+            return {}
+        access = self.access
+        try:
+            project_id = access.project_of(context.invocation_metadata())
+        except ProjectRequiredError as exc:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
+            raise AssertionError("context.abort raises") from None
+        try:
+            self._guarded(
+                context,
+                lambda: access.authorize_submit(
+                    principal, project_id, execution_id=execution_id, details=details
+                ),
+            )
+        except AccessDeniedError as exc:
+            _abort_denied(context, exc, "Project")
+        return {"project_id": project_id, "submitted_by_user_id": principal.user_id}
+
+    def _authorize_job(self, context, principal: Principal | None, action: Action, job_id: int):
+        """Checks `run.read` or `run.cancel` on the recorded job `job_id`."""
+        if self.access is None or principal is None:
+            return
+        access, jobs = self.access, self.jobs
+        try:
+            self._guarded(
+                context,
+                lambda: access.authorize_job(
+                    principal, action, jobs.find(job_id) if jobs is not None else None, job_id
+                ),
+            )
+        except AccessDeniedError as exc:
+            _abort_denied(context, exc, "Job")
 
     def _begin_record(self, context, kind: str, execution_id: str, **fields) -> int | None:
         """
@@ -252,7 +359,14 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
 
         Returns:
             `execution_pb2.ExecuteResponse`: Serialized return value or worker error record.
+
+        With session authentication, the call needs a Nest CLI session
+        (`UNAUTHENTICATED` otherwise) and the `run.submit` permission in the Project
+        named by `x-nest-project-id` (`INVALID_ARGUMENT` when absent, `NOT_FOUND`
+        when the caller is not a member, `PERMISSION_DENIED` when the role or the
+        Provider refuses it). See [`authz.ExecutionAccess`].
         """
+        principal = self._authenticate(context, "Execute")
         if request.HasField("environment"):
             env = request.environment
 
@@ -282,12 +396,24 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
             request.cpu,
             len(request.payload),
         )
+        # The Execution ID is fixed, authorized and recorded before any side
+        # effect; the backend then uses it for the remote directory and worker.
+        execution_id = new_execution_id()
+        attribution = self._authorize_submit(
+            context,
+            principal,
+            execution_id,
+            {
+                "rpc": "Execute",
+                "executor": mode,
+                "gpu": request.gpu,
+                "cpu": request.cpu,
+                "environment": request.HasField("environment"),
+            },
+        )
 
         if mode == "slurm":
             backend = self._require_slurm_backend(context)
-            # The Execution ID is fixed and recorded before any SSH or Slurm side
-            # effect; the backend then uses it for the remote directory and worker.
-            execution_id = new_execution_id()
             job_dir = None
             if self.jobs is not None:
                 try:
@@ -301,6 +427,7 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 job_dir=job_dir,
                 gpu=request.gpu,
                 cpu=request.cpu,
+                **attribution,
             )
 
             try:
@@ -370,8 +497,13 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
 
         Returns:
             `execution_pb2.JobStatusResponse`: The job operation response.
+
+        With session authentication, the job must be recorded in a Project where
+        the caller may `run.read`; any other job is `NOT_FOUND`.
         """
+        principal = self._authenticate(context, "GetJobStatus")
         backend = self._require_slurm_backend(context)
+        self._authorize_job(context, principal, Action.RUN_READ, request.job_id)
 
         try:
             state = backend.status(request.job_id)
@@ -410,7 +542,10 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
 
         Returns:
             `execution_pb2.SubmitJobResponse`: The job operation response.
+
+        With session authentication, the call is authorized as `Execute` is.
         """
+        principal = self._authenticate(context, "SubmitJob")
         backend = self._require_slurm_backend(context)
 
         if request.gpu < 0 or request.cpu < 0:
@@ -424,10 +559,22 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 "Script arguments cannot contain NUL bytes",
             )
 
+        execution_id = new_execution_id()
+        attribution = self._authorize_submit(
+            context,
+            principal,
+            execution_id,
+            {
+                "rpc": "SubmitJob",
+                "gpu": request.gpu,
+                "cpu": request.cpu,
+                "partition": request.partition or None,
+            },
+        )
         record = self._begin_record(
             context,
             "batch",
-            new_execution_id(),
+            execution_id,
             script=request.script,
             workdir=request.workdir,
             account=request.account or None,
@@ -435,6 +582,7 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
             time_limit=request.time or None,
             gpu=request.gpu,
             cpu=request.cpu,
+            **attribution,
         )
         try:
             job_id = backend.submit(
@@ -477,7 +625,12 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
 
         Returns:
             `execution_pb2.CancelJobResponse`: The job operation response.
+
+        With session authentication, only the job's submitter may cancel it, with
+        `run.cancel` in its recorded Project; a job the caller cannot see is
+        `NOT_FOUND`.
         """
+        principal = self._authenticate(context, "CancelJob")
         backend = self._require_slurm_backend(context)
 
         if request.job_id <= 0:
@@ -485,6 +638,7 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 grpc.StatusCode.INVALID_ARGUMENT,
                 "Invalid job ID",
             )
+        self._authorize_job(context, principal, Action.RUN_CANCEL, request.job_id)
 
         try:
             backend.cancel(request.job_id)
@@ -603,6 +757,66 @@ def open_database(config: ControllerConfig) -> Database | None:
     return database
 
 
+def build_access(config: ControllerConfig, database: Database | None) -> ExecutionAccess | None:
+    """
+    Creates the execution service's access check for `NEST_CONTROLLER_AUTH=session`.
+
+    Returns:
+        [`authz.ExecutionAccess`] or `None`: `None` when authentication is off.
+    """
+    if config.auth != "session":
+        if config.tls is None and not _is_loopback_address(config.bind):
+            logger.warning(
+                "gRPC authentication is off (NEST_CONTROLLER_AUTH=none): every caller that "
+                "can reach %s may run jobs; restrict network access to trusted users",
+                config.bind,
+            )
+        return None
+    assert database is not None, "load_controller_config requires a database for session auth"
+    if config.google is None:
+        logger.warning(
+            "NEST_CONTROLLER_AUTH=session without Google sign-in: no one can obtain a Nest "
+            "session, so every RPC is refused"
+        )
+    if not config.allowed_projects:
+        logger.warning(
+            "NEST_PROVIDER_ALLOWED_PROJECTS is empty: the Provider accepts Runs from no "
+            "Project, so every submission is refused"
+        )
+    return ExecutionAccess(
+        database,
+        AllowedProjects(config.allowed_projects),
+        provider_id=config.default_provider or config.executor,
+    )
+
+
+def record_start(config: ControllerConfig, database: Database | None) -> None:
+    """
+    Records the Controller's security-relevant configuration in the audit log:
+    whether each protection is on and where credentials come from, never a value.
+    """
+    AuditLog(database).record(
+        "controller.started",
+        "succeeded",
+        interface="controller",
+        details={
+            "auth": config.auth,
+            "tls": config.tls is not None,
+            "allow_plaintext": config.allow_plaintext,
+            "allowed_projects": (
+                "*" if "*" in config.allowed_projects else len(config.allowed_projects)
+            ),
+            "executor": config.executor,
+            "default_provider": config.default_provider,
+            "ssh_modes_allowed": ",".join(config.ssh.allowed_modes),
+            "ssh_identity_inline": config.ssh.private_key is not None,
+            "database_sslmode": (config.database.effective_sslmode if config.database else None),
+            "email_enabled": config.email is not None,
+            "google_sign_in": config.google is not None,
+        },
+    )
+
+
 def _add_port(server, config: ControllerConfig) -> int:
     if config.tls is None:
         return server.add_insecure_port(config.bind)
@@ -656,9 +870,10 @@ def main():
     )
 
     slurm_backend = build_backend(config)
+    access = build_access(config, database)
 
     execution_pb2_grpc.add_ExecutionServiceServicer_to_server(
-        ExecutionService(slurm_backend, executor=config.executor, jobs=jobs),
+        ExecutionService(slurm_backend, executor=config.executor, jobs=jobs, access=access),
         server,
     )
 
@@ -676,16 +891,18 @@ def main():
         if not _add_port(server, config):
             raise RuntimeError(f"Cannot bind Controller to {config.bind}")
         server.start()
+        record_start(config, database)
         auth = start_auth_service(
             config.google, database, bootstrap_admin_email=config.bootstrap_admin_email
         )
         logger.info(
-            "Controller listening address=%s executor=%s slurm_configured=%s tls=%s database=%s "
-            "email=%s google_sign_in=%s",
+            "Controller listening address=%s executor=%s slurm_configured=%s tls=%s auth=%s "
+            "database=%s email=%s google_sign_in=%s",
             config.bind,
             config.executor,
             slurm_backend is not None,
             config.tls is not None,
+            config.auth,
             database.describe() if database else "none",
             "enabled" if email.enabled else "disabled",
             auth.address or "disabled",

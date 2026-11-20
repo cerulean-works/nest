@@ -85,8 +85,9 @@ with the same lifetimes: a short-lived access token (`NEST_AUTH_ACCESS_TOKEN_TTL
 - **Scoped.** A CLI session carries the scopes it was approved for, shown on the
   approval page: `jobs:run` (run and manage jobs in your Projects) and
   `projects:read` (see your Projects and their members). A CLI token is accepted
-  only by the CLI routes, never as a browser session cookie, and a browser session
-  is never accepted as a CLI token.
+  only by the CLI routes, the Projects API and the Controller's gRPC service (see
+  [Authenticated execution](security#authenticated-execution)), never as a browser
+  session cookie, and a browser session is never accepted as a CLI token.
 - **Stored privately.** The session is kept in `NEST_CLI_CREDENTIALS_FILE`
   (default `~/.config/nest/credentials.json`), written atomically with mode `0600`
   in a `0700` directory. A file that other users can read is refused. Concurrent

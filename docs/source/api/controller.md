@@ -23,6 +23,20 @@ verbatim as one argument, so an element is never an `sbatch` option. Slurm job
 operations require a configured backend, even when `Execute` uses local mode.
 Cancellation requests do not wait for a job to stop.
 
+## Request metadata
+
+| Key | Value |
+| --- | --- |
+| `authorization` | `Bearer <access token>` of a Nest CLI session. Required with `NEST_CONTROLLER_AUTH=session`. |
+| `x-nest-project-id` | The Project a submission (`Execute`, `SubmitJob`) runs in. Required with session authentication. |
+| `x-nest-request-id` | Optional 32-character hex correlation ID, used in logs and audit records. |
+
+With session authentication, a call without an accepted session fails with
+`UNAUTHENTICATED`, a submission without a Project with `INVALID_ARGUMENT`, a
+Project or job the caller cannot see with `NOT_FOUND`, and a refusal by role,
+scope or Provider with `PERMISSION_DENIED`. See
+[Authenticated execution](../security#authenticated-execution).
+
 ## Error statuses
 
 Classified SSH and Slurm failures set the `nest-error-kind` trailing metadata, and
@@ -52,3 +66,7 @@ deadline. The Controller never retries `sbatch`. See
 [[autodoc]] controller.build_backend
 
 [[autodoc]] controller.open_database
+
+[[autodoc]] controller.build_access
+
+[[autodoc]] controller.record_start

@@ -1,3 +1,4 @@
+import sys
 from collections.abc import Callable
 from functools import wraps
 from pathlib import Path
@@ -9,11 +10,15 @@ import grpc
 from ._logging import current_request_id, get_logger, operation, request_context
 from .config import DEFAULT_CONTROLLER_ADDRESS, ClientConfig, load_client_config
 from .errors import (
+    AUTHORIZATION_METADATA,
     ERROR_KIND_METADATA,
     INFRASTRUCTURE_ERRORS,
     JOB_ID_METADATA,
     PENDING_REASON_METADATA,
+    PROJECT_METADATA,
+    AuthenticationRequiredError,
     QueueTimeoutError,
+    RemoteAccessDeniedError,
     RemoteExecutionError,
     RpcTimeoutError,
 )
@@ -67,6 +72,17 @@ def _controller_error(exc: grpc.RpcError, address: str, timeout: float) -> Excep
         return error_class(message, job_id=parsed_id)
 
     status = call.code()
+    if status == grpc.StatusCode.UNAUTHENTICATED:
+        return AuthenticationRequiredError(
+            f"Nest Controller at {address} requires a Nest session. Set NEST_AUTH_URL to "
+            "your Nest's address and run `nest login`."
+        )
+    if status in (grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.NOT_FOUND):
+        return RemoteAccessDeniedError(
+            f"Nest Controller at {address} refused the call: {call.details() or status.name}. "
+            "Check NEST_PROJECT_ID and your role in that Project. Nothing was run."
+        )
+
     if status == grpc.StatusCode.DEADLINE_EXCEEDED:
         return RpcTimeoutError(
             f"Nest Controller at {address} did not reply within {timeout:g} seconds. "
@@ -86,6 +102,52 @@ def _controller_error(exc: grpc.RpcError, address: str, timeout: float) -> Excep
         )
 
     return None
+
+
+def _access_token(config: ClientConfig, *, interactive: bool) -> str | None:
+    """
+    The stored Nest session's access token, refreshed when needed, or `None` when
+    `NEST_AUTH_URL` is unset or no one is signed in and `interactive` is `False`.
+    """
+    if config.auth_url is None:
+        return None
+    from .config import load_cli_auth_config
+    from .login import NotSignedInError, ensure_session
+
+    try:
+        session = ensure_session(load_cli_auth_config(url=config.auth_url), interactive=interactive)
+    except NotSignedInError:
+        return None
+    return session.access_token
+
+
+def call_metadata(config: ClientConfig, token: str | None) -> tuple[tuple[str, str], ...]:
+    """
+    Request metadata for a Controller call: the request ID, the Project from
+    `NEST_PROJECT_ID`, and the Nest session's bearer token when there is one.
+    """
+    metadata = [("x-nest-request-id", current_request_id())]
+    if config.project_id is not None:
+        metadata.append((PROJECT_METADATA, config.project_id))
+    if token is not None:
+        metadata.append((AUTHORIZATION_METADATA, f"Bearer {token}"))
+    return tuple(metadata)
+
+
+def session_metadata(
+    config: ClientConfig | None = None, *, interactive: bool = True
+) -> tuple[tuple[str, str], ...]:
+    """
+    Metadata for a direct gRPC call to the Controller, such as `SubmitJob`: the
+    request ID, `NEST_PROJECT_ID`, and, with `NEST_AUTH_URL` set, the Nest session's
+    bearer token, signing in first when `interactive` and no session is stored.
+
+    Args:
+        config ([`config.ClientConfig`], *optional*): Defaults to the environment.
+        interactive (`bool`): Sign in through the browser when needed.
+    """
+    config = config or load_client_config()
+    return call_metadata(config, _access_token(config, interactive=interactive))
 
 
 def _logged_execution(method):
@@ -109,7 +171,13 @@ def execute_remote(
     deadline unless `NEST_RPC_TIMEOUT` sets another positive number of seconds.
     Non-loopback addresses require an explicit `NEST_CONTROLLER_TLS` setting or
     `NEST_CONTROLLER_TLS_CA_FILE`.
-    The call is never retried. Only send trusted functions and accept results from
+
+    With `NEST_AUTH_URL` set, the stored Nest session (see [`login.ensure_session`])
+    is sent as a bearer token, and `NEST_PROJECT_ID` names the Project the call runs
+    in. When the Controller requires a session and none is stored, an interactive
+    terminal signs in through the browser and the call is sent once more; nothing
+    ran the first time.
+    Otherwise the call is never retried. Only send trusted functions and accept results from
     trusted hosts: deserializing Python objects can execute code.
 
     Args:
@@ -127,6 +195,11 @@ def execute_remote(
         `OSError`: If project environment files cannot be read.
         [`config.ConfigError`]: If a client setting is invalid. It is a `ValueError`.
         `ConnectionError`: If gRPC reports that the controller is unavailable.
+        [`errors.AuthenticationRequiredError`]: If the Controller requires a Nest
+            session and none was accepted.
+        [`errors.RemoteAccessDeniedError`]: If the Controller's Project policy or
+            Provider refused the call.
+        [`login.AuthError`]: If signing in fails.
         [`errors.RpcTimeoutError`]: If the RPC deadline expires.
         [`errors.InfrastructureError`]: If the Controller reports a classified SSH or
             Slurm failure, such as [`errors.SSHTimeoutError`],
@@ -168,14 +241,27 @@ def execute_remote(
     )
 
     # Connect to Controller
+    token = _access_token(config, interactive=False)
     try:
         with _channel(config) as channel:
             stub = execution_pb2_grpc.ExecutionServiceStub(channel)
-            response = stub.Execute(
-                request,
-                timeout=timeout,
-                metadata=(("x-nest-request-id", current_request_id()),),
-            )
+            try:
+                response = stub.Execute(
+                    request, timeout=timeout, metadata=call_metadata(config, token)
+                )
+            except grpc.RpcError as exc:
+                # Refused before anything ran, so one retry after signing in is safe.
+                if not (
+                    cast(grpc.Call, exc).code() == grpc.StatusCode.UNAUTHENTICATED
+                    and token is None
+                    and config.auth_url is not None
+                    and sys.stdin.isatty()
+                ):
+                    raise
+                token = _access_token(config, interactive=True)
+                response = stub.Execute(
+                    request, timeout=timeout, metadata=call_metadata(config, token)
+                )
 
     except grpc.RpcError as exc:
         # Errors raised by stub calls are also `grpc.Call`s, which carry the status.

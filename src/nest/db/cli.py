@@ -18,10 +18,14 @@ Usage:
     nest-db sessions list   --user-id UUID
     nest-db sessions revoke --user-id UUID | --session-id UUID
 
+    # The security audit log (see "Security audit log"):
+    nest-db audit list   [--user-id UUID] [--project-id UUID] [--event NAME] [--limit N]
+    nest-db audit verify # seal new records, then check the hash chain
+
 Reads the same `NEST_DATABASE_*` settings as the Controller. Exit status: 0 on
 success, 1 when the schema is not current, a migration failed or an admin change
-or revocation was not made, 2 for invalid configuration or arguments, 3 when the database is
-unreachable.
+or revocation was not made or the audit chain is broken, 2 for invalid configuration or
+arguments, 3 when the database is unreachable.
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ from uuid import UUID
 import psycopg
 
 from .._logging import configure_logging
+from ..audit import AuditLog
 from ..config import ConfigError, load_database_config
 from .bootstrap import audit_events, bootstrap_state
 from .connection import Database, DatabaseError
@@ -104,7 +109,73 @@ def _parser() -> argparse.ArgumentParser:
         metavar="UUID",
         help="this session and every session rotated from the same sign-in",
     )
+
+    security = commands.add_parser(
+        "audit",
+        help="read and verify the security audit log",
+        description=(
+            "The append-only security audit log (security_audit_events). Records never "
+            "contain tokens, codes, email addresses or credentials."
+        ),
+    )
+    audit_actions = security.add_subparsers(dest="action", required=True)
+    events = audit_actions.add_parser("list", help="show security audit records, newest first")
+    events.add_argument("--user-id", type=UUID, metavar="UUID", help="only this actor's records")
+    events.add_argument("--project-id", type=UUID, metavar="UUID", help="only this Project's")
+    events.add_argument("--event", help="only this event, such as run.submit")
+    events.add_argument("--limit", type=int, default=50)
+    audit_actions.add_parser("verify", help="seal new records, then check the hash chain")
     return parser
+
+
+def _audit(database: Database, args: argparse.Namespace) -> int:
+    """Runs one `nest-db audit` action on an open, verified database."""
+    log = AuditLog(database)
+    if args.action == "verify":
+        log.seal()
+        status = log.verify()
+        if not status.intact:
+            print(
+                f"Audit chain BROKEN at chain_seq={status.first_broken}: a sealed record was "
+                f"changed, removed or reordered ({status.sealed} sealed records checked)",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            f"Audit chain intact: {status.sealed} sealed records"
+            + (f", {status.unsealed} not sealed yet" if status.unsealed else "")
+        )
+        return 0
+    if not 1 <= args.limit <= 1000:
+        print("--limit must be between 1 and 1000", file=sys.stderr)
+        return 2
+    for event in log.events(
+        limit=args.limit,
+        event=args.event,
+        actor_user_id=args.user_id,
+        project_id=args.project_id,
+    ):
+        fields = {
+            "outcome": event.outcome,
+            "interface": event.interface,
+            "actor": event.actor_user_id or event.actor_operator,
+            "session": event.session_id,
+            "project": event.project_id,
+            "target": event.target_user_id,
+            "resource": (
+                f"{event.resource_type}:{event.resource_id}" if event.resource_type else None
+            ),
+            "reason": event.reason,
+            "request_id": event.request_id,
+            "db_role": event.database_role,
+        }
+        print(
+            f"{event.occurred_at.isoformat()} {event.event} "
+            + " ".join(f"{key}={value}" for key, value in fields.items() if value is not None)
+            + (f" note={json.dumps(event.note)}" if event.note else "")
+            + (f" details={json.dumps(event.details, sort_keys=True)}" if event.details else "")
+        )
+    return 0
 
 
 def _sessions(database: Database, args: argparse.Namespace) -> int:
@@ -215,7 +286,7 @@ def main(argv: list[str] | None = None) -> int:
         print(exc, file=sys.stderr)
         return 2
     database = Database(config, application_name="nest-db")
-    if args.command in ("admin", "sessions"):
+    if args.command in ("admin", "sessions", "audit"):
         try:
             database.open()
         except DatabaseError as exc:
@@ -224,7 +295,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             with database.connection() as conn:
                 verify(conn)
-            return (_admin if args.command == "admin" else _sessions)(database, args)
+            action = {"admin": _admin, "sessions": _sessions, "audit": _audit}[args.command]
+            return action(database, args)
         except MigrationError as exc:
             print(f"{exc}; run nest-db upgrade first", file=sys.stderr)
             return 1

@@ -27,6 +27,12 @@ authorization code flow with PKCE and OIDC ID-token verification (see [`auth`]),
 on a small HTTP listener at `NEST_AUTH_HTTP_BIND`. Without it no `NEST_GOOGLE_*` setting
 is read.
 
+With a database, the gRPC execution service authenticates every call by its Nest CLI
+session and authorizes it with the same Project policy as the Projects API
+(`NEST_CONTROLLER_AUTH=session`, see [`authz.ExecutionAccess`]). Session tokens are
+sent only over TLS, unless `NEST_CONTROLLER_ALLOW_PLAINTEXT=true` approves an
+already-encrypted network such as a Tailnet.
+
 Persistence is opt-in: with `NEST_DATABASE_URL` set, the Controller stores Provider
 Profiles and job records in an externally managed PostgreSQL database (see
 [`db.Database`]). Without it the Controller is stateless, unless
@@ -46,6 +52,7 @@ from email.headerregistry import Address
 from email.utils import parseaddr
 from ipaddress import ip_address
 from urllib.parse import parse_qs, urlsplit, urlunsplit
+from uuid import UUID
 
 from ._logging import LOG_LEVELS, parse_log_level
 
@@ -157,6 +164,21 @@ DEFAULT_CLI_SCOPE = "jobs:run projects:read"
 
 CLIENT_AUTH_SETTINGS = ("NEST_AUTH_URL", "NEST_CLI_CREDENTIALS_FILE")
 """CLI sign-in settings, read by [`config.load_cli_auth_config`]."""
+
+CONTROLLER_AUTH_MODES = ("session", "none")
+"""`NEST_CONTROLLER_AUTH` values: `session` authenticates every gRPC call with a Nest
+CLI session; `none` accepts any caller that can reach the listener."""
+
+CONTROLLER_AUTH_SETTINGS = (
+    "NEST_CONTROLLER_AUTH",
+    "NEST_CONTROLLER_ALLOW_PLAINTEXT",
+    "NEST_PROVIDER_ALLOWED_PROJECTS",
+)
+"""gRPC authentication, transport and Provider approval settings, read by
+[`config.load_controller_config`]."""
+
+ALL_PROJECTS = "*"
+"""`NEST_PROVIDER_ALLOWED_PROJECTS` value that approves every Project."""
 
 GOOGLE_SETTINGS = (
     "NEST_GOOGLE_CLIENT_ID",
@@ -625,6 +647,14 @@ class ControllerConfig:
             trimmed and lowercased: the Google account that becomes the first
             `platform_admin` at its first verified sign-in. Has no effect once the
             bootstrap has completed.
+        auth (`str`): `NEST_CONTROLLER_AUTH`: `session` (the default with a
+            database) or `none` (the default without one).
+        allow_plaintext (`bool`): `NEST_CONTROLLER_ALLOW_PLAINTEXT`: the operator
+            approves plaintext gRPC on a network that is already encrypted, so
+            session tokens may be accepted without TLS.
+        allowed_projects (`frozenset[str]`): `NEST_PROVIDER_ALLOWED_PROJECTS`:
+            Project IDs whose members' Runs the Controller's Provider accepts, or
+            `{"*"}` for every Project. Empty, the default, accepts none.
     """
 
     bind: str = DEFAULT_CONTROLLER_BIND
@@ -646,6 +676,9 @@ class ControllerConfig:
     email: EmailConfig | None = None
     google: GoogleAuthConfig | None = None
     bootstrap_admin_email: str | None = None
+    auth: str = "none"
+    allow_plaintext: bool = False
+    allowed_projects: frozenset[str] = frozenset()
 
     @property
     def provider(self) -> ProviderProfile | None:
@@ -687,6 +720,9 @@ class ControllerConfig:
             "google": self.google.summary() if self.google else None,
             # The address is personal data, so only whether it is set is logged.
             "bootstrap_admin_configured": self.bootstrap_admin_email is not None,
+            "auth": self.auth,
+            "allow_plaintext": self.allow_plaintext,
+            "allowed_projects": sorted(self.allowed_projects),
         }
 
 
@@ -700,12 +736,18 @@ class ClientConfig:
         rpc_timeout (`float`): `Execute` deadline in seconds.
         tls (`bool`): Whether to use a TLS channel.
         tls_ca_file (`str | None`): PEM roots for TLS. `None` uses gRPC's default roots.
+        project_id (`str | None`): `NEST_PROJECT_ID`, the Project calls run in, for
+            a Controller with session authentication.
+        auth_url (`str | None`): `NEST_AUTH_URL`, set when the SDK should send the
+            stored Nest session (see [`login.ensure_session`]) with each call.
     """
 
     address: str = DEFAULT_CONTROLLER_ADDRESS
     rpc_timeout: float = DEFAULT_RPC_TIMEOUT
     tls: bool = False
     tls_ca_file: str | None = None
+    project_id: str | None = None
+    auth_url: str | None = None
 
 
 class _Reader:
@@ -1533,6 +1575,7 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
     email = _email(reader, database)
     google = _google(reader, database)
     bootstrap_admin_email = _bootstrap_admin_email(reader, database)
+    auth, allow_plaintext, allowed_projects = _controller_auth(reader, database, bind, tls)
     _reserved(reader)
 
     if reader.problems:
@@ -1550,8 +1593,67 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
         email=email,
         google=google,
         bootstrap_admin_email=bootstrap_admin_email,
+        auth=auth,
+        allow_plaintext=allow_plaintext,
+        allowed_projects=allowed_projects,
         **timeouts,
     )
+
+
+def _controller_auth(
+    reader: _Reader, database: DatabaseConfig | None, bind: str, tls: TLSConfig | None
+) -> tuple[str, bool, frozenset[str]]:
+    """
+    Reads `NEST_CONTROLLER_AUTH`, `NEST_CONTROLLER_ALLOW_PLAINTEXT` and
+    `NEST_PROVIDER_ALLOWED_PROJECTS`.
+
+    Session authentication needs the database, and its bearer tokens travel only
+    over TLS, a loopback listener, or a network the operator has approved with
+    `NEST_CONTROLLER_ALLOW_PLAINTEXT=true`.
+    """
+    auth = reader.choice(
+        "NEST_CONTROLLER_AUTH", CONTROLLER_AUTH_MODES, "session" if database else "none"
+    )
+    allow_plaintext = reader.boolean("NEST_CONTROLLER_ALLOW_PLAINTEXT")
+    raw = reader.get("NEST_PROVIDER_ALLOWED_PROJECTS")
+    projects: set[str] = set()
+    for item in (raw or "").split(","):
+        item = item.strip().lower()
+        if not item:
+            continue
+        if item == ALL_PROJECTS:
+            projects.add(ALL_PROJECTS)
+            continue
+        try:
+            projects.add(str(UUID(item)))
+        except ValueError:
+            reader.fail(
+                f"NEST_PROVIDER_ALLOWED_PROJECTS has {item[:40]!r}, which is not a Project "
+                "ID; list Project UUIDs separated by commas, or '*' for every Project"
+            )
+    if ALL_PROJECTS in projects and len(projects) > 1:
+        reader.fail("NEST_PROVIDER_ALLOWED_PROJECTS cannot combine '*' with Project IDs")
+    if auth == "session":
+        if database is None:
+            reader.fail(
+                "NEST_CONTROLLER_AUTH=session needs NEST_DATABASE_URL, where Nest sessions "
+                "and Project memberships are stored"
+            )
+        if tls is None and not allow_plaintext and not _is_loopback_address(bind):
+            reader.fail(
+                "NEST_CONTROLLER_AUTH=session sends Nest session tokens with every call: set "
+                "NEST_TLS_CERT_FILE and NEST_TLS_KEY_FILE, or set "
+                "NEST_CONTROLLER_ALLOW_PLAINTEXT=true only when the network to the listener is "
+                "already encrypted and access-controlled, such as a Tailnet"
+            )
+    else:
+        # Without authentication it would restrict nothing, so it is refused rather
+        # than suggesting otherwise. NEST_CONTROLLER_ALLOW_PLAINTEXT only loosens a
+        # check that does not apply then, so it is ignored.
+        if raw is not None:
+            reader.fail("NEST_PROVIDER_ALLOWED_PROJECTS needs NEST_CONTROLLER_AUTH=session")
+        allow_plaintext = False
+    return auth, allow_plaintext, frozenset(projects)
 
 
 def _is_loopback_address(address: str) -> bool:
@@ -1595,9 +1697,30 @@ def load_client_config(environ: Mapping[str, str] | None = None) -> ClientConfig
         )
     if ca_file and not tls:
         reader.fail("NEST_CONTROLLER_TLS_CA_FILE is set but NEST_CONTROLLER_TLS is false")
+    project_id = reader.get("NEST_PROJECT_ID")
+    if project_id is not None:
+        try:
+            project_id = str(UUID(project_id))
+        except ValueError:
+            reader.fail("NEST_PROJECT_ID must be a Project ID (a UUID)")
+            project_id = None
+    auth_url = reader.get("NEST_AUTH_URL")
+    if auth_url is not None:
+        try:
+            auth_url = normalize_auth_url(auth_url)
+        except ValueError as exc:
+            reader.fail(f"NEST_AUTH_URL {exc}; got {auth_url!r}")
+            auth_url = None
     if reader.problems:
         raise ConfigError(reader.problems)
-    return ClientConfig(address=address, rpc_timeout=timeout, tls=tls, tls_ca_file=ca_file)
+    return ClientConfig(
+        address=address,
+        rpc_timeout=timeout,
+        tls=tls,
+        tls_ca_file=ca_file,
+        project_id=project_id,
+        auth_url=auth_url,
+    )
 
 
 @dataclass(frozen=True)

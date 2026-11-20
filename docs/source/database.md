@@ -164,6 +164,14 @@ it. Projects can then only be soft-deleted: a direct `DELETE` or `TRUNCATE` on
 deletion record can be removed, and a deleted Project cannot be restored. See
 [Audit history](projects#audit-history).
 
+**Security audit log.** Migration `0009_security_audit` adds the append-only
+`security_audit_events`: authorization decisions on the gRPC execution service and
+the Projects API, the Controller's start, and, from triggers, every identity link,
+sign-in, session revocation, User status change, CLI sign-in decision, invitation
+and Invite Link event and Provider Profile change. It holds no token, code, email
+address, message body or credential, and its rows are sealed into a SHA-256 hash
+chain. See [Review the security audit log](audit-log).
+
 ## Configure the connection
 
 ```bash
@@ -183,6 +191,13 @@ secret injection, over a password inside the URL.
 See [Environment variables and defaults](configuration#database) for every
 setting. Each one is validated at startup together with the rest of the Controller
 configuration, so a typo is reported with all other problems at once.
+
+With a database, the Controller also requires a Nest session on every gRPC call
+(`NEST_CONTROLLER_AUTH=session`). A non-loopback listener then needs TLS, or
+`NEST_CONTROLLER_ALLOW_PLAINTEXT=true` on an already-encrypted network such as an
+authorized Tailnet, and `NEST_PROVIDER_ALLOWED_PROJECTS` must list the Projects
+whose Runs it accepts. Set `NEST_CONTROLLER_AUTH=none` to keep an unauthenticated
+Controller. See [Authenticated execution](security#authenticated-execution).
 
 ### TLS
 

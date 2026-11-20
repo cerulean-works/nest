@@ -37,6 +37,8 @@ guide:
         title: Share Projects and manage roles
       - local: platform-admin
         title: Bootstrap and recover platform administration
+      - local: audit-log
+        title: Review the security audit log
       - local: deployment-architecture
         title: Deployment validation and roadmap
   - title: Contributing
@@ -68,6 +70,8 @@ reference:
         title: Sign-in
       - local: api/authz
         title: Authorization
+      - local: api/audit
+        title: Security audit log
       - local: api/runtime
         title: Executor and workers
   - title: Operations
