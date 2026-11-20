@@ -34,6 +34,7 @@ The database is **externally managed** and **opt-in**:
 | `projects`, `project_memberships` | Nest Projects and their active members with their Project roles. |
 | `project_email_invitations`, `project_invite_links`, `project_invitation_redemptions` | Pending email invitations, Invite Link grants, and each User's redemption of a link. Kept apart from memberships. |
 | `platform_bootstrap`, `platform_audit_events` | The one-time record of how the first `platform_admin` was created, and the append-only audit log of platform role changes. See [Bootstrap and recover platform administration](platform-admin). |
+| `executions`, `execution_attempts`, `execution_attempt_options`, `execution_attempt_nodes` | The Platform-aware execution registry: each logical execution with its owner and Project, and each submission attempt with its Platform, login-node snapshot, HPC identity, Slurm account, resolved options and allocated nodes. See [Execution registry](#execution-registry). |
 | `schema_migrations` | The applied schema versions and their checksums (see [Migrations](#migrations)). |
 
 Every record has an `execution_id`, a UUID written as 32 lowercase hexadecimal
@@ -178,6 +179,59 @@ security audit triggers for the invitation flows (see
 [Invite people to a Project](invitations)): `invite_link.exhausted` when an Invite
 Link's last use is taken, and `invitation.email_failed` when the outbox gives up on
 an invitation email. The invitation tables themselves are unchanged.
+
+**Execution registry.** Migration `0011_execution_registry` adds the
+Platform-aware execution registry described below. The Controller does not write
+to it yet; `jobs` remains the record of today's submissions.
+
+### Execution registry
+
+The registry (`nest.db.ExecutionRegistry`) keeps a stable Nest `execution_id` for
+each logical execution and one `execution_attempts` row per submission attempt.
+Both are committed before the irreversible step they describe, so a Controller
+that restarts finds every execution and its in-flight attempt again.
+
+- **Executions** belong to one Nest User (`owner_user_id`) and one Project. Both,
+  the requested options and the optional idempotency key never change. A repeated
+  registration with the same key, Project and owner returns the same execution;
+  the same key with a different request is refused.
+- **Attempts** record the `platform_id`, a snapshot of the login node used
+  (`login_node_host`, `login_node_port`, `transport_mode`, `login_node_ref`), the
+  HPC binding and its version, the effective UNIX user and UID, the Slurm account,
+  and the source, environment and runtime digests. These columns never change.
+  At most one attempt per execution is in flight (`submitting`, `submitted`,
+  `running` or `unknown`); a `failed` attempt may be followed by a retry, which can
+  use another login node.
+- **Resolved options** (`execution_attempt_options`) keep each option's value and
+  origin: `request` when set explicitly (with the default it overrode, if any) or
+  `default` with the layer that supplied it. Rows are append-only.
+- **Namespaces.** A Slurm job ID, Slurm account or node name means something only
+  on its Platform: none is unique on its own, and every lookup also names the
+  `platform_id`. The same account name on two Platforms stays two entitlements.
+
+An attempt moves through these `status` values:
+
+| Status | Meaning |
+| --- | --- |
+| `submitting` | Written before `sbatch`. |
+| `submitted` | `sbatch` returned the Slurm job ID. |
+| `running` | Slurm started the job; allocated nodes are in `execution_attempt_nodes`. |
+| `succeeded`, `failed`, `cancelled` | Final. |
+| `unknown` | `sbatch` may have run but no job ID arrived. It holds the execution, so nothing is resubmitted until it is reconciled to another status. |
+
+After a restart, `ExecutionRegistry.mark_interrupted(older_than)` marks
+`submitting` attempts older than `older_than` as `unknown`, and `live_attempts()`
+lists everything still to reconcile:
+
+```sql
+SELECT e.execution_id, a.attempt_number, a.platform_id, a.status, a.slurm_job_id
+FROM execution_attempts a JOIN executions e USING (execution_id)
+WHERE a.status IN ('submitting', 'submitted', 'running', 'unknown');
+```
+
+`platform_id` and `login_node_ref` are validated only by form until the Platform
+catalog and login-node registry exist; each attempt's snapshot keeps its history
+correct when the catalog changes.
 
 ## Configure the connection
 

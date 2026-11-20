@@ -1,0 +1,434 @@
+"""Platform-aware durable execution registry (C01).
+
+Every test runs against a real PostgreSQL named by `NEST_TEST_DATABASE_URL` (see
+`postgres_fixture`). Restarts are simulated by closing the connection pool and
+opening a new one on the same database, so only what was committed survives.
+"""
+
+import threading
+from datetime import timedelta
+
+import psycopg
+from postgres_fixture import PostgresTestCase, connect
+
+from nest.config import load_database_config
+from nest.db import (
+    AttemptInFlightError,
+    Database,
+    DatabaseError,
+    ExecutionClosedError,
+    ExecutionNotFoundError,
+    ExecutionRegistry,
+    HPCPrincipal,
+    IdempotencyConflictError,
+    IdentityStore,
+    InvalidTransitionError,
+    LoginNodeSnapshot,
+    ProjectStore,
+    ResolvedOption,
+    upgrade,
+)
+
+DIGEST = "sha256:" + "ab" * 32
+LOGIN_A1 = LoginNodeSnapshot("login1.alpha.example", 22, "ssh", ref="alpha/login1")
+LOGIN_A2 = LoginNodeSnapshot("login2.alpha.example", 2222, "ssh", ref="alpha/login2")
+LOGIN_B1 = LoginNodeSnapshot("login.beta.example", 22, "tailscale")
+ALICE = HPCPrincipal("alice", 1001, binding_id="binding-1", binding_version=3)
+
+
+class _Base(PostgresTestCase):
+    def setUp(self):
+        super().setUp()
+        self.url = self.database()
+        with connect(self.url) as conn:
+            upgrade(conn)
+        self.db = self.open_database()
+        self.registry = ExecutionRegistry(self.db)
+        identities = IdentityStore(self.db)
+        projects = ProjectStore(self.db)
+        self.owner = identities.create_user(display_name="owner").id
+        self.other_user = identities.create_user(display_name="other").id
+        self.project = projects.create_project("p", created_by_user_id=self.owner).id
+        self.other_project = projects.create_project("q", created_by_user_id=self.owner).id
+        self.conn = connect(self.url)
+        self.conn.autocommit = True
+        self.addCleanup(self.conn.close)
+
+    def open_database(self) -> Database:
+        db = Database(
+            load_database_config(
+                {"NEST_DATABASE_URL": self.url, "NEST_DATABASE_POOL_MAX_SIZE": "4"}
+            )
+        )
+        db.open()
+        self.addCleanup(db.close)
+        return db
+
+    def register(self, key=None, options=None, project=None):
+        return self.registry.register(
+            project or self.project,
+            self.owner,
+            "execution",
+            options if options is not None else {"gpu": 1},
+            idempotency_key=key,
+        )
+
+    def begin(self, execution_id, platform="alpha", login=LOGIN_A1, account="proj", **kw):
+        return self.registry.begin_attempt(
+            execution_id,
+            platform_id=platform,
+            login_node=login,
+            principal=kw.pop("principal", ALICE),
+            slurm_account=account,
+            options=kw.pop(
+                "options",
+                {
+                    "gpu": ResolvedOption.requested(1, default=0, default_source="platform"),
+                    "partition": ResolvedOption.defaulted("gpu", "platform"),
+                },
+            ),
+            source_digest=DIGEST,
+            environment_digest=DIGEST,
+            runtime_digest=DIGEST,
+            **kw,
+        )
+
+
+class RegistrationTests(_Base):
+    def test_execution_ids_are_stable_and_scoped_to_their_project(self):
+        execution, created = self.register()
+        self.assertTrue(created)
+        self.assertRegex(execution.execution_id, "^[0-9a-f]{32}$")
+        self.assertEqual(execution.status, "pending")
+        self.assertEqual(execution.requested_options, {"gpu": 1})
+        self.assertEqual(
+            self.registry.get(execution.execution_id, project_id=self.project), execution
+        )
+        # Another Project never sees it, by any read.
+        self.assertIsNone(self.registry.get(execution.execution_id, project_id=self.other_project))
+        self.assertEqual(
+            self.registry.attempts(execution.execution_id, project_id=self.other_project), []
+        )
+        self.assertEqual(self.registry.list_for_project(self.other_project), [])
+        self.assertEqual(self.registry.list_for_project(self.project), [execution])
+
+    def test_duplicate_registration_with_a_key_returns_the_same_execution(self):
+        first, created = self.register(key="client-req-1")
+        again, created_again = self.register(key="client-req-1")
+        self.assertTrue(created)
+        self.assertFalse(created_again)
+        self.assertEqual(again.execution_id, first.execution_id)
+        # The same key in another Project, or by another owner, is a new execution.
+        elsewhere, _ = self.register(key="client-req-1", project=self.other_project)
+        self.assertNotEqual(elsewhere.execution_id, first.execution_id)
+        by_other, _ = self.registry.register(
+            self.project, self.other_user, "execution", {"gpu": 1}, idempotency_key="client-req-1"
+        )
+        self.assertNotEqual(by_other.execution_id, first.execution_id)
+
+    def test_reusing_a_key_for_a_different_request_is_refused(self):
+        self.register(key="k", options={"gpu": 1})
+        with self.assertRaises(IdempotencyConflictError):
+            self.register(key="k", options={"gpu": 2})
+        count = self.conn.execute("SELECT count(*) FROM executions").fetchone()
+        self.assertEqual(count, (1,))
+
+    def test_concurrent_duplicate_registrations_create_one_execution(self):
+        results, errors = [], []
+        barrier = threading.Barrier(4)
+
+        def run():
+            barrier.wait()
+            try:
+                results.append(self.register(key="race"))
+            except (DatabaseError, IdempotencyConflictError) as exc:  # pragma: no cover
+                errors.append(exc)
+
+        threads = [threading.Thread(target=run) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(len({execution.execution_id for execution, _ in results}), 1)
+        self.assertEqual(sum(created for _, created in results), 1)
+
+    def test_registration_survives_a_controller_restart(self):
+        execution, _ = self.register(key="restart")
+        attempt = self.begin(execution.execution_id)
+        self.db.close()
+        restarted = ExecutionRegistry(self.open_database())
+        again, created = restarted.register(
+            self.project, self.owner, "execution", {"gpu": 1}, idempotency_key="restart"
+        )
+        self.assertFalse(created)
+        self.assertEqual(again.execution_id, execution.execution_id)
+        self.assertEqual(again.status, "active")
+        live = restarted.live_attempts()
+        self.assertEqual([a.id for a in live], [attempt.id])
+        self.assertEqual(live[0].options, attempt.options)
+
+
+class AttemptTests(_Base):
+    def test_attempt_is_durable_before_submission_with_its_platform_snapshot(self):
+        execution, _ = self.register()
+        attempt = self.begin(execution.execution_id)
+        # Committed: visible from an unrelated connection before any submission.
+        row = self.conn.execute(
+            "SELECT status, platform_id, login_node_host, login_node_port, transport_mode, "
+            "login_node_ref, unix_user, unix_uid, hpc_binding_id, hpc_binding_version, "
+            "slurm_account FROM execution_attempts WHERE id = %s",
+            (attempt.id,),
+        ).fetchone()
+        self.assertEqual(
+            row,
+            (
+                "submitting",
+                "alpha",
+                "login1.alpha.example",
+                22,
+                "ssh",
+                "alpha/login1",
+                "alice",
+                1001,
+                "binding-1",
+                3,
+                "proj",
+            ),
+        )
+        self.assertEqual(attempt.attempt_number, 1)
+        self.assertEqual(attempt.login_node, LOGIN_A1)
+        self.assertEqual(attempt.principal, ALICE)
+
+    def test_resolved_options_keep_value_and_provenance(self):
+        execution, _ = self.register()
+        attempt = self.begin(execution.execution_id)
+        [loaded] = self.registry.attempts(execution.execution_id, project_id=self.project)
+        self.assertEqual(loaded.options, attempt.options)
+        self.assertEqual(
+            loaded.options["gpu"],
+            ResolvedOption(1, "request", default_value=0, default_source="platform"),
+        )
+        self.assertEqual(
+            loaded.options["partition"],
+            ResolvedOption("gpu", "default", default_value="gpu", default_source="platform"),
+        )
+        # History is append-only.
+        for statement in (
+            "UPDATE execution_attempt_options SET value = '2' WHERE name = 'gpu'",
+            "DELETE FROM execution_attempt_options",
+        ):
+            with (
+                self.subTest(statement=statement),
+                self.assertRaises(psycopg.errors.IntegrityConstraintViolation),
+            ):
+                self.conn.execute(statement)
+        # A defaulted option must carry its source and equal its default.
+        with self.assertRaises(psycopg.errors.CheckViolation):
+            self.conn.execute(
+                "INSERT INTO execution_attempt_options (attempt_id, name, value, origin) "
+                "VALUES (%s, 'cpu', '4', 'default')",
+                (attempt.id,),
+            )
+
+    def test_retry_creates_a_new_attempt_on_another_login_node(self):
+        execution, _ = self.register()
+        first = self.begin(execution.execution_id)
+        with self.assertRaises(AttemptInFlightError):
+            self.begin(execution.execution_id, login=LOGIN_A2)
+        self.registry.finish_attempt(first.id, "failed", error_kind="ssh_unreachable")
+        failed = self.registry.get(execution.execution_id, project_id=self.project)
+        assert failed is not None
+        self.assertEqual(failed.status, "failed")
+        second = self.begin(execution.execution_id, login=LOGIN_A2)
+        self.assertEqual(second.attempt_number, 2)
+        attempts = self.registry.attempts(execution.execution_id, project_id=self.project)
+        self.assertEqual(
+            [(a.attempt_number, a.status, a.login_node.host) for a in attempts],
+            [(1, "failed", "login1.alpha.example"), (2, "submitting", "login2.alpha.example")],
+        )
+        self.assertEqual(attempts[0].error_kind, "ssh_unreachable")
+
+    def test_full_lifecycle_records_slurm_ids_nodes_and_references(self):
+        execution, _ = self.register()
+        attempt = self.begin(execution.execution_id)
+        submitted = self.registry.record_submission(attempt.id, 4242, slurm_state="PENDING")
+        self.assertEqual((submitted.status, submitted.slurm_job_id), ("submitted", 4242))
+        self.assertIsNotNone(submitted.submitted_at)
+        running = self.registry.record_running(attempt.id, ["gpu02", "gpu01", "gpu01"])
+        self.assertEqual(running.nodes, ("gpu01", "gpu02"))
+        done = self.registry.finish_attempt(
+            attempt.id,
+            "succeeded",
+            slurm_state="COMPLETED",
+            output_ref="/w/jobs/x/output.pkl",
+            usage_ref="sacct:alpha:4242",
+        )
+        self.assertEqual(
+            (done.status, done.slurm_state, done.output_ref, done.usage_ref),
+            ("succeeded", "COMPLETED", "/w/jobs/x/output.pkl", "sacct:alpha:4242"),
+        )
+        closed = self.registry.get(execution.execution_id, project_id=self.project)
+        assert closed is not None
+        self.assertEqual(closed.status, "succeeded")
+        self.assertIsNotNone(closed.finished_at)
+        with self.assertRaises(ExecutionClosedError):
+            self.begin(execution.execution_id)
+        with self.assertRaises(InvalidTransitionError):
+            self.registry.finish_attempt(attempt.id, "failed")
+        with self.assertRaises(psycopg.errors.IntegrityConstraintViolation):
+            self.conn.execute(
+                "UPDATE execution_attempts SET status = 'running' WHERE id = %s", (attempt.id,)
+            )
+
+    def test_identity_fields_are_immutable(self):
+        execution, _ = self.register()
+        attempt = self.begin(execution.execution_id)
+        self.registry.record_submission(attempt.id, 7)
+        for statement, params in (
+            ("UPDATE execution_attempts SET platform_id = 'beta' WHERE id = %s", (attempt.id,)),
+            ("UPDATE execution_attempts SET slurm_account = 'x' WHERE id = %s", (attempt.id,)),
+            ("UPDATE execution_attempts SET unix_user = 'root' WHERE id = %s", (attempt.id,)),
+            ("UPDATE execution_attempts SET login_node_host = 'h' WHERE id = %s", (attempt.id,)),
+            ("UPDATE execution_attempts SET slurm_job_id = 8 WHERE id = %s", (attempt.id,)),
+            ("DELETE FROM execution_attempts WHERE id = %s", (attempt.id,)),
+            (
+                "UPDATE executions SET project_id = %s WHERE execution_id = %s",
+                (self.other_project, execution.execution_id),
+            ),
+            (
+                "UPDATE executions SET owner_user_id = %s WHERE execution_id = %s",
+                (self.other_user, execution.execution_id),
+            ),
+            ("DELETE FROM executions WHERE execution_id = %s", (execution.execution_id,)),
+        ):
+            with (
+                self.subTest(statement=statement),
+                self.assertRaises(psycopg.errors.IntegrityConstraintViolation),
+            ):
+                self.conn.execute(statement, params)
+
+    def test_the_database_allows_only_one_live_attempt(self):
+        execution, _ = self.register()
+        attempt = self.begin(execution.execution_id)
+        with self.assertRaises(psycopg.errors.UniqueViolation):
+            self.conn.execute(
+                "INSERT INTO execution_attempts (execution_id, attempt_number, platform_id, "
+                "login_node_host, login_node_port, transport_mode, unix_user, slurm_account) "
+                "VALUES (%s, 2, 'alpha', 'h', 22, 'ssh', 'alice', 'proj')",
+                (execution.execution_id,),
+            )
+        self.assertEqual(len(self.registry.live_attempts()), 1)
+        self.assertEqual(self.registry.live_attempts()[0].id, attempt.id)
+
+    def test_concurrent_attempts_for_one_execution_start_one(self):
+        execution, _ = self.register()
+        results, errors = [], []
+        barrier = threading.Barrier(3)
+
+        def run():
+            barrier.wait()
+            try:
+                results.append(self.begin(execution.execution_id))
+            except AttemptInFlightError as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=run) for _ in range(3)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual((len(results), len(errors)), (1, 2))
+
+    def test_unknown_execution_and_attempt(self):
+        with self.assertRaises(ExecutionNotFoundError):
+            self.begin("0" * 32)
+        with self.assertRaises(ExecutionNotFoundError):
+            self.registry.record_submission(999999, 1)
+        with self.assertRaises(ValueError):
+            self.begin(
+                self.register()[0].execution_id,
+                principal=HPCPrincipal("alice", binding_id="b"),
+            )
+        with self.assertRaises(DatabaseError):
+            self.begin(self.register()[0].execution_id, platform="Not A Platform!")
+
+
+class RecoveryTests(_Base):
+    def test_interrupted_submissions_become_unknown_and_block_blind_retry(self):
+        execution, _ = self.register()
+        attempt = self.begin(execution.execution_id)
+        # A recent attempt may still be in progress on another Controller.
+        self.assertEqual(self.registry.mark_interrupted(timedelta(minutes=5)), [])
+        self.conn.execute(
+            "UPDATE execution_attempts SET updated_at = now() - interval '1 hour' WHERE id = %s",
+            (attempt.id,),
+        )
+        self.db.close()
+        restarted = ExecutionRegistry(self.open_database())
+        [interrupted] = restarted.mark_interrupted(timedelta(minutes=5))
+        self.assertEqual((interrupted.id, interrupted.status), (attempt.id, "unknown"))
+        self.assertEqual(interrupted.error_kind, "controller_interrupted")
+        # sbatch may have run: no new attempt until the unknown one is reconciled.
+        with self.assertRaises(AttemptInFlightError):
+            restarted.begin_attempt(
+                execution.execution_id,
+                platform_id="alpha",
+                login_node=LOGIN_A2,
+                principal=ALICE,
+                slurm_account="proj",
+                options={},
+            )
+        # Reconciliation found the job after all.
+        found = restarted.record_submission(attempt.id, 99)
+        self.assertEqual(found.status, "submitted")
+        self.assertEqual([a.id for a in restarted.live_attempts("alpha")], [attempt.id])
+        self.assertEqual(restarted.live_attempts("beta"), [])
+
+    def test_mark_interrupted_needs_a_positive_age(self):
+        with self.assertRaises(ValueError):
+            self.registry.mark_interrupted(timedelta(0))
+
+
+class PlatformNamespaceTests(_Base):
+    def test_same_account_and_job_id_on_two_platforms_stay_distinct(self):
+        a, _ = self.register()
+        b, _ = self.register()
+        on_alpha = self.begin(a.execution_id, platform="alpha", account="shared")
+        on_beta = self.begin(b.execution_id, platform="beta", login=LOGIN_B1, account="shared")
+        self.registry.record_submission(on_alpha.id, 1000)
+        self.registry.record_submission(on_beta.id, 1000)
+        self.registry.record_running(on_alpha.id, ["node01"])
+        self.registry.record_running(on_beta.id, ["node01"])
+        alpha_job = self.registry.find_by_slurm_job("alpha", 1000)
+        beta_job = self.registry.find_by_slurm_job("beta", 1000)
+        assert alpha_job is not None and beta_job is not None
+        self.assertEqual(
+            (alpha_job.execution_id, beta_job.execution_id), (a.execution_id, b.execution_id)
+        )
+        self.assertIsNone(self.registry.find_by_slurm_job("gamma", 1000))
+        self.assertEqual(
+            [x.id for x in self.registry.attempts_for_account("alpha", "shared")], [on_alpha.id]
+        )
+        self.assertEqual(
+            [x.id for x in self.registry.attempts_for_account("beta", "shared")], [on_beta.id]
+        )
+        self.assertEqual(
+            [x.id for x in self.registry.attempts_on_node("alpha", "node01")], [on_alpha.id]
+        )
+        self.assertEqual(
+            [x.id for x in self.registry.attempts_on_node("beta", "node01")], [on_beta.id]
+        )
+        self.assertEqual(beta_job.login_node, LOGIN_B1)
+
+    def test_a_reused_slurm_job_id_finds_the_latest_attempt(self):
+        old, _ = self.register()
+        new, _ = self.register()
+        first = self.begin(old.execution_id)
+        self.registry.record_submission(first.id, 5)
+        self.registry.finish_attempt(first.id, "succeeded")
+        second = self.begin(new.execution_id)
+        self.registry.record_submission(second.id, 5)
+        found = self.registry.find_by_slurm_job("alpha", 5)
+        assert found is not None
+        self.assertEqual(found.id, second.id)
