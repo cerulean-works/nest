@@ -22,7 +22,9 @@ platform role history in `platform_audit_events` (see
 | `cli_login.approved`, `cli_login.denied` | Trigger | A CLI sign-in is decided in the browser, with the approving session. |
 | `invitation.created`, `.token_issued`, `.accepted`, `.declined`, `.revoked`, `.expired` | Trigger | Each step of an email invitation, with its role and actor. |
 | `invitation.email_queued`, `invitation.email_requeued` | Trigger | An invitation email is queued, sent again, or a failed one queued again. |
-| `invite_link.created`, `.redeemed`, `.revoked` | Trigger | Each step of an Invite Link, with its role and use limit. |
+| `invitation.email_failed` | Trigger | The outbox gave up on an invitation email (outcome `failed`), with the error class and SMTP code and whether it was permanent. |
+| `invite_link.created`, `.redeemed`, `.revoked`, `.exhausted` | Trigger | Each step of an Invite Link, with its role and use limit; `exhausted` when its last use is taken. |
+| `invitation.accept`, `.decline`, `.manage`, `.list`, `.preview`, `invite_link.redeem` | Controller | A refused invitation action (outcome `denied`), with the reason, such as `email_mismatch`, `expired` or `not_found`. |
 | `provider.profile_changed` | Trigger | A Provider Profile is created or a setting changes (the names of the changed columns). |
 
 Calls with no accepted Nest session (`auth.failed`) are logged only, never written

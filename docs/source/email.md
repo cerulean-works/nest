@@ -13,8 +13,8 @@ operate or rent. Email is **optional**:
   contact the SMTP server at startup, so a mail outage never stops the Controller.
 
 This page covers the transport and the delivery outbox. Creating, resending and
-redeeming Project invitations is a separate feature that builds on it and is not
-part of this release.
+redeeming Project invitations, which build on it, are described in
+[Invite people to a Project](invitations).
 
 ## Enable email
 

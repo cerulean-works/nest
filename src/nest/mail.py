@@ -25,14 +25,14 @@ from typing import Protocol
 from urllib.parse import quote
 
 from ._logging import get_logger, register_secret
-from .config import EmailConfig, SMTPConfig
+from .config import INVITATION_PAGE_PATH, EmailConfig, SMTPConfig
 from .db.connection import DatabaseError
 from .db.outbox import EmailOutbox, QueuedEmail
 
 logger = get_logger("nest.mail")
 
 INVITATION_KIND = "project_invitation"
-INVITATION_PATH = "/invitations/accept"
+INVITATION_PATH = INVITATION_PAGE_PATH
 
 
 class DeliveryError(Exception):

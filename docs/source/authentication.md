@@ -115,6 +115,10 @@ Browser                    Nest auth listener                 Google
    short-lived access token for it, and sets both as cookies (see
    [Browser sessions](#browser-sessions)). Only SHA-256 digests of the secrets are
    stored. A disabled User gets no session.
+7. **Invitations.** On a first sign-in, the same transaction also accepts every
+   pending email invitation addressed to the verified address (see
+   [Invite people to a Project](invitations)), and the page says how many Projects
+   the User joined. Returning Users accept or decline invitations explicitly.
 
 The command line signs in by having a signed-in browser approve it; see
 [Sign in from the command line](cli-login). This page covers the Google sign-in and

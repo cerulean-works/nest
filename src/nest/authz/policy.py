@@ -35,6 +35,8 @@ class Action(StrEnum):
     """List members and their roles."""
     MEMBER_INVITE = "member.invite"
     """Invite or add a member with a role (`Target.new_role`)."""
+    INVITATION_MANAGE = "invitation.manage"
+    """List, resend and revoke the Project's email invitations and Invite Links."""
     MEMBER_ROLE_CHANGE = "member.role.change"
     """Change a member's role (`Target.member_role` to `Target.new_role`)."""
     MEMBER_REMOVE = "member.remove"
@@ -182,6 +184,7 @@ def decide(
     | Read the Project, members, Runs, ordinary artifacts | yes | yes | yes | yes |
     | Change settings, read audit history | yes | yes | no | no |
     | Invite or add `admin`, `member`, `viewer` | yes | yes | no | no |
+    | List, resend, revoke invitations and Invite Links | yes | yes | no | no |
     | Change a non-Owner's role among those | yes | yes | no | no |
     | Remove a non-Owner member | yes | yes | no | no |
     | Leave the Project | no (transfer first) | yes | yes | yes |
@@ -213,7 +216,7 @@ def decide(
 
     if action in READ_ACTIONS:
         return ALLOW
-    if action in (Action.PROJECT_UPDATE, Action.PROJECT_AUDIT_READ):
+    if action in (Action.PROJECT_UPDATE, Action.PROJECT_AUDIT_READ, Action.INVITATION_MANAGE):
         return ALLOW if role in managers else _deny("role")
     if action in (Action.PROJECT_DELETE, Action.PROJECT_TRANSFER):
         return ALLOW if role == "owner" else _deny("owner_only")
