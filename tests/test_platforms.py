@@ -328,9 +328,10 @@ class UpgradePathTests(PostgresTestCase):
         url = self.database()
         migrations = load_migrations()
         labels = [m.label for m in migrations]
-        self.assertEqual(labels[-2:], ["0011_platform_metadata", "0012_hpc_platform_catalog"])
+        at = labels.index("0012_hpc_platform_catalog")
+        self.assertEqual(labels[at - 1], "0011_platform_metadata")
         with connect(url) as conn:
-            self.assertEqual(len(upgrade(conn, migrations[:-1])), len(migrations) - 1)
+            self.assertEqual(len(upgrade(conn, migrations[:at])), at)
         db = Database(load_database_config({"NEST_DATABASE_URL": url}))
         db.open()
         self.addCleanup(db.close)
@@ -340,7 +341,10 @@ class UpgradePathTests(PostgresTestCase):
         sync_providers(db, {"nano4": profile}, "nano4")
         old_job = JobStore(db, "nano4").begin("batch", secrets.token_hex(16))
         with connect(url) as conn:
-            self.assertEqual([m.label for m in upgrade(conn)], ["0012_hpc_platform_catalog"])
+            self.assertEqual(
+                [m.label for m in upgrade(conn, migrations[: at + 1])],
+                ["0012_hpc_platform_catalog"],
+            )
             self.assertEqual(
                 conn.execute(
                     "SELECT operator, platform_id FROM provider_profiles p "

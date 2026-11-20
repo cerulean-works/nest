@@ -99,6 +99,40 @@ platforms.grant_project(nano4.id, project_id, **ops)
 
 [[autodoc]] db.EndpointNotApprovedError
 
+## Slurm accounts
+
+See [Map Slurm accounts to Projects](../slurm-accounts). `SlurmAccountStore` is the
+operator-side API; the server chooses a job's account with [`authz.AccountResolver`].
+
+```python
+from nest.db import SlurmAccountStore
+
+accounts = SlurmAccountStore(database)
+ops = {"operator": "ops-alice", "reason": "onboard the chemistry lab"}
+accounts.register_account("nano4", "chem", **ops)
+accounts.link_project(project_id, "nano4", "chem", modes=["A", "B"], default=True, **ops)
+```
+
+[[autodoc]] db.SlurmAccountStore
+
+[[autodoc]] db.SlurmAccount
+
+[[autodoc]] db.ProjectAccountLink
+
+[[autodoc]] db.ProjectAccountMapping
+
+[[autodoc]] db.normalize_account_name
+
+[[autodoc]] db.SlurmAccountError
+
+[[autodoc]] db.SlurmAccountNotFoundError
+
+[[autodoc]] db.DuplicateSlurmAccountError
+
+[[autodoc]] db.AccountLinkNotFoundError
+
+[[autodoc]] db.PlatformNotGrantedError
+
 ## Users and identities
 
 See [Users, Projects and memberships](../database#users-projects-and-memberships)

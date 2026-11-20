@@ -30,6 +30,8 @@ _BEGIN_FIELDS = (
     "cpu",
     "project_id",
     "submitted_by_user_id",
+    "slurm_account_id",
+    "slurm_account_origin",
 )
 
 
@@ -178,9 +180,13 @@ class JobStore:
                 side effect. For executions it is also the remote directory name.
             request_id (`str`, *optional*): Correlation ID from the logs.
             **fields: Any of `script`, `workdir`, `job_dir`, `account`, `partition`,
-                `time_limit`, `gpu`, `cpu`, `project_id` and `submitted_by_user_id`.
-                The last two record the Run's Project and submitter; they must be
-                given together and can never be changed afterwards.
+                `time_limit`, `gpu`, `cpu`, `project_id`, `submitted_by_user_id`,
+                `slurm_account_id` and `slurm_account_origin`. `project_id` and
+                `submitted_by_user_id` record the Run's Project and submitter; they
+                must be given together and can never be changed afterwards. The last
+                two record the registered Slurm account and where the choice came
+                from (see [`authz.AccountResolution.job_fields`]); the account must
+                belong to this store's Platform, and they never change either.
 
         Returns:
             `int`: The record's ID.

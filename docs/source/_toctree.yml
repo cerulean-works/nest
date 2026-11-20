@@ -39,6 +39,8 @@ guide:
         title: Invite people to a Project
       - local: platforms
         title: Register HPC Platforms and login nodes
+      - local: slurm-accounts
+        title: Map Slurm accounts to Projects
       - local: platform-admin
         title: Bootstrap and recover platform administration
       - local: audit-log
