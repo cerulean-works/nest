@@ -31,6 +31,7 @@ its log handler masks an inline private key if any message ever contains it.
 | `NEST_RPC_TIMEOUT` | `900` | Seconds allowed for each `Execute` RPC. Must be a positive number. When it expires, the call raises `RpcTimeoutError`. |
 | `NEST_CONTROLLER_TLS` | `false` for loopback, `true` when a CA file is set | Use a TLS channel with server certificate verification. Accepts `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`. |
 | `NEST_CONTROLLER_TLS_CA_FILE` | Unset | Absolute path to PEM roots for the Controller's certificate. With TLS enabled, an unset file uses gRPC's default trust roots. |
+| `NEST_PROJECT_ID` | Unset | ID of the Project your calls run in. Required by a Controller with session authentication (`NEST_CONTROLLER_AUTH=session`); sent as `x-nest-project-id` metadata. |
 
 Set these in the process running your Nest application. They do not configure
 where the Controller listens. Invalid client settings raise `nest.config.ConfigError`
@@ -40,7 +41,7 @@ where the Controller listens. Invalid client settings raise `nest.config.ConfigE
 
 | Variable | Default | Behavior |
 | --- | --- | --- |
-| `NEST_AUTH_URL` | Unset | Origin of your Nest's sign-in, such as `https://nest.example.com` (the origin of `NEST_GOOGLE_REDIRECT_URL`). Must be `https://` (`http://` only for localhost), with no path, credentials, query or fragment. Read by `nest login` and [`login.ensure_session`]; `--url` overrides it. |
+| `NEST_AUTH_URL` | Unset | Origin of your Nest's sign-in, such as `https://nest.example.com` (the origin of `NEST_GOOGLE_REDIRECT_URL`). Must be `https://` (`http://` only for localhost), with no path, credentials, query or fragment. Read by `nest login` and [`login.ensure_session`]; `--url` overrides it. When set, `.remote()` sends the stored session to the Controller as a bearer token. |
 | `NEST_CLI_CREDENTIALS_FILE` | `$XDG_CONFIG_HOME/nest/credentials.json`, or `~/.config/nest/credentials.json` | Absolute path where the CLI session is kept, mode `0600`. A file other users can read is refused. Holds a Nest session only, never HPC credentials. |
 
 See [Sign in from the command line](cli-login).
@@ -65,6 +66,9 @@ on a trusted private network such as an authorized Tailnet.
 | `NEST_CANCEL_BLOCKED_JOBS` | `false` | Whether to `scancel` a job when the call raises `JobBlockedError`. The job is never resubmitted. |
 | `NEST_TLS_CERT_FILE` | Unset | Absolute path to the PEM certificate chain. Set with `NEST_TLS_KEY_FILE` to serve TLS. |
 | `NEST_TLS_KEY_FILE` | Unset | Absolute path to the PEM private key. Both TLS files, or neither. |
+| `NEST_CONTROLLER_AUTH` | `session` with `NEST_DATABASE_URL`, otherwise `none` | `session` authenticates every gRPC call with a Nest CLI session and authorizes it with the Project policy (see [Security and limitations](security#authenticated-execution)). Needs `NEST_DATABASE_URL`. `none` serves every caller that can reach the listener. |
+| `NEST_CONTROLLER_ALLOW_PLAINTEXT` | `false` | With `NEST_CONTROLLER_AUTH=session`, a non-loopback listener needs TLS (`NEST_TLS_*`) because every call carries a session token. `true` approves plaintext gRPC on a network that is already encrypted and access-controlled, such as an authorized Tailnet. Ignored with `NEST_CONTROLLER_AUTH=none`. |
+| `NEST_PROVIDER_ALLOWED_PROJECTS` | Unset (no Project) | Project IDs, comma-separated, whose members' Runs the Controller's Provider accepts, or `*` for every Project. Every job runs as the Controller's HPC account, so this is the operator's approval; no Project role grants it. Needs `NEST_CONTROLLER_AUTH=session`. |
 | `NEST_PUBLIC_URL` | Unset | Advertised `grpc://`, `grpcs://`, `http://` or `https://` URL, logged at startup. Must not contain credentials or a query string. With email enabled it is also the base of links in messages, so it is required and must be `https://` (`http://` only for `localhost`). |
 
 The four timing settings accept positive numbers, including fractions.
@@ -240,7 +244,7 @@ Controller refuses to start when one is set, rather than ignoring it:
 
 | Variable | Planned use |
 | --- | --- |
-| `NEST_AUTH_TOKEN_FILE` | Caller authentication. |
+| `NEST_AUTH_TOKEN_FILE` | Static service tokens. Callers authenticate with Nest sessions (`NEST_CONTROLLER_AUTH`). |
 | `NEST_RETENTION_DAYS` | Retention of job records and staged files. |
 | `NEST_INTEGRATIONS` | Optional integrations, comma-separated. |
 

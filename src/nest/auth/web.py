@@ -40,6 +40,7 @@ from urllib.parse import parse_qs, quote, urlsplit
 from uuid import UUID
 
 from .._logging import get_logger
+from ..audit import audit_interface
 from ..authz import AccessDeniedError, Principal, ProjectService
 from ..config import (
     AUTH_CLI_PREFIX,
@@ -261,7 +262,8 @@ class _Handler(BaseHTTPRequestHandler):
     def _dispatch(self, route):
         self._set_cookies: list[str] = []
         try:
-            route()
+            with audit_interface("http"):
+                route()
         except DatabaseError:
             logger.error("Auth request failed: the database is unavailable")
             self._fail(

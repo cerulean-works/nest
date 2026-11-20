@@ -655,7 +655,13 @@ class ControllerDatabaseTests(PostgresTestCase):
         root = Path(tempfile.mkdtemp())
         self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
         hpc = FakeHpc(root)
-        return url, hpc, {**hpc.controller_settings(), "NEST_DATABASE_URL": url}
+        # Job records, not authentication, are under test here (see test_security).
+        settings = {
+            **hpc.controller_settings(),
+            "NEST_DATABASE_URL": url,
+            "NEST_CONTROLLER_AUTH": "none",
+        }
+        return url, hpc, settings
 
     @staticmethod
     def worker_jobs(hpc):

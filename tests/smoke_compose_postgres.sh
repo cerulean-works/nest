@@ -20,6 +20,9 @@ export NEST_CONTROLLER_HOST_IP=127.0.0.1
 export NEST_CONTROLLER_PORT=0
 export NEST_POSTGRES_PORT=0
 export NEST_SSH_DIR="$fixture"
+# With a database the Controller authenticates gRPC calls with Nest sessions, which
+# it accepts without TLS only on an approved network: here, the test host.
+export NEST_CONTROLLER_ALLOW_PLAINTEXT=true
 unset COMPOSE_PROFILES NEST_POSTGRES_PASSWORD_FILE NEST_DATABASE_URL NEST_DATABASE_PASSWORD_FILE
 volume="${COMPOSE_PROJECT_NAME}_postgres-data"
 local_db=(docker compose --profile local-db)

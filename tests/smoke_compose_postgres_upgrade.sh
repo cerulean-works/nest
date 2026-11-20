@@ -15,6 +15,8 @@ export NEST_CONTROLLER_HOST_IP=127.0.0.1
 export NEST_CONTROLLER_PORT=0
 export NEST_POSTGRES_PORT=0
 export NEST_SSH_DIR="$fixture"
+# Session authentication without TLS, approved for the test host's network.
+export NEST_CONTROLLER_ALLOW_PLAINTEXT=true
 export NEST_DATABASE_URL=postgresql://nest@postgres:5432/nest
 export NEST_DATABASE_PASSWORD_FILE=/home/nest/.ssh/nest-postgres-password
 unset COMPOSE_PROFILES NEST_POSTGRES_PASSWORD_FILE NEST_POSTGRES_DATA_DIR

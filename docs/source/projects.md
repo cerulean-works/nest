@@ -54,7 +54,10 @@ the role above and the permission of the Run's Provider, asked through an
 its own policy, such as whether the User has a linked Provider Account, never from
 Project membership, so Project Owners and Platform Admins gain no UNIX or Slurm
 access by their role. Until Provider account policy is configured, the default
-[`authz.DenyAllProviders`] refuses every Run action.
+[`authz.DenyAllProviders`] refuses every Run action. The Controller's gRPC
+execution service uses [`authz.AllowedProjects`] instead: its operator lists the
+Projects whose Runs its Provider accepts in `NEST_PROVIDER_ALLOWED_PROJECTS` (see
+[Authenticated execution](security#authenticated-execution)).
 
 ## Sessions and scopes
 

@@ -22,6 +22,7 @@ from uuid import UUID
 import psycopg
 
 from .._logging import get_logger
+from ..audit import AuditLog
 from ..db._transaction import as_uuid, audit_context, transaction
 from ..db.connection import Database
 from ..db.projects import Membership, Project, ProjectAuditEvent, ProjectStore
@@ -92,7 +93,14 @@ class DenyAllProviders:
         return False
 
 
-def _log_denied(principal: Principal, action: str, project_id: UUID | None, reason: str) -> None:
+def _log_denied(
+    audit: AuditLog,
+    principal: Principal,
+    action: str,
+    project_id: UUID | None,
+    reason: str,
+    details: dict[str, object] | None = None,
+) -> None:
     logger.warning(
         "Access denied user_id=%s session_kind=%s action=%s project_id=%s reason=%s",
         principal.user_id,
@@ -100,6 +108,15 @@ def _log_denied(principal: Principal, action: str, project_id: UUID | None, reas
         action,
         project_id,
         reason,
+    )
+    audit.record(
+        action,
+        "denied",
+        actor_user_id=principal.user_id,
+        session_id=principal.session_id,
+        project_id=project_id,
+        reason=reason,
+        details={"session_kind": principal.session_kind, **(details or {})},
     )
 
 
@@ -111,11 +128,30 @@ class Authorizer:
         database ([`db.Database`]): Open database.
         providers ([`authz.ProviderAuthority`], *optional*): Provider policy for
             Run actions. Defaults to [`authz.DenyAllProviders`].
+        audit ([`audit.AuditLog`], *optional*): Where refusals are recorded.
+            Defaults to one on `database`.
     """
 
-    def __init__(self, database: Database, providers: ProviderAuthority | None = None):
+    def __init__(
+        self,
+        database: Database,
+        providers: ProviderAuthority | None = None,
+        audit: AuditLog | None = None,
+    ):
         self.database = database
         self.providers: ProviderAuthority = providers or DenyAllProviders()
+        self.audit = audit or AuditLog(database)
+
+    def denied(
+        self,
+        principal: Principal,
+        action: str,
+        project_id: UUID | None,
+        reason: str,
+        details: dict[str, object] | None = None,
+    ) -> None:
+        """Logs and records a refusal in the security audit log."""
+        _log_denied(self.audit, principal, action, project_id, reason, details)
 
     @staticmethod
     def role_in(cursor: psycopg.Cursor[dict[str, Any]], project_id: UUID, user_id: UUID):
@@ -131,12 +167,14 @@ class Authorizer:
         target: Target = NO_TARGET,
         *,
         conn: psycopg.Connection | None = None,
+        details: dict[str, object] | None = None,
     ) -> Decision:
         """
         Decides an action from the caller's current role, read now.
 
         For the [`authz.Action`] members `RUN_SUBMIT` and `RUN_CANCEL`, the
-        Provider must permit it too.
+        Provider must permit it too. A refusal is recorded in the security audit
+        log (see [`audit.AuditLog`]) with `details`.
         """
         pid = as_uuid(project_id, "project_id")
         with transaction(self.database, conn, "check a Project permission") as cursor:
@@ -149,7 +187,7 @@ class Authorizer:
         ):
             decision = Decision(False, "provider_denied")
         if not decision:
-            _log_denied(principal, str(action), pid, decision.reason)
+            self.denied(principal, str(action), pid, decision.reason, details)
         return decision
 
     def require(
@@ -204,6 +242,7 @@ class ProjectService:
         conn: psycopg.Connection | None = None,
     ) -> Generator[psycopg.Connection]:
         pid = as_uuid(project_id, "project_id")
+        refused: Decision | None = None
         with self._connection(conn) as active, transaction(self.database, active, what) as cursor:
             cursor.execute(
                 "SELECT 1 FROM projects WHERE id = %s AND deleted_at IS NULL FOR NO KEY UPDATE",
@@ -222,11 +261,19 @@ class ProjectService:
                 member_user_id=member_user_id, member_role=member_role, new_role=new_role
             )
             decision = decide(principal, role, action, target)
-            if not decision:
-                _log_denied(principal, str(action), pid, decision.reason)
-                raise AccessDeniedError(str(action), decision)
-            with audit_context(cursor, actor_user_id=principal.user_id):
-                yield active
+            if decision:
+                with audit_context(cursor, actor_user_id=principal.user_id):
+                    yield active
+            else:
+                refused = decision
+        if refused is not None:
+            # Recorded once the transaction has ended, so the refusal is kept
+            # although nothing else is.
+            details: dict[str, object] = {"new_role": new_role} if new_role else {}
+            if member_user_id is not None:
+                details["member_user_id"] = str(member_user_id)
+            self.authorizer.denied(principal, str(action), pid, refused.reason, details)
+            raise AccessDeniedError(str(action), refused)
 
     @contextmanager
     def _connection(self, conn: psycopg.Connection | None) -> Generator[psycopg.Connection]:
@@ -257,7 +304,7 @@ class ProjectService:
         """
         decision = may_create_project(principal)
         if not decision:
-            _log_denied(principal, "project.create", None, decision.reason)
+            self.authorizer.denied(principal, "project.create", None, decision.reason)
             raise AccessDeniedError("project.create", decision)
         org = as_uuid(organization_id, "organization_id") if organization_id else None
         with (
@@ -272,7 +319,7 @@ class ProjectService:
                 ).fetchone()
                 if member is None:
                     denied = Decision(False, "not_a_member")
-                    _log_denied(principal, "project.create", None, "organization")
+                    self.authorizer.denied(principal, "project.create", None, "organization")
                     raise AccessDeniedError("project.create", denied)
             active = cursor.execute(
                 "SELECT 1 FROM users WHERE id = %s AND status = 'active'",
@@ -289,7 +336,7 @@ class ProjectService:
         """The caller's Projects with their role in each."""
         decision = session_allows(principal, Action.PROJECT_READ)
         if not decision:
-            _log_denied(principal, "project.list", None, decision.reason)
+            self.authorizer.denied(principal, "project.list", None, decision.reason)
             raise AccessDeniedError("project.list", decision)
         with transaction(self.database, None, "check a User") as cursor:
             active = cursor.execute(

@@ -11,6 +11,12 @@ JOB_ID_METADATA = "nest-job-id"
 PENDING_REASON_METADATA = "nest-pending-reason"
 """Trailing-metadata key carrying the last Slurm pending reason of a job that never started."""
 
+AUTHORIZATION_METADATA = "authorization"
+"""Request-metadata key carrying `Bearer <Nest CLI access token>`."""
+
+PROJECT_METADATA = "x-nest-project-id"
+"""Request-metadata key naming the Project a submission runs in (`NEST_PROJECT_ID`)."""
+
 
 class RemoteExecutionError(RuntimeError):
     """An exception raised by a remotely executed function."""
@@ -215,6 +221,23 @@ class DatabaseUnavailableError(InfrastructureError):
 
     kind = "database_unavailable"
     status = grpc.StatusCode.UNAVAILABLE
+
+
+class AuthenticationRequiredError(PermissionError):
+    """
+    The Controller requires a Nest session and the call presented none it accepts.
+
+    Sign in with `nest login` and set `NEST_AUTH_URL`, so the SDK sends the session.
+    """
+
+
+class RemoteAccessDeniedError(PermissionError):
+    """
+    The Controller's Project policy or its Provider refused the call. Nothing was run.
+
+    A Project or job the caller is not a member of is reported as not found, so this
+    does not reveal whether it exists.
+    """
 
 
 INFRASTRUCTURE_ERRORS: dict[str, type[InfrastructureError]] = {

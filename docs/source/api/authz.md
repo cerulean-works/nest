@@ -55,3 +55,13 @@ except AccessDeniedError as exc:
 [[autodoc]] authz.ProviderAuthority
 
 [[autodoc]] authz.DenyAllProviders
+
+[[autodoc]] authz.AllowedProjects
+
+## Execution service
+
+[[autodoc]] authz.ExecutionAccess
+
+[[autodoc]] authz.UnauthenticatedError
+
+[[autodoc]] authz.ProjectRequiredError
