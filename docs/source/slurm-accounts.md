@@ -114,12 +114,20 @@ from nest.authz import AccountResolver, HPCIdentity
 
 resolver = AccountResolver(database)
 chosen = resolver.resolve(
-    principal, project_id, platform="nano4", mode="A",
+    principal,
+    project_id,
+    platform="nano4",
+    mode="A",
     identity=HPCIdentity.controller(nano4_id),
 )
 jobs = JobStore(database, provider_id, platform_id=chosen.platform_id)
-jobs.begin("batch", execution_id, project_id=project_id,
-           submitted_by_user_id=principal.user_id, **chosen.job_fields())
+jobs.begin(
+    "batch",
+    execution_id,
+    project_id=project_id,
+    submitted_by_user_id=principal.user_id,
+    **chosen.job_fields(),
+)
 ```
 
 ## Limitations

@@ -103,7 +103,10 @@ from nest.authz import AccountResolver, HPCIdentity
 
 resolver = AccountResolver(database)
 chosen = resolver.resolve(
-    principal, project_id, platform="nano4", mode="B",
+    principal,
+    project_id,
+    platform="nano4",
+    mode="B",
     identity=HPCIdentity.user(nano4_id, principal.user_id, verified_default_account="chem"),
 )
 chosen.origin  # "explicit", "project_default", "mode_b_user_default", ...
