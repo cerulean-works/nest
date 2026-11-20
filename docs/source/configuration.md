@@ -60,8 +60,8 @@ on a trusted private network such as an authorized Tailnet.
 | `NEST_RESULT_TIMEOUT` | `600` | Seconds the Controller polls a worker job. When it expires, the call raises `QueueTimeoutError` or `ExecutionTimeoutError`. |
 | `NEST_ENVIRONMENT_TIMEOUT` | `1800` | Seconds the Controller polls an environment build job. When it expires, the same timeout classes are raised. |
 | `NEST_POLL_INTERVAL` | `5` | Seconds between Slurm status queries. |
-| `NEST_PENDING_BLOCKED_TIMEOUT` | `120` | Seconds a job may stay pending for a reason it cannot outwait, such as `PartitionConfig`, `InvalidQOS`, a per-job limit, or a hold, before the call raises `JobBlockedError`. Set it above `NEST_RESULT_TIMEOUT` to wait for the full deadline instead. |
-| `NEST_PENDING_LIMIT_TIMEOUT` | Unset | Seconds a job may stay pending on a QoS or association usage limit, such as `MaxGRESPerAccount`, before the call raises `JobBlockedError`. Unset waits until `NEST_RESULT_TIMEOUT`, since such limits clear as the account's other jobs finish. |
+| `NEST_PENDING_BLOCKED_TIMEOUT` | `120` | Seconds a job may stay pending for a reason it cannot outwait, such as `PartitionConfig`, `InvalidQOS`, a per-job limit, or a hold, before the call raises `JobBlockedError`. `0` stops at the first such observation. Set it above `NEST_RESULT_TIMEOUT` to wait for the full deadline instead. |
+| `NEST_PENDING_LIMIT_TIMEOUT` | Unset | Seconds a job may stay pending on a QoS or association usage limit, such as `MaxGRESPerAccount`, before the call raises `JobBlockedError`. `0` stops at the first such observation. Unset waits until `NEST_RESULT_TIMEOUT`, since such limits clear as the account's other jobs finish. |
 | `NEST_CANCEL_BLOCKED_JOBS` | `false` | Whether to `scancel` a job when the call raises `JobBlockedError`. The job is never resubmitted. |
 | `NEST_TLS_CERT_FILE` | Unset | Absolute path to the PEM certificate chain. Set with `NEST_TLS_KEY_FILE` to serve TLS. |
 | `NEST_TLS_KEY_FILE` | Unset | Absolute path to the PEM private key. Both TLS files, or neither. |

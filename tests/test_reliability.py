@@ -457,6 +457,33 @@ class PendingWaitTests(Polling, unittest.TestCase):
             self.wait([self.gpu_limit, job("RUNNING"), job("RUNNING"), job("RUNNING")], 3)
         self.assertIn("Pending reasons seen: MaxGRESPerAccount.", str(caught.exception))
 
+    def test_zero_timeouts_from_the_environment_stop_at_the_first_observation(self):
+        from nest.controller import build_backend
+
+        config = load_controller_config(
+            {
+                "NEST_EXECUTOR": "slurm",
+                "NEST_SLURM_HOST": "hpc",
+                "NEST_SLURM_ACCOUNT": "acct",
+                "NEST_SLURM_WORKDIR": "/nest",
+                "NEST_PENDING_BLOCKED_TIMEOUT": "0",
+                "NEST_PENDING_LIMIT_TIMEOUT": "0",
+            }
+        )
+        slurm = build_backend(config)
+        assert slurm is not None
+        self.assertEqual((slurm.config.blocked_timeout, slurm.config.limit_timeout), (0, 0))
+        for info in (self.bad_partition, self.gpu_limit):
+            with (
+                self.subTest(reason=info.reason),
+                mock.patch.object(slurm, "job_info", return_value=info) as poll,
+                mock.patch.object(slurm, "_with_details", side_effect=lambda job: job),
+                mock.patch("nest.backends.slurm.time.sleep"),
+                self.assertRaises(JobBlockedError),
+            ):
+                slurm._wait_job(9, "Slurm job", 600, 0.1)
+            poll.assert_called_once()
+
     def test_negative_pending_timeouts_are_rejected(self):
         with self.assertRaises(ValueError):
             backend(blocked_timeout=-1)
@@ -655,9 +682,17 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(config.pending_blocked_timeout, 30)
         self.assertEqual(config.pending_limit_timeout, 900)
         self.assertTrue(config.cancel_blocked_jobs)
+        zero = load_controller_config(
+            {"NEST_PENDING_BLOCKED_TIMEOUT": "0", "NEST_PENDING_LIMIT_TIMEOUT": "0"}
+        )
+        self.assertEqual((zero.pending_blocked_timeout, zero.pending_limit_timeout), (0, 0))
         for name in ("NEST_PENDING_BLOCKED_TIMEOUT", "NEST_PENDING_LIMIT_TIMEOUT"):
-            with self.subTest(name=name), self.assertRaisesRegex(ValueError, name):
-                load_controller_config({name: "-1"})
+            for bad in ("-1", "soon", "inf", "nan"):
+                with self.subTest(name=name, value=bad), self.assertRaisesRegex(ValueError, name):
+                    load_controller_config({name: bad})
+        # Other deadlines still reject zero.
+        with self.assertRaisesRegex(ValueError, "NEST_RESULT_TIMEOUT must be a positive"):
+            load_controller_config({"NEST_RESULT_TIMEOUT": "0"})
 
     def test_timeout_settings_are_validated(self):
         def timeout(value):

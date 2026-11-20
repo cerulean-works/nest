@@ -603,10 +603,11 @@ class ControllerConfig:
         ssh_timeout, result_timeout, environment_timeout, poll_interval (`float`):
             Deadlines in seconds.
         pending_blocked_timeout (`float`): Seconds a job may stay pending for a
-            reason it cannot outwait before the Controller stops waiting.
+            reason it cannot outwait before the Controller stops waiting. `0` stops
+            at the first such observation.
         pending_limit_timeout (`float | None`): Seconds a job may stay pending on a
-            QoS or association limit before the Controller stops waiting. `None`
-            waits until the polling deadline.
+            QoS or association limit before the Controller stops waiting. `0` stops
+            at the first such observation; `None` waits until the polling deadline.
         cancel_blocked_jobs (`bool`): Whether to cancel a job the Controller stopped
             waiting for because of its pending reason.
         providers (`dict[str, ProviderProfile]`): Profiles by ID.
@@ -721,7 +722,7 @@ class _Reader:
     def fail(self, message: str) -> None:
         self.problems.append(message)
 
-    def seconds(self, name: str, default: float) -> float:
+    def seconds(self, name: str, default: float, *, allow_zero: bool = False) -> float:
         raw = self.get(name)
         if raw is None:
             return default
@@ -729,8 +730,11 @@ class _Reader:
             value = float(raw)
         except ValueError:
             value = math.nan
+        if allow_zero and 0 <= value < math.inf:
+            return value
         if not 0 < value < math.inf:
-            self.fail(f"{name} must be a positive number of seconds, got {raw!r}")
+            kind = "nonnegative" if allow_zero else "positive"
+            self.fail(f"{name} must be a {kind} number of seconds, got {raw!r}")
             return default
         return value
 
@@ -1464,10 +1468,10 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
         ),
         "poll_interval": reader.seconds("NEST_POLL_INTERVAL", DEFAULT_POLL_INTERVAL),
         "pending_blocked_timeout": reader.seconds(
-            "NEST_PENDING_BLOCKED_TIMEOUT", DEFAULT_PENDING_BLOCKED_TIMEOUT
+            "NEST_PENDING_BLOCKED_TIMEOUT", DEFAULT_PENDING_BLOCKED_TIMEOUT, allow_zero=True
         ),
         "pending_limit_timeout": (
-            reader.seconds("NEST_PENDING_LIMIT_TIMEOUT", 0)
+            reader.seconds("NEST_PENDING_LIMIT_TIMEOUT", 0, allow_zero=True)
             if reader.get("NEST_PENDING_LIMIT_TIMEOUT") is not None
             else None
         ),
