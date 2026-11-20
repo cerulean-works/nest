@@ -74,7 +74,7 @@ from .projects import (
     UserNotFoundError,
 )
 from .sessions import AccessGrant, Rotation, SessionRefreshError, SessionStore
-from .store import JobStore, sync_providers
+from .store import JobStore, PlatformIdentityError, sync_platforms, sync_providers
 
 __all__ = [
     "ASSIGNABLE_ROLES",
@@ -116,6 +116,7 @@ __all__ = [
     "OwnerRuleError",
     "PendingInvitation",
     "PlatformAdminBootstrap",
+    "PlatformIdentityError",
     "Project",
     "ProjectAuditEvent",
     "ProjectError",
@@ -140,6 +141,7 @@ __all__ = [
     "normalize_email",
     "normalize_invited_email",
     "schema_status",
+    "sync_platforms",
     "sync_providers",
     "upgrade",
     "verify",

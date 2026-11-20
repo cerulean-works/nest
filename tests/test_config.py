@@ -3,7 +3,9 @@
 These are `unittest` cases so they also run inside the Controller image.
 """
 
+import dataclasses
 import io
+import json
 import logging
 import os
 import shutil
@@ -25,6 +27,8 @@ from nest.config import (
     DEFAULT_CONTROLLER_ADDRESS,
     ConfigError,
     LoginNode,
+    PlatformProfile,
+    ProviderProfile,
     Secret,
     load_client_config,
     load_controller_config,
@@ -150,7 +154,7 @@ class ValidationTests(unittest.TestCase):
             "NEST_LOG_LEVEL",
         ):
             self.assertIn(name, text)
-        self.assertIn("NEST_PROVIDERS", text, "the error points at the alternative")
+        self.assertIn("NEST_PLATFORMS", text, "the error points at the alternative")
 
     def test_executor_must_be_known(self):
         self.assertIn("NEST_EXECUTOR", self.problems({"NEST_EXECUTOR": "Slurm"}))
@@ -461,6 +465,337 @@ class ModeSeparationTests(unittest.TestCase):
         self.assertEqual(os.stat(os.path.dirname(identity)).st_mode & 0o777, 0o700)
         self.assertEqual(Path(identity).read_text(), PRIVATE_KEY + "\n")
         self.assertEqual(len(Path(known_hosts).read_text().splitlines()), 2)
+
+
+def platforms(files: Files, **extra: str) -> dict[str, str]:
+    """Two Mode B HPC Platforms under one operator, with differing defaults."""
+    return {
+        "NEST_EXECUTOR": "slurm",
+        "NEST_PLATFORMS": "campus, lab",
+        "NEST_DEFAULT_PLATFORM": "lab",
+        "NEST_PLATFORM_CAMPUS_NAME": "Campus GPU cluster",
+        "NEST_PLATFORM_CAMPUS_OPERATOR": "Example-University",
+        "NEST_PLATFORM_CAMPUS_SSH_MODE": "B",
+        "NEST_PLATFORM_CAMPUS_LOGIN_NODES": "login1.example.edu, login2.example.edu:2222",
+        "NEST_PLATFORM_CAMPUS_SSH_USER": "svc-nest",
+        "NEST_PLATFORM_CAMPUS_ACCOUNT": "physics",
+        "NEST_PLATFORM_CAMPUS_PARTITION": "gpu",
+        "NEST_PLATFORM_CAMPUS_TIME": "02:00:00",
+        "NEST_PLATFORM_CAMPUS_WORKDIR": "/scratch/nest",
+        "NEST_PLATFORM_LAB_OPERATOR": "example-university",
+        "NEST_PLATFORM_LAB_SSH_MODE": "B",
+        "NEST_PLATFORM_LAB_LOGIN_NODES": "lab-login.example.edu",
+        "NEST_PLATFORM_LAB_SSH_USER": "svc-lab",
+        "NEST_PLATFORM_LAB_ACCOUNT": "physics",
+        "NEST_PLATFORM_LAB_WORKDIR": "/home/svc-lab/nest",
+        "NEST_SSH_KNOWN_HOSTS": files.known_hosts,
+        "NEST_SSH_IDENTITY_FILE": files.identity,
+        **extra,
+    }
+
+
+class PlatformTests(unittest.TestCase):
+    """HPC Platform bootstrap from `NEST_PLATFORMS` (M1 patch A04)."""
+
+    def problems(self, environ: dict[str, str]) -> str:
+        with self.assertRaises(ConfigError) as caught:
+            load_controller_config(environ)
+        return "\n".join(caught.exception.problems)
+
+    def test_two_platforms_under_one_operator_keep_their_own_defaults(self):
+        files = Files(self)
+        config = load_controller_config(platforms(files))
+        self.assertEqual(list(config.platforms), ["campus", "lab"])
+        self.assertEqual(config.default_platform, "lab")
+        campus, lab = config.platforms["campus"], config.platforms["lab"]
+        self.assertIs(config.platform, lab)
+        self.assertEqual(campus.operator, lab.operator)
+        self.assertEqual(campus.operator, "example-university", "labels are lowercased")
+        self.assertEqual((campus.display_name, lab.display_name), ("Campus GPU cluster", None))
+        self.assertEqual((campus.partition, campus.time), ("gpu", "02:00:00"))
+        self.assertEqual((lab.partition, lab.time), ("h200_256gpu", "00:05:00"))
+        self.assertEqual(
+            campus.login_nodes,
+            (LoginNode("login1.example.edu"), LoginNode("login2.example.edu", 2222)),
+        )
+        self.assertEqual(lab.login_nodes, (LoginNode("lab-login.example.edu"),))
+        # The same Slurm account name on two Platforms is two distinct accounts.
+        self.assertEqual(campus.account, lab.account)
+        self.assertNotEqual(campus.slurm_account, lab.slurm_account)
+        self.assertEqual(lab.slurm_account, ("lab", "physics"))
+        self.assertEqual(config.warnings, ())
+
+    def test_default_platform_is_the_first_listed(self):
+        files = Files(self)
+        config = load_controller_config(platforms(files, NEST_DEFAULT_PLATFORM=""))
+        self.assertEqual(config.default_platform, "campus")
+        backend = build_backend(config)
+        assert backend is not None
+        self.assertEqual(backend.config.ssh_host, "login1.example.edu")
+        self.assertEqual((backend.config.account, backend.config.partition), ("physics", "gpu"))
+
+    def test_default_platform_selects_the_backend(self):
+        files = Files(self)
+        backend = build_backend(load_controller_config(platforms(files)))
+        assert backend is not None
+        cfg = backend.config
+        self.assertEqual((cfg.ssh_host, cfg.ssh_user), ("lab-login.example.edu", "svc-lab"))
+        self.assertEqual(cfg.allowed_hosts, ("lab-login.example.edu",))
+        self.assertEqual((cfg.partition, cfg.time), ("h200_256gpu", "00:05:00"))
+        self.assertEqual(cfg.work_root, "/home/svc-lab/nest/jobs")
+
+    def test_platform_identity_is_immutable(self):
+        files = Files(self)
+        config = load_controller_config(platforms(files))
+        profile = config.platforms["lab"]
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            profile.id = "campus"  # ty: ignore[invalid-assignment]
+        with self.assertRaises(TypeError):
+            config.platforms["lab"] = profile  # ty: ignore[invalid-assignment]
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            config.default_platform = "campus"  # ty: ignore[invalid-assignment]
+
+    def test_invalid_platform_ids_and_defaults_are_reported(self):
+        files = Files(self)
+        cases = {
+            "Campus!": "invalid ID",
+            "1lab": "invalid ID",
+            "campus,campus": "twice",
+            " , ": "at least one ID",
+        }
+        for value, message in cases.items():
+            with self.subTest(value=value):
+                self.assertIn(message, self.problems(platforms(files, NEST_PLATFORMS=value)))
+        text = self.problems(platforms(files, NEST_DEFAULT_PLATFORM="other"))
+        self.assertIn("NEST_DEFAULT_PLATFORM 'other' is not in NEST_PLATFORMS", text)
+
+    def test_required_platform_fields_are_named(self):
+        files = Files(self)
+        for name in (
+            "NEST_PLATFORM_LAB_LOGIN_NODES",
+            "NEST_PLATFORM_LAB_ACCOUNT",
+            "NEST_PLATFORM_LAB_WORKDIR",
+            "NEST_PLATFORM_LAB_SSH_USER",
+        ):
+            with self.subTest(missing=name):
+                self.assertIn(name, self.problems({**platforms(files), name: ""}))
+
+    def test_platform_fields_are_validated(self):
+        files = Files(self)
+        cases = {
+            "NEST_PLATFORM_CAMPUS_LOGIN_NODES": "-oProxyCommand=x",
+            "NEST_PLATFORM_CAMPUS_ACCOUNT": "a b",
+            "NEST_PLATFORM_CAMPUS_TIME": "soon",
+            "NEST_PLATFORM_CAMPUS_WORKDIR": "relative",
+            "NEST_PLATFORM_CAMPUS_SSH_MODE": "C",
+            "NEST_PLATFORM_CAMPUS_OPERATOR": "Example University!",
+            "NEST_PLATFORM_CAMPUS_NAME": "bad\x1b[31mname",
+        }
+        for name, value in cases.items():
+            with self.subTest(name=name):
+                self.assertIn(name, self.problems(platforms(files, **{name: value})))
+
+    def test_stray_and_misspelled_platform_settings_fail(self):
+        files = Files(self)
+        text = self.problems(platforms(files, NEST_PLATFORM_GPU_ACCOUNT="x"))
+        self.assertIn("NEST_PLATFORM_GPU_ACCOUNT match no Platform", text)
+        text = self.problems(platforms(files, NEST_PLATFORM_LAB_LOGIN_NODE="x"))
+        self.assertIn("NEST_PLATFORM_LAB_LOGIN_NODE match no Platform", text)
+        text = self.problems({"NEST_PLATFORM_LAB_ACCOUNT": "x", "NEST_DEFAULT_PLATFORM": "lab"})
+        self.assertIn("NEST_PLATFORM_LAB_ACCOUNT, NEST_DEFAULT_PLATFORM need NEST_PLATFORMS", text)
+
+    def test_platforms_replace_provider_and_slurm_settings(self):
+        files = Files(self)
+        for name in ("NEST_PROVIDERS", "NEST_PROVIDER_CAMPUS_ACCOUNT", "NEST_SLURM_HOST"):
+            with self.subTest(name=name):
+                text = self.problems(platforms(files, **{name: "x"}))
+                self.assertIn("NEST_PLATFORMS replaces", text)
+                self.assertIn(name, text)
+        # compose.managed-ssh.yaml's NEST_SLURM_SSH_MODE=B is ignored, with a warning;
+        # any other single-cluster setting is not.
+        config = load_controller_config(platforms(files, NEST_SLURM_SSH_MODE="b"))
+        self.assertEqual(len(config.platforms), 2)
+        self.assertIn("NEST_SLURM_SSH_MODE=B is ignored", config.warnings[0])
+        self.assertIn(
+            "unset NEST_SLURM_SSH_MODE", self.problems(platforms(files, NEST_SLURM_SSH_MODE="A"))
+        )
+        text = self.problems(platforms(files, NEST_SLURM_SSH_MODE="B", NEST_SLURM_ACCOUNT="a"))
+        self.assertIn("unset NEST_SLURM_ACCOUNT, NEST_SLURM_SSH_MODE", text)
+        # The Provider approval setting is not a Provider Profile field.
+        config = load_controller_config(
+            platforms(
+                files,
+                NEST_DATABASE_URL="postgresql://nest@db.example/nest",
+                NEST_PROVIDER_ALLOWED_PROJECTS="*",
+                NEST_CONTROLLER_ALLOW_PLAINTEXT="true",
+            )
+        )
+        self.assertEqual(config.allowed_projects, frozenset({"*"}))
+
+    def test_a_login_node_belongs_to_one_platform(self):
+        files = Files(self)
+        shared = platforms(files, NEST_PLATFORM_LAB_LOGIN_NODES="Login2.example.edu:2222")
+        self.assertIn("approved for both Platforms 'campus' and 'lab'", self.problems(shared))
+        # A different port on the same host is a different endpoint.
+        other_port = platforms(files, NEST_PLATFORM_LAB_LOGIN_NODES="login1.example.edu:2200")
+        load_controller_config(other_port)
+
+    def test_mode_b_platforms_ignore_tailscale_and_ssh_config(self):
+        files = Files(self)
+        without = load_controller_config(platforms(files))
+        with_tailscale = load_controller_config({**platforms(files), **TAILSCALE_SETTINGS})
+        self.assertEqual(without, with_tailscale)
+        backend = build_backend(without)
+        assert backend is not None
+        argv = backend._ssh_argv()
+        self.assertEqual(argv[:3], ["ssh", "-F", "none"])
+        self.assertEqual(argv[-5:], ["-p", "22", "-l", "svc-lab", "lab-login.example.edu"])
+        self.assertFalse(any("proxy" in a.lower() or "tailscale" in a for a in argv))
+
+    def test_mode_policy_names_the_platform(self):
+        files = Files(self)
+        text = self.problems(
+            platforms(files, NEST_PLATFORM_LAB_SSH_MODE="A", NEST_SSH_MODES_ALLOWED="B")
+        )
+        self.assertIn("Platform 'lab' uses SSH mode A", text)
+
+    def test_summary_describes_platforms_without_secrets(self):
+        files = Files(self)
+        settings = platforms(files, NEST_SSH_IDENTITY_FILE="", NEST_SSH_PRIVATE_KEY=PRIVATE_KEY)
+        config = load_controller_config(settings)
+        summary = config.summary()
+        self.assertEqual(summary["default_platform"], "lab")
+        described = cast(dict, summary["platforms"])
+        self.assertEqual(set(described), {"campus", "lab"})
+        self.assertEqual(described["campus"]["operator"], "example-university")
+        self.assertEqual(described["campus"]["name"], "Campus GPU cluster")
+        self.assertEqual(described["lab"]["login_nodes"], ["lab-login.example.edu"])
+        self.assertEqual(summary["ssh_private_key"], "***")
+        text = repr(config) + json.dumps(summary)
+        self.assertNotIn("c2VjcmV0LW1hcmtlci", text)
+        self.assertNotIn("PRIVATE KEY", text)
+
+    def test_errors_never_echo_platform_secrets(self):
+        files = Files(self)
+        secret = "c2VjcmV0LW1hcmtlci1ub3QtYS1yZWFsLWtleQ"
+        text = self.problems(
+            platforms(
+                files,
+                NEST_SSH_IDENTITY_FILE="",
+                NEST_SSH_PRIVATE_KEY=secret,
+                NEST_PLATFORM_LAB_ACCOUNT="",
+                NEST_DATABASE_URL=f"postgresql://nest:{secret}@db/nest?sslmode=bogus",
+            )
+        )
+        self.assertIn("NEST_PLATFORM_LAB_ACCOUNT", text)
+        self.assertIn("NEST_SSH_PRIVATE_KEY", text)
+        self.assertNotIn(secret, text)
+
+
+class ProviderCompatibilityTests(unittest.TestCase):
+    """`NEST_PROVIDERS` and `NEST_SLURM_*` keep working, as Platforms."""
+
+    def test_provider_settings_define_the_same_platforms(self):
+        files = Files(self)
+        renamed = {
+            key.replace("NEST_PLATFORMS", "NEST_PROVIDERS")
+            .replace("NEST_PLATFORM_", "NEST_PROVIDER_")
+            .replace("NEST_DEFAULT_PLATFORM", "NEST_DEFAULT_PROVIDER"): value
+            for key, value in platforms(files).items()
+            if not key.endswith(("_OPERATOR", "_NAME"))
+        }
+        legacy = load_controller_config(renamed)
+        current = load_controller_config(platforms(files))
+        self.assertEqual(legacy.default_platform, current.default_platform)
+        self.assertEqual(list(legacy.platforms), list(current.platforms))
+        for pid, profile in legacy.platforms.items():
+            expected = dataclasses.replace(current.platforms[pid], operator=None, display_name=None)
+            self.assertEqual(profile, expected)
+        self.assertEqual(len(legacy.warnings), 1)
+        self.assertIn("NEST_PLATFORMS", legacy.warnings[0])
+
+    def test_provider_names_remain_aliases(self):
+        files = Files(self)
+        config = load_controller_config(platforms(files))
+        self.assertIs(config.providers, config.platforms)
+        self.assertEqual(config.default_provider, config.default_platform)
+        self.assertIs(config.provider, config.platform)
+        self.assertIs(ProviderProfile, PlatformProfile)
+
+    def test_provider_profiles_do_not_read_platform_metadata(self):
+        files = Files(self)
+        config = load_controller_config(managed(files, NEST_PROVIDER_CAMPUS_OPERATOR="x"))
+        assert config.platform is not None
+        self.assertIsNone(config.platform.operator)
+
+    def test_single_cluster_settings_are_the_default_platform(self):
+        config = load_controller_config(LEGACY)
+        self.assertEqual(list(config.platforms), ["default"])
+        self.assertEqual(config.default_platform, "default")
+        self.assertEqual(config.warnings, ())
+
+
+class ComposePlatformTests(unittest.TestCase):
+    """The Compose deployment hands the Controller the same Platform settings."""
+
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def render(self, platforms_file: Path, *overrides: str, **settings: str) -> dict[str, str]:
+        compose = os.environ.get("NEST_COMPOSE_COMMAND", "docker compose").split()
+        if not (self.ROOT / "compose.yaml").is_file() or not shutil.which(compose[0]):
+            self.skipTest("needs the repository's compose.yaml and Docker Compose")
+        result = subprocess.run(
+            [*compose, "--env-file", "/dev/null"]
+            + [a for f in ("compose.yaml", *overrides) for a in ("-f", str(self.ROOT / f))]
+            + ["config", "--format", "json"],
+            cwd=self.ROOT,
+            env={
+                **{k: v for k, v in os.environ.items() if not k.startswith("NEST_")},
+                "NEST_PLATFORMS_ENV_FILE": str(platforms_file),
+                "NEST_SSH_DIR": "./ssh",
+                **settings,
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            self.skipTest(f"docker compose config failed: {result.stderr.strip()[:200]}")
+        environment = json.loads(result.stdout)["services"]["controller"]["environment"]
+        return {name: value or "" for name, value in environment.items()}
+
+    def test_native_and_compose_load_the_same_platforms(self):
+        files = Files(self)
+        native_settings = platforms(files)
+        # Platform settings go in the env file; the rest stay ordinary Compose settings.
+        listed = {k: v for k, v in native_settings.items() if k.startswith("NEST_PLATFORM")}
+        listed["NEST_DEFAULT_PLATFORM"] = native_settings["NEST_DEFAULT_PLATFORM"]
+        text = "".join(f"{k}={v}\n" for k, v in listed.items())
+        platforms_file = Path(files.write("platforms.env", text))
+        credentials = {
+            "NEST_SSH_KNOWN_HOSTS": files.known_hosts,
+            "NEST_SSH_IDENTITY_FILE": files.identity,
+        }
+        native = load_controller_config(native_settings)
+        # compose.managed-ssh.yaml drops the SSH mount for Mode B Platforms too.
+        for overrides in ((), ("compose.managed-ssh.yaml",)):
+            with self.subTest(overrides=overrides):
+                rendered = self.render(platforms_file, *overrides, **credentials)
+                docker = load_controller_config(rendered)
+                self.assertEqual(docker.platforms, native.platforms)
+                self.assertEqual(docker.default_platform, native.default_platform)
+                self.assertEqual(docker.summary()["platforms"], native.summary()["platforms"])
+
+    def test_compose_reports_invalid_platforms_like_native(self):
+        files = Files(self)
+        settings = {"NEST_PLATFORMS": "lab", "NEST_PLATFORM_LAB_ACCOUNT": "a b"}
+        text = "".join(f"{k}={v}\n" for k, v in settings.items())
+        platforms_file = Path(files.write("platforms.env", text))
+        with self.assertRaises(ConfigError) as docker:
+            load_controller_config(self.render(platforms_file))
+        with self.assertRaises(ConfigError) as native:
+            load_controller_config({**settings, "NEST_EXECUTOR": "slurm"})
+        self.assertEqual(docker.exception.problems, native.exception.problems)
 
 
 @unittest.skipUnless(shutil.which("openssl"), "needs the openssl command")

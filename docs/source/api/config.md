@@ -32,7 +32,7 @@ except ConfigError as error:
 
 [[autodoc]] config.ControllerConfig
 
-[[autodoc]] config.ProviderProfile
+[[autodoc]] config.PlatformProfile
 
 [[autodoc]] config.LoginNode
 
