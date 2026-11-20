@@ -135,7 +135,7 @@ class Authorizer:
         """
         Decides an action from the caller's current role, read now.
 
-        For [`authz.Action.RUN_SUBMIT`] and [`authz.Action.RUN_CANCEL`], the
+        For the [`authz.Action`] members `RUN_SUBMIT` and `RUN_CANCEL`, the
         Provider must permit it too.
         """
         pid = as_uuid(project_id, "project_id")
