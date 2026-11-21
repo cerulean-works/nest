@@ -237,6 +237,10 @@ that restarts finds every execution and its in-flight attempt again.
 - **Namespaces.** A Slurm job ID, Slurm account or node name means something only
   on its Platform: none is unique on its own, and every lookup also names the
   `platform_id`. The same account name on two Platforms stays two entitlements.
+  Every read also takes the caller's Project, so a lookup by Slurm job ID, node
+  or account never returns another Project's attempts. Only the restart recovery
+  methods (`live_attempts`, `mark_interrupted`) span all Projects; they are for
+  the Controller itself and are never exposed to Users.
 
 An attempt moves through these `status` values:
 

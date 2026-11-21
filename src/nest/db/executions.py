@@ -17,8 +17,11 @@ until someone reconciles them.
 
 A Slurm job ID, a Slurm account and a node name are never global identifiers:
 every lookup by one also names the Platform. Who may read an execution is decided
-by the authorization layer; the read methods here take the caller's Project so a
-lookup can never cross a Project boundary.
+by the authorization layer; every read method takes the caller's Project, so a
+lookup can never cross a Project boundary. The only exceptions are the recovery
+methods [`db.ExecutionRegistry.live_attempts`] and
+[`db.ExecutionRegistry.mark_interrupted`], which serve the Controller's own
+restart reconciliation across all Projects and must never back a User-facing API.
 
 Platforms and login nodes come from the HPC Platform Catalog (D07): an attempt
 takes the [`db.LoginEndpoint`] the server selected, and is recorded only while that
@@ -91,6 +94,8 @@ _ATTEMPT_COLUMNS = (
     "a.submitted_at, a.finished_at"
 )
 _ATTEMPT_FROM = "execution_attempts a JOIN hpc_platforms p ON p.id = a.platform_id"
+# Restricts an attempt query to one Project; its parameter comes first.
+_IN_PROJECT = "JOIN executions e ON e.execution_id = a.execution_id AND e.project_id = %s"
 
 
 class ExecutionRegistryError(Exception):
@@ -779,6 +784,9 @@ class ExecutionRegistry:
         """
         Returns every attempt still in flight, oldest first, for reconciliation
         after a restart. With `platform_id`, only that Platform's.
+
+        Controller-internal: the result spans every Project, so it must never be
+        returned to a User. User-facing reads go through the Project-scoped methods.
         """
         pid = as_uuid(platform_id, "platform_id") if platform_id is not None else None
         with transaction(self.database, None, "list live execution attempts") as cursor:
@@ -798,6 +806,9 @@ class ExecutionRegistry:
 
         `older_than` must exceed the longest submission any running Controller may
         still be making, so an attempt in progress elsewhere is never touched.
+
+        Controller-internal, like [`db.ExecutionRegistry.live_attempts`]: it spans
+        every Project and must never be exposed to a User.
 
         Returns:
             `list[Attempt]`: The attempts marked `unknown`.
@@ -859,44 +870,73 @@ class ExecutionRegistry:
             ).fetchall()
         return [_execution(row) for row in rows]
 
-    def find_by_slurm_job(self, platform_id: UUID | str, slurm_job_id: int) -> Attempt | None:
+    def find_by_slurm_job(
+        self, platform_id: UUID | str, slurm_job_id: int, *, project_id: UUID | str
+    ) -> Attempt | None:
         """
-        Returns the latest attempt that received `slurm_job_id` on `platform_id`.
+        Returns the latest attempt of `project_id` that received `slurm_job_id` on
+        `platform_id`, or `None`.
 
         Slurm job IDs repeat across Platforms and after a Slurm reset, so a job ID
-        is never looked up without its Platform.
+        is never looked up without its Platform, and never outside a Project: an
+        attempt of another Project is answered as not found.
         """
         with transaction(self.database, None, "find an execution attempt") as cursor:
             row = cursor.execute(
-                f"SELECT {_ATTEMPT_COLUMNS} FROM {_ATTEMPT_FROM} "
+                f"SELECT {_ATTEMPT_COLUMNS} FROM {_ATTEMPT_FROM} {_IN_PROJECT} "
                 "WHERE a.platform_id = %s AND a.slurm_job_id = %s ORDER BY a.id DESC LIMIT 1",
-                (as_uuid(platform_id, "platform_id"), slurm_job_id),
+                (
+                    as_uuid(project_id, "project_id"),
+                    as_uuid(platform_id, "platform_id"),
+                    slurm_job_id,
+                ),
             ).fetchone()
             return self._load_attempt(cursor, row) if row else None
 
     def attempts_on_node(
-        self, platform_id: UUID | str, node_name: str, *, limit: int = 100
+        self, platform_id: UUID | str, node_name: str, *, project_id: UUID | str, limit: int = 100
     ) -> list[Attempt]:
-        """Returns the attempts allocated `node_name` on `platform_id`, newest first."""
+        """
+        Returns `project_id`'s attempts allocated `node_name` on `platform_id`,
+        newest first.
+        """
         with transaction(self.database, None, "find attempts on a node") as cursor:
             rows = cursor.execute(
-                f"SELECT {_ATTEMPT_COLUMNS} FROM {_ATTEMPT_FROM} "
+                f"SELECT {_ATTEMPT_COLUMNS} FROM {_ATTEMPT_FROM} {_IN_PROJECT} "
                 "JOIN execution_attempt_nodes n ON n.attempt_id = a.id "
                 "WHERE a.platform_id = %s AND n.node_name = %s ORDER BY a.id DESC LIMIT %s",
-                (as_uuid(platform_id, "platform_id"), node_name, limit),
+                (
+                    as_uuid(project_id, "project_id"),
+                    as_uuid(platform_id, "platform_id"),
+                    node_name,
+                    limit,
+                ),
             ).fetchall()
             return [self._load_attempt(cursor, row) for row in rows]
 
     def attempts_for_account(
-        self, platform_id: UUID | str, slurm_account: str, *, limit: int = 100
+        self,
+        platform_id: UUID | str,
+        slurm_account: str,
+        *,
+        project_id: UUID | str,
+        limit: int = 100,
     ) -> list[Attempt]:
-        """Returns the attempts charged to `slurm_account` on `platform_id`, newest first."""
+        """
+        Returns `project_id`'s attempts charged to `slurm_account` on `platform_id`,
+        newest first. Another Project charging the same account sees only its own.
+        """
         with transaction(self.database, None, "find attempts for an account") as cursor:
             rows = cursor.execute(
-                f"SELECT {_ATTEMPT_COLUMNS} FROM {_ATTEMPT_FROM} "
+                f"SELECT {_ATTEMPT_COLUMNS} FROM {_ATTEMPT_FROM} {_IN_PROJECT} "
                 "WHERE a.platform_id = %s AND a.slurm_account = %s "
                 "ORDER BY a.created_at DESC, a.id DESC LIMIT %s",
-                (as_uuid(platform_id, "platform_id"), slurm_account, limit),
+                (
+                    as_uuid(project_id, "project_id"),
+                    as_uuid(platform_id, "platform_id"),
+                    slurm_account,
+                    limit,
+                ),
             ).fetchall()
             return [self._load_attempt(cursor, row) for row in rows]
 

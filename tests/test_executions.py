@@ -33,7 +33,9 @@ from nest.db import (
     ProjectStore,
     ResolvedOption,
     SlurmAccountStore,
+    load_migrations,
     upgrade,
+    verify,
 )
 from nest.db.platforms import endpoint_for
 
@@ -53,6 +55,7 @@ class _Base(PostgresTestCase):
         self.registry = ExecutionRegistry(self.db)
         identities = IdentityStore(self.db)
         projects = ProjectStore(self.db)
+        self.projects = projects
         self.owner = identities.create_user(display_name="owner").id
         self.other_user = identities.create_user(display_name="other").id
         self.project = projects.create_project("p", created_by_user_id=self.owner).id
@@ -463,25 +466,50 @@ class PlatformNamespaceTests(_Base):
         self.registry.record_submission(on_beta.id, 1000)
         self.registry.record_running(on_alpha.id, ["node01"])
         self.registry.record_running(on_beta.id, ["node01"])
-        alpha_job = self.registry.find_by_slurm_job(self.alpha.id, 1000)
-        beta_job = self.registry.find_by_slurm_job(self.beta.id, 1000)
+        alpha_job = self.registry.find_by_slurm_job(self.alpha.id, 1000, project_id=self.project)
+        beta_job = self.registry.find_by_slurm_job(self.beta.id, 1000, project_id=self.project)
         assert alpha_job is not None and beta_job is not None
         self.assertEqual(
             (alpha_job.execution_id, beta_job.execution_id), (a.execution_id, b.execution_id)
         )
-        self.assertIsNone(self.registry.find_by_slurm_job(uuid.uuid4(), 1000))
+        self.assertIsNone(
+            self.registry.find_by_slurm_job(uuid.uuid4(), 1000, project_id=self.project)
+        )
         self.assertEqual(
-            [x.id for x in self.registry.attempts_for_account(self.alpha.id, "shared")],
+            [
+                x.id
+                for x in self.registry.attempts_for_account(
+                    self.alpha.id, "shared", project_id=self.project
+                )
+            ],
             [on_alpha.id],
         )
         self.assertEqual(
-            [x.id for x in self.registry.attempts_for_account(self.beta.id, "shared")], [on_beta.id]
+            [
+                x.id
+                for x in self.registry.attempts_for_account(
+                    self.beta.id, "shared", project_id=self.project
+                )
+            ],
+            [on_beta.id],
         )
         self.assertEqual(
-            [x.id for x in self.registry.attempts_on_node(self.alpha.id, "node01")], [on_alpha.id]
+            [
+                x.id
+                for x in self.registry.attempts_on_node(
+                    self.alpha.id, "node01", project_id=self.project
+                )
+            ],
+            [on_alpha.id],
         )
         self.assertEqual(
-            [x.id for x in self.registry.attempts_on_node(self.beta.id, "node01")], [on_beta.id]
+            [
+                x.id
+                for x in self.registry.attempts_on_node(
+                    self.beta.id, "node01", project_id=self.project
+                )
+            ],
+            [on_beta.id],
         )
         self.assertEqual(beta_job.endpoint, self.B1)
 
@@ -493,7 +521,7 @@ class PlatformNamespaceTests(_Base):
         self.registry.finish_attempt(first.id, "succeeded")
         second = self.begin(new.execution_id)
         self.registry.record_submission(second.id, 5)
-        found = self.registry.find_by_slurm_job(self.alpha.id, 5)
+        found = self.registry.find_by_slurm_job(self.alpha.id, 5, project_id=self.project)
         assert found is not None
         self.assertEqual(found.id, second.id)
 
@@ -629,3 +657,105 @@ class AccountRegistryTests(_Base):
                 self.conn.execute(
                     f"UPDATE execution_attempts SET {column} = NULL WHERE id = %s", (attempt.id,)
                 )
+
+
+class TenantScopeTests(_Base):
+    """Platform-scoped lookups never return another Project's attempts."""
+
+    def test_lookups_by_job_node_and_account_stay_in_their_project(self):
+        self.platforms.grant_project(self.alpha.id, self.other_project, **OPS)
+        self.accounts.link_project(self.other_project, self.alpha.id, "shared", modes=["A"], **OPS)
+        mine, _ = self.register()
+        theirs, _ = self.register(project=self.other_project)
+        my_attempt = self.begin(mine.execution_id, account="shared")
+        their_attempt = self.begin(theirs.execution_id, account="shared")
+        # The same Platform, Slurm job ID, node and account in both Projects.
+        for attempt in (my_attempt, their_attempt):
+            self.registry.record_submission(attempt.id, 777)
+            self.registry.record_running(attempt.id, ["cn01"])
+        for project, expected in (
+            (self.project, my_attempt.id),
+            (self.other_project, their_attempt.id),
+        ):
+            with self.subTest(project=project):
+                found = self.registry.find_by_slurm_job(self.alpha.id, 777, project_id=project)
+                assert found is not None
+                self.assertEqual(found.id, expected)
+                self.assertEqual(
+                    [
+                        a.id
+                        for a in self.registry.attempts_on_node(
+                            self.alpha.id, "cn01", project_id=project
+                        )
+                    ],
+                    [expected],
+                )
+                self.assertEqual(
+                    [
+                        a.id
+                        for a in self.registry.attempts_for_account(
+                            self.alpha.id, "shared", project_id=project
+                        )
+                    ],
+                    [expected],
+                )
+        stranger = self.projects.create_project("r", created_by_user_id=self.owner).id
+        self.assertIsNone(self.registry.find_by_slurm_job(self.alpha.id, 777, project_id=stranger))
+        self.assertEqual(
+            self.registry.attempts_on_node(self.alpha.id, "cn01", project_id=stranger), []
+        )
+        self.assertEqual(
+            self.registry.attempts_for_account(self.alpha.id, "shared", project_id=stranger), []
+        )
+        self.assertEqual(self.registry.get(mine.execution_id, project_id=self.other_project), None)
+
+
+class UpgradePathTests(PostgresTestCase):
+    def test_upgrade_from_the_account_registry_keeps_records(self):
+        """A populated database at 0012, then D08's 0013, upgrades to 0014."""
+        url = self.database()
+        labels = [m.label for m in load_migrations()]
+        accounts_at = labels.index("0013_slurm_account_registry")
+        registry_at = labels.index("0014_execution_registry")
+        self.assertEqual(labels[accounts_at - 1], "0012_hpc_platform_catalog")
+        self.assertEqual(registry_at, accounts_at + 1)
+        migrations = load_migrations()
+        with connect(url) as conn:
+            upgrade(conn, migrations[:accounts_at])
+        db = Database(load_database_config({"NEST_DATABASE_URL": url}))
+        db.open()
+        self.addCleanup(db.close)
+        owner = IdentityStore(db).create_user(display_name="owner").id
+        project = ProjectStore(db).create_project("p", created_by_user_id=owner).id
+        platforms = PlatformStore(db)
+        nano4 = platforms.create_platform("nano4", "Nano 4", **OPS)
+        node = platforms.add_login_node(nano4.id, "ln01.example", transport_modes=["A"], **OPS)
+        platforms.grant_project(nano4.id, project, **OPS)
+        with connect(url) as conn:
+            self.assertEqual(
+                [m.label for m in upgrade(conn, migrations[: accounts_at + 1])],
+                ["0013_slurm_account_registry"],
+            )
+        accounts = SlurmAccountStore(db)
+        chem = accounts.register_account(nano4.id, "chem", **OPS)
+        accounts.link_project(project, nano4.id, "chem", modes=["A"], **OPS)
+        with connect(url) as conn:
+            self.assertEqual(
+                [m.label for m in upgrade(conn, migrations[: registry_at + 1])],
+                ["0014_execution_registry"],
+            )
+            verify(conn, migrations[: registry_at + 1])
+        # The Platform, grant and account written before 0014 are usable at once.
+        registry = ExecutionRegistry(db)
+        execution, _ = registry.register(project, owner, "batch", {})
+        attempt = registry.begin_attempt(
+            execution.execution_id,
+            endpoint=endpoint_for(nano4, node, "A"),
+            principal=ALICE,
+            account="chem",
+            slurm_account_id=chem.id,
+            slurm_account_origin="project_default",
+            options={},
+        )
+        self.assertEqual((attempt.platform_id, attempt.slurm_account_id), (nano4.id, chem.id))
+        self.assertEqual(accounts.get_account(nano4.id, "chem"), chem)
