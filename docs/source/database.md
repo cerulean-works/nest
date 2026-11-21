@@ -34,6 +34,7 @@ The database is **externally managed** and **opt-in**:
 | `projects`, `project_memberships` | Nest Projects and their active members with their Project roles. |
 | `project_email_invitations`, `project_invite_links`, `project_invitation_redemptions` | Pending email invitations, Invite Link grants, and each User's redemption of a link. Kept apart from memberships. |
 | `platform_bootstrap`, `platform_audit_events` | The one-time record of how the first `platform_admin` was created, and the append-only audit log of platform role changes. See [Bootstrap and recover platform administration](platform-admin). |
+| `executions`, `execution_attempts`, `execution_attempt_options`, `execution_attempt_nodes` | The Platform-aware execution registry: each logical execution with its owner and Project, and each submission attempt with its Platform, login-node snapshot, HPC identity, Slurm account, resolved options and allocated nodes. See [Execution registry](#execution-registry). |
 | `schema_migrations` | The applied schema versions and their checksums (see [Migrations](#migrations)). |
 
 Every record has an `execution_id`, a UUID written as 32 lowercase hexadecimal
@@ -204,6 +205,79 @@ and `jobs.slurm_account_origin`. Composite foreign keys keep every link and job 
 the account's own Platform. Changes must name an operator and are recorded in the
 security audit log. Existing job records keep `NULL` in the new columns. See
 [Map Slurm accounts to Projects](slurm-accounts).
+
+**Execution registry.** Migration `0014_execution_registry` adds the
+Platform-aware execution registry described below. The Controller does not write
+to it yet; `jobs` remains the record of today's submissions.
+
+### Execution registry
+
+The registry (`nest.db.ExecutionRegistry`) keeps a stable Nest `execution_id` for
+each logical execution and one `execution_attempts` row per submission attempt.
+Both are committed before the irreversible step they describe, so a Controller
+that restarts finds every execution and its in-flight attempt again.
+
+- **Executions** belong to one Nest User (`owner_user_id`) and one Project. Both,
+  the requested options and the optional idempotency key never change. A repeated
+  registration with the same key, Project and owner returns the same execution;
+  the same key with a different request is refused.
+- **Attempts** record the `platform_id` (an `hpc_platforms` ID), the selected
+  `login_node_id` and a snapshot of its endpoint (`login_node_host`,
+  `login_node_port`, `transport_mode` `A` or `B`, `host_key_pin_ref`), the
+  HPC binding and its version, the effective UNIX user and UID, the charged Slurm
+  account (`slurm_account_id` from `slurm_accounts`, its name, and
+  `slurm_account_origin`, the selection step that chose it), and the source,
+  environment and runtime digests. These columns never change.
+  At most one attempt per execution is in flight (`submitting`, `submitted`,
+  `running` or `unknown`); a `failed` attempt may be followed by a retry, which can
+  use another login node.
+- **Resolved options** (`execution_attempt_options`) keep each option's value and
+  origin: `request` when set explicitly (with the default it overrode, if any) or
+  `default` with the layer that supplied it. Rows are append-only.
+- **Namespaces.** A Slurm job ID, Slurm account or node name means something only
+  on its Platform: none is unique on its own, and every lookup also names the
+  `platform_id`. The same account name on two Platforms stays two entitlements.
+  Every read also takes the caller's Project, so a lookup by Slurm job ID, node
+  or account never returns another Project's attempts. Only the restart recovery
+  methods (`live_attempts`, `mark_interrupted`) span all Projects; they are for
+  the Controller itself and are never exposed to Users.
+
+An execution's own `status` always follows its attempts, and the database checks
+this at commit for every writer: `pending` with no attempt, `active` while its
+latest attempt is in flight, and otherwise that attempt's final status. A
+`succeeded` or `cancelled` execution is final, and only a `failed` one can become
+`active` again, through a new attempt.
+
+An attempt moves through these `status` values:
+
+| Status | Meaning |
+| --- | --- |
+| `submitting` | Written before `sbatch`. |
+| `submitted` | `sbatch` returned the Slurm job ID. |
+| `running` | Slurm started the job; allocated nodes are in `execution_attempt_nodes`. |
+| `succeeded`, `failed`, `cancelled` | Final. |
+| `unknown` | `sbatch` may have run but no job ID arrived. It holds the execution, so nothing is resubmitted until it is reconciled to another status. |
+
+After a restart, `ExecutionRegistry.mark_interrupted(older_than)` marks
+`submitting` attempts older than `older_than` as `unknown`, and `live_attempts()`
+lists everything still to reconcile:
+
+```sql
+SELECT e.execution_id, a.attempt_number, a.platform_id, a.status, a.slurm_job_id
+FROM execution_attempts a JOIN executions e USING (execution_id)
+WHERE a.status IN ('submitting', 'submitted', 'running', 'unknown');
+```
+
+An attempt is recorded only while its Platform is active and granted to the
+execution's Project, and its login node is still approved for the transport mode
+with the same host, port and host-key pin reference (see
+[Register HPC Platforms and login nodes](platforms)). `login_node_id` is not a
+foreign key: an operator may later remove the node, and the attempt's snapshot
+keeps its history correct. Its account must be active and linked to the Project
+on that Platform for the attempt's mode (see
+[Map Slurm accounts to Projects](slurm-accounts)); `native_default` names no
+account and needs Mode B and the Project's permission. A composite foreign key
+keeps the account on the attempt's own Platform.
 
 ## Configure the connection
 

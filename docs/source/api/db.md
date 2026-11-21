@@ -133,6 +133,63 @@ accounts.link_project(project_id, "nano4", "chem", modes=["A", "B"], default=Tru
 
 [[autodoc]] db.PlatformNotGrantedError
 
+## Execution registry
+
+See [Execution registry](../database#execution-registry). Register a logical
+execution, then record each attempt before submitting it, on the endpoint the
+server selected from the Platform catalog:
+
+```python
+from nest.db import ExecutionRegistry, HPCPrincipal, ResolvedOption
+
+registry = ExecutionRegistry(database)
+execution, created = registry.register(
+    project_id, user_id, "execution", {"gpu": 1}, idempotency_key=request_key
+)
+endpoint = catalog.select_login_node(principal, "nano4", mode="B", project_id=project_id)
+resolution = resolver.resolve(
+    principal, project_id, mode="B", identity=identity, platform=endpoint.platform_id
+)
+attempt = registry.begin_attempt(
+    execution.execution_id,
+    endpoint=endpoint,
+    principal=HPCPrincipal("alice", 1001),
+    **resolution.job_fields(),
+    options={
+        "gpu": ResolvedOption.requested(1, default=0, default_source="platform"),
+        "partition": ResolvedOption.defaulted("gpu", "platform"),
+    },
+)
+# Committed: now run sbatch.
+registry.record_submission(attempt.id, slurm_job_id)
+```
+
+[[autodoc]] db.ExecutionRegistry
+
+[[autodoc]] db.Execution
+
+[[autodoc]] db.Attempt
+
+[[autodoc]] db.HPCPrincipal
+
+[[autodoc]] db.ResolvedOption
+
+[[autodoc]] db.ExecutionRegistryError
+
+[[autodoc]] db.ExecutionNotFoundError
+
+[[autodoc]] db.IdempotencyConflictError
+
+[[autodoc]] db.AttemptInFlightError
+
+[[autodoc]] db.ExecutionClosedError
+
+[[autodoc]] db.InvalidTransitionError
+
+[[autodoc]] db.PlatformUnavailableError
+
+[[autodoc]] db.AccountNotPermittedError
+
 ## Users and identities
 
 See [Users, Projects and memberships](../database#users-projects-and-memberships)
