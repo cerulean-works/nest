@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from uuid import UUID
 
-from ..db.identity import Session
+from ..db.identity import ORGANIZATION_ROLES, Session
 from ..db.projects import ASSIGNABLE_ROLES, PROJECT_ROLES
 
 
@@ -51,10 +51,20 @@ class Action(StrEnum):
     """Read a Run's ordinary outputs and logs."""
     ARTIFACT_READ_SENSITIVE = "artifact.read_sensitive"
     """Read a Run's outputs marked sensitive."""
+    PLATFORM_READ = "project.platform.read"
+    """See the Project's eligible HPC Platforms and its default Platform."""
+    PLATFORM_DEFAULT_SET = "project.platform.default.set"
+    """Choose or clear the Project's default Platform among its eligible ones."""
 
 
 READ_ACTIONS = frozenset(
-    {Action.PROJECT_READ, Action.MEMBER_LIST, Action.RUN_READ, Action.ARTIFACT_READ}
+    {
+        Action.PROJECT_READ,
+        Action.MEMBER_LIST,
+        Action.RUN_READ,
+        Action.ARTIFACT_READ,
+        Action.PLATFORM_READ,
+    }
 )
 """Actions every role, including `viewer`, may take."""
 
@@ -69,6 +79,7 @@ CLI_ACTION_SCOPES: dict[Action, frozenset[str]] = {
     Action.RUN_CANCEL: frozenset({"jobs:run"}),
     Action.ARTIFACT_READ: frozenset({"jobs:run"}),
     Action.ARTIFACT_READ_SENSITIVE: frozenset({"jobs:run"}),
+    Action.PLATFORM_READ: frozenset({"projects:read", "jobs:run"}),
 }
 """Which CLI scopes allow each action; a CLI session needs any one of them. An
 action missing here, such as every change to a Project or its members, needs a
@@ -182,7 +193,9 @@ def decide(
     | Action | Owner | Admin | Member | Viewer |
     | --- | --- | --- | --- | --- |
     | Read the Project, members, Runs, ordinary artifacts | yes | yes | yes | yes |
+    | See eligible Platforms and the default Platform | yes | yes | yes | yes |
     | Change settings, read audit history | yes | yes | no | no |
+    | Choose the default among eligible Platforms | yes | yes | no | no |
     | Invite or add `admin`, `member`, `viewer` | yes | yes | no | no |
     | List, resend, revoke invitations and Invite Links | yes | yes | no | no |
     | Change a non-Owner's role among those | yes | yes | no | no |
@@ -195,7 +208,8 @@ def decide(
 
     Nobody can grant `owner` except by an ownership transfer, and nobody can
     change or remove the Owner's membership. Provider permission is checked by
-    [`authz.Authorizer`], not here.
+    [`authz.Authorizer`], not here. Which Platforms are eligible is the operator's
+    grant, checked by [`authz.PlatformCatalog`]; no role makes a Platform eligible.
 
     Args:
         principal ([`authz.Principal`]): The caller.
@@ -216,7 +230,12 @@ def decide(
 
     if action in READ_ACTIONS:
         return ALLOW
-    if action in (Action.PROJECT_UPDATE, Action.PROJECT_AUDIT_READ, Action.INVITATION_MANAGE):
+    if action in (
+        Action.PROJECT_UPDATE,
+        Action.PROJECT_AUDIT_READ,
+        Action.INVITATION_MANAGE,
+        Action.PLATFORM_DEFAULT_SET,
+    ):
         return ALLOW if role in managers else _deny("role")
     if action in (Action.PROJECT_DELETE, Action.PROJECT_TRANSFER):
         return ALLOW if role == "owner" else _deny("owner_only")
@@ -255,6 +274,87 @@ def decide(
             return ALLOW
         return _deny("role")
     return _deny("unknown_action")
+
+
+class OrganizationAction(StrEnum):
+    """Actions on an Organization, each checked by [`authz.decide_organization`]."""
+
+    READ = "organization.read"
+    """See the Organization's name and ID."""
+    UPDATE = "organization.update"
+    """Rename the Organization."""
+    DELETE = "organization.delete"
+    """Delete the Organization. Only once no Project is filed under it."""
+    MEMBER_LIST = "organization.member.list"
+    """List members and their Organization roles."""
+    MEMBER_ADD = "organization.member.add"
+    """Add an existing User with a role (`Target.new_role`)."""
+    MEMBER_ROLE_CHANGE = "organization.member.role.change"
+    """Change a member's role."""
+    MEMBER_REMOVE = "organization.member.remove"
+    """Remove a member, or leave when the member is the caller."""
+
+
+ORGANIZATION_READ_ACTIONS = frozenset({OrganizationAction.READ, OrganizationAction.MEMBER_LIST})
+"""Organization actions every Organization member may take."""
+
+
+def decide_organization(
+    principal: Principal,
+    role: str | None,
+    action: OrganizationAction | str,
+    target: Target = NO_TARGET,
+) -> Decision:
+    """
+    Applies the Organization permission matrix.
+
+    | Action | `org_admin` | `member` |
+    | --- | --- | --- |
+    | Read the Organization and its members | yes | yes |
+    | Rename or delete it | yes | no |
+    | Add a member, change a member's role | yes | no |
+    | Remove a member | yes | only themselves |
+
+    Reads need a browser session or a CLI session with `projects:read`; changes
+    need a browser session. An Organization role grants no Project role and no
+    Platform: Projects stay the authorization boundary, and filing a Project under
+    an Organization changes no Project membership. The rule that an Organization
+    keeps at least one `org_admin` is enforced by [`authz.OrganizationService`].
+
+    Args:
+        principal ([`authz.Principal`]): The caller.
+        role (`str` or `None`): The caller's Organization role, `None` if none.
+        action ([`authz.OrganizationAction`]): What they want to do.
+        target ([`authz.Target`], *optional*): The member acted on and new role.
+    """
+    try:
+        action = OrganizationAction(action)
+    except ValueError:
+        return _deny("unknown_action")
+    if role not in ORGANIZATION_ROLES:
+        return _deny("not_a_member")
+    if principal.session_kind == "cli":
+        if action not in ORGANIZATION_READ_ACTIONS:
+            return _deny("browser_only")
+        if "projects:read" not in principal.scopes:
+            return _deny("scope")
+    elif principal.session_kind != "browser":
+        return _deny("browser_only")
+    if action in ORGANIZATION_READ_ACTIONS:
+        return ALLOW
+    if action in (OrganizationAction.MEMBER_ADD, OrganizationAction.MEMBER_ROLE_CHANGE):
+        if role != "org_admin":
+            return _deny("role")
+        if action == OrganizationAction.MEMBER_ROLE_CHANGE and target.member_role is None:
+            return _deny("member_not_found")
+        return ALLOW if target.new_role in ORGANIZATION_ROLES else _deny("invalid_role")
+    if action == OrganizationAction.MEMBER_REMOVE:
+        if target.member_role is None:
+            return _deny("member_not_found")
+        if role == "org_admin" or target.member_user_id == principal.user_id:
+            return ALLOW
+        return _deny("role")
+    return ALLOW if role == "org_admin" else _deny("role")
 
 
 def _grantable(new_role: str | None) -> Decision:

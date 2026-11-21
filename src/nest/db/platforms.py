@@ -450,6 +450,42 @@ class PlatformStore:
             ).fetchall()
         return [_platform(r) for r in rows]
 
+    def project_platforms(
+        self, user_id: UUID | str, project_id: UUID | str
+    ) -> tuple[list[Platform], UUID | None]:
+        """
+        A Project's eligible Platforms for a User, and the Project's default.
+
+        Read in one statement, so a concurrent grant revocation is either wholly
+        seen or not at all. The Platforms are the active Platforms granted to the
+        Project, by slug, when the Project is live and the User an active member of
+        it; otherwise none. The default is the Project's chosen Platform ID, also
+        when that Platform is disabled (so the caller can refuse it rather than
+        silently use another); `None` when there is none or the User may not see it.
+        """
+        uid = as_uuid(user_id, "user_id")
+        pid = as_uuid(project_id, "project_id")
+        with transaction(self.database, None, "list a Project's Platforms") as cursor:
+            rows = cursor.execute(
+                f"SELECT {_P_PLATFORM_COLUMNS}, (d.platform_id IS NOT NULL) AS project_default "
+                "FROM hpc_platform_project_grants g "
+                "JOIN hpc_platforms p ON p.id = g.platform_id "
+                "JOIN projects pr ON pr.id = g.project_id AND pr.deleted_at IS NULL "
+                "JOIN project_memberships m ON m.project_id = g.project_id AND m.user_id = %s "
+                "JOIN users u ON u.id = m.user_id AND u.status = 'active' "
+                "LEFT JOIN project_default_platforms d "
+                " ON d.project_id = g.project_id AND d.platform_id = g.platform_id "
+                "WHERE g.project_id = %s ORDER BY p.slug",
+                (uid, pid),
+            ).fetchall()
+        default = next((r["id"] for r in rows if r["project_default"]), None)
+        platforms = [
+            _platform({k: v for k, v in r.items() if k != "project_default"})
+            for r in rows
+            if r["status"] == "active"
+        ]
+        return platforms, default
+
     # Platforms ---------------------------------------------------------------
 
     def create_platform(

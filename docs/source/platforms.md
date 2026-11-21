@@ -139,10 +139,9 @@ case. There are no write routes: the catalog cannot be changed through the API.
 [`authz.PlatformCatalog`] resolves the Platform and login node for a request on
 the server:
 
-1. **Platform.** A named Platform must be authorized for the caller. Without a
-   name, the server's default is used if the caller is authorized for it,
-   otherwise the caller's only authorized Platform. With several authorized
-   Platforms and no usable default, the caller must name one.
+1. **Platform.** See [Project eligibility and default Platform](#project-eligibility-and-default-platform)
+   below for the full order. In short: a named Platform must be eligible, then the
+   Project's default, then the server's default, then the only eligible Platform.
 2. **Login node.** Of the Platform's active nodes approved for the transport mode,
    healthy nodes come first, then unknown, degraded and unhealthy ones, each by
    priority. A caller can at most ask for one of the approved node IDs. A host,
@@ -157,11 +156,101 @@ Tailscale. Refused requests (an unauthorized Platform, an unapproved node) are
 recorded in the security audit log as `platform.resolve` or
 `platform.endpoint.select` with outcome `denied`.
 
+## Project eligibility and default Platform
+
+A Project's **eligible Platforms** are exactly the active Platforms the operator
+granted to it (`nest-db platform grant`). Nothing else makes a Platform eligible: no
+Project, Organization or Platform role, no Slurm account and no client input.
+[`authz.PlatformCatalog.select_platform`] is the one policy every interface uses to
+decide which Platform a Project's request runs on; it returns the Platform and the
+`origin` of the choice. With a Project, the first rule that applies wins:
+
+| Step | Rule | `origin` |
+| --- | --- | --- |
+| 1 | The Platform the caller named (slug or ID), which must be eligible | `explicit` |
+| 2 | The Project's default Platform | `project_default` |
+| 3 | The operator's server default (`set-default`), if eligible | `server_default` |
+| 4 | The Project's only eligible Platform | `only_eligible` |
+
+These outcomes are deterministic and never substitute another Platform:
+
+- **Unauthorized selection.** A named Platform that does not exist, is disabled, or
+  is not granted to the Project is refused as not found (`404`), with
+  `platform.resolve` and reason `platform_not_authorized` in the security audit
+  log. The server never falls through to a default.
+- **Unavailable default.** If the Project's default Platform is disabled, a request
+  that names no Platform is refused with `default_unavailable` instead of running
+  on another cluster. Naming an eligible Platform still works.
+- **Missing default.** With no Project default, steps 3 and 4 apply. With no
+  eligible Platform the answer is `none_authorized`; with several and no usable
+  default it is `ambiguous` and the caller must name one.
+
+Without a Project (`GET /api/platforms` with no `project_id`), the caller's
+Platforms across all their Projects are considered and step 2 does not apply.
+Requests that run on a Platform, such as job submissions, must always name their
+Project.
+
+### Choose a Project's default Platform
+
+A Project's Owners and Admins may choose its default among its eligible
+Platforms, from a browser session. Members and Viewers, CLI sessions and
+non-members are refused. The schema keeps the default one of the Project's grants
+for every writer (`project_default_platforms` has a foreign key to the grant), and
+revoking the grant clears the default in the same transaction. Choosing a default
+and a concurrent revocation are serialized: the revocation wins, and the choice is
+refused. Every change is recorded as `project.default_platform.set` or
+`project.default_platform.cleared`.
+
+| Route | Body | Answer |
+| --- | --- | --- |
+| `GET /api/projects/<id>/platforms` | | The Project's eligible Platforms and default |
+| `POST /api/projects/<id>/platforms/default` | `{"platform": "<slug or ID>"}` or `{"platform": null}` | The same, after the change |
+
+The answer lists `platforms` (each with `is_project_default`),
+`project_default_platform_id`, and what a request naming no Platform resolves to:
+`default_platform_id` and `default_origin`, or `unresolved_reason`. Any member,
+and a CLI session with `projects:read` or `jobs:run`, may read it. A non-member gets
+`404` for a Project that exists, and so does a Platform that is not eligible.
+
+From the command line and Python:
+
+```bash
+nest platforms default --project-id 6f0c...e1
+# nano4 (project_default)
+```
+
+```python
+from nest.platforms import project_platforms
+
+view = project_platforms("6f0c...e1")
+view.default_platform_id, view.default_origin
+```
+
+### Contract for the Controller and other interfaces
+
+The Controller's execution path (C01 Part 2) and every later interface, including
+a Web UI, must resolve the Platform on the server with
+[`authz.PlatformCatalog.select_platform`] (or [`authz.AccountResolver.resolve`],
+which calls it) from the **authenticated** principal and Project, passing the
+caller's requested Platform only as a reference to check. They must not read
+grants or defaults themselves, accept a Platform, login node, Slurm account or HPC
+identity from the client as authority, or retry on another Platform when the
+chosen one is refused. A Web UI may hide controls it knows will be refused; that
+is never the check.
+
+The [`authz.HPCIdentity`] that account selection needs is built by the server
+from its own records only. Today that is the Controller's own identity in Mode A.
+Nest has no verified per-User HPC identity binding yet, so no Mode B identity,
+default account or entitlement can be supplied to the policy from a client or
+from Project membership; Mode B never falls back to Controller credentials.
+Verified bindings are future Mode B work.
+
 ## Limitations
 
 - The Controller still submits each job through its default Provider Profile's
-  backend. Choosing the Platform per request, and running each Platform's
-  connection through [`authz.PlatformCatalog`], is follow-up work (C01).
+  backend. Choosing the Platform per request with
+  [`authz.PlatformCatalog.select_platform`], and running each Platform's
+  connection through [`authz.PlatformCatalog`], is follow-up work (C01 Part 2).
 - Health is recorded when a caller fails over. There is no background probe.
 - A Platform's Slurm accounts and their Project links are in the
   [Slurm Account Registry](slurm-accounts).

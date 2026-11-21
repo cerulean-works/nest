@@ -8,6 +8,7 @@ Usage:
     nest auth status [--url URL] [--check] [--json]
     nest platforms list [--url URL] [--project-id UUID] [--json]
     nest platforms show SLUG [--url URL] [--project-id UUID] [--json]
+    nest platforms default --project-id UUID [--url URL] [--json]
 
 `nest login` is optional: commands that need a Nest session sign in the same way
 when there is none. The session is kept in `NEST_CLI_CREDENTIALS_FILE` (default
@@ -15,6 +16,8 @@ when there is none. The session is kept in `NEST_CLI_CREDENTIALS_FILE` (default
 or password as an argument.
 
 `nest platforms` lists only the HPC Platforms granted to your Projects.
+`nest platforms default` shows which of a Project's eligible Platforms a job that
+names none runs on, and why; a Project Owner or Admin chooses it in a browser.
 
 Exit status: 0 on success, 1 when not signed in or the sign-in was denied or
 expired or the Platform is not available, 2 for invalid configuration or arguments,
@@ -39,7 +42,13 @@ from .login import (
     logout,
     status,
 )
-from .platforms import PlatformInfo, PlatformNotAvailableError, get_platform, list_platforms
+from .platforms import (
+    PlatformInfo,
+    PlatformNotAvailableError,
+    get_platform,
+    list_platforms,
+    project_platforms,
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -84,6 +93,13 @@ def _parser() -> argparse.ArgumentParser:
         "show", parents=[url, scope], help="describe one available Platform"
     )
     show_platform.add_argument("platform", metavar="SLUG", help="the Platform's slug or ID")
+    default_platform = platform_actions.add_parser(
+        "default", parents=[url], help="show the Platform a Project's jobs default to"
+    )
+    default_platform.add_argument(
+        "--project-id", type=UUID, metavar="UUID", required=True, help="the Project"
+    )
+    default_platform.add_argument("--json", action="store_true", help="print JSON")
     return parser
 
 
@@ -101,6 +117,30 @@ def _platform_json(info: PlatformInfo) -> dict[str, object]:
 
 
 def _platforms(config, args) -> int:
+    if args.action == "default":
+        view = project_platforms(args.project_id, config)
+        if args.json:
+            payload = {
+                "project_id": str(view.project_id),
+                "platforms": [_platform_json(i) for i in view.platforms],
+                "project_default_platform_id": _optional_id(view.project_default_platform_id),
+                "default_platform_id": _optional_id(view.default_platform_id),
+                "default_origin": view.default_origin,
+                "unresolved_reason": view.unresolved_reason,
+            }
+            print(json.dumps(payload, indent=2))
+            return 0
+        chosen = next((i for i in view.platforms if i.id == view.default_platform_id), None)
+        if chosen is not None:
+            print(f"{chosen.slug} ({view.default_origin})")
+            return 0
+        reasons = {
+            "none_authorized": "No HPC Platform is granted to this Project.",
+            "ambiguous": "Several Platforms are eligible and none is the default; name one.",
+            "default_unavailable": "The Project's default Platform is unavailable.",
+        }
+        print(reasons.get(view.unresolved_reason or "", "No default Platform."), file=sys.stderr)
+        return 1
     if args.action == "show":
         info = get_platform(args.platform, config, project_id=args.project_id)
         if args.json:
@@ -129,6 +169,10 @@ def _platforms(config, args) -> int:
             operator = f" ({info.operator_name})" if info.operator_name else ""
             print(f"{marker} {info.slug:<16} {info.display_name}{operator}  id={info.id}")
     return 0
+
+
+def _optional_id(value: UUID | None) -> str | None:
+    return str(value) if value else None
 
 
 def _status(config, args) -> int:

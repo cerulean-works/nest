@@ -67,7 +67,13 @@ class PolicyMatrixTests(unittest.TestCase):
     def test_every_role_may_read(self):
         for role, action in itertools.product(
             ROLES,
-            (Action.PROJECT_READ, Action.MEMBER_LIST, Action.RUN_READ, Action.ARTIFACT_READ),
+            (
+                Action.PROJECT_READ,
+                Action.MEMBER_LIST,
+                Action.RUN_READ,
+                Action.ARTIFACT_READ,
+                Action.PLATFORM_READ,
+            ),
         ):
             with self.subTest(role=role, action=action):
                 self.assertTrue(self.allowed(role, action))
@@ -146,7 +152,13 @@ class PolicyMatrixTests(unittest.TestCase):
         self.assertFalse(self.allowed("member", Action.RUN_CANCEL, Target()))
 
     def test_viewer_is_read_only(self):
-        reads = {Action.PROJECT_READ, Action.MEMBER_LIST, Action.RUN_READ, Action.ARTIFACT_READ}
+        reads = {
+            Action.PROJECT_READ,
+            Action.MEMBER_LIST,
+            Action.RUN_READ,
+            Action.ARTIFACT_READ,
+            Action.PLATFORM_READ,
+        }
         leave = Target(member_user_id=ALICE, member_role="viewer")
         for action in Action:
             target = (

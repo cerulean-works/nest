@@ -206,6 +206,13 @@ the account's own Platform. Changes must name an operator and are recorded in th
 security audit log. Existing job records keep `NULL` in the new columns. See
 [Map Slurm accounts to Projects](slurm-accounts).
 
+**Project Platform policy.** Migration `0015_project_platform_policy` adds
+`project_default_platforms` (at most one default Platform per Project, with a
+foreign key to the Project's Platform grant, so revoking the grant clears it),
+makes Project and Organization IDs immutable, and records Organization and
+default-Platform changes in the security audit log. See
+[Project eligibility and default Platform](platforms#project-eligibility-and-default-platform).
+
 **Execution registry.** Migration `0014_execution_registry` adds the
 Platform-aware execution registry described below. The Controller does not write
 to it yet; `jobs` remains the record of today's submissions.

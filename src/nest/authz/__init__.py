@@ -5,8 +5,10 @@ The fixed Owner/Admin/Member/Viewer matrix is [`authz.decide`]; [`authz.Authoriz
 and [`authz.ProjectService`] enforce it on the server for every interface, and
 [`authz.ExecutionAccess`] applies the same checks to the gRPC execution service,
 and [`authz.InvitationService`] to email invitations and Invite Links.
-[`authz.PlatformCatalog`] authorizes HPC Platform discovery and login-node selection,
-and [`authz.AccountResolver`] chooses the Slurm account a job charges.
+[`authz.PlatformCatalog`] authorizes HPC Platform discovery, Project-to-Platform
+eligibility, default Platform selection and login-node selection,
+[`authz.OrganizationService`] Organization changes, and [`authz.AccountResolver`]
+chooses the Slurm account a job charges.
 See *Share Projects and manage roles* and *Security and limitations*.
 """
 
@@ -30,22 +32,34 @@ from .invitations import (
     IssuedInvitation,
     IssuedInviteLink,
 )
+from .organizations import (
+    Organization,
+    OrganizationMembership,
+    OrganizationRuleError,
+    OrganizationService,
+)
 from .platforms import (
     PLATFORM_SCOPES,
+    SELECTION_ORIGINS,
     PlatformCatalog,
     PlatformResolutionError,
+    PlatformSelection,
     PlatformSummary,
+    ProjectPlatforms,
     select_endpoint,
 )
 from .policy import (
     CLI_ACTION_SCOPES,
+    ORGANIZATION_READ_ACTIONS,
     PROVIDER_ACTIONS,
     READ_ACTIONS,
     Action,
     Decision,
+    OrganizationAction,
     Principal,
     Target,
     decide,
+    decide_organization,
     may_create_project,
     session_allows,
 )
@@ -61,9 +75,11 @@ __all__ = [
     "CLI_ACTION_SCOPES",
     "DEFAULT_INVITATION_TTL",
     "DEFAULT_LINK_MAX_USES",
+    "ORGANIZATION_READ_ACTIONS",
     "PLATFORM_SCOPES",
     "PROVIDER_ACTIONS",
     "READ_ACTIONS",
+    "SELECTION_ORIGINS",
     "AccessDeniedError",
     "AccountResolution",
     "AccountResolutionError",
@@ -78,16 +94,24 @@ __all__ = [
     "InvitationService",
     "IssuedInvitation",
     "IssuedInviteLink",
+    "Organization",
+    "OrganizationAction",
+    "OrganizationMembership",
+    "OrganizationRuleError",
+    "OrganizationService",
     "PlatformCatalog",
     "PlatformResolutionError",
+    "PlatformSelection",
     "PlatformSummary",
     "Principal",
+    "ProjectPlatforms",
     "ProjectRequiredError",
     "ProjectService",
     "ProviderAuthority",
     "Target",
     "UnauthenticatedError",
     "decide",
+    "decide_organization",
     "may_create_project",
     "resolve_account",
     "select_endpoint",

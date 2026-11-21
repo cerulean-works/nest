@@ -182,6 +182,9 @@ INVITATIONS_API_PATH = "/api/invitations"
 PLATFORMS_API_PATH = "/api/platforms"
 """Root of the HPC Platform discovery API served by the auth listener."""
 
+ORGANIZATIONS_API_PATH = "/api/organizations"
+"""Root of the Organizations API served by the auth listener."""
+
 INVITATION_PAGE_PATH = "/invitations/accept"
 """Browser page where a signed-in User reviews and accepts an invitation link."""
 

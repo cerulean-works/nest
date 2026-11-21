@@ -19,6 +19,12 @@ It serves these routes and nothing else:
 - `/api/projects` and below serve the Projects API (see *Share Projects and manage
   roles*). Every request is authorized by [`authz.ProjectService`], and its
   invitation routes by [`authz.InvitationService`].
+- `GET /api/projects/<id>/platforms` lists a Project's eligible HPC Platforms, its
+  default Platform and what a request naming none resolves to, and `POST
+  /api/projects/<id>/platforms/default` lets its Owners and Admins choose or clear
+  that default among the eligible Platforms (see [`authz.PlatformCatalog`]).
+- `/api/organizations` and below serve Organization CRUD and membership (see
+  [`authz.OrganizationService`]).
 - `GET /api/platforms` lists the HPC Platforms the signed-in User may use, with the
   server's default for them, and `GET /api/platforms/<id or slug>` describes one
   (see [`authz.PlatformCatalog`]). Platforms the User is not authorized for are
@@ -54,10 +60,15 @@ from ..audit import audit_interface
 from ..authz import (
     AccessDeniedError,
     InvitationService,
+    Organization,
+    OrganizationMembership,
+    OrganizationRuleError,
+    OrganizationService,
     PlatformCatalog,
     PlatformResolutionError,
     PlatformSummary,
     Principal,
+    ProjectPlatforms,
     ProjectService,
 )
 from ..config import (
@@ -66,6 +77,7 @@ from ..config import (
     CLI_SCOPES,
     INVITATION_PAGE_PATH,
     INVITATIONS_API_PATH,
+    ORGANIZATIONS_API_PATH,
     PLATFORMS_API_PATH,
     PROJECTS_API_PATH,
     GoogleAuthConfig,
@@ -1159,6 +1171,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.GONE, {"error": "invitation_unavailable", "reason": exc.reason})
         except OwnerRuleError:
             self._json(HTTPStatus.CONFLICT, {"error": "owner_rule"})
+        except OrganizationRuleError as exc:
+            self._json(HTTPStatus.CONFLICT, {"error": "organization_rule", "reason": exc.reason})
+        except LookupError:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "user_not_found"})
         except ValueError, TypeError:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
 
@@ -1170,11 +1186,17 @@ class _Handler(BaseHTTPRequestHandler):
         if path == PLATFORMS_API_PATH or path.startswith(PLATFORMS_API_PATH + "/"):
             self._platforms_api(method, path, who)
             return
+        if path == ORGANIZATIONS_API_PATH or path.startswith(ORGANIZATIONS_API_PATH + "/"):
+            self._organizations_api(method, path, who, body)
+            return
         service = self.app.projects
         rest = path[len(PROJECTS_API_PATH) :].strip("/")
         parts = rest.split("/") if rest else []
         if len(parts) >= 2 and parts[1] in ("invitations", "invite-links"):
             self._project_invitations_api(method, parts, who, body)
+            return
+        if len(parts) >= 2 and parts[1] == "platforms":
+            self._project_platforms_api(method, parts, who, body)
             return
         ids = [_parse_uuid(part) for part in parts[0:1] + parts[2:3]]
         pid, uid = (ids + [None, None])[:2]
@@ -1275,6 +1297,74 @@ class _Handler(BaseHTTPRequestHandler):
             HTTPStatus.OK,
             {"platforms": [_platform_json(s) for s in summaries], "default_platform_id": default},
         )
+
+    def _project_platforms_api(self, method: str, parts: list[str], who: Principal, body: dict):
+        """`/api/projects/<id>/platforms[/default]`: Project-to-Platform eligibility."""
+        pid = _parse_uuid(parts[0])
+        shape = tuple(parts[1:])
+        allowed = {("platforms",): ("GET",), ("platforms", "default"): ("POST",)}.get(shape)
+        if pid is None:
+            allowed = None
+        if not self._route(method, allowed):
+            return
+        assert pid is not None
+        catalog = self.app.platforms
+        if shape == ("platforms",):
+            self._json(HTTPStatus.OK, _project_platforms_json(catalog.project_platforms(who, pid)))
+            return
+        if "platform" not in body:
+            raise TypeError("platform must be given, or null to clear the default")
+        reference = body["platform"]
+        if reference is not None and not isinstance(reference, str):
+            raise TypeError("platform must be a string or null")
+        view = catalog.set_project_default(who, pid, reference)
+        self._json(HTTPStatus.OK, _project_platforms_json(view))
+
+    def _organizations_api(self, method: str, path: str, who: Principal, body: dict):
+        """`/api/organizations`: Organization CRUD and membership."""
+        service = self.app.organizations
+        rest = path[len(ORGANIZATIONS_API_PATH) :].strip("/")
+        parts = rest.split("/") if rest else []
+        ids = [_parse_uuid(part) for part in parts[0:1] + parts[2:3]]
+        if None in ids:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        oid, uid = (ids + [None, None])[:2]
+        shape = tuple("{id}" if i in (0, 2) else part for i, part in enumerate(parts))
+        if not self._route(method, _ORGANIZATION_ROUTES.get(shape)):
+            return
+        if not parts:
+            if method == "GET":
+                items = [_organization_json(o, r) for o, r in service.list_organizations(who)]
+                self._json(HTTPStatus.OK, {"organizations": items})
+            else:
+                organization = service.create_organization(who, _string(body, "name"))
+                self._json(HTTPStatus.CREATED, _organization_json(organization, "org_admin"))
+            return
+        assert oid is not None
+        action = parts[-1] if len(parts) > 1 else ""
+        if shape == ("{id}",):
+            self._json(HTTPStatus.OK, _organization_json(*service.get_organization(who, oid)))
+        elif action == "rename":
+            organization = service.rename_organization(who, oid, _string(body, "name"))
+            self._json(HTTPStatus.OK, _organization_json(organization, None))
+        elif action == "delete":
+            service.delete_organization(who, oid)
+            self._json(HTTPStatus.OK, {"deleted": True})
+        elif action == "members" and method == "GET":
+            members = [_org_member_json(m) for m in service.members(who, oid)]
+            self._json(HTTPStatus.OK, {"members": members})
+        elif action == "members":
+            member = service.add_member(who, oid, _string(body, "user_id"), _string(body, "role"))
+            self._json(HTTPStatus.CREATED, _org_member_json(member))
+        else:
+            assert uid is not None
+            if action == "role":
+                member = service.change_role(who, oid, uid, _string(body, "role"))
+                self._json(HTTPStatus.OK, _org_member_json(member))
+            else:
+                service.remove_member(who, oid, uid)
+                self._json(HTTPStatus.OK, {"removed": True})
 
     def _route(self, method: str, allowed: tuple[str, ...] | None) -> bool:
         """Whether a route exists and takes `method`, answering when not."""
@@ -1406,6 +1496,17 @@ _API_ROUTES: dict[tuple[str, ...], tuple[str, ...]] = {
 }
 """Projects API routes under `PROJECTS_API_PATH` and their methods."""
 
+_ORGANIZATION_ROUTES: dict[tuple[str, ...], tuple[str, ...]] = {
+    (): ("GET", "POST"),
+    ("{id}",): ("GET",),
+    ("{id}", "rename"): ("POST",),
+    ("{id}", "delete"): ("POST",),
+    ("{id}", "members"): ("GET", "POST"),
+    ("{id}", "members", "{id}", "role"): ("POST",),
+    ("{id}", "members", "{id}", "remove"): ("POST",),
+}
+"""Organizations API routes under `ORGANIZATIONS_API_PATH` and their methods."""
+
 
 _INVITATION_ROUTES: dict[tuple[str, ...], tuple[str, ...]] = {
     ("invitations",): ("GET", "POST"),
@@ -1442,7 +1543,12 @@ _UNAVAILABLE = {
 def _is_api(path: str) -> bool:
     return any(
         path == root or path.startswith(root + "/")
-        for root in (PROJECTS_API_PATH, INVITATIONS_API_PATH, PLATFORMS_API_PATH)
+        for root in (
+            PROJECTS_API_PATH,
+            INVITATIONS_API_PATH,
+            PLATFORMS_API_PATH,
+            ORGANIZATIONS_API_PATH,
+        )
     )
 
 
@@ -1518,6 +1624,44 @@ def _platform_json(summary: PlatformSummary) -> dict[str, object]:
         "is_default": platform.is_default,
         "transport_modes": list(summary.transport_modes),
         "login_node_count": summary.login_node_count,
+    }
+
+
+def _project_platforms_json(view: ProjectPlatforms) -> dict[str, object]:
+    selection = view.selection
+    platforms = []
+    for summary in view.platforms:
+        item = _platform_json(summary)
+        item["is_project_default"] = summary.platform.id == view.project_default_platform_id
+        platforms.append(item)
+    return {
+        "project_id": str(view.project_id),
+        "platforms": platforms,
+        "project_default_platform_id": _id(view.project_default_platform_id),
+        "default_platform_id": str(selection.platform.id) if selection else None,
+        "default_origin": selection.origin if selection else None,
+        "unresolved_reason": view.unresolved_reason,
+    }
+
+
+def _organization_json(organization: Organization, role: str | None) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "id": str(organization.id),
+        "name": organization.name,
+        "created_by_user_id": _id(organization.created_by_user_id),
+        "created_at": _iso(organization.created_at),
+    }
+    if role is not None:
+        payload["role"] = role
+    return payload
+
+
+def _org_member_json(member: OrganizationMembership) -> dict[str, object]:
+    return {
+        "organization_id": str(member.organization_id),
+        "user_id": str(member.user_id),
+        "role": member.role,
+        "created_at": _iso(member.created_at),
     }
 
 
@@ -1661,6 +1805,7 @@ class AuthHTTPServer(ThreadingHTTPServer):
         invitations: InvitationService | None = None,
         platforms: PlatformCatalog | None = None,
         email: EmailService | None = None,
+        organizations: OrganizationService | None = None,
     ):
         self.sign_in = sign_in
         self.cli = cli or CLISignIn(sign_in.database, sign_in.sessions)
@@ -1673,7 +1818,10 @@ class AuthHTTPServer(ThreadingHTTPServer):
         self.origin = f"{redirect.scheme}://{redirect.netloc}"
         self.sessions = sign_in.session_store
         self.projects = projects or ProjectService(sign_in.database)
-        self.platforms = platforms or PlatformCatalog(sign_in.database)
+        self.platforms = platforms or PlatformCatalog(sign_in.database, projects=self.projects)
+        self.organizations = organizations or OrganizationService(
+            sign_in.database, self.projects.authorizer
+        )
         self.invitations = invitations or InvitationService(
             sign_in.database, self.projects, email, link_base_url=self.origin
         )
