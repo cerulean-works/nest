@@ -33,14 +33,27 @@ Usage:
     nest-db platform grant | revoke PLATFORM --project-id UUID
     (every change also takes --operator NAME --reason TEXT)
 
+    # The Platform-scoped Slurm Account Registry (see "Slurm accounts"):
+    nest-db account list     PLATFORM
+    nest-db account show     PLATFORM --project-id UUID
+    nest-db account register PLATFORM NAME [--kind standard|chargeback] [--description TEXT]
+    nest-db account disable | enable PLATFORM NAME
+    nest-db account set-mode-a-default PLATFORM NAME | --none
+    nest-db account link     PLATFORM NAME --project-id UUID --modes A,B [--default]
+    nest-db account unlink   PLATFORM NAME --project-id UUID
+    nest-db account clear-default  PLATFORM --project-id UUID
+    nest-db account native-default PLATFORM --project-id UUID --allow | --forbid
+    (every change also takes --operator NAME --reason TEXT)
+
     # The security audit log (see "Security audit log"):
     nest-db audit list   [--user-id UUID] [--project-id UUID] [--event NAME] [--limit N]
     nest-db audit verify # seal new records, then check the hash chain
 
 Reads the same `NEST_DATABASE_*` settings as the Controller. Exit status: 0 on
 success, 1 when the schema is not current, a migration failed or an admin change
-or revocation or Platform change was not made or the audit chain is broken, 2 for
-invalid configuration or arguments, 3 when the database is unreachable.
+or revocation or Platform or Slurm account change was not made or the audit chain
+is broken, 2 for invalid configuration or arguments, 3 when the database is
+unreachable.
 """
 
 from __future__ import annotations
@@ -56,6 +69,7 @@ import psycopg
 from .._logging import configure_logging
 from ..audit import AuditLog
 from ..config import ConfigError, load_database_config
+from .accounts import ProjectAccountLink, SlurmAccount, SlurmAccountStore
 from .bootstrap import audit_events, bootstrap_state
 from .connection import Database, DatabaseError
 from .identity import IdentityStore
@@ -136,6 +150,7 @@ def _parser() -> argparse.ArgumentParser:
     )
 
     _platform_parser(commands)
+    _account_parser(commands)
 
     security = commands.add_parser(
         "audit",
@@ -216,6 +231,165 @@ def _platform_parser(commands) -> None:
         grant = actions.add_parser(name, parents=[change], help=f"{verb} a Platform")
         grant.add_argument("platform", metavar="PLATFORM")
         grant.add_argument("--project-id", required=True, type=UUID, metavar="UUID")
+
+
+def _account_parser(commands) -> None:
+    account = commands.add_parser(
+        "account",
+        help="manage Platform-scoped Slurm accounts and their Project links",
+        description=(
+            "The Slurm Account Registry. An account belongs to one Platform: the same name "
+            "on two Platforms is two accounts. Every change is audited with the operator "
+            "name, the reason and the PostgreSQL role. PLATFORM is a slug or ID."
+        ),
+    )
+    actions = account.add_subparsers(dest="action", required=True)
+    change = argparse.ArgumentParser(add_help=False)
+    change.add_argument(
+        "--operator", required=True, help="who is making the change, for the audit log"
+    )
+    change.add_argument("--reason", required=True, help="why, for the audit log")
+    project = argparse.ArgumentParser(add_help=False)
+    project.add_argument("--project-id", required=True, type=UUID, metavar="UUID")
+    listing = actions.add_parser("list", help="list a Platform's Slurm accounts")
+    listing.add_argument("platform", metavar="PLATFORM")
+    show = actions.add_parser(
+        "show", parents=[project], help="show a Project's accounts and policy on a Platform"
+    )
+    show.add_argument("platform", metavar="PLATFORM")
+    register = actions.add_parser("register", parents=[change], help="register an account")
+    register.add_argument("platform", metavar="PLATFORM")
+    register.add_argument("name", metavar="NAME")
+    register.add_argument("--kind", choices=("standard", "chargeback"), default="standard")
+    register.add_argument("--description")
+    for name, verb in (("disable", "disable"), ("enable", "re-enable")):
+        status = actions.add_parser(name, parents=[change], help=f"{verb} an account")
+        status.add_argument("platform", metavar="PLATFORM")
+        status.add_argument("name", metavar="NAME")
+    default = actions.add_parser(
+        "set-mode-a-default", parents=[change], help="set or clear the Mode A operator default"
+    )
+    default.add_argument("platform", metavar="PLATFORM")
+    target = default.add_mutually_exclusive_group(required=True)
+    target.add_argument("name", metavar="NAME", nargs="?")
+    target.add_argument("--none", action="store_true", help="clear the default")
+    link = actions.add_parser(
+        "link", parents=[change, project], help="let a Project charge an account"
+    )
+    link.add_argument("platform", metavar="PLATFORM")
+    link.add_argument("name", metavar="NAME")
+    link.add_argument("--modes", required=True, help="permitted modes: A, B or A,B")
+    link.add_argument("--default", action="store_true", help="make it the Project default")
+    unlink = actions.add_parser(
+        "unlink", parents=[change, project], help="stop a Project charging an account"
+    )
+    unlink.add_argument("platform", metavar="PLATFORM")
+    unlink.add_argument("name", metavar="NAME")
+    clear = actions.add_parser(
+        "clear-default", parents=[change, project], help="clear a Project's default account"
+    )
+    clear.add_argument("platform", metavar="PLATFORM")
+    native = actions.add_parser(
+        "native-default",
+        parents=[change, project],
+        help="allow or forbid Mode B jobs to use the User's native Slurm default",
+    )
+    native.add_argument("platform", metavar="PLATFORM")
+    choice = native.add_mutually_exclusive_group(required=True)
+    choice.add_argument("--allow", action="store_true")
+    choice.add_argument("--forbid", action="store_true")
+
+
+def _print_account(account: SlurmAccount) -> None:
+    print(
+        f"{account.account_name} id={account.id} platform={account.platform_id} "
+        f"kind={account.kind} status={account.status} "
+        f"mode_a_default={'yes' if account.is_mode_a_default else 'no'}"
+        + (f" description={json.dumps(account.description)}" if account.description else "")
+    )
+
+
+def _print_link(link: ProjectAccountLink) -> None:
+    print(
+        f"  link {link.account.account_name} id={link.account.id} "
+        f"modes={','.join(link.modes)} default={'yes' if link.is_default else 'no'} "
+        f"status={link.account.status} kind={link.account.kind}"
+    )
+
+
+def _account(database: Database, args: argparse.Namespace) -> int:
+    """Runs one `nest-db account` action on an open, verified database."""
+    store = SlurmAccountStore(database)
+    audit: dict[str, Any] = {
+        "operator": getattr(args, "operator", None),
+        "reason": getattr(args, "reason", None),
+    }
+    try:
+        if args.action == "list":
+            for account in store.list_accounts(args.platform):
+                _print_account(account)
+        elif args.action == "show":
+            mapping = store.mapping(args.project_id, args.platform)
+            print(
+                f"project={mapping.project_id} platform={mapping.platform.slug} "
+                f"granted={'yes' if mapping.granted else 'no'} "
+                f"native_default={'allowed' if mapping.allow_native_default else 'forbidden'}"
+            )
+            for link in mapping.links:
+                _print_link(link)
+        elif args.action == "register":
+            _print_account(
+                store.register_account(
+                    args.platform,
+                    args.name,
+                    kind=args.kind,
+                    description=args.description,
+                    **audit,
+                )
+            )
+        elif args.action in ("disable", "enable"):
+            status = "disabled" if args.action == "disable" else "active"
+            _print_account(store.update_account(args.platform, args.name, status=status, **audit))
+        elif args.action == "set-mode-a-default":
+            account = store.set_mode_a_default(
+                args.platform, None if args.none else args.name, **audit
+            )
+            if account is None:
+                print("No Mode A default account")
+            else:
+                _print_account(account)
+        elif args.action == "link":
+            _print_link(
+                store.link_project(
+                    args.project_id,
+                    args.platform,
+                    args.name,
+                    modes=args.modes.split(","),
+                    default=args.default,
+                    **audit,
+                )
+            )
+        elif args.action == "unlink":
+            store.unlink_project(args.project_id, args.platform, args.name, **audit)
+            print(f"Project {args.project_id} no longer charges {args.name} on {args.platform}")
+        elif args.action == "clear-default":
+            if not store.clear_project_default(args.project_id, args.platform, **audit):
+                print("No change: the Project has no default account", file=sys.stderr)
+                return 1
+            print(f"Project {args.project_id} has no default account on {args.platform}")
+        else:
+            store.set_native_default(args.project_id, args.platform, args.allow, **audit)
+            print(
+                f"Native Slurm default {'allowed' if args.allow else 'forbidden'} for Mode B "
+                f"jobs of Project {args.project_id} on {args.platform}"
+            )
+        return 0
+    except PlatformError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 2
 
 
 def _print_platform(platform: Platform) -> None:
@@ -499,7 +673,7 @@ def main(argv: list[str] | None = None) -> int:
         print(exc, file=sys.stderr)
         return 2
     database = Database(config, application_name="nest-db")
-    if args.command in ("admin", "sessions", "audit", "platform"):
+    if args.command in ("admin", "sessions", "audit", "platform", "account"):
         try:
             database.open()
         except DatabaseError as exc:
@@ -513,6 +687,7 @@ def main(argv: list[str] | None = None) -> int:
                 "sessions": _sessions,
                 "audit": _audit,
                 "platform": _platform,
+                "account": _account,
             }[args.command]
             return action(database, args)
         except MigrationError as exc:

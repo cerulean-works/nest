@@ -86,7 +86,7 @@ derived from another:
 | Nest User | `users.id`, a generated UUID | Never an email address. A User row exists only once a person has signed in or an operator has created it. |
 | External sign-in identity | `user_identities (issuer, subject)` | The identity provider's stable subject ID (Google's `sub`) under its issuer, linked to one User. A changed email keeps the same User; a reused address on another subject is a different identity. These identity providers are unrelated to Compute Providers. |
 | Nest Project | `projects.id`, a generated UUID | Independent of its name, Owner and Provider Accounts. Two Projects may share a name. |
-| HPC Platform and its Slurm account | `provider_profiles.id` (the Platform ID) and the account name within that Platform | The Platform ID namespaces the account: the same account name on two Platforms is two accounts. The operator label is metadata, not part of the key. No identity or Project table references them. |
+| HPC Platform and its Slurm account | `provider_profiles.id` (the Platform ID) and the account name within that Platform; in the registry, `slurm_accounts (platform_id, account_name)` | The Platform ID namespaces the account: the same account name on two Platforms is two accounts. The operator label is metadata, not part of the key. Projects are only linked to accounts (`project_platform_accounts`); no Project or identity is keyed by an account name. |
 
 **Membership.** Users and Projects are many-to-many through `project_memberships`,
 one row per (Project, User) (`UNIQUE (project_id, user_id)`), with a role of
@@ -194,6 +194,16 @@ host-key pin references) and `hpc_platform_project_grants`, and records each
 job's Platform in `jobs.platform_id`. Changes to all three tables must name an
 operator and are recorded in the security audit log. Platforms are never deleted.
 See [Register HPC Platforms and login nodes](platforms).
+
+**Slurm Account Registry.** Migration `0013_slurm_account_registry` adds
+`slurm_accounts` (`UNIQUE (platform_id, account_name)`), `project_platform_accounts`
+(the accounts a Project may charge on a granted Platform, with permitted modes and
+an optional default) and `project_platform_account_policies`, and records each
+job's registered account and the origin of the choice in `jobs.slurm_account_id`
+and `jobs.slurm_account_origin`. Composite foreign keys keep every link and job on
+the account's own Platform. Changes must name an operator and are recorded in the
+security audit log. Existing job records keep `NULL` in the new columns. See
+[Map Slurm accounts to Projects](slurm-accounts).
 
 ## Configure the connection
 
