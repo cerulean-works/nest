@@ -17,6 +17,17 @@ AUTHORIZATION_METADATA = "authorization"
 PROJECT_METADATA = "x-nest-project-id"
 """Request-metadata key naming the Project a submission runs in (`NEST_PROJECT_ID`)."""
 
+PLATFORM_METADATA = "x-nest-platform"
+"""Request-metadata key naming the HPC Platform (slug or ID) a submission asks for. The
+server still decides: an ineligible Platform is refused, never replaced."""
+
+IDEMPOTENCY_METADATA = "x-nest-idempotency-key"
+"""Request-metadata key making a registry-backed submission idempotent for its owner
+and Project: a repeated request with the same key never submits twice."""
+
+EXECUTION_ID_METADATA = "nest-execution-id"
+"""Trailing-metadata key carrying the Nest execution ID of a registry-backed submission."""
+
 
 class RemoteExecutionError(RuntimeError):
     """An exception raised by a remotely executed function."""

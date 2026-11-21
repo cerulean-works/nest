@@ -41,6 +41,8 @@ guide:
         title: Register HPC Platforms and login nodes
       - local: slurm-accounts
         title: Map Slurm accounts to Projects
+      - local: execution-registry
+        title: Admit submissions through the Execution Registry
       - local: platform-admin
         title: Bootstrap and recover platform administration
       - local: audit-log

@@ -15,7 +15,9 @@ platform role history in `platform_audit_events` (see
 | `run.cancel` | Controller | Every `CancelJob` call, allowed or refused; an allowed one is recorded and sealed before Slurm is asked. |
 | `run.read` | Controller | A refused `GetJobStatus` call. Allowed reads are not recorded. |
 | `project.*`, `member.*` | Controller | A refused Projects API action, such as `project.update` or `member.invite`. Allowed changes are in `project_audit_events`. |
-| `controller.started` | Controller | Each start: which protections are on (`auth`, `tls`, `allow_plaintext`, the number of approved Projects), the executor, the default Provider, and whether an inline SSH key is used. Never a value. |
+| `controller.started` | Controller | Each start: which protections are on (`auth`, `tls`, `allow_plaintext`, the number of approved Projects), the executor, the default Provider, whether an inline SSH key is used, and the `execution_registry` mode (`required` or `legacy`). Never a value. |
+| `execution.admit` | Controller | A registry-backed submission refused before anything was submitted, with its reason (such as `platform_not_served`, `hpc_binding_unavailable` or `ambiguous`). |
+| `execution.reconciled` | `nest-db` | An operator reconciled an `unknown` execution attempt: the operator, the evidence, the outcome and the Slurm job ID. |
 | `identity.linked` | Trigger | A sign-in identity is linked to a User (the issuer only). |
 | `session.created`, `session.revoked` | Trigger | A sign-in (browser or CLI, with its scope) and every revocation with its reason, such as `logout`, `refresh_reuse`, `user_disabled` or `admin_revoked`. Routine refreshes are not recorded. |
 | `user.disabled`, `user.enabled` | Trigger | A User's status changes. |

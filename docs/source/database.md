@@ -214,8 +214,12 @@ default-Platform changes in the security audit log. See
 [Project eligibility and default Platform](platforms#project-eligibility-and-default-platform).
 
 **Execution registry.** Migration `0014_execution_registry` adds the
-Platform-aware execution registry described below. The Controller does not write
-to it yet; `jobs` remains the record of today's submissions.
+Platform-aware execution registry described below. With
+`NEST_EXECUTION_REGISTRY=required` (the default with session authentication) it is
+the only record of new Slurm submissions, which write nothing to `jobs`; see
+[Admit submissions through the Execution Registry](execution-registry). The legacy
+path (`NEST_EXECUTION_REGISTRY=legacy`) still records in `jobs`, and existing
+`jobs` rows are kept unchanged.
 
 ### Execution registry
 
@@ -266,8 +270,11 @@ An attempt moves through these `status` values:
 | `unknown` | `sbatch` may have run but no job ID arrived. It holds the execution, so nothing is resubmitted until it is reconciled to another status. |
 
 After a restart, `ExecutionRegistry.mark_interrupted(older_than)` marks
-`submitting` attempts older than `older_than` as `unknown`, and `live_attempts()`
-lists everything still to reconcile:
+`submitting` attempts older than `older_than` as `unknown` (a registry-backed
+Controller does this at start and every five minutes), `live_attempts()` and
+`nest-db execution list` list everything still to reconcile, and
+`nest-db execution reconcile` resolves an `unknown` attempt from the evidence an
+operator checked:
 
 ```sql
 SELECT e.execution_id, a.attempt_number, a.platform_id, a.status, a.slurm_job_id

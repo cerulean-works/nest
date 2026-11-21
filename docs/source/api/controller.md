@@ -30,6 +30,13 @@ Cancellation requests do not wait for a job to stop.
 | `authorization` | `Bearer <access token>` of a Nest CLI session. Required with `NEST_CONTROLLER_AUTH=session`. |
 | `x-nest-project-id` | The Project a submission (`Execute`, `SubmitJob`) runs in. Required with session authentication. |
 | `x-nest-request-id` | Optional 32-character hex correlation ID, used in logs and audit records. |
+| `x-nest-platform` | Optional HPC Platform slug or ID for a registry-backed submission. It must be eligible for the Project; it is refused, never replaced. |
+| `x-nest-idempotency-key` | Optional key (1 to 200 printable ASCII characters) that makes a registry-backed submission idempotent for its owner and Project. |
+
+A registry-backed submission (`NEST_EXECUTION_REGISTRY=required`) answers with its
+execution ID in the `nest-execution-id` trailing metadata. See
+[Admit submissions through the Execution Registry](../execution-registry) for its
+refusals and failure statuses.
 
 With session authentication, a call without an accepted session fails with
 `UNAUTHENTICATED`, a submission without a Project with `INVALID_ARGUMENT`, a
@@ -69,4 +76,26 @@ deadline. The Controller never retries `sbatch`. See
 
 [[autodoc]] controller.build_access
 
+[[autodoc]] controller.build_admission
+
+[[autodoc]] controller.recovery_threshold
+
 [[autodoc]] controller.record_start
+
+## Registry-backed admission
+
+[[autodoc]] admission.RegistryAdmission
+
+[[autodoc]] admission.SubmissionRequest
+
+[[autodoc]] admission.Admission
+
+[[autodoc]] admission.HPCIdentitySource
+
+[[autodoc]] admission.ControllerIdentitySource
+
+[[autodoc]] admission.AdmissionRefusedError
+
+[[autodoc]] admission.DuplicateSubmissionError
+
+[[autodoc]] admission.RecoverySweeper

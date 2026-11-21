@@ -208,9 +208,16 @@ CONTROLLER_AUTH_SETTINGS = (
     "NEST_CONTROLLER_AUTH",
     "NEST_CONTROLLER_ALLOW_PLAINTEXT",
     "NEST_PROVIDER_ALLOWED_PROJECTS",
+    "NEST_EXECUTION_REGISTRY",
 )
 """gRPC authentication, transport and Provider approval settings, read by
 [`config.load_controller_config`]."""
+
+EXECUTION_REGISTRY_MODES = ("required", "legacy")
+"""`NEST_EXECUTION_REGISTRY` values: `required` admits every Slurm submission through
+the durable Execution Registry (the default with `NEST_CONTROLLER_AUTH=session`);
+`legacy` keeps the trusted Mode A path that records only the `jobs` table (the only
+choice without session authentication)."""
 
 ALL_PROJECTS = "*"
 """`NEST_PROVIDER_ALLOWED_PROJECTS` value that approves every Project."""
@@ -716,6 +723,12 @@ class ControllerConfig:
         allowed_projects (`frozenset[str]`): `NEST_PROVIDER_ALLOWED_PROJECTS`:
             Project IDs whose members' Runs the Controller's Provider accepts, or
             `{"*"}` for every Project. Empty, the default, accepts none.
+        execution_registry (`str`): `NEST_EXECUTION_REGISTRY`: `required` (every
+            Slurm submission is admitted through the Execution Registry; see
+            [`admission.RegistryAdmission`]) or `legacy` (the trusted Mode A path that
+            records only the `jobs` table). `required` is the default with session
+            authentication, and the only choice for a Mode B Platform under it;
+            `legacy` is the only choice without session authentication.
 
     `providers`, `default_provider`, and `provider` are deprecated read-only aliases
     of `platforms`, `default_platform`, and `platform`.
@@ -743,6 +756,7 @@ class ControllerConfig:
     auth: str = "none"
     allow_plaintext: bool = False
     allowed_projects: frozenset[str] = frozenset()
+    execution_registry: str = "legacy"
     warnings: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -809,6 +823,7 @@ class ControllerConfig:
             "auth": self.auth,
             "allow_plaintext": self.allow_plaintext,
             "allowed_projects": sorted(self.allowed_projects),
+            "execution_registry": self.execution_registry,
         }
 
 
@@ -1668,6 +1683,9 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
     google = _google(reader, database)
     bootstrap_admin_email = _bootstrap_admin_email(reader, database)
     auth, allow_plaintext, allowed_projects = _controller_auth(reader, database, bind, tls)
+    execution_registry = _execution_registry(
+        reader, auth, platforms.get(default_platform) if default_platform else None
+    )
     _reserved(reader)
 
     if reader.problems:
@@ -1689,6 +1707,7 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
         auth=auth,
         allow_plaintext=allow_plaintext,
         allowed_projects=allowed_projects,
+        execution_registry=execution_registry,
         **timeouts,
     )
 
@@ -1892,6 +1911,45 @@ def _controller_auth(
             reader.fail("NEST_PROVIDER_ALLOWED_PROJECTS needs NEST_CONTROLLER_AUTH=session")
         allow_plaintext = False
     return auth, allow_plaintext, frozenset(projects)
+
+
+def _execution_registry(reader: _Reader, auth: str, platform: PlatformProfile | None) -> str:
+    """
+    Reads `NEST_EXECUTION_REGISTRY`.
+
+    The registry needs an authenticated Nest User to own each execution, so it
+    requires session authentication. Under session authentication the legacy path
+    is an explicit, Mode A-only choice: Mode B must never run a User's job with the
+    Controller's own credentials. A registry-backed Mode A Platform must name the
+    operator's UNIX user (`SSH_USER`), which every attempt records as its effective
+    HPC identity.
+    """
+    mode = reader.choice(
+        "NEST_EXECUTION_REGISTRY",
+        EXECUTION_REGISTRY_MODES,
+        "required" if auth == "session" else "legacy",
+    )
+    if mode == "required" and auth != "session":
+        reader.fail(
+            "NEST_EXECUTION_REGISTRY=required needs NEST_CONTROLLER_AUTH=session: every "
+            "registry-backed execution is owned by an authenticated Nest User"
+        )
+    if platform is None or auth != "session":
+        return mode
+    prefix = f"the {platform.id!r} Platform"
+    if mode == "legacy" and platform.ssh_mode == "B":
+        reader.fail(
+            f"NEST_EXECUTION_REGISTRY=legacy cannot serve {prefix} in Mode B with session "
+            "authentication: Mode B never falls back to the Controller's credentials; use "
+            "NEST_EXECUTION_REGISTRY=required"
+        )
+    if mode == "required" and platform.ssh_mode == "A" and platform.ssh_user is None:
+        reader.fail(
+            f"NEST_EXECUTION_REGISTRY=required needs the operator's UNIX user for {prefix}: "
+            "set its SSH_USER (such as NEST_PLATFORM_<ID>_SSH_USER or NEST_SLURM_SSH_USER), "
+            "which every execution attempt records as its HPC identity"
+        )
+    return mode
 
 
 def _is_loopback_address(address: str) -> bool:
