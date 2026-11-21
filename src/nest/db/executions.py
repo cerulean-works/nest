@@ -23,7 +23,9 @@ lookup can never cross a Project boundary.
 Platforms and login nodes come from the HPC Platform Catalog (D07): an attempt
 takes the [`db.LoginEndpoint`] the server selected, and is recorded only while that
 Platform is active and granted to the execution's Project and the node is still
-approved for the transport mode, checked in the same transaction.
+approved for the transport mode, checked in the same transaction. The account it
+charges comes from the Platform-scoped Slurm Account Registry (D08), as chosen by
+[`authz.AccountResolver`], and must still be linked to the Project for that mode.
 """
 
 from __future__ import annotations
@@ -82,7 +84,8 @@ _ATTEMPT_COLUMNS = (
     "a.id, a.execution_id, a.attempt_number, a.platform_id, p.slug AS platform_slug, "
     "a.login_node_id, a.login_node_host, a.login_node_port, a.transport_mode, "
     "a.host_key_pin_ref, a.hpc_binding_id, "
-    "a.hpc_binding_version, a.unix_user, a.unix_uid, a.slurm_account, a.source_digest, "
+    "a.hpc_binding_version, a.unix_user, a.unix_uid, a.slurm_account_id, a.slurm_account, "
+    "a.slurm_account_origin, a.source_digest, "
     "a.environment_digest, a.runtime_digest, a.status, a.slurm_job_id, a.slurm_state, "
     "a.output_ref, a.usage_ref, a.error_kind, a.error_message, a.created_at, a.updated_at, "
     "a.submitted_at, a.finished_at"
@@ -114,8 +117,12 @@ class InvalidTransitionError(ExecutionRegistryError):
     """The attempt cannot move to the requested status from its current one."""
 
 
-class PlatformNotGrantedError(ExecutionRegistryError):
+class PlatformUnavailableError(ExecutionRegistryError):
     """The Platform is unknown, disabled, or not granted to the execution's Project."""
+
+
+class AccountNotPermittedError(ExecutionRegistryError):
+    """The Slurm account is not an active account linked to the Project for the mode."""
 
 
 @dataclass(frozen=True)
@@ -214,7 +221,10 @@ class Attempt:
         platform_id (`UUID`): The Platform (Slurm namespace) it targeted.
         endpoint (`LoginEndpoint`): Snapshot of the login-node endpoint used.
         principal (`HPCPrincipal`): The HPC identity used.
-        slurm_account (`str`): The Slurm account, meaningful only with `platform_id`.
+        slurm_account_id (`int | None`): The registered Slurm account on
+            `platform_id`; `None` only for `native_default`.
+        slurm_account (`str | None`): Its name, passed as `--account`.
+        slurm_account_origin (`str`): The account selection step that chose it.
         source_digest, environment_digest, runtime_digest (`str | None`): Digests.
         status (`str`): One of [`db.executions.ATTEMPT_STATUSES`].
         slurm_job_id (`int | None`): Slurm job ID on `platform_id`.
@@ -232,7 +242,9 @@ class Attempt:
     platform_id: UUID
     endpoint: LoginEndpoint
     principal: HPCPrincipal
-    slurm_account: str
+    slurm_account_id: int | None
+    slurm_account: str | None
+    slurm_account_origin: str
     source_digest: str | None
     environment_digest: str | None
     runtime_digest: str | None
@@ -302,7 +314,9 @@ def _attempt(
             binding_id=row["hpc_binding_id"],
             binding_version=row["hpc_binding_version"],
         ),
+        slurm_account_id=row["slurm_account_id"],
         slurm_account=row["slurm_account"],
+        slurm_account_origin=row["slurm_account_origin"],
         source_digest=row["source_digest"],
         environment_digest=row["environment_digest"],
         runtime_digest=row["runtime_digest"],
@@ -331,7 +345,7 @@ def _check_endpoint(cursor: Any, endpoint: LoginEndpoint, project_id: UUID) -> N
         (project_id, endpoint.platform_id),
     ).fetchone()
     if platform is None:
-        raise PlatformNotGrantedError("The Platform is not available to this Project")
+        raise PlatformUnavailableError("The Platform is not available to this Project")
     node = cursor.execute(
         "SELECT host, port, transport_modes, host_key_pin_ref FROM hpc_login_nodes "
         "WHERE id = %s AND platform_id = %s AND status = 'active' FOR SHARE",
@@ -350,6 +364,48 @@ def _check_endpoint(cursor: Any, endpoint: LoginEndpoint, project_id: UUID) -> N
     ):
         raise EndpointNotApprovedError(
             "The login node is not an approved endpoint of the Platform for this transport mode"
+        )
+
+
+def _check_account(
+    cursor: Any,
+    endpoint: LoginEndpoint,
+    project_id: UUID,
+    account: str | None,
+    slurm_account_id: int | None,
+    origin: str,
+) -> None:
+    """Re-checks the account choice against the Project's links, share-locking them."""
+    if origin == "native_default":
+        if account is not None or slurm_account_id is not None:
+            raise ValueError("The native Slurm default names no account")
+        allowed = cursor.execute(
+            "SELECT allow_native_default FROM project_platform_account_policies "
+            "WHERE project_id = %s AND platform_id = %s FOR SHARE",
+            (project_id, endpoint.platform_id),
+        ).fetchone()
+        if endpoint.mode != "B" or allowed is None or not allowed["allow_native_default"]:
+            raise AccountNotPermittedError(
+                "The native Slurm default is not permitted for this Project and mode"
+            )
+        return
+    if slurm_account_id is None or account is None:
+        raise ValueError("Every account origin but native_default names a registered account")
+    link = cursor.execute(
+        "SELECT a.account_name, a.kind, l.modes FROM project_platform_accounts l "
+        "JOIN slurm_accounts a ON a.id = l.slurm_account_id AND a.platform_id = l.platform_id "
+        "WHERE l.project_id = %s AND l.platform_id = %s AND l.slurm_account_id = %s "
+        "AND a.status = 'active' FOR SHARE",
+        (project_id, endpoint.platform_id, slurm_account_id),
+    ).fetchone()
+    if (
+        link is None
+        or link["account_name"] != account
+        or endpoint.mode not in link["modes"]
+        or (endpoint.mode == "B" and link["kind"] == "chargeback")
+    ):
+        raise AccountNotPermittedError(
+            "The Slurm account is not linked to this Project for this mode on the Platform"
         )
 
 
@@ -467,7 +523,9 @@ class ExecutionRegistry:
         *,
         endpoint: LoginEndpoint,
         principal: HPCPrincipal,
-        slurm_account: str,
+        account: str | None,
+        slurm_account_id: int | None,
+        slurm_account_origin: str,
         options: Mapping[str, ResolvedOption],
         source_digest: str | None = None,
         environment_digest: str | None = None,
@@ -489,7 +547,11 @@ class ExecutionRegistry:
             endpoint ([`db.LoginEndpoint`]): The login node the server selected,
                 such as from [`authz.PlatformCatalog.select_login_node`].
             principal (`HPCPrincipal`): The HPC identity it will run as.
-            slurm_account (`str`): The Slurm account on the endpoint's Platform.
+            account, slurm_account_id, slurm_account_origin: The charged account, as
+                [`authz.AccountResolution.job_fields`] gives them (pass
+                `**resolution.job_fields()`). The account must still be active and
+                linked to the Project on the endpoint's Platform for its mode;
+                `native_default` needs Mode B and the Project's permission.
             options (`Mapping[str, ResolvedOption]`): Every resolved option.
             source_digest, environment_digest, runtime_digest (`str`, *optional*):
                 `sha256:<hex>` digests of what is submitted.
@@ -499,8 +561,10 @@ class ExecutionRegistry:
             [`db.executions.ExecutionClosedError`]: If it succeeded or was cancelled.
             [`db.executions.AttemptInFlightError`]: If an attempt is still in flight
                 or has an unknown outcome.
-            [`db.executions.PlatformNotGrantedError`]: If the Platform is unknown,
+            [`db.executions.PlatformUnavailableError`]: If the Platform is unknown,
                 disabled or not granted to the execution's Project.
+            [`db.executions.AccountNotPermittedError`]: If the account may not be
+                charged by the Project in the endpoint's mode.
             [`db.EndpointNotApprovedError`]: If the login node no longer matches an
                 approved endpoint of the Platform.
             [`db.DatabaseError`]: If the database refuses a row.
@@ -526,14 +590,23 @@ class ExecutionRegistry:
                     f"Attempt {live['attempt_number']} is still {live['status']}"
                 )
             _check_endpoint(cursor, endpoint, execution["project_id"])
+            _check_account(
+                cursor,
+                endpoint,
+                execution["project_id"],
+                account,
+                slurm_account_id,
+                slurm_account_origin,
+            )
             row = cursor.execute(
                 """
                 INSERT INTO execution_attempts (execution_id, attempt_number, platform_id,
                     login_node_id, login_node_host, login_node_port, transport_mode,
                     host_key_pin_ref, hpc_binding_id, hpc_binding_version, unix_user, unix_uid,
-                    slurm_account, source_digest, environment_digest, runtime_digest)
+                    slurm_account_id, slurm_account, slurm_account_origin, source_digest,
+                    environment_digest, runtime_digest)
                 SELECT %s, COALESCE(max(attempt_number), 0) + 1, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s
                 FROM execution_attempts WHERE execution_id = %s
                 RETURNING id
                 """,
@@ -549,7 +622,9 @@ class ExecutionRegistry:
                     principal.binding_version,
                     principal.unix_user,
                     principal.unix_uid,
-                    slurm_account,
+                    slurm_account_id,
+                    account,
+                    slurm_account_origin,
                     source_digest,
                     environment_digest,
                     runtime_digest,

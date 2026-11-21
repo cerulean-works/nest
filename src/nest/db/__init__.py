@@ -6,6 +6,21 @@ are applied only by `nest-db upgrade`; the Controller verifies the schema at sta
 and refuses to serve when it is unreachable or out of date.
 """
 
+from .accounts import (
+    ACCOUNT_KINDS,
+    ACCOUNT_MODES,
+    ACCOUNT_ORIGINS,
+    AccountLinkNotFoundError,
+    DuplicateSlurmAccountError,
+    PlatformNotGrantedError,
+    ProjectAccountLink,
+    ProjectAccountMapping,
+    SlurmAccount,
+    SlurmAccountError,
+    SlurmAccountNotFoundError,
+    SlurmAccountStore,
+    normalize_account_name,
+)
 from .bootstrap import (
     GOOGLE_ISSUERS,
     AuditEvent,
@@ -25,6 +40,7 @@ from .cli_logins import (
 )
 from .connection import Database, DatabaseError
 from .executions import (
+    AccountNotPermittedError,
     Attempt,
     AttemptInFlightError,
     Execution,
@@ -35,7 +51,7 @@ from .executions import (
     HPCPrincipal,
     IdempotencyConflictError,
     InvalidTransitionError,
-    PlatformNotGrantedError,
+    PlatformUnavailableError,
     ResolvedOption,
 )
 from .identity import (
@@ -108,12 +124,17 @@ from .sessions import AccessGrant, Rotation, SessionRefreshError, SessionStore
 from .store import JobStore, PlatformIdentityError, sync_platforms, sync_providers
 
 __all__ = [
+    "ACCOUNT_KINDS",
+    "ACCOUNT_MODES",
+    "ACCOUNT_ORIGINS",
     "ASSIGNABLE_ROLES",
     "GOOGLE_ISSUERS",
     "PROJECT_ROLES",
     "TRANSPORT_MODES",
     "Acceptance",
     "AccessGrant",
+    "AccountLinkNotFoundError",
+    "AccountNotPermittedError",
     "AlreadyInvitedError",
     "Attempt",
     "AttemptInFlightError",
@@ -130,6 +151,7 @@ __all__ = [
     "DuplicateLoginNodeError",
     "DuplicateMemberError",
     "DuplicatePlatformError",
+    "DuplicateSlurmAccountError",
     "EmailInvitation",
     "EmailMismatchError",
     "EmailOutbox",
@@ -173,7 +195,10 @@ __all__ = [
     "PlatformNotGrantedError",
     "PlatformSlugConflictError",
     "PlatformStore",
+    "PlatformUnavailableError",
     "Project",
+    "ProjectAccountLink",
+    "ProjectAccountMapping",
     "ProjectAuditEvent",
     "ProjectError",
     "ProjectNotFoundError",
@@ -185,6 +210,10 @@ __all__ = [
     "Session",
     "SessionRefreshError",
     "SessionStore",
+    "SlurmAccount",
+    "SlurmAccountError",
+    "SlurmAccountNotFoundError",
+    "SlurmAccountStore",
     "TooManyPendingCLILoginsError",
     "TooManyPendingSignInsError",
     "User",
@@ -195,6 +224,7 @@ __all__ = [
     "bootstrap_state",
     "hash_token",
     "load_migrations",
+    "normalize_account_name",
     "normalize_email",
     "normalize_invited_email",
     "order_login_nodes",

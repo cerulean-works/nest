@@ -94,6 +94,34 @@ except OSError:
 
 [[autodoc]] authz.select_endpoint
 
+## Slurm account selection
+
+See [Map Slurm accounts to Projects](../slurm-accounts).
+
+```python
+from nest.authz import AccountResolver, HPCIdentity
+
+resolver = AccountResolver(database)
+chosen = resolver.resolve(
+    principal,
+    project_id,
+    platform="nano4",
+    mode="B",
+    identity=HPCIdentity.user(nano4_id, principal.user_id, verified_default_account="chem"),
+)
+chosen.origin  # "explicit", "project_default", "mode_b_user_default", ...
+```
+
+[[autodoc]] authz.AccountResolver
+
+[[autodoc]] authz.resolve_account
+
+[[autodoc]] authz.HPCIdentity
+
+[[autodoc]] authz.AccountResolution
+
+[[autodoc]] authz.AccountResolutionError
+
 ## Provider authority
 
 [[autodoc]] authz.ProviderAuthority

@@ -326,13 +326,12 @@ class UpgradePathTests(PostgresTestCase):
     def test_upgrade_from_the_platform_metadata_migration(self):
         """A database at 0011 (Platform metadata, A04) with records upgrades to 0012."""
         url = self.database()
-        labels = [m.label for m in load_migrations()]
-        catalog = labels.index("0012_hpc_platform_catalog")
-        self.assertEqual(labels[catalog - 1], "0011_platform_metadata")
-        # Later migrations are not part of this step.
-        migrations = load_migrations()[: catalog + 1]
+        migrations = load_migrations()
+        labels = [m.label for m in migrations]
+        at = labels.index("0012_hpc_platform_catalog")
+        self.assertEqual(labels[at - 1], "0011_platform_metadata")
         with connect(url) as conn:
-            self.assertEqual(len(upgrade(conn, migrations[:-1])), len(migrations) - 1)
+            self.assertEqual(len(upgrade(conn, migrations[:at])), at)
         db = Database(load_database_config({"NEST_DATABASE_URL": url}))
         db.open()
         self.addCleanup(db.close)
@@ -343,7 +342,8 @@ class UpgradePathTests(PostgresTestCase):
         old_job = JobStore(db, "nano4").begin("batch", secrets.token_hex(16))
         with connect(url) as conn:
             self.assertEqual(
-                [m.label for m in upgrade(conn, migrations)], ["0012_hpc_platform_catalog"]
+                [m.label for m in upgrade(conn, migrations[: at + 1])],
+                ["0012_hpc_platform_catalog"],
             )
             self.assertEqual(
                 conn.execute(

@@ -1,4 +1,4 @@
--- 0013: Platform-aware durable execution registry (C01).
+-- 0014: Platform-aware durable execution registry (C01).
 --
 -- Applied migrations are immutable: never edit this file. Change the schema by
 -- adding the next numbered file (see "Database migrations" in the docs).
@@ -14,7 +14,8 @@
 -- Slurm job ID or account name is only meaningful together with its platform_id,
 -- so neither is unique on its own and every lookup by one is scoped by the other.
 --
--- platform_id refers to the HPC Platform Catalog (0012). login_node_id names the
+-- platform_id refers to the HPC Platform Catalog (0012) and slurm_account_id to
+-- the Platform-scoped Slurm Account Registry (0013). login_node_id names the
 -- hpc_login_nodes row the server selected, but is not a foreign key: an operator
 -- may remove a login node, and the attempt keeps a snapshot of the endpoint it
 -- used (host, port, transport mode and host-key pin reference), so its history
@@ -80,8 +81,15 @@ CREATE TABLE execution_attempts (
     -- Effective UNIX identity on the Platform.
     unix_user           text NOT NULL CHECK (unix_user ~ '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$'),
     unix_uid            integer CHECK (unix_uid >= 0),
-    -- Slurm account, entitled per (platform_id, slurm_account).
-    slurm_account       text NOT NULL CHECK (length(slurm_account) BETWEEN 1 AND 200),
+    -- The Slurm account charged, from the Platform-scoped account registry (0013),
+    -- and which selection step chose it. The composite foreign key keeps the
+    -- account on the attempt's own Platform. 'native_default' (Mode B only) names
+    -- no account: Slurm charges the HPC identity's own default.
+    slurm_account_id    bigint,
+    slurm_account       text CHECK (slurm_account ~ '^[a-z0-9][a-z0-9_.-]{0,63}$'),
+    slurm_account_origin text NOT NULL CHECK (slurm_account_origin IN (
+                            'explicit', 'project_default', 'mode_a_operator_default',
+                            'mode_b_user_default', 'native_default')),
     -- 'sha256:<64 hex>' digests of the code, environment and runtime submitted.
     source_digest       text CHECK (source_digest ~ '^sha256:[0-9a-f]{64}$'),
     environment_digest  text CHECK (environment_digest ~ '^sha256:[0-9a-f]{64}$'),
@@ -105,6 +113,14 @@ CREATE TABLE execution_attempts (
     UNIQUE (execution_id, attempt_number),
     CHECK ((hpc_binding_id IS NULL) = (hpc_binding_version IS NULL)),
     CHECK (transport_mode = 'A' OR (login_node_port IS NOT NULL AND host_key_pin_ref IS NOT NULL)),
+    CONSTRAINT execution_attempts_slurm_account_same_platform
+        FOREIGN KEY (platform_id, slurm_account_id)
+        REFERENCES slurm_accounts (platform_id, id) ON DELETE RESTRICT,
+    CONSTRAINT execution_attempts_slurm_account_origin
+        CHECK (CASE WHEN slurm_account_origin = 'native_default'
+                    THEN slurm_account_id IS NULL AND slurm_account IS NULL
+                         AND transport_mode = 'B'
+                    ELSE slurm_account_id IS NOT NULL AND slurm_account IS NOT NULL END),
     CHECK ((status IN ('succeeded', 'failed', 'cancelled')) = (finished_at IS NOT NULL))
 );
 
@@ -116,6 +132,8 @@ CREATE INDEX execution_attempts_platform_job ON execution_attempts (platform_id,
     WHERE slurm_job_id IS NOT NULL;
 CREATE INDEX execution_attempts_platform_account
     ON execution_attempts (platform_id, slurm_account, created_at);
+CREATE INDEX execution_attempts_slurm_account ON execution_attempts (slurm_account_id)
+    WHERE slurm_account_id IS NOT NULL;
 CREATE INDEX execution_attempts_live ON execution_attempts (status, updated_at)
     WHERE status IN ('submitting', 'submitted', 'running', 'unknown');
 
@@ -154,8 +172,26 @@ CREATE TRIGGER execution_attempts_identity_immutable BEFORE UPDATE ON execution_
         'id', 'execution_id', 'attempt_number', 'platform_id', 'login_node_id',
         'login_node_host', 'login_node_port', 'transport_mode', 'host_key_pin_ref',
         'hpc_binding_id',
-        'hpc_binding_version', 'unix_user', 'unix_uid', 'slurm_account', 'source_digest',
+        'hpc_binding_version', 'unix_user', 'unix_uid', 'slurm_account_id', 'slurm_account',
+        'slurm_account_origin', 'source_digest',
         'environment_digest', 'runtime_digest', 'created_at');
+-- An attempt's account name is always its registered account's.
+CREATE FUNCTION nest_check_attempt_account() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.slurm_account_id IS NOT NULL AND NEW.slurm_account IS DISTINCT FROM (
+        SELECT account_name FROM slurm_accounts WHERE id = NEW.slurm_account_id
+    ) THEN
+        RAISE EXCEPTION 'the attempt account does not match its registered Slurm account'
+            USING ERRCODE = 'check_violation',
+                  CONSTRAINT = 'execution_attempts_slurm_account_name';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER execution_attempts_account_name BEFORE INSERT ON execution_attempts
+    FOR EACH ROW EXECUTE FUNCTION nest_check_attempt_account();
 CREATE TRIGGER execution_attempts_no_delete BEFORE DELETE ON execution_attempts
     FOR EACH ROW EXECUTE FUNCTION nest_forbid_change();
 CREATE TRIGGER execution_attempts_no_truncate BEFORE TRUNCATE ON execution_attempts

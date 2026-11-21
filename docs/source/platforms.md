@@ -23,8 +23,8 @@ An **HPC Platform** is one Slurm job and account namespace, such as `nano4` or
 - A Slurm job ID belongs to one Platform: job records store the Platform ID
   (`jobs.platform_id`) they were submitted to, so job `4242` on `nano4` and job
   `4242` on `f1` never collide.
-- Slurm accounts are not part of a Platform's identity. The account registry is a
-  separate record (D08).
+- Slurm accounts are not part of a Platform's identity. They are registered per
+  Platform in a separate registry: see [Map Slurm accounts to Projects](slurm-accounts).
 
 Each Platform has one or more **login nodes**. Every login node of a Platform
 reaches the same namespace, so failing over from one node to another keeps the
@@ -163,5 +163,5 @@ recorded in the security audit log as `platform.resolve` or
   backend. Choosing the Platform per request, and running each Platform's
   connection through [`authz.PlatformCatalog`], is follow-up work (C01).
 - Health is recorded when a caller fails over. There is no background probe.
-- A Platform's Slurm accounts and per-User account links are not modeled here
-  (D08).
+- A Platform's Slurm accounts and their Project links are in the
+  [Slurm Account Registry](slurm-accounts).

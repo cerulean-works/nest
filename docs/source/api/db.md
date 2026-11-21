@@ -99,6 +99,40 @@ platforms.grant_project(nano4.id, project_id, **ops)
 
 [[autodoc]] db.EndpointNotApprovedError
 
+## Slurm accounts
+
+See [Map Slurm accounts to Projects](../slurm-accounts). `SlurmAccountStore` is the
+operator-side API; the server chooses a job's account with [`authz.AccountResolver`].
+
+```python
+from nest.db import SlurmAccountStore
+
+accounts = SlurmAccountStore(database)
+ops = {"operator": "ops-alice", "reason": "onboard the chemistry lab"}
+accounts.register_account("nano4", "chem", **ops)
+accounts.link_project(project_id, "nano4", "chem", modes=["A", "B"], default=True, **ops)
+```
+
+[[autodoc]] db.SlurmAccountStore
+
+[[autodoc]] db.SlurmAccount
+
+[[autodoc]] db.ProjectAccountLink
+
+[[autodoc]] db.ProjectAccountMapping
+
+[[autodoc]] db.normalize_account_name
+
+[[autodoc]] db.SlurmAccountError
+
+[[autodoc]] db.SlurmAccountNotFoundError
+
+[[autodoc]] db.DuplicateSlurmAccountError
+
+[[autodoc]] db.AccountLinkNotFoundError
+
+[[autodoc]] db.PlatformNotGrantedError
+
 ## Execution registry
 
 See [Execution registry](../database#execution-registry). Register a logical
@@ -113,11 +147,14 @@ execution, created = registry.register(
     project_id, user_id, "execution", {"gpu": 1}, idempotency_key=request_key
 )
 endpoint = catalog.select_login_node(principal, "nano4", mode="B", project_id=project_id)
+resolution = resolver.resolve(
+    principal, project_id, mode="B", identity=identity, platform=endpoint.platform_id
+)
 attempt = registry.begin_attempt(
     execution.execution_id,
     endpoint=endpoint,
     principal=HPCPrincipal("alice", 1001),
-    slurm_account="proj01",
+    **resolution.job_fields(),
     options={
         "gpu": ResolvedOption.requested(1, default=0, default_source="platform"),
         "partition": ResolvedOption.defaulted("gpu", "platform"),
@@ -149,7 +186,9 @@ registry.record_submission(attempt.id, slurm_job_id)
 
 [[autodoc]] db.InvalidTransitionError
 
-[[autodoc]] db.PlatformNotGrantedError
+[[autodoc]] db.PlatformUnavailableError
+
+[[autodoc]] db.AccountNotPermittedError
 
 ## Users and identities
 

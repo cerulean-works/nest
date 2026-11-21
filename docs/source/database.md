@@ -87,7 +87,7 @@ derived from another:
 | Nest User | `users.id`, a generated UUID | Never an email address. A User row exists only once a person has signed in or an operator has created it. |
 | External sign-in identity | `user_identities (issuer, subject)` | The identity provider's stable subject ID (Google's `sub`) under its issuer, linked to one User. A changed email keeps the same User; a reused address on another subject is a different identity. These identity providers are unrelated to Compute Providers. |
 | Nest Project | `projects.id`, a generated UUID | Independent of its name, Owner and Provider Accounts. Two Projects may share a name. |
-| HPC Platform and its Slurm account | `provider_profiles.id` (the Platform ID) and the account name within that Platform | The Platform ID namespaces the account: the same account name on two Platforms is two accounts. The operator label is metadata, not part of the key. No identity or Project table references them. |
+| HPC Platform and its Slurm account | `provider_profiles.id` (the Platform ID) and the account name within that Platform; in the registry, `slurm_accounts (platform_id, account_name)` | The Platform ID namespaces the account: the same account name on two Platforms is two accounts. The operator label is metadata, not part of the key. Projects are only linked to accounts (`project_platform_accounts`); no Project or identity is keyed by an account name. |
 
 **Membership.** Users and Projects are many-to-many through `project_memberships`,
 one row per (Project, User) (`UNIQUE (project_id, user_id)`), with a role of
@@ -196,7 +196,17 @@ job's Platform in `jobs.platform_id`. Changes to all three tables must name an
 operator and are recorded in the security audit log. Platforms are never deleted.
 See [Register HPC Platforms and login nodes](platforms).
 
-**Execution registry.** Migration `0013_execution_registry` adds the
+**Slurm Account Registry.** Migration `0013_slurm_account_registry` adds
+`slurm_accounts` (`UNIQUE (platform_id, account_name)`), `project_platform_accounts`
+(the accounts a Project may charge on a granted Platform, with permitted modes and
+an optional default) and `project_platform_account_policies`, and records each
+job's registered account and the origin of the choice in `jobs.slurm_account_id`
+and `jobs.slurm_account_origin`. Composite foreign keys keep every link and job on
+the account's own Platform. Changes must name an operator and are recorded in the
+security audit log. Existing job records keep `NULL` in the new columns. See
+[Map Slurm accounts to Projects](slurm-accounts).
+
+**Execution registry.** Migration `0014_execution_registry` adds the
 Platform-aware execution registry described below. The Controller does not write
 to it yet; `jobs` remains the record of today's submissions.
 
@@ -214,8 +224,10 @@ that restarts finds every execution and its in-flight attempt again.
 - **Attempts** record the `platform_id` (an `hpc_platforms` ID), the selected
   `login_node_id` and a snapshot of its endpoint (`login_node_host`,
   `login_node_port`, `transport_mode` `A` or `B`, `host_key_pin_ref`), the
-  HPC binding and its version, the effective UNIX user and UID, the Slurm account,
-  and the source, environment and runtime digests. These columns never change.
+  HPC binding and its version, the effective UNIX user and UID, the charged Slurm
+  account (`slurm_account_id` from `slurm_accounts`, its name, and
+  `slurm_account_origin`, the selection step that chose it), and the source,
+  environment and runtime digests. These columns never change.
   At most one attempt per execution is in flight (`submitting`, `submitted`,
   `running` or `unknown`); a `failed` attempt may be followed by a retry, which can
   use another login node.
@@ -251,7 +263,11 @@ execution's Project, and its login node is still approved for the transport mode
 with the same host, port and host-key pin reference (see
 [Register HPC Platforms and login nodes](platforms)). `login_node_id` is not a
 foreign key: an operator may later remove the node, and the attempt's snapshot
-keeps its history correct.
+keeps its history correct. Its account must be active and linked to the Project
+on that Platform for the attempt's mode (see
+[Map Slurm accounts to Projects](slurm-accounts)); `native_default` names no
+account and needs Mode B and the Project's permission. A composite foreign key
+keeps the account on the attempt's own Platform.
 
 ## Configure the connection
 

@@ -16,6 +16,7 @@ from postgres_fixture import PostgresTestCase, connect
 
 from nest.config import load_database_config
 from nest.db import (
+    AccountNotPermittedError,
     AttemptInFlightError,
     Database,
     DatabaseError,
@@ -27,10 +28,11 @@ from nest.db import (
     IdempotencyConflictError,
     IdentityStore,
     InvalidTransitionError,
-    PlatformNotGrantedError,
     PlatformStore,
+    PlatformUnavailableError,
     ProjectStore,
     ResolvedOption,
+    SlurmAccountStore,
     upgrade,
 )
 from nest.db.platforms import endpoint_for
@@ -76,6 +78,18 @@ class _Base(PostgresTestCase):
         )
         for platform in (self.alpha, self.beta):
             platforms.grant_project(platform.id, self.project, **OPS)
+        # D08 accounts: "proj" on alpha only; "shared" exists on both Platforms.
+        accounts = SlurmAccountStore(self.db)
+        self.accounts = accounts
+        self.account_ids = {}
+        for platform, name, modes in (
+            (self.alpha, "proj", ["A", "B"]),
+            (self.alpha, "shared", ["A", "B"]),
+            (self.beta, "shared", ["B"]),
+        ):
+            registered = accounts.register_account(platform.id, name, **OPS)
+            accounts.link_project(self.project, platform.id, name, modes=modes, **OPS)
+            self.account_ids[platform.id, name] = registered.id
         self.A1 = endpoint_for(self.alpha, a1, "A")
         self.A2 = endpoint_for(self.alpha, a2, "B")
         self.B1 = endpoint_for(self.beta, b1, "B")
@@ -102,12 +116,21 @@ class _Base(PostgresTestCase):
             idempotency_key=key,
         )
 
+    def account(self, endpoint, name="proj", origin="explicit"):
+        """The `job_fields()` of an account resolution for `name` on the endpoint's Platform."""
+        return {
+            "account": name,
+            "slurm_account_id": self.account_ids.get((endpoint.platform_id, name)),
+            "slurm_account_origin": origin,
+        }
+
     def begin(self, execution_id, endpoint=None, account="proj", **kw):
+        endpoint = endpoint or self.A1
         return self.registry.begin_attempt(
             execution_id,
-            endpoint=endpoint or self.A1,
+            endpoint=endpoint,
             principal=kw.pop("principal", ALICE),
-            slurm_account=account,
+            **kw.pop("account_fields", self.account(endpoint, account)),
             options=kw.pop(
                 "options",
                 {
@@ -205,7 +228,8 @@ class AttemptTests(_Base):
         row = self.conn.execute(
             "SELECT status, platform_id, login_node_host, login_node_port, transport_mode, "
             "login_node_id, unix_user, unix_uid, hpc_binding_id, hpc_binding_version, "
-            "slurm_account FROM execution_attempts WHERE id = %s",
+            "slurm_account, slurm_account_id, slurm_account_origin "
+            "FROM execution_attempts WHERE id = %s",
             (attempt.id,),
         ).fetchone()
         self.assertEqual(
@@ -222,6 +246,8 @@ class AttemptTests(_Base):
                 "binding-1",
                 3,
                 "proj",
+                self.account_ids[self.alpha.id, "proj"],
+                "explicit",
             ),
         )
         self.assertEqual(attempt.attempt_number, 1)
@@ -346,9 +372,15 @@ class AttemptTests(_Base):
         with self.assertRaises(psycopg.errors.UniqueViolation):
             self.conn.execute(
                 "INSERT INTO execution_attempts (execution_id, attempt_number, platform_id, "
-                "login_node_id, login_node_host, transport_mode, unix_user, slurm_account) "
-                "VALUES (%s, 2, %s, %s, 'h', 'A', 'alice', 'proj')",
-                (execution.execution_id, self.alpha.id, self.A1.node_id),
+                "login_node_id, login_node_host, transport_mode, unix_user, "
+                "slurm_account_id, slurm_account, slurm_account_origin) "
+                "VALUES (%s, 2, %s, %s, 'h', 'A', 'alice', %s, 'proj', 'explicit')",
+                (
+                    execution.execution_id,
+                    self.alpha.id,
+                    self.A1.node_id,
+                    self.account_ids[self.alpha.id, "proj"],
+                ),
             )
         self.assertEqual(len(self.registry.live_attempts()), 1)
         self.assertEqual(self.registry.live_attempts()[0].id, attempt.id)
@@ -382,8 +414,8 @@ class AttemptTests(_Base):
                 self.register()[0].execution_id,
                 principal=HPCPrincipal("alice", binding_id="b"),
             )
-        with self.assertRaises(DatabaseError):
-            self.begin(self.register()[0].execution_id, account="")
+        with self.assertRaises(ValueError):
+            self.begin(self.register()[0].execution_id, account="unregistered")
 
 
 class RecoveryTests(_Base):
@@ -407,7 +439,7 @@ class RecoveryTests(_Base):
                 execution.execution_id,
                 endpoint=self.A2,
                 principal=ALICE,
-                slurm_account="proj",
+                **self.account(self.A2),
                 options={},
             )
         # Reconciliation found the job after all.
@@ -471,11 +503,11 @@ class PlatformCatalogTests(_Base):
 
     def test_an_ungranted_platform_is_refused(self):
         execution, _ = self.register(project=self.other_project)
-        with self.assertRaises(PlatformNotGrantedError):
+        with self.assertRaises(PlatformUnavailableError):
             self.begin(execution.execution_id)
         execution2, _ = self.register()
         self.platforms.revoke_project(self.beta.id, self.project, **OPS)
-        with self.assertRaises(PlatformNotGrantedError):
+        with self.assertRaises(PlatformUnavailableError):
             self.begin(execution2.execution_id, self.B1)
         # Nothing was recorded and the execution can still start elsewhere.
         self.assertEqual(
@@ -486,7 +518,7 @@ class PlatformCatalogTests(_Base):
     def test_a_disabled_platform_is_refused(self):
         execution, _ = self.register()
         self.platforms.set_status(self.beta.id, "disabled", **OPS)
-        with self.assertRaises(PlatformNotGrantedError):
+        with self.assertRaises(PlatformUnavailableError):
             self.begin(execution.execution_id, self.B1)
 
     def test_an_endpoint_that_no_longer_matches_the_registry_is_refused(self):
@@ -511,3 +543,89 @@ class PlatformCatalogTests(_Base):
         self.platforms.remove_login_node(self.A1.node_id, **OPS)
         [kept] = self.registry.attempts(execution.execution_id, project_id=self.project)
         self.assertEqual(kept.endpoint, self.A1)
+
+
+class AccountRegistryTests(_Base):
+    """Attempts charge only D08 accounts linked to the Project for the mode."""
+
+    def test_an_account_of_another_platform_or_unlinked_is_refused(self):
+        execution, _ = self.register()
+        alpha_shared = self.account_ids[self.alpha.id, "shared"]
+        for fields in (
+            # The beta "shared" account presented on an alpha endpoint.
+            {
+                **self.account(self.A1, "shared"),
+                "slurm_account_id": self.account_ids[self.beta.id, "shared"],
+            },
+            # A name that disagrees with the registered account.
+            {**self.account(self.A1, "shared"), "account": "proj"},
+        ):
+            with self.subTest(fields=fields), self.assertRaises(AccountNotPermittedError):
+                self.begin(execution.execution_id, account_fields=fields)
+        self.accounts.unlink_project(self.project, self.alpha.id, "shared", **OPS)
+        with self.assertRaises(AccountNotPermittedError):
+            self.begin(execution.execution_id, account="shared")
+        self.assertEqual(alpha_shared, self.account_ids[self.alpha.id, "shared"])
+
+    def test_an_account_not_permitted_for_the_mode_is_refused(self):
+        execution, _ = self.register()
+        self.accounts.link_project(self.project, self.alpha.id, "proj", modes=["B"], **OPS)
+        with self.assertRaises(AccountNotPermittedError):
+            self.begin(execution.execution_id)  # A1 is Mode A
+        self.assertEqual(self.begin(execution.execution_id, self.A2).endpoint.mode, "B")
+
+    def test_a_disabled_account_is_refused(self):
+        execution, _ = self.register()
+        self.accounts.update_account(self.alpha.id, "proj", status="disabled", **OPS)
+        with self.assertRaises(AccountNotPermittedError):
+            self.begin(execution.execution_id)
+
+    def test_native_default_needs_mode_b_and_the_projects_permission(self):
+        execution, _ = self.register()
+        native = {
+            "account": None,
+            "slurm_account_id": None,
+            "slurm_account_origin": "native_default",
+        }
+        with self.assertRaises(AccountNotPermittedError):
+            self.begin(execution.execution_id, self.B1, account_fields=native)
+        self.accounts.set_native_default(self.project, self.beta.id, True, **OPS)
+        with self.assertRaises(AccountNotPermittedError):
+            self.begin(execution.execution_id, self.A1, account_fields=native)
+        attempt = self.begin(execution.execution_id, self.B1, account_fields=native)
+        self.assertEqual(
+            (attempt.slurm_account, attempt.slurm_account_id, attempt.slurm_account_origin),
+            (None, None, "native_default"),
+        )
+
+    def test_the_database_keeps_the_account_on_the_attempts_platform(self):
+        execution, _ = self.register()
+        attempt = self.begin(execution.execution_id)
+        self.registry.finish_attempt(attempt.id, "failed")
+        insert = (
+            "INSERT INTO execution_attempts (execution_id, attempt_number, platform_id, "
+            "login_node_id, login_node_host, transport_mode, unix_user, "
+            "slurm_account_id, slurm_account, slurm_account_origin) "
+            "VALUES (%s, 2, %s, %s, 'h', 'A', 'alice', %s, %s, 'explicit')"
+        )
+        for account_id, name, error in (
+            (
+                self.account_ids[self.beta.id, "shared"],
+                "shared",
+                psycopg.errors.ForeignKeyViolation,
+            ),
+            (self.account_ids[self.alpha.id, "proj"], "shared", psycopg.errors.CheckViolation),
+        ):
+            with self.subTest(name=name), self.assertRaises(error):
+                self.conn.execute(
+                    insert,
+                    (execution.execution_id, self.alpha.id, self.A1.node_id, account_id, name),
+                )
+        for column in ("slurm_account_id", "slurm_account_origin"):
+            with (
+                self.subTest(column=column),
+                self.assertRaises(psycopg.errors.IntegrityConstraintViolation),
+            ):
+                self.conn.execute(
+                    f"UPDATE execution_attempts SET {column} = NULL WHERE id = %s", (attempt.id,)
+                )
