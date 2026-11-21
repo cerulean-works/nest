@@ -448,7 +448,8 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
             )
             submitted = True
             logger.info("Worker submitted job_id=%s job_dir=%s", job_id, job_dir)
-            admission_service.submitted(admission, job_id)
+            if not admission_service.submitted(admission, job_id):
+                self._abort_unrecorded(context, admission, job_id)
             result_bytes = backend.wait_result(job_id, job_dir)
             admission_service.succeeded(admission, output_ref=f"{job_dir}/output.pkl")
             context.set_trailing_metadata(((EXECUTION_ID_METADATA, admission.execution_id),))
@@ -462,6 +463,23 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
             admission_service.failed(admission, exc, submitted=submitted)
             context.abort(grpc.StatusCode.INTERNAL, _status_details(str(exc)))
         raise AssertionError("context.abort raises")
+
+    @staticmethod
+    def _abort_unrecorded(context, admission, job_id: int) -> None:
+        """
+        Answers a submission Slurm accepted but the registry could not record as
+        `UNKNOWN` (`submission_unknown`), never as a success, with the Slurm job ID
+        and execution ID in the trailing metadata so the job can be found.
+        """
+        error = SubmissionUnknownError(
+            f"Slurm accepted job {job_id} for execution {admission.execution_id}, but the "
+            "Controller database could not record it, so the submission is not acknowledged. "
+            "The job is not resubmitted; the Controller records it once the database is "
+            "available again, or an operator can run `nest-db execution reconcile "
+            f"{admission.attempt.id} --slurm-job-id {job_id}`.",
+            job_id=job_id,
+        )
+        _abort_infrastructure(context, error, execution_id=admission.execution_id)
 
     def _submit_job_registry(self, request, context, backend, principal, execution_id, attribution):
         """`SubmitJob` through the Execution Registry."""
@@ -515,7 +533,8 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
             _abort_infrastructure(context, exc, execution_id=admission.execution_id)
             raise AssertionError("context.abort raises") from None
         logger.info("Batch job submitted job_id=%s", job_id)
-        admission_service.submitted(admission, job_id)
+        if not admission_service.submitted(admission, job_id):
+            self._abort_unrecorded(context, admission, job_id)
         context.set_trailing_metadata(((EXECUTION_ID_METADATA, admission.execution_id),))
         return execution_pb2.SubmitJobResponse(job_id=job_id)
 

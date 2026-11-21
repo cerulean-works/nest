@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import hashlib
 import threading
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -332,6 +333,9 @@ class RegistryAdmission:
         self.profile = profile
         self.platform_id = platform_id
         self.identities = identities or ControllerIdentitySource(profile)
+        # Job IDs sbatch returned that could not be recorded yet, by attempt ID.
+        self._unrecorded: dict[int, int] = {}
+        self._unrecorded_lock = threading.Lock()
 
     # Admission ----------------------------------------------------------------
 
@@ -441,8 +445,8 @@ class RegistryAdmission:
                 "native_default_unsupported", "The native Slurm default cannot be used here"
             )
         partition = request.partition or self.profile.partition
-        time = request.time or self.profile.time
-        options = self._options(request, selection, resolution, partition, time)
+        time_limit = request.time or self.profile.time
+        options = self._options(request, selection, resolution, partition, time_limit)
         try:
             execution, created = self.registry.register(
                 project_id,
@@ -503,7 +507,7 @@ class RegistryAdmission:
             backend,
             resolution.account_name,
             partition,
-            time,
+            time_limit,
             selection,
             resolution,
             details,
@@ -610,13 +614,82 @@ class RegistryAdmission:
                 exc,
             )
 
-    def submitted(self, admission: Admission, slurm_job_id: int) -> None:
-        """Records the Slurm job ID `sbatch` returned."""
-        self._write(
-            "submitted",
-            admission,
-            lambda: self.registry.record_submission(admission.attempt.id, slurm_job_id),
+    RECORD_RETRY_DELAYS = (0.0, 0.25, 1.0)
+    """Seconds before each try to record a Slurm job ID that `sbatch` returned."""
+
+    def submitted(self, admission: Admission, slurm_job_id: int) -> bool:
+        """
+        Durably records the Slurm job ID `sbatch` returned, retrying briefly.
+
+        Returns:
+            `bool`: Whether the job ID is committed. When it is not, the caller must
+                not acknowledge the submission as successful: the attempt is still
+                `submitting` without a job ID. The job ID is kept, and every
+                [`admission.RegistryAdmission.recover`] tries to record it again (also
+                after recovery has marked the attempt `unknown`), so the Controller
+                reconciles it on its own while it keeps running.
+        """
+        attempt_id = admission.attempt.id
+        for delay in self.RECORD_RETRY_DELAYS:
+            if delay:
+                time.sleep(delay)
+            try:
+                self.registry.record_submission(attempt_id, slurm_job_id)
+                return True
+            except ExecutionRegistryError as exc:
+                logger.error(
+                    "Slurm job ID refused by the registry execution_id=%s job_id=%s: %s",
+                    admission.execution_id,
+                    slurm_job_id,
+                    exc,
+                )
+                break
+            except DatabaseError as exc:
+                logger.warning(
+                    "Slurm job ID not recorded yet execution_id=%s job_id=%s: %s",
+                    admission.execution_id,
+                    slurm_job_id,
+                    exc,
+                )
+        with self._unrecorded_lock:
+            self._unrecorded[attempt_id] = slurm_job_id
+        logger.error(
+            "Slurm accepted job_id=%s for execution_id=%s attempt_id=%s, but the registry "
+            "could not record it; it is not resubmitted and is recorded on the next "
+            "recovery sweep, or with nest-db execution reconcile %s --slurm-job-id %s",
+            slurm_job_id,
+            admission.execution_id,
+            attempt_id,
+            attempt_id,
+            slurm_job_id,
         )
+        return False
+
+    def _record_unrecorded(self) -> None:
+        """Retries the job IDs [`admission.RegistryAdmission.submitted`] could not store."""
+        with self._unrecorded_lock:
+            pending = dict(self._unrecorded)
+        for attempt_id, slurm_job_id in pending.items():
+            try:
+                self.registry.record_submission(attempt_id, slurm_job_id)
+            except ExecutionRegistryError as exc:
+                # Reconciled or settled meanwhile: that record stands.
+                logger.warning(
+                    "Kept Slurm job ID not recorded attempt_id=%s job_id=%s: %s",
+                    attempt_id,
+                    slurm_job_id,
+                    exc,
+                )
+            except DatabaseError:
+                continue
+            else:
+                logger.info(
+                    "Slurm job ID recorded on recovery attempt_id=%s job_id=%s",
+                    attempt_id,
+                    slurm_job_id,
+                )
+            with self._unrecorded_lock:
+                self._unrecorded.pop(attempt_id, None)
 
     def succeeded(self, admission: Admission, *, output_ref: str | None = None) -> None:
         """Records that the job completed and its result was received."""
@@ -694,8 +767,10 @@ class RegistryAdmission:
     def recover(self, older_than: timedelta) -> list[Attempt]:
         """
         Marks attempts interrupted before a Slurm job ID arrived as `unknown`, for
-        reconciliation (see [`db.ExecutionRegistry.mark_interrupted`]).
+        reconciliation (see [`db.ExecutionRegistry.mark_interrupted`]), after
+        recording any Slurm job ID this Controller received but could not store.
         """
+        self._record_unrecorded()
         interrupted = self.registry.mark_interrupted(older_than)
         live = self.registry.live_attempts(self.platform_id)
         unknown = sum(1 for attempt in live if attempt.status == "unknown")

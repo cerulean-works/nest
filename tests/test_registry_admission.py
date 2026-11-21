@@ -393,22 +393,71 @@ class DatabaseFailureTests(_Base):
                 self.assertEqual(self.refused(call).code(), grpc.StatusCode.UNAVAILABLE)
         self.assert_nothing_sent()
 
-    def test_lost_record_after_sbatch_is_left_for_recovery(self):
+    def lose_job_id_records(self):
+        """Makes every attempt to record a Slurm job ID fail, without retry delays."""
         failure = DatabaseError("Cannot mark an execution attempt submitted")
-        with mock.patch.object(ExecutionRegistry, "record_submission", side_effect=failure):
-            response = self.submit()
-        # The job exists, so the RPC still answers with it, and nothing is resubmitted.
-        self.assertEqual(response.job_id, self.sbatch_calls()[0]["job_id"])
+        for patcher in (
+            mock.patch.object(ExecutionRegistry, "record_submission", side_effect=failure),
+            mock.patch.object(RegistryAdmission, "RECORD_RETRY_DELAYS", (0.0, 0.0)),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return failure
+
+    def test_unrecorded_job_id_is_never_acknowledged_as_success(self):
+        self.lose_job_id_records()
+        for call in (self.submit, self.execute):
+            with self.subTest(rpc=call.__name__):
+                before = len(self.sbatch_calls())
+                error = self.refused(call)
+                self.assertEqual(error.code(), grpc.StatusCode.UNKNOWN)
+                metadata = dict(error.trailing_metadata())
+                self.assertEqual(metadata["nest-error-kind"], "submission_unknown")
+                [job] = self.sbatch_calls()[before:]  # submitted once, never resubmitted
+                # The job is recoverable from the answer itself.
+                self.assertEqual(metadata["nest-job-id"], str(job["job_id"]))
+                self.assertIn("nest-execution-id", metadata)
+                self.assertIn(f"--slurm-job-id {job['job_id']}", error.details())
+        # Execute did not wait for, or return, a result it could not record.
+        self.assertEqual([c for c in self.hpc.calls("ssh") if "output.pkl" in str(c)], [])
+        self.assertEqual({a["status"] for a in self.attempts()}, {"submitting"})
+
+    def test_recovery_records_a_job_id_the_controller_received(self):
+        self.lose_job_id_records()
+        error = self.refused(self.submit)
+        job_id = int(dict(error.trailing_metadata())["nest-job-id"])
+        # While the database stays down, recovery keeps the job ID for later.
+        self.admission.recover(timedelta(hours=1))
+        self.assertEqual(self.attempts()[0]["status"], "submitting")
+        mock.patch.stopall()
+        # Even after the attempt was marked unknown, the kept job ID is recorded.
+        self.sql("UPDATE execution_attempts SET updated_at = now() - interval '1 day'")
+        self.registry.mark_interrupted(timedelta(hours=1))
+        self.admission.recover(timedelta(hours=1))
         [attempt] = self.attempts()
-        self.assertEqual(attempt["status"], "submitting")
-        self.sql(
-            "UPDATE execution_attempts SET updated_at = now() - interval '1 day' WHERE id = %s",
-            attempt["id"],
-        )
-        [interrupted] = self.admission.recover(timedelta(hours=1))
+        self.assertEqual((attempt["status"], attempt["slurm_job_id"]), ("submitted", job_id))
+        self.assertEqual(len(self.sbatch_calls()), 1)
+
+    def test_restart_before_recording_leaves_an_unknown_attempt_to_reconcile(self):
+        self.lose_job_id_records()
+        error = self.refused(lambda: self.submit(x_nest_idempotency_key="k"))
+        mock.patch.stopall()
+        self.sql("UPDATE execution_attempts SET updated_at = now() - interval '1 day'")
+        # A new Controller has no memory of the job ID: the attempt becomes unknown.
+        restarted = RegistryAdmission(self.db, self.backend, self.profile, self.platform_id)
+        [interrupted] = restarted.recover(timedelta(hours=1))
         self.assertEqual(
             (interrupted.status, interrupted.error_kind), ("unknown", "controller_interrupted")
         )
+        retry = self.refused(lambda: self.submit(x_nest_idempotency_key="k"))
+        self.assertEqual(retry.code(), grpc.StatusCode.ABORTED)
+        # The job ID the client was given is the operator's evidence.
+        job_id = dict(error.trailing_metadata())["nest-job-id"]
+        self.registry.reconcile(
+            interrupted.id, evidence="job ID in the UNKNOWN answer", slurm_job_id=int(job_id)
+        )
+        self.assertEqual(self.submit(x_nest_idempotency_key="k").job_id, int(job_id))
+        self.assertEqual(len(self.sbatch_calls()), 1)
 
 
 class UnknownOutcomeTests(_Base):

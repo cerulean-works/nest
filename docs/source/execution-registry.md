@@ -93,7 +93,7 @@ attempt in flight per execution.
 | SSH or `sbatch` refused the job | `failed` | The classified error |
 | `sbatch` may have run, but no job ID arrived | `unknown` | `UNKNOWN`, `nest-error-kind: submission_unknown` |
 | Slurm accepted the job | `submitted`, then `running`, `succeeded`, `failed` or `cancelled` as `Execute` or `GetJobStatus` observe it | The result or job ID |
-| The job ID could not be stored after `sbatch` | stays `submitting` until recovery marks it `unknown` | The job ID, which is logged |
+| Slurm accepted the job, but its job ID could not be stored (after brief retries) | `submitting`; the Controller records the kept job ID at its next recovery sweep, also after the attempt was marked `unknown` | `UNKNOWN`, `nest-error-kind: submission_unknown`, with the job ID in `nest-job-id`; never a success |
 | A timeout or lost status query while waiting | stays `submitted` | The classified error; the job is not cancelled |
 
 An `unknown` attempt is never resubmitted. At start, and every five minutes, the
