@@ -65,6 +65,10 @@ platforms, default_id = list_platforms()  # only Platforms granted to your Proje
 
 [[autodoc]] platforms.get_platform
 
+[[autodoc]] platforms.project_platforms
+
 [[autodoc]] platforms.PlatformInfo
+
+[[autodoc]] platforms.ProjectPlatformsInfo
 
 [[autodoc]] platforms.PlatformNotAvailableError

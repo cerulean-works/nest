@@ -14,7 +14,7 @@ from typing import Any
 from urllib.parse import quote, urlencode
 from uuid import UUID
 
-from .config import PLATFORMS_API_PATH, CLIAuthConfig, load_cli_auth_config
+from .config import PLATFORMS_API_PATH, PROJECTS_API_PATH, CLIAuthConfig, load_cli_auth_config
 from .login import AuthClient, AuthError, ensure_session
 
 
@@ -121,3 +121,60 @@ def get_platform(
     config = config or load_cli_auth_config()
     path = f"{PLATFORMS_API_PATH}/{quote(reference.strip(), safe='')}" + _query(project_id)
     return PlatformInfo.from_json(_get(config, path, **options))
+
+
+@dataclass(frozen=True)
+class ProjectPlatformsInfo:
+    """
+    A Project's eligible HPC Platforms and the Platform its requests default to.
+
+    Attributes:
+        project_id (`UUID`): The Project.
+        platforms (`list[PlatformInfo]`): Eligible Platforms, by slug: those the
+            operator granted to the Project.
+        project_default_platform_id (`UUID | None`): The default the Project's
+            Owners and Admins chose, if any.
+        default_platform_id (`UUID | None`): What a request naming no Platform
+            runs on now, if anything.
+        default_origin (`str | None`): Why: `project_default`, `server_default` or
+            `only_eligible`.
+        unresolved_reason (`str | None`): Why nothing is chosen: `none_authorized`,
+            `ambiguous` or `default_unavailable`.
+    """
+
+    project_id: UUID
+    platforms: list[PlatformInfo]
+    project_default_platform_id: UUID | None
+    default_platform_id: UUID | None
+    default_origin: str | None
+    unresolved_reason: str | None
+
+
+def project_platforms(
+    project_id: UUID | str,
+    config: CLIAuthConfig | None = None,
+    **options: Any,
+) -> ProjectPlatformsInfo:
+    """
+    A Project's eligible Platforms and default, as decided by the server. Choosing
+    the default needs a browser session (see *Register HPC Platforms*).
+
+    Raises:
+        [`platforms.PlatformNotAvailableError`]: If the Project does not exist or
+            the signed-in User is not a member.
+    """
+    config = config or load_cli_auth_config()
+    pid = UUID(str(project_id))
+    body = _get(config, f"{PROJECTS_API_PATH}/{pid}/platforms", **options)
+
+    def uuid_or_none(value: object) -> UUID | None:
+        return UUID(str(value)) if value else None
+
+    return ProjectPlatformsInfo(
+        project_id=pid,
+        platforms=[PlatformInfo.from_json(item) for item in body.get("platforms") or ()],
+        project_default_platform_id=uuid_or_none(body.get("project_default_platform_id")),
+        default_platform_id=uuid_or_none(body.get("default_platform_id")),
+        default_origin=body.get("default_origin"),
+        unresolved_reason=body.get("unresolved_reason"),
+    )

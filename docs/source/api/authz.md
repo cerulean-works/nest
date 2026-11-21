@@ -42,6 +42,10 @@ except AccessDeniedError as exc:
 
 [[autodoc]] authz.Decision
 
+[[autodoc]] authz.decide_organization
+
+[[autodoc]] authz.OrganizationAction
+
 ## Enforcement
 
 [[autodoc]] authz.Authorizer
@@ -49,6 +53,18 @@ except AccessDeniedError as exc:
 [[autodoc]] authz.ProjectService
 
 [[autodoc]] authz.AccessDeniedError
+
+## Organizations
+
+See [Share Projects and manage roles](../projects#organizations).
+
+[[autodoc]] authz.OrganizationService
+
+[[autodoc]] authz.Organization
+
+[[autodoc]] authz.OrganizationMembership
+
+[[autodoc]] authz.OrganizationRuleError
 
 ## Invitations
 
@@ -84,9 +100,17 @@ try:
     connect(endpoint.host, endpoint.port, endpoint.host_key_pin_ref)
 except OSError:
     endpoint = catalog.failover(principal, endpoint)  # same Platform ID, next node
+
+chosen = catalog.select_platform(principal, project_id, requested)  # eligible only
+chosen.platform.slug, chosen.origin  # "nano4", "project_default"
+catalog.set_project_default(owner, project_id, "nano4")  # Owners and Admins only
 ```
 
 [[autodoc]] authz.PlatformCatalog
+
+[[autodoc]] authz.PlatformSelection
+
+[[autodoc]] authz.ProjectPlatforms
 
 [[autodoc]] authz.PlatformSummary
 

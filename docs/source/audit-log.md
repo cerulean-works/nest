@@ -29,11 +29,15 @@ platform role history in `platform_audit_events` (see
 | `platform.changed` | Trigger | An HPC Platform is registered or its name, operator metadata, status or default changes (the names of the changed columns). |
 | `platform.login_node.changed` | Trigger | A login node is approved, changed or removed, with its endpoint, modes, priority, status and host-key pin reference. Health observations are not recorded. |
 | `platform.grant.added`, `platform.grant.removed` | Trigger | A Project is granted a Platform or loses the grant. |
+| `project.default_platform.set`, `project.default_platform.cleared` | Trigger | A Project Owner or Admin chooses or clears the Project's default Platform, or the grant it pointed to is revoked. |
+| `organization.created`, `organization.renamed`, `organization.deleted` | Trigger | An Organization is created, renamed or deleted. |
+| `organization.member.added`, `organization.member.role_changed`, `organization.member.removed` | Trigger | An Organization membership changes, with the old and new roles. |
+| `project.platform.default.set`, `organization.*` | Controller | A refused default-Platform choice or Organization action (outcome `denied`, with the reason). |
 | `slurm_account.changed` | Trigger | A Slurm account is registered, or its status, description or Mode A default changes (the names of the changed columns). |
 | `slurm_account.link.added`, `slurm_account.link.changed`, `slurm_account.link.removed` | Trigger | A Project is linked to an account on a Platform, its modes or default change, or the link is removed (also when the Platform grant is revoked). |
 | `slurm_account.policy.changed` | Trigger | A Project's native Slurm default permission on a Platform changes. |
 | `slurm_account.resolve` | Controller | No account may be charged for a request (outcome `denied`, with a machine-readable reason). See [Map Slurm accounts to Projects](slurm-accounts). |
-| `platform.list`, `platform.resolve`, `platform.endpoint.select` | Controller | A refused Platform discovery, an unauthorized Platform, or an unapproved login node (outcome `denied`). See [Register HPC Platforms and login nodes](platforms). |
+| `platform.list`, `platform.resolve`, `platform.endpoint.select` | Controller | A refused Platform discovery, an unauthorized Platform, an unavailable Project default, or an unapproved login node (outcome `denied`). See [Register HPC Platforms and login nodes](platforms). |
 
 Calls with no accepted Nest session (`auth.failed`) are logged only, never written
 to the database, so an unauthenticated caller cannot fill it.

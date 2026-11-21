@@ -1,9 +1,12 @@
 """
-Server-side discovery, default resolution and login-node selection for HPC
-Platforms (D07).
+Server-side discovery, Project eligibility, default resolution and login-node
+selection for HPC Platforms (D07, Patch B06).
 
-[`authz.PlatformCatalog`] is the one place a caller learns which Platforms exist
-and which login node the server will use. A User sees a Platform only through an
+[`authz.PlatformCatalog`] is the one place a caller learns which Platforms exist,
+which Platform a Project's request runs on and which login node the server will
+use. Every interface (HTTP, CLI, SDK, gRPC and the Web UI) must go through it.
+A Project's eligible Platforms are exactly the operator's grants to it; an
+explicitly named Platform that is not eligible is refused, never replaced. A User sees a Platform only through an
 active membership in a live Project the operator granted it to; any other
 Platform, disabled or not, is answered as not found, so its existence is not
 revealed. Login nodes are always chosen by the server from the operator-approved
@@ -36,8 +39,8 @@ from ..db.platforms import (
     endpoint_for,
     order_login_nodes,
 )
-from .policy import Decision, Principal
-from .service import AccessDeniedError
+from .policy import Action, Decision, Principal
+from .service import AccessDeniedError, ProjectService
 
 logger = get_logger("nest.authz.platforms")
 
@@ -50,8 +53,10 @@ class PlatformResolutionError(PlatformError):
     No Platform was named and none can be chosen for the caller.
 
     Attributes:
-        reason (`str`): `none_authorized` when the caller may use no Platform, or
-            `ambiguous` when several are authorized and none is the default.
+        reason (`str`): `none_authorized` when the caller may use no Platform,
+            `ambiguous` when several are authorized and none is the default, or
+            `default_unavailable` when the Project's default Platform is disabled
+            (the server does not silently run the Project elsewhere).
     """
 
     def __init__(self, reason: str):
@@ -59,8 +64,35 @@ class PlatformResolutionError(PlatformError):
         message = {
             "none_authorized": "No HPC Platform is available to you",
             "ambiguous": "Several HPC Platforms are available to you; name one",
+            "default_unavailable": (
+                "The Project's default HPC Platform is unavailable; name another eligible "
+                "Platform or ask a Project Owner or Admin to change the default"
+            ),
         }[reason]
         super().__init__(message)
+
+
+SELECTION_ORIGINS = ("explicit", "project_default", "server_default", "only_eligible")
+"""How [`authz.PlatformCatalog.select_platform`] chose a Platform, in order."""
+
+
+@dataclass(frozen=True)
+class PlatformSelection:
+    """
+    The Platform a request runs on and why.
+
+    Attributes:
+        platform ([`db.Platform`]): The chosen, eligible Platform.
+        origin (`str`): One of `SELECTION_ORIGINS`: `explicit` (named by the
+            caller), `project_default` (the Project's chosen default),
+            `server_default` (the operator's server-wide default) or
+            `only_eligible` (the only eligible Platform).
+        project_id (`UUID | None`): The Project it was resolved for, if any.
+    """
+
+    platform: Platform
+    origin: str
+    project_id: UUID | None = None
 
 
 @dataclass(frozen=True)
@@ -79,20 +111,52 @@ class PlatformSummary:
     login_node_count: int
 
 
+@dataclass(frozen=True)
+class ProjectPlatforms:
+    """
+    A Project's eligible Platforms and its default, as its member may see them.
+
+    Attributes:
+        project_id (`UUID`): The Project.
+        platforms (`list[PlatformSummary]`): Eligible Platforms, by slug.
+        project_default_platform_id (`UUID | None`): The Project's chosen default,
+            also when that Platform is currently disabled.
+        selection ([`authz.PlatformSelection`] or `None`): What a request that
+            names no Platform resolves to now.
+        unresolved_reason (`str | None`): Why it resolves to none (see
+            [`authz.PlatformResolutionError`]).
+    """
+
+    project_id: UUID
+    platforms: list[PlatformSummary]
+    project_default_platform_id: UUID | None
+    selection: PlatformSelection | None
+    unresolved_reason: str | None
+
+
 class PlatformCatalog:
     """
-    Authorizes Platform discovery, default resolution and endpoint selection.
+    Authorizes Platform discovery, Project eligibility, default resolution and
+    endpoint selection.
 
     Args:
         database ([`db.Database`]): Open database.
         audit ([`audit.AuditLog`], *optional*): Where refusals are recorded.
             Defaults to one on `database`.
+        projects ([`authz.ProjectService`], *optional*): Checks Project roles for
+            changing the Project default. Defaults to one on `database`.
     """
 
-    def __init__(self, database: Database, audit: AuditLog | None = None):
+    def __init__(
+        self,
+        database: Database,
+        audit: AuditLog | None = None,
+        projects: ProjectService | None = None,
+    ):
         self.database = database
         self.store = PlatformStore(database)
         self.audit = audit or AuditLog(database)
+        self.projects = projects or ProjectService(database)
 
     def _denied(
         self,
@@ -145,12 +209,15 @@ class PlatformCatalog:
         Raises:
             [`authz.AccessDeniedError`]: If the session may not discover Platforms.
         """
-        summaries = []
-        for platform in self._authorized(principal, "platform.list", project_id):
-            nodes = self.store.login_nodes(platform.id, include_disabled=False)
-            modes = sorted({mode for node in nodes for mode in node.transport_modes})
-            summaries.append(PlatformSummary(platform, tuple(modes), len(nodes)))
-        return summaries
+        return [
+            self._summary(platform)
+            for platform in self._authorized(principal, "platform.list", project_id)
+        ]
+
+    def _summary(self, platform: Platform) -> PlatformSummary:
+        nodes = self.store.login_nodes(platform.id, include_disabled=False)
+        modes = sorted({mode for node in nodes for mode in node.transport_modes})
+        return PlatformSummary(platform, tuple(modes), len(nodes))
 
     def resolve_platform(
         self,
@@ -160,37 +227,185 @@ class PlatformCatalog:
         project_id: UUID | str | None = None,
     ) -> Platform:
         """
-        The Platform a request runs on, decided by the server.
-
-        A named Platform (UUID or slug) must be authorized for the caller. With no
-        name, the server's default Platform is used if the caller is authorized for
-        it; otherwise the caller's only authorized Platform; otherwise none.
+        The Platform a request runs on, decided by the server. See
+        [`authz.PlatformCatalog.select_platform`] for the order; this returns only
+        the Platform. Without `project_id`, the caller's Platforms across all of
+        their Projects are considered and no Project default applies.
 
         Raises:
             [`db.PlatformNotFoundError`]: If the named Platform does not exist, is
                 disabled, or is not authorized for the caller (indistinguishably).
-            [`authz.PlatformResolutionError`]: If none was named and none or
-                several, without a default, are authorized.
+            [`authz.PlatformResolutionError`]: If none was named and none can be
+                chosen.
             [`authz.AccessDeniedError`]: If the session may not use Platforms.
         """
-        authorized = self._authorized(principal, "platform.resolve", project_id)
+        return self._select(principal, "platform.resolve", reference, project_id).platform
+
+    def select_platform(
+        self,
+        principal: Principal,
+        project_id: UUID | str,
+        reference: UUID | str | None = None,
+    ) -> PlatformSelection:
+        """
+        The Platform a request of `project_id` runs on, and why.
+
+        This is the server-side policy contract every entry point uses, including
+        the Controller's execution path. The caller must be an active member of the
+        live Project, and only the Project's eligible Platforms (active Platforms the
+        operator granted to it) are considered. The first that applies wins:
+
+        1. `reference`, a Platform UUID or slug, which must be eligible. Anything
+           else is refused as not found and audited; it never falls through.
+        2. The Project's default Platform. If it is disabled, the request is
+           refused (`default_unavailable`) instead of running elsewhere.
+        3. The operator's server default, when it is eligible.
+        4. The only eligible Platform.
+
+        Otherwise: `none_authorized` when none is eligible, `ambiguous` when
+        several are. Grants, memberships and statuses are read on every call.
+
+        Raises:
+            Everything [`authz.PlatformCatalog.resolve_platform`] raises.
+        """
+        return self._select(principal, "platform.resolve", reference, project_id)
+
+    def _select(
+        self,
+        principal: Principal,
+        event: str,
+        reference: UUID | str | None,
+        project_id: UUID | str | None,
+        *,
+        record: bool = True,
+    ) -> PlatformSelection:
+        self._check_session(principal, event)
+        pid = as_uuid(project_id, "project_id") if project_id is not None else None
+        if pid is None:
+            eligible = self.store.authorized_platforms(principal.user_id)
+            project_default = None
+        else:
+            eligible, project_default = self.store.project_platforms(principal.user_id, pid)
         if reference is not None:
             ref = str(reference).strip()
-            for platform in authorized:
+            for platform in eligible:
                 if ref in (str(platform.id), platform.slug):
-                    return platform
-            self._denied(
-                principal, "platform.resolve", "platform_not_authorized", _uuid_or_none(project_id)
-            )
+                    return PlatformSelection(platform, "explicit", pid)
+            self._denied(principal, event, "platform_not_authorized", pid)
             raise PlatformNotFoundError("No such Platform")
-        if not authorized:
+        if project_default is not None:
+            chosen = next((p for p in eligible if p.id == project_default), None)
+            if chosen is None:
+                if record:
+                    self._denied(
+                        principal,
+                        event,
+                        "default_unavailable",
+                        pid,
+                        {"platform_id": str(project_default)},
+                    )
+                raise PlatformResolutionError("default_unavailable")
+            return PlatformSelection(chosen, "project_default", pid)
+        if not eligible:
             raise PlatformResolutionError("none_authorized")
-        default = next((p for p in authorized if p.is_default), None)
+        default = next((p for p in eligible if p.is_default), None)
         if default is not None:
-            return default
-        if len(authorized) == 1:
-            return authorized[0]
+            return PlatformSelection(default, "server_default", pid)
+        if len(eligible) == 1:
+            return PlatformSelection(eligible[0], "only_eligible", pid)
         raise PlatformResolutionError("ambiguous")
+
+    def project_platforms(self, principal: Principal, project_id: UUID | str) -> ProjectPlatforms:
+        """
+        The Project's eligible Platforms, its default, and what a request naming
+        no Platform resolves to. Any member may read them.
+
+        Raises:
+            [`authz.AccessDeniedError`]: If the caller is not a member (invisible)
+                or the session lacks a `projects:read` or `jobs:run` scope.
+        """
+        pid = as_uuid(project_id, "project_id")
+        self.projects.authorizer.require(principal, Action.PLATFORM_READ, pid)
+        return self._project_view(principal, pid)
+
+    def _project_view(self, principal: Principal, pid: UUID) -> ProjectPlatforms:
+        eligible, project_default = self.store.project_platforms(principal.user_id, pid)
+        try:
+            selection: PlatformSelection | None = self._select(
+                principal, "platform.resolve", None, pid, record=False
+            )
+            unresolved = None
+        except PlatformResolutionError as exc:
+            selection, unresolved = None, exc.reason
+        return ProjectPlatforms(
+            pid, [self._summary(p) for p in eligible], project_default, selection, unresolved
+        )
+
+    def set_project_default(
+        self,
+        principal: Principal,
+        project_id: UUID | str,
+        reference: UUID | str | None,
+    ) -> ProjectPlatforms:
+        """
+        Chooses the Project's default Platform among its eligible ones, or clears
+        it with `None`. Project Owners and Admins only, from a browser session.
+
+        The Project's lock, the caller's role and the grant are read and the
+        default written in one transaction, and the grant row is locked so a
+        concurrent revocation either waits or wins (and then the choice is
+        refused). The change is recorded in the security audit log.
+
+        Raises:
+            [`authz.AccessDeniedError`]: If the caller may not change it.
+            [`db.PlatformNotFoundError`]: If `reference` is not an eligible
+                Platform of the Project, whether or not it exists.
+        """
+        pid = as_uuid(project_id, "project_id")
+        event = str(Action.PLATFORM_DEFAULT_SET)
+        not_eligible = False
+        with (
+            self.projects._authorized(
+                principal, pid, Action.PLATFORM_DEFAULT_SET, "set a Project's default Platform"
+            ) as conn,
+            conn.cursor() as cursor,
+        ):
+            if reference is None:
+                cursor.execute(
+                    "DELETE FROM project_default_platforms WHERE project_id = %s", (pid,)
+                )
+            else:
+                ref = str(reference).strip()
+                row = cursor.execute(
+                    "SELECT g.platform_id FROM hpc_platform_project_grants g "
+                    "JOIN hpc_platforms p ON p.id = g.platform_id AND p.status = 'active' "
+                    "WHERE g.project_id = %s AND (p.id::text = %s OR p.slug = %s) "
+                    "FOR KEY SHARE OF g",
+                    (pid, ref, ref),
+                ).fetchone()
+                if row is None:
+                    not_eligible = True
+                else:
+                    cursor.execute(
+                        "INSERT INTO project_default_platforms "
+                        "(project_id, platform_id, set_by_user_id) VALUES (%s, %s, %s) "
+                        "ON CONFLICT (project_id) DO UPDATE SET "
+                        "platform_id = EXCLUDED.platform_id, "
+                        "set_by_user_id = EXCLUDED.set_by_user_id, set_at = now() "
+                        "WHERE project_default_platforms.platform_id "
+                        "IS DISTINCT FROM EXCLUDED.platform_id",
+                        (pid, row[0], principal.user_id),
+                    )
+        if not_eligible:
+            self._denied(principal, event, "platform_not_authorized", pid)
+            raise PlatformNotFoundError("No such Platform")
+        logger.info(
+            "Project default Platform %s project_id=%s user_id=%s",
+            "cleared" if reference is None else "set",
+            pid,
+            principal.user_id,
+        )
+        return self._project_view(principal, pid)
 
     def select_login_node(
         self,

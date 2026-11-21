@@ -29,6 +29,8 @@ Owner.
 | Submit a Run, if the Provider permits it | yes | yes | yes | no |
 | Cancel one's own Run, if the Provider permits it | yes | yes | yes | no |
 | Read artifacts marked sensitive | yes | yes | of own Runs | no |
+| See the eligible HPC Platforms and the default Platform | yes | yes | yes | yes |
+| Choose the default among eligible Platforms | yes | yes | no | no |
 
 - `owner` is never granted by an invitation, by adding a member or by a role change.
   It moves only when the current Owner transfers ownership, which demotes them
@@ -45,7 +47,53 @@ Owner.
 **Platform and Organization roles grant nothing here.** A `platform_admin` manages
 the Nest service and has no role in any Project they are not a member of. Being in
 an Organization lets a User file new Projects under it, and grants no role in its
-Projects.
+Projects. Which HPC Platforms a Project may use is the operator's grant; see
+[Project eligibility and default Platform](platforms#project-eligibility-and-default-platform).
+
+Project and Organization IDs are tenant keys: the database refuses to change them
+(`projects_id_immutable`, `organizations_id_immutable`). Two Projects that share a
+Slurm account, or an account string, stay two Projects with their own members,
+Owner, Runs and permissions; see [Map Slurm accounts to Projects](slurm-accounts).
+
+## Organizations
+
+An Organization is an optional grouping of Projects with a generated, immutable ID.
+[`authz.OrganizationService`] authorizes every Organization change on the server
+with [`authz.decide_organization`]:
+
+| Action | `org_admin` | `member` |
+| --- | --- | --- |
+| See the Organization and its members | yes | yes |
+| File a new Project under it | yes | yes |
+| Rename it, or delete it once no Project is filed under it | yes | no |
+| Add an existing User, change a member's role | yes | no |
+| Remove a member | yes | only themselves |
+
+Whoever creates an Organization is its first `org_admin`, and it always keeps at
+least one: the last `org_admin` cannot be demoted, removed or leave. Reads need a
+browser session or a CLI session with `projects:read`; changes need a browser
+session. Organization roles grant no Project role, no Platform and no HPC
+authority, and an Organization with Projects filed under it, live or deleted,
+cannot be deleted. Changes are recorded in the security audit log
+(`organization.created`, `organization.renamed`, `organization.deleted`,
+`organization.member.added`, `organization.member.role_changed` and
+`organization.member.removed`).
+
+| Route | Body | Does |
+| --- | --- | --- |
+| `GET /api/organizations` | | Lists your Organizations with your role |
+| `POST /api/organizations` | `name` | Creates one, with you as `org_admin` |
+| `GET /api/organizations/<id>` | | Describes one |
+| `POST /api/organizations/<id>/rename` | `name` | Renames it |
+| `POST /api/organizations/<id>/delete` | | Deletes it |
+| `GET /api/organizations/<id>/members` | | Lists members, `org_admin`s first |
+| `POST /api/organizations/<id>/members` | `user_id`, `role` | Adds an existing User |
+| `POST /api/organizations/<id>/members/<user_id>/role` | `role` | Changes a role |
+| `POST /api/organizations/<id>/members/<user_id>/remove` | | Removes a member, or leaves |
+
+They answer like the Projects API below, and a broken Organization rule is `409
+{"error": "organization_rule", "reason": "last_org_admin" | "not_empty" |
+"already_member"}`.
 
 ## Provider and HPC authority
 
@@ -113,6 +161,8 @@ under `/api/projects`. Browsers authenticate with the session cookie, and their
 | `POST /api/projects/<id>/members/<user_id>/role` | `role` | Changes a role |
 | `POST /api/projects/<id>/members/<user_id>/remove` | | Removes a member, or leaves |
 | `GET /api/projects/<id>/audit?limit=&before=` | | Audit history, newest first |
+| `GET /api/projects/<id>/platforms` | | Eligible Platforms and the default |
+| `POST /api/projects/<id>/platforms/default` | `platform` (slug, ID or `null`) | Chooses or clears the default |
 
 ```bash
 curl -s -H "Authorization: Bearer $NEST_ACCESS_TOKEN" \
@@ -135,6 +185,7 @@ Email invitations and Invite Links have their own routes under
 `/api/projects/<id>/invitations` and `/api/projects/<id>/invite-links`; see
 [Invite people to a Project](invitations).
 
-The gRPC execution service does not yet authenticate callers (see
-[Security](security)), so it does not apply Project permissions. When it does, it
-must call [`authz.Authorizer`] like every other interface.
+The gRPC execution service authorizes Project access with
+[`authz.ExecutionAccess`] (see [Security](security)). When it chooses a Platform per
+request (C01 Part 2), it must call [`authz.PlatformCatalog.select_platform`] like
+every other interface.
