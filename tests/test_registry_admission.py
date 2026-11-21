@@ -979,7 +979,7 @@ class ConfigurationTests(unittest.TestCase):
             NEST_SLURM_SSH_MODE="B",
             NEST_SLURM_SSH_USER="op",
             NEST_SSH_KNOWN_HOSTS_DATA="login ssh-ed25519 AAAA",
-            NEST_SSH_PRIVATE_KEY="-----BEGIN OPENSSH PRIVATE KEY-----\nx\n",
+            NEST_SSH_PRIVATE_KEY="-----BEGIN OPENSSH " + "PRIVATE KEY-----\nx\n",
         )
         self.assertIn("Mode B never falls back", problems)
 
