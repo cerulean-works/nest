@@ -108,6 +108,8 @@ CREATE TABLE execution_attempts (
     error_message       text CHECK (length(error_message) <= 4000),
     created_at          timestamptz NOT NULL DEFAULT now(),
     updated_at          timestamptz NOT NULL DEFAULT now(),
+    -- When Nest recorded the Slurm job ID: on sbatch's reply, or when an
+    -- 'unknown' attempt was reconciled.
     submitted_at        timestamptz,
     finished_at         timestamptz,
     UNIQUE (execution_id, attempt_number),
@@ -121,7 +123,14 @@ CREATE TABLE execution_attempts (
                     THEN slurm_account_id IS NULL AND slurm_account IS NULL
                          AND transport_mode = 'B'
                     ELSE slurm_account_id IS NOT NULL AND slurm_account IS NOT NULL END),
-    CHECK ((status IN ('succeeded', 'failed', 'cancelled')) = (finished_at IS NOT NULL))
+    CHECK ((status IN ('succeeded', 'failed', 'cancelled')) = (finished_at IS NOT NULL)),
+    -- An attempt Slurm accepted always has its Slurm identity. Only an attempt that
+    -- failed or was cancelled before submission, or whose outcome is still
+    -- 'unknown', may lack one.
+    CONSTRAINT execution_attempts_submitted_has_job
+        CHECK (status NOT IN ('submitted', 'running', 'succeeded')
+               OR (slurm_job_id IS NOT NULL AND submitted_at IS NOT NULL)),
+    CHECK ((slurm_job_id IS NULL) = (submitted_at IS NULL))
 );
 
 -- At most one attempt per execution is in flight.

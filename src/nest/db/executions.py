@@ -70,6 +70,9 @@ LIVE_ATTEMPT_STATUSES = ("submitting", "submitted", "running", "unknown")
 
 FINAL_ATTEMPT_STATUSES = ("succeeded", "failed", "cancelled")
 
+# Attempt states Slurm must have accepted, so they always carry a Slurm job ID.
+_NEEDS_SLURM_JOB = frozenset({"submitted", "running", "succeeded"})
+
 _TRANSITIONS: dict[str, frozenset[str]] = {
     "submitting": frozenset({"submitted", "failed", "cancelled", "unknown"}),
     "submitted": frozenset({"running", "succeeded", "failed", "cancelled", "unknown"}),
@@ -679,6 +682,7 @@ class ExecutionRegistry:
             "slurm_job_id = %s, slurm_state = COALESCE(%s, slurm_state), "
             "submitted_at = COALESCE(submitted_at, now())",
             (slurm_job_id, slurm_state),
+            slurm_job_id=slurm_job_id,
         )
 
     def record_running(
@@ -707,9 +711,14 @@ class ExecutionRegistry:
         A final status also updates the execution: `succeeded` and `cancelled` close
         it, and `failed` leaves it open for a retry.
 
+        `succeeded` needs a Slurm job ID, recorded earlier or given here (as when an
+        `unknown` attempt is reconciled); `failed`, `cancelled` and `unknown` may
+        have none, for an attempt that never reached Slurm.
+
         Raises:
             [`db.executions.ExecutionNotFoundError`]: If the attempt does not exist.
-            [`db.executions.InvalidTransitionError`]: If the attempt is already final.
+            [`db.executions.InvalidTransitionError`]: If the attempt is already final,
+                or would be `succeeded` without a Slurm job ID.
         """
         if status not in (*FINAL_ATTEMPT_STATUSES, "unknown"):
             raise ValueError(f"Unknown final attempt status {status!r}")
@@ -717,11 +726,14 @@ class ExecutionRegistry:
         return self._transition(
             attempt_id,
             status,
+            "submitted_at = CASE WHEN slurm_job_id IS NULL AND %s::bigint IS NOT NULL "
+            "THEN now() ELSE submitted_at END, "
             "slurm_job_id = COALESCE(slurm_job_id, %s), "
             "slurm_state = COALESCE(%s, slurm_state), output_ref = COALESCE(%s, output_ref), "
             "usage_ref = COALESCE(%s, usage_ref), error_kind = %s, error_message = %s, "
             "finished_at = CASE WHEN %s THEN now() END",
             (
+                slurm_job_id,
                 slurm_job_id,
                 slurm_state,
                 output_ref,
@@ -730,6 +742,7 @@ class ExecutionRegistry:
                 message,
                 status in FINAL_ATTEMPT_STATUSES,
             ),
+            slurm_job_id=slurm_job_id,
         )
 
     def _transition(
@@ -740,10 +753,11 @@ class ExecutionRegistry:
         params: tuple,
         *,
         nodes: Iterable[str] = (),
+        slurm_job_id: int | None = None,
     ) -> Attempt:
         with transaction(self.database, None, f"mark an execution attempt {status}") as cursor:
             current = cursor.execute(
-                "SELECT e.execution_id, a.status FROM execution_attempts a "
+                "SELECT e.execution_id, a.status, a.slurm_job_id FROM execution_attempts a "
                 "JOIN executions e USING (execution_id) WHERE a.id = %s FOR UPDATE",
                 (attempt_id,),
             ).fetchone()
@@ -754,6 +768,15 @@ class ExecutionRegistry:
             ):
                 raise InvalidTransitionError(
                     f"An attempt cannot move from {current['status']} to {status}"
+                )
+            if (
+                status in _NEEDS_SLURM_JOB
+                and current["slurm_job_id"] is None
+                and slurm_job_id is None
+            ):
+                raise InvalidTransitionError(
+                    f"An attempt cannot be {status} without a Slurm job ID; "
+                    "record the submission first"
                 )
             row = cursor.execute(
                 f"UPDATE execution_attempts a SET status = %s, updated_at = now(), "

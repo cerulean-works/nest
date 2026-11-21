@@ -759,3 +759,61 @@ class UpgradePathTests(PostgresTestCase):
         )
         self.assertEqual((attempt.platform_id, attempt.slurm_account_id), (nano4.id, chem.id))
         self.assertEqual(accounts.get_account(nano4.id, "chem"), chem)
+
+
+class SlurmIdentityTests(_Base):
+    """An attempt Slurm accepted always carries its Slurm job ID."""
+
+    def test_accepted_states_need_a_job_id(self):
+        execution, _ = self.register()
+        attempt = self.begin(execution.execution_id)
+        # Through the registry: refused before any write.
+        for call in (
+            lambda: self.registry.record_running(attempt.id, ["cn01"]),
+            lambda: self.registry.finish_attempt(attempt.id, "succeeded"),
+        ):
+            with self.assertRaises(InvalidTransitionError):
+                call()
+        # Directly in SQL: refused by the database, from 'submitting' and from an
+        # unreconciled 'unknown' (the only states that may reach these).
+        direct = (
+            "UPDATE execution_attempts SET status = %s, "
+            "finished_at = CASE WHEN %s = 'succeeded' THEN now() END WHERE id = %s"
+        )
+        with self.assertRaises(psycopg.errors.CheckViolation):
+            self.conn.execute(direct, ("submitted", "submitted", attempt.id))
+        unknown_execution, _ = self.register()
+        unknown = self.begin(unknown_execution.execution_id)
+        self.registry.finish_attempt(unknown.id, "unknown")
+        for status in ("submitted", "running", "succeeded"):
+            with (
+                self.subTest(status=status),
+                self.assertRaises(psycopg.errors.CheckViolation),
+            ):
+                self.conn.execute(direct, (status, status, unknown.id))
+        with self.assertRaises(psycopg.errors.CheckViolation):
+            self.conn.execute(
+                "UPDATE execution_attempts SET slurm_job_id = 5 WHERE id = %s", (attempt.id,)
+            )
+        [unchanged] = self.registry.attempts(execution.execution_id, project_id=self.project)
+        self.assertEqual((unchanged.status, unchanged.slurm_job_id), ("submitting", None))
+
+    def test_pre_submission_outcomes_may_lack_a_job_id(self):
+        for status in ("failed", "cancelled", "unknown"):
+            with self.subTest(status=status):
+                execution, _ = self.register()
+                attempt = self.begin(execution.execution_id)
+                done = self.registry.finish_attempt(attempt.id, status, error_kind="ssh")
+                self.assertEqual(
+                    (done.status, done.slurm_job_id, done.submitted_at), (status, None, None)
+                )
+
+    def test_reconciling_an_unknown_attempt_records_when_its_job_was_learned(self):
+        execution, _ = self.register()
+        attempt = self.begin(execution.execution_id)
+        self.registry.finish_attempt(attempt.id, "unknown")
+        with self.assertRaises(InvalidTransitionError):
+            self.registry.finish_attempt(attempt.id, "succeeded")
+        done = self.registry.finish_attempt(attempt.id, "succeeded", slurm_job_id=42)
+        self.assertEqual((done.status, done.slurm_job_id), ("succeeded", 42))
+        self.assertIsNotNone(done.submitted_at)
