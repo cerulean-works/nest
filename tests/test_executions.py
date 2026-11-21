@@ -817,3 +817,78 @@ class SlurmIdentityTests(_Base):
         done = self.registry.finish_attempt(attempt.id, "succeeded", slurm_job_id=42)
         self.assertEqual((done.status, done.slurm_job_id), ("succeeded", 42))
         self.assertIsNotNone(done.submitted_at)
+
+
+class ExecutionLifecycleTests(_Base):
+    """The database keeps an execution's status consistent with its attempts."""
+
+    def refused(self, statement, params):
+        with self.assertRaises(psycopg.errors.IntegrityConstraintViolation):
+            self.conn.execute(statement, params)
+
+    def status(self, execution_id):
+        execution = self.registry.get(execution_id, project_id=self.project)
+        assert execution is not None
+        return execution.status, execution.finished_at
+
+    def test_premature_success_is_refused(self):
+        execution, _ = self.register()
+        eid = execution.execution_id
+        mark = "UPDATE executions SET status = %s, finished_at = now() WHERE execution_id = %s"
+        # No attempt yet.
+        self.refused(mark, ("succeeded", eid))
+        attempt = self.begin(eid)
+        self.registry.record_submission(attempt.id, 1)
+        # An attempt in flight, or one that failed, is not a success.
+        self.refused(mark, ("succeeded", eid))
+        self.refused(mark, ("cancelled", eid))
+        self.registry.finish_attempt(attempt.id, "failed")
+        self.refused(mark, ("succeeded", eid))
+        self.assertEqual(self.status(eid)[0], "failed")
+        # Inserting an execution that claims to be finished is refused too.
+        self.refused(
+            "INSERT INTO executions (execution_id, project_id, owner_user_id, kind, "
+            "request_digest, requested_options, status, finished_at) "
+            "VALUES (%s, %s, %s, 'batch', %s, '{}', 'succeeded', now())",
+            ("f" * 32, self.project, self.owner, b"\0" * 32),
+        )
+
+    def test_a_finished_execution_cannot_be_reopened(self):
+        for final in ("succeeded", "cancelled"):
+            with self.subTest(final=final):
+                execution, _ = self.register()
+                eid = execution.execution_id
+                attempt = self.begin(eid)
+                self.registry.record_submission(attempt.id, 2)
+                self.registry.finish_attempt(attempt.id, final)
+                before = self.status(eid)
+                for status in ("pending", "active", "failed"):
+                    self.refused(
+                        "UPDATE executions SET status = %s, finished_at = NULL "
+                        "WHERE execution_id = %s",
+                        (status, eid),
+                    )
+                self.refused(
+                    "UPDATE executions SET finished_at = now() - interval '1 day' "
+                    "WHERE execution_id = %s",
+                    (eid,),
+                )
+                self.assertEqual(self.status(eid), before)
+
+    def test_attempt_and_execution_cannot_drift_apart(self):
+        execution, _ = self.register()
+        eid = execution.execution_id
+        attempt = self.begin(eid)
+        # An active execution cannot be marked failed while its attempt is in flight.
+        self.refused("UPDATE executions SET status = 'failed' WHERE execution_id = %s", (eid,))
+        # Nor can an attempt finish without its execution following.
+        self.refused(
+            "UPDATE execution_attempts SET status = 'failed', finished_at = now() WHERE id = %s",
+            (attempt.id,),
+        )
+        self.assertEqual(self.status(eid)[0], "active")
+        # The registry moves both together, and a retry reopens a failed one.
+        self.registry.finish_attempt(attempt.id, "failed")
+        self.assertEqual(self.status(eid)[0], "failed")
+        self.assertEqual(self.begin(eid, self.A2).attempt_number, 2)
+        self.assertEqual(self.status(eid)[0], "active")

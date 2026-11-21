@@ -242,6 +242,12 @@ that restarts finds every execution and its in-flight attempt again.
   methods (`live_attempts`, `mark_interrupted`) span all Projects; they are for
   the Controller itself and are never exposed to Users.
 
+An execution's own `status` always follows its attempts, and the database checks
+this at commit for every writer: `pending` with no attempt, `active` while its
+latest attempt is in flight, and otherwise that attempt's final status. A
+`succeeded` or `cancelled` execution is final, and only a `failed` one can become
+`active` again, through a new attempt.
+
 An attempt moves through these `status` values:
 
 | Status | Meaning |

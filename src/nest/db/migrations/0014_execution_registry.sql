@@ -244,3 +244,70 @@ CREATE TRIGGER execution_attempt_nodes_append_only
     FOR EACH ROW EXECUTE FUNCTION nest_forbid_change();
 CREATE TRIGGER execution_attempt_nodes_no_truncate BEFORE TRUNCATE ON execution_attempt_nodes
     FOR EACH STATEMENT EXECUTE FUNCTION nest_forbid_change();
+
+-- An execution's status follows its attempts, for every writer:
+--   no attempt yet              -> 'pending'
+--   latest attempt in flight    -> 'active' ('submitting', 'submitted', 'running', 'unknown')
+--   latest attempt final        -> that status ('succeeded', 'failed' or 'cancelled')
+-- Checked at commit, so the registry may write the attempt and its execution in
+-- either order within one transaction.
+CREATE FUNCTION nest_check_execution_lifecycle() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    eid text := NEW.execution_id;
+    current text;
+    latest text;
+    expected text;
+BEGIN
+    SELECT status INTO current FROM executions WHERE execution_id = eid;
+    SELECT status INTO latest FROM execution_attempts
+        WHERE execution_id = eid ORDER BY attempt_number DESC LIMIT 1;
+    expected := CASE
+        WHEN latest IS NULL THEN 'pending'
+        WHEN latest IN ('submitting', 'submitted', 'running', 'unknown') THEN 'active'
+        ELSE latest
+    END;
+    IF current IS DISTINCT FROM expected THEN
+        RAISE EXCEPTION 'execution % is % but its attempts say %', eid, current, expected
+            USING ERRCODE = 'integrity_constraint_violation',
+                  CONSTRAINT = 'executions_status_follows_attempts';
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+CREATE CONSTRAINT TRIGGER executions_status_follows_attempts
+    AFTER INSERT OR UPDATE ON executions
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION nest_check_execution_lifecycle();
+CREATE CONSTRAINT TRIGGER execution_attempts_status_follows_attempts
+    AFTER INSERT OR UPDATE ON execution_attempts
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION nest_check_execution_lifecycle();
+
+-- Allowed execution transitions. 'succeeded' and 'cancelled' are final; a failed
+-- execution may only be retried (back to 'active').
+CREATE FUNCTION nest_execution_transition() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.status IS DISTINCT FROM OLD.status AND NOT (
+        (OLD.status = 'pending' AND NEW.status = 'active')
+        OR (OLD.status = 'active' AND NEW.status IN ('succeeded', 'failed', 'cancelled'))
+        OR (OLD.status = 'failed' AND NEW.status = 'active')
+    ) THEN
+        RAISE EXCEPTION 'execution cannot move from % to %', OLD.status, NEW.status
+            USING ERRCODE = 'integrity_constraint_violation',
+                  CONSTRAINT = 'executions_status_transition';
+    END IF;
+    IF OLD.status IN ('succeeded', 'cancelled')
+       AND NEW.finished_at IS DISTINCT FROM OLD.finished_at THEN
+        RAISE EXCEPTION 'a finished execution keeps its finished_at'
+            USING ERRCODE = 'integrity_constraint_violation',
+                  CONSTRAINT = 'executions_status_transition';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER executions_transition BEFORE UPDATE ON executions
+    FOR EACH ROW EXECUTE FUNCTION nest_execution_transition();
