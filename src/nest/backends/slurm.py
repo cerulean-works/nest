@@ -346,6 +346,25 @@ class SlurmConfig:
                 raise ValueError("Managed SSH (mode B) requires " + ", ".join(missing))
 
 
+def environment_id(pyproject_toml: bytes, uv_lock: bytes) -> str:
+    """
+    The SHA-256 ID of a Python environment, computed locally from its files.
+
+    Hashes each file's name, byte length and contents, so the Controller knows the
+    ID, and can record it, before anything is staged or built on the cluster.
+
+    Returns:
+        `str`: 64 lowercase hexadecimal characters.
+    """
+    hasher = hashlib.sha256()
+    for name, content in (("pyproject.toml", pyproject_toml), ("uv.lock", uv_lock)):
+        hasher.update(name.encode())
+        hasher.update(b"\0")
+        hasher.update(len(content).to_bytes(8, "big"))
+        hasher.update(content)
+    return hasher.hexdigest()
+
+
 class SlurmBackend:
     """Stages files and manages Slurm jobs through noninteractive SSH commands."""
 
@@ -357,6 +376,24 @@ class SlurmBackend:
             config ([`backends.slurm.SlurmConfig`]): SSH host, Slurm defaults, and paths.
         """
         self.config = config
+
+    def for_endpoint(self, host: str, port: int | None) -> SlurmBackend:
+        """
+        The same backend connected to another approved login node.
+
+        Only the host and port change: the SSH mode, credentials, host-key file and
+        every Slurm default stay the operator's.
+
+        Raises:
+            `ValueError`: If `host` is not one of `allowed_hosts` (or the configured
+                host, when no list is set).
+        """
+        allowed = self.config.allowed_hosts or (self.config.ssh_host,)
+        if host not in allowed:
+            raise ValueError(f"SSH host {host!r} is not an approved login node")
+        if (host, port) == (self.config.ssh_host, self.config.ssh_port):
+            return self
+        return SlurmBackend(replace(self.config, ssh_host=host, ssh_port=port))
 
     def _ssh_process(
         self, command: str, input: bytes | None = None
@@ -779,6 +816,9 @@ class SlurmBackend:
         cpu: int = 0,
         environment_id: str | None = None,
         execution_id: str | None = None,
+        account: str | None = None,
+        partition: str | None = None,
+        time: str | None = None,
     ) -> tuple[int, str]:
         """
         Stages a serialized call and submits the deployed worker batch script once.
@@ -797,6 +837,10 @@ class SlurmBackend:
                 lowercase hexadecimal ID. Omitting it selects the Nest runtime.
             execution_id (`str`, *optional*): Execution ID from
                 [`backends.slurm.new_execution_id`]. Omitted, a new one is generated.
+            account, partition, time (`str`, *optional*): Passed to
+                [`backends.slurm.SlurmBackend.submit`]; unset uses the configured
+                defaults, as before. The registry-backed Controller passes the values
+                it resolved and recorded.
 
         Returns:
             `tuple[int, str]`: Submitted job ID and remote execution directory.
@@ -840,6 +884,9 @@ class SlurmBackend:
                 script="project/scripts/worker.sbatch",
                 gpu=gpu,
                 cpu=cpu,
+                account=account,
+                partition=partition,
+                time=time,
                 script_args=script_args,
             )
         except SubmissionUnknownError as exc:
@@ -1135,16 +1182,7 @@ class SlurmBackend:
             "uv.lock": uv_lock,
         }
 
-        # Calculate environment hash
-        hasher = hashlib.sha256()
-
-        for name, content in files.items():
-            hasher.update(name.encode())
-            hasher.update(b"\0")
-            hasher.update(len(content).to_bytes(8, "big"))
-            hasher.update(content)
-
-        env_id = hasher.hexdigest()
+        env_id = environment_id(pyproject_toml, uv_lock)
 
         env_dir = f"{self.config.worker_workdir.rstrip('/')}/environments/{env_id}"
 

@@ -754,6 +754,7 @@ class ExecutionRegistry:
         *,
         nodes: Iterable[str] = (),
         slurm_job_id: int | None = None,
+        expected: str | None = None,
     ) -> Attempt:
         with transaction(self.database, None, f"mark an execution attempt {status}") as cursor:
             current = cursor.execute(
@@ -763,6 +764,10 @@ class ExecutionRegistry:
             ).fetchone()
             if current is None:
                 raise ExecutionNotFoundError("The execution attempt does not exist")
+            if expected is not None and current["status"] != expected:
+                raise InvalidTransitionError(
+                    f"The attempt is {current['status']}, no longer {expected}"
+                )
             if current["status"] in FINAL_ATTEMPT_STATUSES or (
                 status != current["status"] and status not in _TRANSITIONS[current["status"]]
             ):
@@ -857,7 +862,109 @@ class ExecutionRegistry:
             )
         return attempts
 
+    def reconcile(
+        self,
+        attempt_id: int,
+        *,
+        evidence: str,
+        slurm_job_id: int | None = None,
+        not_submitted: bool = False,
+    ) -> Attempt:
+        """
+        Resolves an `unknown` attempt from evidence an operator has checked.
+
+        Exactly one outcome is given: `slurm_job_id`, the job Slurm accepted for
+        the attempt (it becomes `submitted`, and its later states are observed as
+        usual), or `not_submitted`, when the operator verified that Slurm has no
+        job for it (it becomes `failed` with error kind `reconciled_not_submitted`,
+        so the execution may be retried). Only an `unknown` attempt is reconciled:
+        an attempt Nest still knows the state of never is.
+
+        Controller-internal, like [`db.ExecutionRegistry.live_attempts`]: it is
+        served by `nest-db execution reconcile`, which records the operator and
+        the evidence in the security audit log.
+
+        Raises:
+            [`db.executions.ExecutionNotFoundError`]: If the attempt does not exist.
+            [`db.executions.InvalidTransitionError`]: If it is not `unknown`.
+        """
+        if (slurm_job_id is None) == (not not_submitted):
+            raise ValueError("Give either slurm_job_id or not_submitted")
+        evidence = evidence.strip()
+        if not evidence:
+            raise ValueError("Reconciling an unknown attempt needs the evidence checked")
+        with transaction(self.database, None, "read an execution attempt") as cursor:
+            row = cursor.execute(
+                "SELECT status FROM execution_attempts WHERE id = %s", (attempt_id,)
+            ).fetchone()
+        if row is None:
+            raise ExecutionNotFoundError("The execution attempt does not exist")
+        if row["status"] != "unknown":
+            raise InvalidTransitionError(
+                f"Only an unknown attempt is reconciled; this one is {row['status']}"
+            )
+        if slurm_job_id is not None:
+            return self._transition(
+                attempt_id,
+                "submitted",
+                "slurm_job_id = %s, submitted_at = COALESCE(submitted_at, now()), "
+                "error_message = %s",
+                (slurm_job_id, evidence[:_MAX_ERROR_MESSAGE]),
+                slurm_job_id=slurm_job_id,
+                expected="unknown",
+            )
+        return self._transition(
+            attempt_id,
+            "failed",
+            "error_kind = 'reconciled_not_submitted', error_message = %s, finished_at = now()",
+            (evidence[:_MAX_ERROR_MESSAGE],),
+            expected="unknown",
+        )
+
     # Reads --------------------------------------------------------------------
+
+    def job_owner(self, platform_id: UUID | str, slurm_job_id: int) -> dict[str, Any] | None:
+        """
+        Who owns the latest attempt that received `slurm_job_id` on `platform_id`,
+        for authorizing a job operation, or `None`.
+
+        Returns `project_id`, `submitted_by_user_id` (the execution's owner),
+        `execution_id`, `attempt_id`, `kind`, `status` and `created_at`; the same
+        fields as a legacy `jobs` record, so [`authz.ExecutionAccess.authorize_job`]
+        decides both alike. Controller-internal: it spans every Project and is used
+        only to authorize, never returned to a User; a caller who may not see the
+        Project is answered as not found.
+        """
+        with transaction(self.database, None, "find an execution attempt") as cursor:
+            return cursor.execute(
+                "SELECT e.project_id, e.owner_user_id AS submitted_by_user_id, "
+                "e.execution_id, e.kind, a.id AS attempt_id, a.status, a.created_at "
+                f"FROM {_ATTEMPT_FROM} JOIN executions e ON e.execution_id = a.execution_id "
+                "WHERE a.platform_id = %s AND a.slurm_job_id = %s ORDER BY a.id DESC LIMIT 1",
+                (as_uuid(platform_id, "platform_id"), slurm_job_id),
+            ).fetchone()
+
+    def project_of(self, execution_id: str) -> UUID | None:
+        """
+        The Project of an execution, or `None`. Controller-internal, for audit
+        records of operator actions such as reconciliation.
+        """
+        with transaction(self.database, None, "read an execution") as cursor:
+            row = cursor.execute(
+                "SELECT project_id FROM executions WHERE execution_id = %s", (execution_id,)
+            ).fetchone()
+        return row["project_id"] if row else None
+
+    def get_attempt(self, attempt_id: int) -> Attempt | None:
+        """
+        Returns one attempt by its record ID, or `None`. Controller-internal, for
+        reconciliation; User-facing reads go through the Project-scoped methods.
+        """
+        with transaction(self.database, None, "read an execution attempt") as cursor:
+            row = cursor.execute(
+                f"SELECT {_ATTEMPT_COLUMNS} FROM {_ATTEMPT_FROM} WHERE a.id = %s", (attempt_id,)
+            ).fetchone()
+            return self._load_attempt(cursor, row) if row else None
 
     def get(self, execution_id: str, *, project_id: UUID | str) -> Execution | None:
         """Returns the execution if it belongs to `project_id`, else `None`."""

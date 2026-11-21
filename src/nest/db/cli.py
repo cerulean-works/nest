@@ -45,6 +45,11 @@ Usage:
     nest-db account native-default PLATFORM --project-id UUID --allow | --forbid
     (every change also takes --operator NAME --reason TEXT)
 
+    # Execution Registry recovery (see "Execution Registry"):
+    nest-db execution list [--platform PLATFORM]
+    nest-db execution reconcile ATTEMPT_ID --slurm-job-id N | --not-submitted
+                              --operator NAME --reason EVIDENCE
+
     # The security audit log (see "Security audit log"):
     nest-db audit list   [--user-id UUID] [--project-id UUID] [--event NAME] [--limit N]
     nest-db audit verify # seal new records, then check the hash chain
@@ -69,9 +74,11 @@ import psycopg
 from .._logging import configure_logging
 from ..audit import AuditLog
 from ..config import ConfigError, load_database_config
+from ..errors import DatabaseUnavailableError
 from .accounts import ProjectAccountLink, SlurmAccount, SlurmAccountStore
 from .bootstrap import audit_events, bootstrap_state
 from .connection import Database, DatabaseError
+from .executions import Attempt, ExecutionRegistry, ExecutionRegistryError
 from .identity import IdentityStore
 from .migrate import MigrationError, schema_status, upgrade, verify
 from .platforms import (
@@ -151,6 +158,7 @@ def _parser() -> argparse.ArgumentParser:
 
     _platform_parser(commands)
     _account_parser(commands)
+    _execution_parser(commands)
 
     security = commands.add_parser(
         "audit",
@@ -168,6 +176,110 @@ def _parser() -> argparse.ArgumentParser:
     events.add_argument("--limit", type=int, default=50)
     audit_actions.add_parser("verify", help="seal new records, then check the hash chain")
     return parser
+
+
+def _execution_parser(commands) -> None:
+    execution = commands.add_parser(
+        "execution",
+        help="list in-flight execution attempts and reconcile unknown outcomes",
+        description=(
+            "Execution Registry recovery. An attempt is 'unknown' when sbatch may have run "
+            "but no Slurm job ID arrived; Nest never resubmits it until an operator has "
+            "checked the cluster and reconciled it here with the evidence, which is kept "
+            "in the security audit log."
+        ),
+    )
+    actions = execution.add_subparsers(dest="action", required=True)
+    listing = actions.add_parser("list", help="list attempts still in flight, oldest first")
+    listing.add_argument("--platform", metavar="PLATFORM", help="only this Platform's")
+    reconcile = actions.add_parser("reconcile", help="resolve an unknown attempt from evidence")
+    reconcile.add_argument("attempt_id", type=int, metavar="ATTEMPT_ID")
+    outcome = reconcile.add_mutually_exclusive_group(required=True)
+    outcome.add_argument(
+        "--slurm-job-id", type=int, metavar="N", help="the job Slurm accepted for the attempt"
+    )
+    outcome.add_argument(
+        "--not-submitted",
+        action="store_true",
+        help="Slurm has no job for the attempt; the execution may be retried",
+    )
+    reconcile.add_argument(
+        "--operator", required=True, help="who checked the cluster, for the audit log"
+    )
+    reconcile.add_argument(
+        "--reason", required=True, help="the evidence checked, such as an sacct query"
+    )
+
+
+def _print_attempt(attempt: Attempt) -> None:
+    print(
+        f"attempt {attempt.id} execution={attempt.execution_id} "
+        f"number={attempt.attempt_number} platform={attempt.endpoint.platform_slug} "
+        f"status={attempt.status} slurm_job_id={attempt.slurm_job_id or '-'} "
+        f"account={attempt.slurm_account or '-'} error_kind={attempt.error_kind or '-'} "
+        f"updated_at={attempt.updated_at.isoformat()}"
+    )
+
+
+def _execution(database: Database, args: argparse.Namespace) -> int:
+    """Runs one `nest-db execution` action on an open, verified database."""
+    registry = ExecutionRegistry(database)
+    if args.action == "list":
+        platform_id = None
+        if args.platform is not None:
+            platform = PlatformStore(database).get_platform(args.platform)
+            if platform is None:
+                print("No such Platform", file=sys.stderr)
+                return 1
+            platform_id = platform.id
+        for attempt in registry.live_attempts(platform_id):
+            _print_attempt(attempt)
+        return 0
+    if args.slurm_job_id is not None and args.slurm_job_id <= 0:
+        print("--slurm-job-id must be positive", file=sys.stderr)
+        return 2
+    try:
+        attempt = registry.reconcile(
+            args.attempt_id,
+            evidence=args.reason,
+            slurm_job_id=args.slurm_job_id,
+            not_submitted=args.not_submitted,
+        )
+    except ExecutionRegistryError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    try:
+        _record_reconciliation(database, registry, attempt, args)
+    except DatabaseUnavailableError as exc:
+        print(f"Reconciled, but the audit record was not written: {exc}", file=sys.stderr)
+        return 3
+    _print_attempt(attempt)
+    return 0
+
+
+def _record_reconciliation(
+    database: Database, registry: ExecutionRegistry, attempt: Attempt, args: argparse.Namespace
+) -> None:
+    AuditLog(database).record(
+        "execution.reconciled",
+        "succeeded",
+        project_id=registry.project_of(attempt.execution_id),
+        resource_type="execution_attempt",
+        resource_id=str(attempt.id),
+        interface="cli",
+        details={
+            "operator": args.operator.strip()[:200],
+            "evidence": args.reason.strip()[:500],
+            "execution_id": attempt.execution_id,
+            "platform_id": str(attempt.platform_id),
+            "outcome": attempt.status,
+            "slurm_job_id": attempt.slurm_job_id,
+        },
+        required=True,
+    )
 
 
 def _platform_parser(commands) -> None:
@@ -673,7 +785,7 @@ def main(argv: list[str] | None = None) -> int:
         print(exc, file=sys.stderr)
         return 2
     database = Database(config, application_name="nest-db")
-    if args.command in ("admin", "sessions", "audit", "platform", "account"):
+    if args.command in ("admin", "sessions", "audit", "platform", "account", "execution"):
         try:
             database.open()
         except DatabaseError as exc:
@@ -688,6 +800,7 @@ def main(argv: list[str] | None = None) -> int:
                 "audit": _audit,
                 "platform": _platform,
                 "account": _account,
+                "execution": _execution,
             }[args.command]
             return action(database, args)
         except MigrationError as exc:
