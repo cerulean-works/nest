@@ -66,6 +66,11 @@ The bootstrap needs the PostgreSQL database (`NEST_DATABASE_URL`) with migration
   every refused claim by an identity with the configured address are written to
   `platform_audit_events` (see [Audit log](#audit-log)).
 
+- **Active Users only.** A disabled User cannot be granted `platform_admin`
+  (`nest-db admin grant` exits with status 1), and an administrator who is
+  disabled has no effective role until re-enabled (migration
+  `0016_platform_role_boundaries`).
+
 If the claim is refused, for example because the address was not yet verified,
 the sign-in itself still succeeds without the role, a `bootstrap_refused` event
 records why, and a later verified sign-in can still claim.
