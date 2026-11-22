@@ -21,6 +21,7 @@ import uuid
 from concurrent import futures
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import cloudpickle
 import grpc
@@ -40,12 +41,22 @@ from nest.client import _controller_error, call_metadata, execute_remote
 from nest.config import (
     ClientConfig,
     ConfigError,
+    LoginNode,
+    PlatformProfile,
     load_client_config,
     load_controller_config,
     load_database_config,
 )
 from nest.controller import ExecutionService, build_access, record_start
-from nest.db import Database, IdentityStore, JobStore, SessionStore, hash_token, upgrade
+from nest.db import (
+    Database,
+    IdentityStore,
+    JobStore,
+    PlatformStore,
+    SessionStore,
+    hash_token,
+    upgrade,
+)
 from nest.db.cli import main as nest_db
 from nest.errors import (
     AuthenticationRequiredError,
@@ -57,6 +68,7 @@ from nest.proto import execution_pb2, execution_pb2_grpc
 
 DB_URL = "postgresql://nest@db.example.internal:5432/nest"
 SECRET_EMAIL = "invitee.private@example.org"
+OPS: dict[str, Any] = {"operator": "ops-test", "reason": "security tests"}
 
 
 def browser(user_id: uuid.UUID) -> Principal:
@@ -277,6 +289,11 @@ class FakeSlurm:
 
     def __init__(self):
         self.cancelled: list[int] = []
+        self.submitted: list[str] = []
+
+    def submit(self, *, script: str, **options) -> int:
+        self.submitted.append(script)
+        return 4000 + len(self.submitted)
 
     def status(self, job_id: int) -> str:
         return "RUNNING"
@@ -302,11 +319,22 @@ class ExecutionAccessTests(_DatabaseCase):
             "INSERT INTO provider_profiles (id, ssh_mode, login_nodes, account, partition, "
             "time_limit) VALUES ('nano', 'A', ARRAY['login'], 'acct', 'dev', '00:05:00')"
         )
-        self.jobs = JobStore(self.db, "nano")
+        # The served Platform, granted by the operator to both Projects.
+        self.platforms = PlatformStore(self.db)
+        profile = PlatformProfile("nano", "A", (LoginNode("login"),), "acct")
+        self.platform_id = self.platforms.sync_environment({"nano": profile})["nano"]
+        for project in (self.project, self.other):
+            self.platforms.grant_project(self.platform_id, project, **OPS)
+        self.jobs = JobStore(self.db, "nano", platform_id=self.platform_id)
         self.slurm = FakeSlurm()
         access = ExecutionAccess(
-            self.db, AllowedProjects([str(self.project)]), provider_id="nano", audit=self.audit
+            self.db,
+            AllowedProjects([str(self.project)]),
+            provider_id="nano",
+            platform_id=self.platform_id,
+            audit=self.audit,
         )
+        self.access = access
         service = ExecutionService(self.slurm, executor="local", jobs=self.jobs, access=access)
         self.server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
         execution_pb2_grpc.add_ExecutionServiceServicer_to_server(service, self.server)
@@ -461,6 +489,105 @@ class ExecutionAccessTests(_DatabaseCase):
         self.assertIn((self.outsider, "denied", "not_a_member"), outcomes)
         [cancelled] = [e for e in self.events("run.cancel") if e.outcome == "succeeded"]
         self.assertEqual((cancelled.resource_type, cancelled.resource_id), ("slurm_job", "101"))
+
+    def submit_job(self, token, project):
+        return self.stub.SubmitJob(
+            execution_pb2.SubmitJobRequest(workdir="/w", script="run.sbatch"),
+            timeout=10,
+            metadata=[("authorization", f"Bearer {token}"), ("x-nest-project-id", str(project))],
+        ).job_id
+
+    def platform_denials(self, event: str):
+        return [
+            (e.actor_user_id, e.project_id, e.details.get("platform_id"))
+            for e in self.events(event)
+            if e.reason == "platform_not_authorized"
+        ]
+
+    def test_slurm_submission_needs_the_served_platform_granted_to_the_project(self):
+        member, _ = self.token(self.member)
+        self.assertEqual(self.submit_job(member, self.project), 4001)
+        [allowed] = [e for e in self.events("run.submit") if e.outcome == "succeeded"]
+        self.assertEqual(allowed.details["platform_id"], str(self.platform_id))
+
+        # A revoked grant is refused from the next call on, as not found, and no
+        # trusted Mode A credential runs anything.
+        self.platforms.revoke_project(self.platform_id, self.project, **OPS)
+        status = self.code(lambda: self.submit_job(member, self.project))
+        self.assertEqual(status, grpc.StatusCode.NOT_FOUND)
+        self.assertEqual(self.slurm.submitted, ["run.sbatch"])
+        self.assertEqual(
+            self.platform_denials("run.submit"),
+            [(self.member, self.project, str(self.platform_id))],
+        )
+        # A disabled Platform is refused even with the grant restored.
+        self.platforms.grant_project(self.platform_id, self.project, **OPS)
+        self.platforms.sync_environment({})  # The operator removed the profile.
+        status = self.code(lambda: self.submit_job(member, self.project))
+        self.assertEqual(status, grpc.StatusCode.NOT_FOUND)
+        self.assertEqual(self.slurm.submitted, ["run.sbatch"])
+
+    def test_platform_check_comes_after_the_project_check(self):
+        # A non-member learns nothing about the Project's Platforms: the refusal is
+        # the Project's, and no Platform decision is recorded.
+        outsider, _ = self.token(self.outsider)
+        self.platforms.revoke_project(self.platform_id, self.project, **OPS)
+        status = self.code(lambda: self.submit_job(outsider, self.project))
+        self.assertEqual(status, grpc.StatusCode.NOT_FOUND)
+        reasons = [e.reason for e in self.events("run.submit")]
+        self.assertEqual(reasons, ["not_a_member"])
+
+    def test_controller_without_a_catalog_platform_refuses_platform_bound_calls(self):
+        access = ExecutionAccess(
+            self.db, AllowedProjects([str(self.project)]), provider_id="nano", audit=self.audit
+        )
+        member = Principal(self.member, "cli", frozenset({"jobs:run"}))
+        with self.assertRaises(AccessDeniedError) as caught:
+            access.authorize_submit(member, self.project, platform_bound=True)
+        self.assertEqual(caught.exception.reason, "platform_not_authorized")
+        self.assertFalse(caught.exception.visible)
+        self.assertEqual([e.outcome for e in self.events("run.submit")], ["denied"])
+
+    def test_job_status_and_cancellation_fail_closed_on_revoked_platform_access(self):
+        self.job(self.project, self.member, 101)
+        member, _ = self.token(self.member)
+        self.assertEqual(self.status(member, 101), "RUNNING")
+        self.platforms.revoke_project(self.platform_id, self.project, **OPS)
+        for call in (self.status, self.cancel):
+            with self.subTest(call=call.__name__):
+                status = self.code(lambda c=call: c(member, 101))
+                self.assertEqual(status, grpc.StatusCode.NOT_FOUND)
+        self.assertEqual(self.slurm.cancelled, [])
+        self.assertEqual(
+            self.platform_denials("run.read") + self.platform_denials("run.cancel"),
+            [(self.member, self.project, str(self.platform_id))] * 2,
+        )
+        # Restoring the grant restores access; disabling the Platform ends it again.
+        self.platforms.grant_project(self.platform_id, self.project, **OPS)
+        self.assertEqual(self.status(member, 101), "RUNNING")
+        self.platforms.sync_environment({})  # The operator removed the profile.
+        status = self.code(lambda: self.cancel(member, 101))
+        self.assertEqual(status, grpc.StatusCode.NOT_FOUND)
+        self.assertEqual(self.slurm.cancelled, [])
+
+    def test_jobs_of_another_platform_are_not_found(self):
+        f1 = self.platforms.create_platform("f1", "F1", **OPS)
+        self.platforms.grant_project(f1.id, self.project, **OPS)
+        record = JobStore(self.db, "nano", platform_id=f1.id).begin(
+            "batch", uuid.uuid4().hex, project_id=self.project, submitted_by_user_id=self.member
+        )
+        self.jobs.submitted(record, 515)
+        member, _ = self.token(self.member)
+        for call in (self.status, self.cancel):
+            with self.subTest(call=call.__name__):
+                status = self.code(lambda c=call: c(member, 515))
+                self.assertEqual(status, grpc.StatusCode.NOT_FOUND)
+        self.assertEqual(self.slurm.cancelled, [])
+        [denied] = [e for e in self.events("run.cancel") if e.outcome == "denied"]
+        self.assertEqual(
+            (denied.reason, denied.details["job_platform_id"]),
+            ("platform_not_authorized", str(f1.id)),
+        )
 
     def test_sdk_sends_the_stored_session_and_project(self):
         token, session = self.token(self.member, scope="jobs:run projects:read")

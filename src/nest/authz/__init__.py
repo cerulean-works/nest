@@ -6,7 +6,8 @@ and [`authz.ProjectService`] enforce it on the server for every interface, and
 [`authz.ExecutionAccess`] applies the same checks to the gRPC execution service,
 and [`authz.InvitationService`] to email invitations and Invite Links.
 [`authz.PlatformCatalog`] authorizes HPC Platform discovery, Project-to-Platform
-eligibility, default Platform selection and login-node selection,
+eligibility, default Platform selection, login-node selection and every
+Platform-bound operation (`authorize_platform_action`),
 [`authz.OrganizationService`] Organization changes, and [`authz.AccountResolver`]
 chooses the Slurm account a job charges.
 See *Share Projects and manage roles* and *Security and limitations*.

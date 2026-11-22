@@ -155,6 +155,7 @@ class _Base(PostgresTestCase):
             self.db,
             AllowedProjects([str(self.project), str(self.other)]),
             provider_id="nano",
+            platform_id=self.platform_id,
             audit=self.audit,
         )
         self.admission = RegistryAdmission(

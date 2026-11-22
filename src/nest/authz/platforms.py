@@ -315,6 +315,55 @@ class PlatformCatalog:
             return PlatformSelection(eligible[0], "only_eligible", pid)
         raise PlatformResolutionError("ambiguous")
 
+    def authorize_platform_action(
+        self,
+        principal: Principal,
+        action: Action | str,
+        project_id: UUID | str,
+        platform_id: UUID | str | None,
+        *,
+        details: dict[str, object] | None = None,
+    ) -> Platform:
+        """
+        Checks that a Platform-bound operation of `project_id`, such as submitting,
+        reading or cancelling a Slurm job, may use `platform_id` now.
+
+        This is the Platform half of every such check; the Project half (the
+        caller's role for `action`) is the caller's [`authz.Authorizer`] check and
+        must come first, so a non-member learns nothing about the Project's
+        Platforms. The Platform must be active, granted to the live Project, and
+        the caller an active member of it, all read now. A Controller serving no
+        Platform (`platform_id=None`) refuses every such operation: running with
+        trusted Mode A credentials never skips the check.
+
+        A refusal is recorded in the security audit log as `action` with reason
+        `platform_not_authorized` and the Platform ID, and raised as not visible,
+        so interfaces answer it as not found.
+
+        Returns:
+            [`db.Platform`]: The authorized Platform.
+
+        Raises:
+            [`authz.AccessDeniedError`]: If the Platform may not be used, with
+                reason `platform_not_authorized` (or the session's reason).
+        """
+        event = str(action)
+        self._check_session(principal, event)
+        pid = as_uuid(project_id, "project_id")
+        wanted = str(platform_id) if platform_id is not None else None
+        eligible, _ = self.store.project_platforms(principal.user_id, pid)
+        for platform in eligible:
+            if wanted == str(platform.id):
+                return platform
+        self._denied(
+            principal,
+            event,
+            "platform_not_authorized",
+            pid,
+            {"platform_id": wanted, **(details or {})},
+        )
+        raise AccessDeniedError(event, Decision(False, "platform_not_authorized"))
+
     def project_platforms(self, principal: Principal, project_id: UUID | str) -> ProjectPlatforms:
         """
         The Project's eligible Platforms, its default, and what a request naming

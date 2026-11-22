@@ -36,9 +36,9 @@ API:
 
 | RPC | Needs | Refused as |
 | --- | --- | --- |
-| `Execute`, `SubmitJob` | `run.submit` in the Project named by `NEST_PROJECT_ID`, a `jobs:run` scope, and a Project the operator approved in `NEST_PROVIDER_ALLOWED_PROJECTS` | `NOT_FOUND` when not a member, `PERMISSION_DENIED` for the role, scope or Provider |
-| `GetJobStatus` | `run.read` in the job's recorded Project | `NOT_FOUND` |
-| `CancelJob` | `run.cancel` in the job's recorded Project, and being its submitter | `NOT_FOUND`, or `PERMISSION_DENIED` for someone else's Run |
+| `Execute`, `SubmitJob` | `run.submit` in the Project named by `NEST_PROJECT_ID`, a `jobs:run` scope, a Project the operator approved in `NEST_PROVIDER_ALLOWED_PROJECTS`, and for Slurm the served Platform eligible for the Project | `NOT_FOUND` when not a member or the Platform is not eligible, `PERMISSION_DENIED` for the role, scope or Provider |
+| `GetJobStatus` | `run.read` in the job's recorded Project, and the job's Platform (the served one) still eligible for it | `NOT_FOUND` |
+| `CancelJob` | `run.cancel` in the job's recorded Project, being its submitter, and the job's Platform still eligible | `NOT_FOUND`, or `PERMISSION_DENIED` for someone else's Run |
 
 - A call without an accepted session is refused with `UNAUTHENTICATED`. Browser
   session tokens are not accepted, and a revoked session, a disabled User or a
@@ -63,6 +63,52 @@ access control, and the Controller logs a warning when it listens beyond loopbac
 Every submission and cancellation, every refusal on either API, and identity,
 session, invitation and Provider changes are recorded without secrets in the
 [security audit log](audit-log).
+
+## Platform authorization
+
+HPC Platforms (see [Register HPC Platforms and login nodes](platforms)) are
+authorized by the same server-side, deny-by-default policy as Projects. There is
+no separate Platform role: a User may use a Platform only through an active
+membership in a live Project that the operator granted the Platform to, and only
+while the Platform is active. Every decision is made from the authenticated
+principal and the immutable Project and Platform IDs, read from the database on
+each call; a client can name a Platform or an approved login node only as a
+reference to check, never as authority.
+
+| Operation | Interfaces | Enforced by | Refused as |
+| --- | --- | --- | --- |
+| Discover Platforms, describe one | `GET /api/platforms[/<id or slug>]`, `nest platforms`, [`platforms.list_platforms`] | [`authz.PlatformCatalog.list_platforms`], `.resolve_platform` | not found (HTTP 404) |
+| Read a Project's eligible Platforms and default | `GET /api/projects/<id>/platforms`, [`platforms.project_platforms`] | [`authz.PlatformCatalog.project_platforms`] (`project.platform.read`, any role) | not found for a non-member |
+| Choose or clear a Project's default | `POST /api/projects/<id>/platforms/default` (browser only) | [`authz.PlatformCatalog.set_project_default`] (`project.platform.default.set`, Owner and Admin) | 403 for the role, 404 for a Platform that is not eligible |
+| Select the Platform and login node of a submission | gRPC `Execute`, `SubmitJob` with the Execution Registry | [`authz.PlatformCatalog.select_platform`], `.select_login_node`, then [`authz.AccountResolver`] | `NOT_FOUND`, or `FAILED_PRECONDITION` with the reason |
+| Submit, read or cancel a Slurm job on the served Platform | gRPC `Execute`, `SubmitJob` (legacy path), `GetJobStatus`, `CancelJob` | [`authz.ExecutionAccess`]: the Project check, then [`authz.PlatformCatalog.authorize_platform_action`] | `NOT_FOUND` |
+| Register, change, disable Platforms, approve login nodes, grant Projects | `nest-db platform` on a host with the database credentials | The database: each change must name an operator, or is refused | not applied |
+
+- **Fail closed.** A revoked grant, a disabled Platform, a removed member, a
+  disabled User or a deleted Project is refused from the next call on, and a
+  refused Platform is never replaced by another. A Controller whose served Platform
+  is not in the catalog refuses every Platform-bound RPC. Running with trusted
+  Mode A credentials never skips a check.
+- **No existence leaks.** The Project check comes first, so a non-member learns
+  nothing about a Project's Platforms. A Platform the caller may not use is
+  answered exactly like one that does not exist, and no host, port, host key or
+  SSH option is ever returned to a caller.
+- **Separate authorities.** No Project role, Organization role or `platform_admin`
+  makes a Platform eligible, changes the catalog through an API, or grants a UNIX
+  account, a Slurm account or any other HPC identity. Catalog changes are
+  operator actions with database credentials; Slurm account choice is the
+  [Slurm Account Registry](slurm-accounts)'s.
+- **Audited.** Every catalog change, grant and default change is recorded by a
+  database trigger with the operator or the acting User. Every refusal is recorded
+  as the refused action (such as `run.submit` or `platform.resolve`) with the
+  actor, session, Project, reason (such as `platform_not_authorized`) and Platform
+  ID, never an endpoint credential. See [Review the security audit log](audit-log).
+
+Future interfaces, such as the Relay, a Web UI or Mode B interactive SSH, must use
+the same checks: resolve and authorize the Platform with
+[`authz.PlatformCatalog`] after the Project check, bind it to the authenticated
+principal, and answer refusals as not found. A Web UI may hide controls that will
+be refused; that is never the check. None of these interfaces exists yet.
 
 ## Deployment credentials
 
