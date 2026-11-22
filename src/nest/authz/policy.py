@@ -145,7 +145,8 @@ class Decision:
         reason (`str`): `allowed`, or why not: `not_a_member`, `role`,
             `owner_only`, `owner_protected`, `owner_by_transfer_only`,
             `invalid_role`, `member_not_found`, `not_own_run`, `scope`, `browser_only`,
-            `provider_denied` or `unknown_action`.
+            `provider_denied`, `unknown_action`, or `platform_not_authorized` (from
+            [`authz.PlatformCatalog.authorize_platform_action`]).
     """
 
     allowed: bool

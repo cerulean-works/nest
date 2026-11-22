@@ -297,11 +297,18 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
             raise AssertionError("context.abort raises") from None
 
     def _authorize_submit(
-        self, context, principal: Principal | None, execution_id: str, details: dict
+        self,
+        context,
+        principal: Principal | None,
+        execution_id: str,
+        details: dict,
+        *,
+        platform_bound: bool = False,
     ) -> dict:
         """
-        Checks `run.submit` for the Project in the call's metadata. Returns the job
-        record's attribution fields, empty when authentication is off.
+        Checks `run.submit` for the Project in the call's metadata, and with
+        `platform_bound` that the served Platform is eligible for it. Returns the
+        job record's attribution fields, empty when authentication is off.
         """
         if self.access is None or principal is None:
             return {}
@@ -315,11 +322,17 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
             self._guarded(
                 context,
                 lambda: access.authorize_submit(
-                    principal, project_id, execution_id=execution_id, details=details
+                    principal,
+                    project_id,
+                    execution_id=execution_id,
+                    details=details,
+                    platform_bound=platform_bound,
                 ),
             )
         except AccessDeniedError as exc:
-            _abort_denied(context, exc, "Project")
+            _abort_denied(
+                context, exc, "Platform" if exc.reason == "platform_not_authorized" else "Project"
+            )
         return {"project_id": project_id, "submitted_by_user_id": principal.user_id}
 
     def _job_record(self, job_id: int) -> dict | None:
@@ -611,7 +624,9 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
         (`UNAUTHENTICATED` otherwise) and the `run.submit` permission in the Project
         named by `x-nest-project-id` (`INVALID_ARGUMENT` when absent, `NOT_FOUND`
         when the caller is not a member, `PERMISSION_DENIED` when the role or the
-        Provider refuses it). See [`authz.ExecutionAccess`].
+        Provider refuses it). A Slurm execution also needs the served Platform to
+        be eligible for the Project (`NOT_FOUND` otherwise). See
+        [`authz.ExecutionAccess`].
         """
         principal = self._authenticate(context, "Execute")
         if request.HasField("environment"):
@@ -657,6 +672,8 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 "cpu": request.cpu,
                 "environment": request.HasField("environment"),
             },
+            # The registry's admission selects and authorizes the Platform itself.
+            platform_bound=mode == "slurm" and self.admission is None,
         )
 
         if mode == "slurm" and self.admission is not None:
@@ -750,7 +767,8 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
             `execution_pb2.JobStatusResponse`: The job operation response.
 
         With session authentication, the job must be recorded in a Project where
-        the caller may `run.read`; any other job is `NOT_FOUND`.
+        the caller may `run.read`, on the served Platform, which must still be
+        eligible for that Project; any other job is `NOT_FOUND`.
         """
         principal = self._authenticate(context, "GetJobStatus")
         backend = self._require_slurm_backend(context)
@@ -823,6 +841,7 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 "cpu": request.cpu,
                 "partition": request.partition or None,
             },
+            platform_bound=self.admission is None,
         )
         if self.admission is not None:
             return self._submit_job_registry(
@@ -884,8 +903,8 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
             `execution_pb2.CancelJobResponse`: The job operation response.
 
         With session authentication, only the job's submitter may cancel it, with
-        `run.cancel` in its recorded Project; a job the caller cannot see is
-        `NOT_FOUND`.
+        `run.cancel` in its recorded Project, while the served Platform is still
+        eligible for that Project; a job the caller cannot see is `NOT_FOUND`.
         """
         principal = self._authenticate(context, "CancelJob")
         backend = self._require_slurm_backend(context)
@@ -1059,10 +1078,18 @@ def build_access(config: ControllerConfig, database: Database | None) -> Executi
             "NEST_PROVIDER_ALLOWED_PROJECTS is empty: the Provider accepts Runs from no "
             "Project, so every submission is refused"
         )
+    platform_id = None
+    if config.platform is not None:
+        try:
+            platform_id = environment_platform_id(database, config.platform.id)
+        except DatabaseError as exc:
+            # Fail closed: without a catalog Platform, nothing reaches the HPC side.
+            logger.error("%s; every Platform-bound RPC is refused", exc)
     return ExecutionAccess(
         database,
         AllowedProjects(config.allowed_projects),
         provider_id=config.default_platform or config.executor,
+        platform_id=platform_id,
     )
 
 

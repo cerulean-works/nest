@@ -235,7 +235,10 @@ which calls it) from the **authenticated** principal and Project, passing the
 caller's requested Platform only as a reference to check. They must not read
 grants or defaults themselves, accept a Platform, login node, Slurm account or HPC
 identity from the client as authority, or retry on another Platform when the
-chosen one is refused. A Web UI may hide controls it knows will be refused; that
+chosen one is refused. An operation on a Platform already chosen, such as reading
+or cancelling a job the Controller submitted to it, is checked with
+[`authz.PlatformCatalog.authorize_platform_action`] after the Project check. See
+[Platform authorization](security#platform-authorization) for every entry point. A Web UI may hide controls it knows will be refused; that
 is never the check.
 
 The [`authz.HPCIdentity`] that account selection needs is built by the server

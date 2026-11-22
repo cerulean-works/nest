@@ -48,6 +48,10 @@ _ROLE_QUERY = (
 )
 
 
+HIDDEN_REASONS = frozenset({"not_a_member", "platform_not_authorized"})
+"""Refusal reasons answered as not found, so the object's existence is not revealed."""
+
+
 class AccessDeniedError(Exception):
     """
     The policy refused an action. Nothing was changed.
@@ -55,15 +59,17 @@ class AccessDeniedError(Exception):
     Attributes:
         action (`str`): The refused action.
         reason (`str`): The policy's reason (see [`authz.Decision`]).
-        visible (`bool`): Whether the caller may know the Project exists. `False`
-            when they are not a member (or it does not exist or was deleted);
-            interfaces should then answer as if it were not found.
+        visible (`bool`): Whether the caller may know the object exists. `False`
+            when they are not a member (or the Project does not exist or was
+            deleted), or when the Platform is not authorized for the Project
+            (`platform_not_authorized`); interfaces should then answer as if it
+            were not found.
     """
 
     def __init__(self, action: str, decision: Decision):
         self.action = str(action)
         self.reason = decision.reason
-        self.visible = decision.reason != "not_a_member"
+        self.visible = decision.reason not in HIDDEN_REASONS
         super().__init__(f"Not allowed to {self.action}: {self.reason}")
 
 

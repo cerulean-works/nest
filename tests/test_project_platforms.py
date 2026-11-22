@@ -426,6 +426,80 @@ class AccountIsolationTests(_PolicyBase):
         self.assertEqual(caught.exception.reason, "identity_not_allowed")
 
 
+class PlatformActionTests(_PolicyBase):
+    """`PlatformCatalog.authorize_platform_action`, the check behind every
+    Platform-bound operation (Patch B07)."""
+
+    def allowed(self, who, project, platform, action=Action.RUN_SUBMIT) -> bool:
+        try:
+            self.catalog.authorize_platform_action(who, action, project, platform)
+        except AccessDeniedError as exc:
+            self.assertEqual(exc.reason, "platform_not_authorized")
+            self.assertFalse(exc.visible)
+            return False
+        return True
+
+    def test_only_the_projects_eligible_platforms_are_authorized(self):
+        platform = self.catalog.authorize_platform_action(
+            cli(self.bob, "jobs:run"), Action.RUN_SUBMIT, self.lab, self.nano4.id
+        )
+        self.assertEqual(platform.id, self.nano4.id)
+        cases = {
+            # hpc3 exists, but is granted to another Project only.
+            "cross-Project Platform": (self.bob, self.lab, self.hpc3.id, False),
+            # f1 is granted to `other`, but bob is not a member of it.
+            "cross-user Project": (self.bob, self.other, self.f1.id, False),
+            "unknown Platform": (self.bob, self.lab, uuid.uuid4(), False),
+            "no Platform served": (self.bob, self.lab, None, False),
+            "unknown Project": (self.bob, uuid.uuid4(), self.nano4.id, False),
+            "viewer reads": (self.carol, self.lab, self.f1.id, True),
+        }
+        for name, (user, project, platform_id, expected) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self.allowed(browser(user), project, platform_id), expected)
+        # A slug is not an immutable ID and is never accepted here.
+        self.assertFalse(self.allowed(browser(self.bob), self.lab, "nano4"))
+        denied = self.denials("run.submit")
+        self.assertEqual(len(denied), 6)
+        self.assertTrue(all(r[2] == "platform_not_authorized" for r in denied))
+
+    def test_revocations_take_effect_at_once(self):
+        who = browser(self.bob)
+        self.assertTrue(self.allowed(who, self.lab, self.nano4.id))
+        self.store.revoke_project("nano4", self.lab, **OPS)
+        self.assertFalse(self.allowed(who, self.lab, self.nano4.id))
+        self.store.set_status("f1", "disabled", **OPS)
+        self.assertFalse(self.allowed(who, self.lab, self.f1.id))
+        self.store.set_status("f1", "active", **OPS)
+        self.assertTrue(self.allowed(who, self.lab, self.f1.id))
+        self.service.remove_member(browser(self.alice), self.lab, self.bob)
+        self.assertFalse(self.allowed(who, self.lab, self.f1.id))
+        self.identities.set_user_status(self.carol, "disabled")
+        self.assertFalse(self.allowed(browser(self.carol), self.lab, self.f1.id))
+        self.service.delete_project(browser(self.alice), self.lab)
+        self.assertFalse(self.allowed(browser(self.alice), self.lab, self.f1.id))
+
+    def test_sessions_need_a_platform_scope(self):
+        with self.assertRaises(AccessDeniedError) as caught:
+            self.catalog.authorize_platform_action(
+                cli(self.bob, "other"), Action.RUN_SUBMIT, self.lab, self.nano4.id
+            )
+        self.assertEqual(caught.exception.reason, "scope")
+        self.assertEqual(self.denials("run.submit"), [(self.bob, None, "scope")])
+
+    def test_denials_are_traceable_and_reveal_no_endpoint(self):
+        self.store.add_login_node(
+            "hpc3", "ln01.hpc3.internal", transport_modes=["A"], port=2222, **OPS
+        )
+        self.assertFalse(self.allowed(browser(self.bob), self.lab, self.hpc3.id))
+        [(details,)] = self.conn.execute(
+            "SELECT details FROM security_audit_events "
+            "WHERE event = 'run.submit' AND outcome = 'denied'"
+        ).fetchall()
+        self.assertEqual(details, {"session_kind": "browser", "platform_id": str(self.hpc3.id)})
+        self.assertNotIn("ln01.hpc3.internal", json.dumps(details))
+
+
 class OrganizationTests(_PolicyBase):
     def setUp(self):
         super().setUp()

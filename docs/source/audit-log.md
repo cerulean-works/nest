@@ -11,9 +11,9 @@ platform role history in `platform_audit_events` (see
 
 | Event | Written by | When |
 | --- | --- | --- |
-| `run.submit` | Controller | Every `Execute` and `SubmitJob` call by an authenticated caller, allowed or refused. An allowed one is recorded and sealed into the hash chain before anything runs, and refused if its record cannot be written or sealed. |
-| `run.cancel` | Controller | Every `CancelJob` call, allowed or refused; an allowed one is recorded and sealed before Slurm is asked. |
-| `run.read` | Controller | A refused `GetJobStatus` call. Allowed reads are not recorded. |
+| `run.submit` | Controller | Every `Execute` and `SubmitJob` call by an authenticated caller, allowed or refused. An allowed one is recorded and sealed into the hash chain before anything runs, and refused if its record cannot be written or sealed. A refusal because the served Platform is not eligible for the Project has reason `platform_not_authorized` and the Platform ID. |
+| `run.cancel` | Controller | Every `CancelJob` call, allowed or refused (also `platform_not_authorized`); an allowed one is recorded and sealed before Slurm is asked. |
+| `run.read` | Controller | A refused `GetJobStatus` call, including `platform_not_authorized`. Allowed reads are not recorded. |
 | `project.*`, `member.*` | Controller | A refused Projects API action, such as `project.update` or `member.invite`. Allowed changes are in `project_audit_events`. |
 | `controller.started` | Controller | Each start: which protections are on (`auth`, `tls`, `allow_plaintext`, the number of approved Projects), the executor, the default Provider, whether an inline SSH key is used, and the `execution_registry` mode (`required` or `legacy`). Never a value. |
 | `execution.admit` | Controller | A registry-backed submission refused before anything was submitted, with its reason (such as `platform_not_served`, `hpc_binding_unavailable` or `ambiguous`). |

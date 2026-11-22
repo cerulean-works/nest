@@ -12,6 +12,13 @@ cancelled only by someone the Project policy and the Provider allow:
 | `GetJobStatus` | `run.read` | the job's recorded Project |
 | `CancelJob` | `run.cancel` (own Runs only) | the job's recorded Project |
 
+Every operation that reaches the HPC Platform (a Slurm submission on the
+Controller's legacy path, a status query, a cancellation) also needs the
+Controller's served Platform to be eligible for the Project now, checked by
+[`authz.PlatformCatalog.authorize_platform_action`] after the Project check: an
+active Platform granted to the live Project. A revoked grant or a disabled
+Platform is refused from the next call on, and answered as not found.
+
 A job with no recorded Project, or one in a Project the caller cannot see, is
 answered as not found. Submissions and cancellations, allowed or refused, and
 every other refusal are recorded in the security audit log (see [`audit.AuditLog`]).
@@ -35,6 +42,7 @@ from ..db.connection import Database
 from ..db.identity import hash_token
 from ..db.sessions import SessionStore
 from ..errors import AUTHORIZATION_METADATA, PROJECT_METADATA
+from .platforms import PlatformCatalog
 from .policy import Action, Decision, Principal, Target
 from .service import AccessDeniedError, Authorizer, ProviderAuthority
 
@@ -124,6 +132,9 @@ class ExecutionAccess:
         providers ([`authz.ProviderAuthority`]): Provider policy for Run actions.
         provider_id (`str`, *optional*): The Provider the Controller submits to,
             recorded with each decision.
+        platform_id (`UUID`, *optional*): The catalog ID of the HPC Platform the
+            Controller submits to (see [`controller.environment_platform_id`]).
+            Without one, every Platform-bound operation is refused.
         audit ([`audit.AuditLog`], *optional*): Defaults to one on `database`.
     """
 
@@ -133,10 +144,13 @@ class ExecutionAccess:
         providers: ProviderAuthority,
         *,
         provider_id: str | None = None,
+        platform_id: UUID | None = None,
         audit: AuditLog | None = None,
     ):
         self.audit = audit or AuditLog(database)
         self.authorizer = Authorizer(database, providers, self.audit)
+        self.platforms = PlatformCatalog(database, self.audit)
+        self.platform_id = platform_id
         self.sessions = SessionStore(database)
         self.provider_id = provider_id
         self._log_only = AuditLog(None)
@@ -223,13 +237,20 @@ class ExecutionAccess:
         *,
         execution_id: str | None = None,
         details: Mapping[str, object] | None = None,
+        platform_bound: bool = False,
     ) -> None:
         """
         Checks `run.submit` and records the decision. An allowed submission is
         recorded before it runs, and refused if its record cannot be written.
 
+        With `platform_bound`, for a submission this Controller sends to its
+        Platform itself, the served Platform must also be eligible for the Project
+        (see [`authz.PlatformCatalog.authorize_platform_action`]). Registry-backed
+        admission selects and checks the Platform itself, so it leaves this off.
+
         Raises:
-            [`authz.AccessDeniedError`]: If the policy or the Provider refuses it.
+            [`authz.AccessDeniedError`]: If the policy, the Platform policy or the
+                Provider refuses it.
             [`errors.DatabaseUnavailableError`]: If the audit record cannot be written.
         """
         decision = self.authorizer.check(
@@ -243,6 +264,11 @@ class ExecutionAccess:
         if not decision:
             # Authorizer.check has recorded the refusal.
             raise AccessDeniedError(Action.RUN_SUBMIT, decision)
+        if platform_bound:
+            self._require_platform(
+                principal, Action.RUN_SUBMIT, project_id, details, self.platform_id
+            )
+            details = {**(details or {}), "platform_id": str(self.platform_id)}
         self._record(
             Action.RUN_SUBMIT,
             "succeeded",
@@ -251,6 +277,22 @@ class ExecutionAccess:
             resource=resource,
             details=details,
             required=True,
+        )
+
+    def _require_platform(
+        self,
+        principal: Principal,
+        action: Action,
+        project_id: UUID,
+        details: Mapping[str, object] | None,
+        platform_id: UUID | None,
+    ) -> None:
+        self.platforms.authorize_platform_action(
+            principal,
+            action,
+            project_id,
+            platform_id,
+            details={"provider": self.provider_id, **(details or {})},
         )
 
     def authorize_job(
@@ -265,7 +307,10 @@ class ExecutionAccess:
 
         A cancellation is recorded, allowed or not, and refused if its record
         cannot be written. A job with no record or no Project is refused as
-        `not_a_member`, so its existence is not revealed.
+        `not_a_member`, so its existence is not revealed. Both operations reach
+        the HPC Platform, so the job's Platform must be the served one and still
+        eligible for the job's Project (`platform_not_authorized` otherwise, also
+        answered as not found).
 
         Raises:
             [`authz.AccessDeniedError`]: If refused.
@@ -296,6 +341,15 @@ class ExecutionAccess:
         )
         if not decision:
             raise AccessDeniedError(action, decision)
+        recorded = record.get("platform_id")
+        check: dict[str, object] = {"slurm_job_id": slurm_job_id}
+        platform = self.platform_id
+        if recorded is not None and recorded != self.platform_id:
+            # A job of another Platform: this Controller would act on the wrong
+            # Slurm namespace. Refused like an ineligible Platform.
+            platform = None
+            check["job_platform_id"] = str(recorded)
+        self._require_platform(principal, action, project_id, check, platform)
         if action == Action.RUN_CANCEL:
             self._record(
                 action,
