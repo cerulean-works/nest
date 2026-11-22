@@ -79,7 +79,7 @@ from .accounts import ProjectAccountLink, SlurmAccount, SlurmAccountStore
 from .bootstrap import audit_events, bootstrap_state
 from .connection import Database, DatabaseError
 from .executions import Attempt, ExecutionRegistry, ExecutionRegistryError
-from .identity import IdentityStore
+from .identity import IdentityStore, UserNotActiveError
 from .migrate import MigrationError, schema_status, upgrade, verify
 from .platforms import (
     LoginNodeNotFoundError,
@@ -744,7 +744,7 @@ def _admin(database: Database, args: argparse.Namespace) -> int:
                 changed = identities.revoke_platform_role(
                     args.user_id, operator=args.operator, reason=args.reason
                 )
-        except LookupError as exc:
+        except (LookupError, UserNotActiveError) as exc:
             print(exc, file=sys.stderr)
             return 1
         except ValueError as exc:

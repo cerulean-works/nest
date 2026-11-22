@@ -554,14 +554,21 @@ class IdentityStore:
 
         Raises:
             `LookupError`: If the User does not exist.
+            [`db.UserNotActiveError`]: If the User is disabled.
         """
         uid = as_uuid(user_id, "user_id")
         by = as_uuid(granted_by_user_id, "granted_by_user_id") if granted_by_user_id else None
         if role not in PLATFORM_ROLES:
             raise ValueError(f"role must be one of {PLATFORM_ROLES}")
         with transaction(self.database, conn, "grant a platform role") as cursor:
-            if cursor.execute("SELECT 1 FROM users WHERE id = %s", (uid,)).fetchone() is None:
+            # FOR SHARE: a concurrent disable waits for this grant, or this sees it.
+            user = cursor.execute(
+                "SELECT status FROM users WHERE id = %s FOR SHARE", (uid,)
+            ).fetchone()
+            if user is None:
                 raise LookupError("The User does not exist")
+            if user["status"] != "active":
+                raise UserNotActiveError("A disabled User cannot be granted a platform role")
             with audit_context(cursor, actor_user_id=by, operator=operator, reason=reason):
                 cursor.execute(
                     "INSERT INTO platform_role_assignments (user_id, role, granted_by_user_id) "
@@ -644,11 +651,21 @@ class IdentityStore:
         return [(users[row["user_id"]], Identity(**row)) for row in rows]
 
     def platform_roles(self, user_id: UUID | str) -> set[str]:
-        """Returns a User's platform roles."""
+        """
+        Returns a User's effective platform roles: none while the User is disabled.
+
+        A disabled User keeps their assignments, so re-enabling them restores exactly
+        what was granted, but nothing is effective in the meantime. Platform roles
+        are service-wide and never imply an Organization or Project role, an HPC
+        Platform, a Slurm account or an HPC identity.
+        """
         uid = as_uuid(user_id, "user_id")
         with transaction(self.database, None, "read platform roles") as cursor:
             rows = cursor.execute(
-                "SELECT role FROM platform_role_assignments WHERE user_id = %s", (uid,)
+                "SELECT r.role FROM platform_role_assignments r "
+                "JOIN users u ON u.id = r.user_id "
+                "WHERE r.user_id = %s AND u.status = 'active'",
+                (uid,),
             ).fetchall()
         return {row["role"] for row in rows}
 

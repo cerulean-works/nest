@@ -213,6 +213,17 @@ makes Project and Organization IDs immutable, and records Organization and
 default-Platform changes in the security audit log. See
 [Project eligibility and default Platform](platforms#project-eligibility-and-default-platform).
 
+**Platform-role boundaries.** Migration `0016_platform_role_boundaries` refuses
+a platform role assignment for a disabled User, whoever writes it. Each role
+vocabulary stays in its own table: `platform_admin` in
+`platform_role_assignments` (the Nest service), `org_admin` and `member` in
+`organization_memberships` (one Organization), and `owner`, `admin`, `member` and
+`viewer` in `project_memberships` (one Project). None of these tables references an
+HPC Platform, a Slurm account or a login node, and none implies another. A
+disabled User keeps their assignment but has no effective platform role until
+they are re-enabled; a revoked assignment is deleted, so a later grant is a new,
+separately audited assignment. Existing rows are not changed.
+
 **Execution registry.** Migration `0014_execution_registry` adds the
 Platform-aware execution registry described below. With
 `NEST_EXECUTION_REGISTRY=required` (the default with session authentication) it is
