@@ -1,8 +1,8 @@
 # Store Controller records in PostgreSQL
 
-A Controller can keep its control-plane records in PostgreSQL: the Provider Profiles
-it is configured with and every Slurm job it submits. The records survive Controller
-restarts, upgrades, and host moves.
+A Controller can keep its control-plane records in PostgreSQL: the HPC Platforms,
+login nodes and Slurm accounts it may use, its Users and Projects, and every Slurm
+job it submits. The records survive Controller restarts, upgrades, and host moves.
 
 The database is **externally managed** and **opt-in**:
 
@@ -34,6 +34,9 @@ The database is **externally managed** and **opt-in**:
 | `projects`, `project_memberships` | Nest Projects and their active members with their Project roles. |
 | `project_email_invitations`, `project_invite_links`, `project_invitation_redemptions` | Pending email invitations, Invite Link grants, and each User's redemption of a link. Kept apart from memberships. |
 | `platform_bootstrap`, `platform_audit_events` | The one-time record of how the first `platform_admin` was created, and the append-only audit log of platform role changes. See [Bootstrap and recover platform administration](platform-admin). |
+| `hpc_platforms`, `hpc_login_nodes`, `hpc_platform_project_grants` | The HPC Platform Catalog: each Platform's immutable UUID and slug, its approved login nodes, and the Projects granted each Platform. See [Register HPC Platforms and login nodes](platforms). |
+| `slurm_accounts`, `project_platform_accounts`, `project_platform_account_policies` | The Slurm Account Registry: accounts scoped to one Platform, and the accounts each Project may charge on each granted Platform. See [Map Slurm accounts to Projects](slurm-accounts). |
+| `project_default_platforms` | Each Project's optional default Platform, one of its grants. See [Project eligibility and default Platform](platforms#project-eligibility-and-default-platform). |
 | `executions`, `execution_attempts`, `execution_attempt_options`, `execution_attempt_nodes` | The Platform-aware execution registry: each logical execution with its owner and Project, and each submission attempt with its Platform, login-node snapshot, HPC identity, Slurm account, resolved options and allocated nodes. See [Execution registry](#execution-registry). |
 | `schema_migrations` | The applied schema versions and their checksums (see [Migrations](#migrations)). |
 
@@ -86,8 +89,9 @@ derived from another:
 | --- | --- | --- |
 | Nest User | `users.id`, a generated UUID | Never an email address. A User row exists only once a person has signed in or an operator has created it. |
 | External sign-in identity | `user_identities (issuer, subject)` | The identity provider's stable subject ID (Google's `sub`) under its issuer, linked to one User. A changed email keeps the same User; a reused address on another subject is a different identity. These identity providers are unrelated to Compute Providers. |
-| Nest Project | `projects.id`, a generated UUID | Independent of its name, Owner and Provider Accounts. Two Projects may share a name. |
-| HPC Platform and its Slurm account | `provider_profiles.id` (the Platform ID) and the account name within that Platform; in the registry, `slurm_accounts (platform_id, account_name)` | The Platform ID namespaces the account: the same account name on two Platforms is two accounts. The operator label is metadata, not part of the key. Projects are only linked to accounts (`project_platform_accounts`); no Project or identity is keyed by an account name. |
+| Nest Project | `projects.id`, a generated UUID | Independent of its name, its Owner, its Platforms and the Slurm accounts it may charge. Two Projects may share a name. |
+| HPC Platform | `hpc_platforms.id`, a generated UUID, and the unique slug | Neither ever changes, and a Platform is never deleted. An environment profile (`provider_profiles.id`) is mirrored to the Platform whose slug is the profile ID. The operator label is metadata, not part of the key. |
+| Slurm account | `slurm_accounts.id`, unique per `(platform_id, account_name)` | The Platform namespaces the account: the same account name on two Platforms is two accounts, and an account never moves to another Platform. Projects are only linked to accounts (`project_platform_accounts`); no Project or identity is keyed by an account name. UNIX users on a Platform are a separate namespace again (see [Execution registry](#execution-registry)). |
 
 **Membership.** Users and Projects are many-to-many through `project_memberships`,
 one row per (Project, User) (`UNIQUE (project_id, user_id)`), with a role of
@@ -388,6 +392,40 @@ Nest keeps its whole schema in one ordered migration chain, packaged with Nest i
 - A database with a version this Nest does not know (it was migrated by a newer
   Nest) is rejected rather than used.
 
+### Migration order and schema ownership
+
+The chain is applied in this order on every install and upgrade. A fresh install
+and a database upgraded release by release end with the same schema.
+
+| Version | Migration | Adds |
+| --- | --- | --- |
+| 0001 | `providers_and_jobs` | `provider_profiles` (environment Platform profiles) and `jobs` |
+| 0002 | `email_outbox` | `email_outbox` |
+| 0003 | `identity_and_projects` | Users, sign-in identities, sessions, Organizations, Projects, memberships and invitations |
+| 0004 | `oidc_login_flows` | `oidc_login_flows` |
+| 0005 | `platform_admin_bootstrap` | `platform_bootstrap`, `platform_audit_events` |
+| 0006 | `browser_session_rotation` | Session families and `session_access_tokens` |
+| 0007 | `cli_login_requests` | `cli_login_requests` |
+| 0008 | `project_audit` | `project_audit_events` |
+| 0009 | `security_audit` | `security_audit_events` |
+| 0010 | `invitation_onboarding` | Invitation audit triggers |
+| 0011 | `platform_metadata` | Operator labels and display names on `provider_profiles` |
+| 0012 | `hpc_platform_catalog` | **D07 Platform Catalog:** `hpc_platforms`, `hpc_login_nodes`, `hpc_platform_project_grants`, `jobs.platform_id` |
+| 0013 | `slurm_account_registry` | **D08 Slurm Account Registry:** `slurm_accounts`, `project_platform_accounts`, `project_platform_account_policies`, `jobs.slurm_account_id` |
+| 0014 | `execution_registry` | Execution registry: `executions`, `execution_attempts` and their options and nodes |
+| 0015 | `project_platform_policy` | `project_default_platforms`; immutable Project and Organization IDs |
+
+D07 (0012) owns Platform identity: the Platform UUID and slug, its login nodes and
+its Project grants. D08 (0013) owns Slurm accounts, which reference D07's Platform,
+and the Project×Platform account links, which reference D07's grant. Later
+migrations only reference these tables. Composite foreign keys keep every
+account link, job and execution attempt on its account's own Platform, and
+revoking a Project's grant removes its account links and default Platform.
+
+`tests/test_migration_chain.py` pins the SHA-256 of every released migration and
+checks this order. It also upgrades a database populated at each release from
+0011 and compares the result with a fresh install.
+
 ```console
 $ nest-db upgrade
 applied 0001_providers_and_jobs
@@ -431,13 +469,23 @@ logs `run nest-db upgrade`. Nest has no down-migrations. To roll back a Nest
 release after migrating, restore the backup taken in step 1 and deploy the older
 version.
 
+**If `nest-db upgrade` fails**, the failing migration is rolled back completely:
+none of its changes and no `schema_migrations` row are left, and every record
+written before it is unchanged. Migrations applied before it in the same run stay
+applied. The new Controller refuses to start until the schema is current. Fix the
+cause, such as a connection or permission problem, and run `nest-db upgrade`
+again: it continues from the failed migration. Otherwise, restore the backup and
+deploy the older version as above.
+
 ### Add a migration
 
 Every Nest component that needs tables, including future accounts and
 authentication, adds files to this same chain. There is one `schema_migrations`
 table and no per-component migration system or database.
 
-1. Add `src/nest/db/migrations/NNNN_short_name.sql` with the next number.
+1. Add `src/nest/db/migrations/NNNN_short_name.sql` with the next number. One
+   number names one file; if another change already uses that number, take the
+   next one before merging.
 2. Write plain SQL without `BEGIN`, `COMMIT` or `ROLLBACK`; the runner wraps the
    file in a transaction. Statements that cannot run in a transaction, such as
    `CREATE INDEX CONCURRENTLY`, are not supported.
@@ -445,7 +493,9 @@ table and no per-component migration system or database.
    in a new migration.
 4. Prefer additive, backward-compatible changes (new tables, nullable columns) so
    the previous Controller keeps working between `nest-db upgrade` and restart.
-5. Run the PostgreSQL tests (see [Develop Nest](developing)).
+5. Add the new file's checksum to `RELEASED` in `tests/test_migration_chain.py`,
+   and its version to [Migration order and schema ownership](#migration-order-and-schema-ownership).
+6. Run the PostgreSQL tests (see [Develop Nest](developing)).
 
 ## Back up and restore
 
