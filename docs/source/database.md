@@ -425,6 +425,7 @@ and a database upgraded release by release end with the same schema.
 | 0013 | `slurm_account_registry` | **D08 Slurm Account Registry:** `slurm_accounts`, `project_platform_accounts`, `project_platform_account_policies`, `jobs.slurm_account_id` |
 | 0014 | `execution_registry` | Execution registry: `executions`, `execution_attempts` and their options and nodes |
 | 0015 | `project_platform_policy` | `project_default_platforms`; immutable Project and Organization IDs |
+| 0016 | `platform_role_boundaries` | Platform roles can only be granted to an active User |
 
 D07 (0012) owns Platform identity: the Platform UUID and slug, its login nodes and
 its Project grants. D08 (0013) owns Slurm accounts, which reference D07's Platform,

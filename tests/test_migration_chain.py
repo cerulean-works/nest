@@ -9,7 +9,8 @@ and one upgrade step. These tests cover the chain as a whole:
   same schema a fresh install creates, keeping every Platform, login node,
   Platform-scoped account, Project link and job or execution record;
 - the upgraded database still rejects cross-Platform account references and keeps
-  identical account names on two Platforms apart;
+  identical account names on two Platforms apart, and keeps a disabled User's
+  platform role without making it effective or granting a new one (0016);
 - a failing migration after the chain is rolled back without touching D07/D08
   records;
 - a restarted pool sees the same records, and a Controller refuses to start on a
@@ -44,6 +45,7 @@ from nest.db import (
     PlatformStore,
     ProjectStore,
     SlurmAccountStore,
+    UserNotActiveError,
     load_migrations,
     schema_status,
     sync_providers,
@@ -75,6 +77,7 @@ RELEASED = {
     "0013_slurm_account_registry": "45a900fc4b847da9d53923624ff1e1ed6e9b0c1f5d8526e7938be5fabe12fb55",
     "0014_execution_registry": "c8e8536289f3a6e967ef343992c0f3cc45793a834c48bf571d883ca1844aa2d2",
     "0015_project_platform_policy": "db74337d18d5b84c2293e3f52d4cde959861af2966cdaddeeb921a2626c48324",
+    "0016_platform_role_boundaries": "4d670bc13c35c6e2ae4b785744bc87c93bb18d6ad3676255b849483a69ec0c2e",
 }  # fmt: skip
 
 # The Platform and account schema and the migration that owns each table.
@@ -144,13 +147,14 @@ class ChainTests(unittest.TestCase):
     def test_platform_and_account_schema_is_owned_in_this_order(self):
         catalog, accounts = index("0012_hpc_platform_catalog"), index("0013_slurm_account_registry")
         self.assertEqual(
-            [m.label for m in load_migrations()[catalog - 1 : catalog + 4]],
+            [m.label for m in load_migrations()[catalog - 1 : catalog + 5]],
             [
                 "0011_platform_metadata",
                 "0012_hpc_platform_catalog",
                 "0013_slurm_account_registry",
                 "0014_execution_registry",
                 "0015_project_platform_policy",
+                "0016_platform_role_boundaries",
             ],
         )
         self.assertEqual(accounts, catalog + 1)
@@ -267,7 +271,19 @@ class _ChainBase(PostgresTestCase):
                 "VALUES (%s, %s, %s)",
                 (r["lab"], beta.id, r["owner"]),
             )
-            # Whatever follows 0015 on this branch applies on top of the records.
+
+        # 0016 (Patch B01): a platform_admin granted before the User was disabled is
+        # kept by the upgrade, but is not effective while the User is disabled.
+        identity = IdentityStore(db)
+        r["admin"] = identity.create_user(display_name="former admin").id
+        identity.grant_platform_role(r["admin"], operator="ops-chain", reason="chain tests")
+        identity.set_user_status(r["admin"], "disabled")
+        self.assertEqual(
+            self.upgrade_to(url, "0016_platform_role_boundaries"),
+            ["0016_platform_role_boundaries"],
+        )
+        with connect(url) as conn:
+            # Whatever follows 0016 on this branch applies on top of the records.
             upgrade(conn)
             verify(conn)
         r["db"], r["url"] = db, url
@@ -337,6 +353,42 @@ class UpgradeChainTests(_ChainBase):
                 ).fetchone(),
                 (r["beta"].id,),
             )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT role FROM platform_role_assignments WHERE user_id = %s",
+                    (r["admin"],),
+                ).fetchall(),
+                [("platform_admin",)],
+            )
+        self.assertEqual(IdentityStore(db).platform_roles(r["admin"]), set())
+
+    def test_upgraded_database_refuses_platform_roles_for_disabled_users(self):
+        url = self.database()
+        r = self.populate(url)
+        identity = IdentityStore(r["db"])
+        disabled = identity.create_user(display_name="disabled").id
+        identity.set_user_status(disabled, "disabled")
+        with self.assertRaises(UserNotActiveError):
+            identity.grant_platform_role(disabled, operator="ops-chain", reason="chain tests")
+        with connect(url) as conn:
+            # The 0016 trigger refuses a grant that bypasses the store, too.
+            with self.assertRaises(psycopg.errors.CheckViolation):
+                conn.execute(
+                    "INSERT INTO platform_role_assignments (user_id, role) "
+                    "VALUES (%s, 'platform_admin')",
+                    (disabled,),
+                )
+            conn.rollback()
+            self.assertEqual(
+                conn.execute(
+                    "SELECT count(*) FROM platform_role_assignments WHERE user_id = %s",
+                    (disabled,),
+                ).fetchone(),
+                (0,),
+            )
+        # Re-enabling restores exactly the assignment granted before the upgrade.
+        identity.set_user_status(r["admin"], "active")
+        self.assertEqual(identity.platform_roles(r["admin"]), {"platform_admin"})
 
     def test_upgraded_database_rejects_cross_platform_accounts(self):
         url = self.database()
