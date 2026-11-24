@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, LiteralString
 
 import psycopg
-from postgres_fixture import PostgresTestCase, connect
+from postgres_fixture import ADVISORY_LOCK_COUNT, PostgresTestCase, connect
 from test_controller import controller_environment
 
 from nest.config import LoginNode, ProviderProfile, load_database_config
@@ -467,9 +467,7 @@ class UpgradeChainTests(_ChainBase):
             # The released chain is still current, so the Controller would start.
             verify(conn)
             self.assertEqual(
-                conn.execute(
-                    "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'"
-                ).fetchone(),
+                conn.execute(ADVISORY_LOCK_COUNT).fetchone(),
                 (0,),
             )
         self.assert_links(r)

@@ -9,6 +9,12 @@ on:
 
 permissions: {}
 
+# A new commit on a pull request cancels that pull request's superseded run. Pushes to
+# main and tags get a group of their own (the run ID), so they are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -67,5 +73,8 @@ jobs:
           } >> "$GITHUB_ENV"
       - name: Install Chromium for the real-browser tests
         run: uv run --frozen playwright install --with-deps chromium
+      # Eight pytest-xdist workers: the suite mostly waits on subprocesses, servers and
+      # PostgreSQL, and on the 4-vCPU runner wall time stops improving beyond eight
+      # (see docs/source/developing.md). Coverage is combined across the workers.
       - name: Test with python ${{ matrix.python-version }}
-        run: uv run --frozen pytest --cov=src/nest
+        run: uv run --frozen pytest --cov=src/nest --numprocesses 8 --durations 20
