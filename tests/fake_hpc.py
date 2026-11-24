@@ -9,7 +9,8 @@ then run unmodified:
 - `sbatch` runs the batch script synchronously and records its final state.
 - `apptainer exec --bind SRC:DST` rewrites `DST` to `SRC` in the command.
 - `uv run ... python` uses the test interpreter, which has Nest installed;
-  `uv sync` creates a real virtual environment at `UV_PROJECT_ENVIRONMENT`.
+  `uv sync` creates a real virtual environment at `UV_PROJECT_ENVIRONMENT`. Each
+  call logs its HOME, uv cache, and Git and SSH environment variables.
 
 Every shim appends its invocation to a JSON-lines log so tests can assert the
 exact commands the Controller sends to the cluster.
@@ -206,7 +207,9 @@ os.execvpe(command[0], command, env)
 """,
     "uv": """
 args = sys.argv[1:]
-log("uv", argv=args, cwd=os.getcwd())
+ENV_KEYS = ("HOME", "UV_CACHE_DIR", "UV_PYTHON_INSTALL_DIR", "SSH_AUTH_SOCK")
+env = {k: v for k, v in os.environ.items() if k in ENV_KEYS or k.startswith("GIT_")}
+log("uv", argv=args, cwd=os.getcwd(), env=env)
 if "--frozen" not in args:
     sys.exit("Nest must always use a frozen lock")
 if args[0] == "run":

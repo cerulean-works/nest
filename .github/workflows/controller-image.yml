@@ -46,3 +46,5 @@ jobs:
         run: bash tests/smoke_compose_postgres_upgrade.sh
       - name: Test Controller-to-Login-Node SSH through the Tailnet proxy path
         run: bash tests/smoke_tailnet_ssh.sh
+      - name: Test the HPC runtime image with a Git-based uv dependency
+        run: bash tests/smoke_hpc_runtime.sh

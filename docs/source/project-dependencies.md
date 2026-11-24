@@ -53,6 +53,13 @@ The user environment is created from the lockfile without installing the project
 itself or its development dependencies. The Slurm backend caches environments
 using the dependency files and the container runtime identity.
 
+Dependencies pinned to a public Git repository, such as
+`uv add "six @ git+https://github.com/benjaminp/six@<commit>"`, are installed
+from the lockfile like PyPI packages, provided the host's runtime image includes
+Git and compute nodes can reach the repository. Private Git repositories are not
+supported yet: builds use no host or operator credentials. See
+[Build and roll out the HPC runtime image](runtime-image#git-dependencies-supported-scope).
+
 Environment preparation applies to Slurm execution. A local Controller executes
 in its own Python environment and does not install the supplied project
 dependencies.

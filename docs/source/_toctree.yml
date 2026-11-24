@@ -25,6 +25,8 @@ guide:
         title: Deploy on Dokploy from environment variables
       - local: deploy
         title: Deploy a Slurm Controller
+      - local: runtime-image
+        title: Build and roll out the HPC runtime image
       - local: local-controller
         title: Run a local Controller
       - local: database

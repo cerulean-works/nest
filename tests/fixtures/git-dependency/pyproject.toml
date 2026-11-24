@@ -1,0 +1,10 @@
+# Fixture for tests/smoke_hpc_runtime.sh: one PyPI dependency and one public Git
+# dependency pinned to a commit (six 1.17.0), locked with the runtime image's uv.
+[project]
+name = "nest-git-dependency-fixture"
+version = "0"
+requires-python = ">=3.14"
+dependencies = [
+    "iniconfig==2.1.0",
+    "six @ git+https://github.com/benjaminp/six@ebd9b3af90247b8858d415a05e96e9ee61e48d07",
+]

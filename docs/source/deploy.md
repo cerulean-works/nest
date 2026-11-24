@@ -72,6 +72,11 @@ Directory purposes:
 
 The Nest runtime, Slurm scripts, and Apptainer image must be deployed by the host before starting remote executions.
 
+`images/uv-python314.sif` is built from the `hpc-runtime` target of the repository's
+`Dockerfile`, which adds Git, CA certificates and the OpenSSH client so that
+`uv.lock` files with Git dependencies install. See
+[Build and roll out the HPC runtime image](runtime-image).
+
 The Controller passes the configured working directory to Slurm jobs. Inside Apptainer, this directory is mounted at `/workspace`.
 
 Changing `NEST_SLURM_WORKDIR` does not automatically migrate existing files or deploy the runtime to the new location.
