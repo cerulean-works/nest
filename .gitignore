@@ -18,5 +18,6 @@ wheels/
 platforms.env
 ssh/
 secrets/
+.secrets/
 tailscale-state/
 files/

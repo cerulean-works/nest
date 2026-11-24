@@ -1,0 +1,76 @@
+# H06 public gRPC transport PoC: a staging-only, synthetic deployment.
+#
+# Never point this at the production Controller, DNS name or firewall. The origin
+# is the synthetic `origin.py` (real ExecutionService handler, synthetic auth, no
+# Slurm backend), so reaching it never runs code. See README.md.
+#
+#   python poc/public-grpc/make_certs.py poc/public-grpc/.secrets/certs
+#   python -c 'import secrets; print(secrets.token_urlsafe(32))' > poc/public-grpc/.secrets/token
+#   docker compose -f poc/public-grpc/compose.yaml --profile envoy up -d     # topology D
+#   docker compose -f poc/public-grpc/compose.yaml --profile traefik up -d   # topology C
+#
+# The gateway publishes 127.0.0.1:8443 by default; set NEST_POC_PUBLISH=0.0.0.0:443
+# only on a disposable staging host. The origin publishes nothing and is attached
+# only to the internal `origin` network.
+name: nest-h06-poc
+
+services:
+  origin:
+    image: ${NEST_CONTROLLER_IMAGE:-nest-controller:local}
+    build: ../..
+    pull_policy: build
+    entrypoint: ["python", "/poc/origin.py"]
+    environment:
+      NEST_POC_ORIGIN_BIND: 0.0.0.0:50061
+      NEST_POC_TOKEN_FILE: /run/secrets/poc_token
+      NEST_LOG_LEVEL: INFO
+    secrets: [poc_token]
+    volumes:
+      - type: bind
+        source: ./origin.py
+        target: /poc/origin.py
+        read_only: true
+    read_only: true
+    user: "10001"
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    networks: [origin]
+
+  envoy:
+    profiles: [envoy]
+    image: ${NEST_POC_ENVOY_IMAGE:-envoyproxy/envoy:v1.36.2}
+    ports: ["${NEST_POC_PUBLISH:-127.0.0.1:8443}:8443"]
+    volumes:
+      - ./envoy.yaml:/etc/envoy/envoy.yaml:ro
+      - ${NEST_POC_CERTS:-./.secrets/certs}:/certs:ro
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    networks: [edge, origin]
+    depends_on: [origin]
+
+  traefik:
+    profiles: [traefik]
+    image: ${NEST_POC_TRAEFIK_IMAGE:-traefik:v3.6.2}
+    command: ["--configFile=/etc/traefik/static.yml"]
+    ports: ["${NEST_POC_PUBLISH:-127.0.0.1:8443}:8443"]
+    volumes:
+      - ./traefik/static.yml:/etc/traefik/static.yml:ro
+      - ./traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+      - ${NEST_POC_CERTS:-./.secrets/certs}:/certs:ro
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    networks: [edge, origin]
+    depends_on: [origin]
+
+networks:
+  # The gateway's public side.
+  edge: {}
+  # Gateway-to-origin only: no route out, and no published port.
+  origin:
+    internal: true
+
+secrets:
+  poc_token:
+    file: ${NEST_POC_TOKEN_FILE:-./.secrets/token}

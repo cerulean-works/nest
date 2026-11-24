@@ -57,6 +57,8 @@ guide:
         title: Review the security audit log
       - local: deployment-architecture
         title: Deployment validation and roadmap
+      - local: public-grpc-transport
+        title: Public gRPC transport feasibility (H06)
   - title: Contributing
     sections:
       - local: developing
