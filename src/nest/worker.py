@@ -8,6 +8,7 @@ from pathlib import Path
 import cloudpickle
 
 from ._logging import configure_logging, get_logger, operation, request_context
+from .gpu import GpuUnavailableError, check_gpu_access
 
 logger = get_logger("nest.worker")
 
@@ -22,6 +23,10 @@ def main():
     call in this process. Writes the return value or a remote error record to the
     output file with cloudpickle.
 
+    When the worker script passes a GPU request (`NEST_GPU_REQUESTED`), first runs
+    [`gpu.check_gpu_access`]; if the GPUs Slurm assigned are unusable, writes a
+    `nest.gpu.GpuUnavailableError` record instead and does not run the call.
+
     Raises:
         `ValueError`: If the command line does not contain two or three arguments.
         `subprocess.CalledProcessError`: If the user interpreter exits unsuccessfully.
@@ -35,6 +40,22 @@ def main():
     output_path = Path(sys.argv[2])
     user_python = sys.argv[3] if len(sys.argv) == 4 else None
     logger.info("Worker input job_dir=%s user_environment=%s", input_path.parent, bool(user_python))
+
+    # A GPU request must see exactly its allocation before user code runs.
+    try:
+        gpus = check_gpu_access()
+    except GpuUnavailableError as exc:
+        logger.error("GPU check failed job_dir=%s: %s", input_path.parent, exc)
+        _write_error(output_path, exc)
+        return
+
+    if gpus is not None:
+        logger.info(
+            "GPUs ready count=%s visible_devices=%s cuda_driver=%s",
+            gpus.device_count,
+            gpus.visible_devices,
+            gpus.driver_version,
+        )
 
     if user_python:
         # Prepare cloudpickle bootstrap for the user process
@@ -95,15 +116,20 @@ def main():
 
     except Exception as exc:
         logger.exception("User function failed job_dir=%s", input_path.parent)
-        error = {
-            "__nest_remote_error_v1__": True,
-            "type": (f"{type(exc).__module__}.{type(exc).__qualname__}"),
-            "message": str(exc),
-            "traceback": traceback.format_exc(),
-        }
+        _write_error(output_path, exc)
 
-        with output_path.open("wb") as f:
-            cloudpickle.dump(error, f)
+
+def _write_error(output_path: Path, exc: BaseException) -> None:
+    """Writes the remote error record for `exc`, with its traceback, as the result."""
+    error = {
+        "__nest_remote_error_v1__": True,
+        "type": (f"{type(exc).__module__}.{type(exc).__qualname__}"),
+        "message": str(exc),
+        "traceback": "".join(traceback.format_exception(exc)),
+    }
+
+    with output_path.open("wb") as f:
+        cloudpickle.dump(error, f)
 
 
 if __name__ == "__main__":

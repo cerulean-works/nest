@@ -169,13 +169,14 @@ def test_slurm_job_executes_and_returns_result(slurm_controller, hpc):
     assert result["total"] == 6
 
     [job] = _worker_jobs(hpc)
-    execution_id, environment_id, workdir, request_id, log_level = job["args"]
+    execution_id, environment_id, workdir, request_id, log_level, gpu = job["args"]
     job_dir = hpc.base / "jobs" / execution_id
     assert (job_dir / "input.pkl").is_file()
     assert (job_dir / "output.pkl").stat().st_size > 0
     assert environment_id == ""
     assert workdir == str(hpc.base)
     assert log_level == "INFO"
+    assert gpu == "1"
     assert "Worker finished successfully" in hpc.job_output(job["job_id"])
     assert f"request_id={request_id}" in hpc.job_output(job["job_id"])
     assert _build_jobs(hpc) == []
@@ -534,16 +535,20 @@ def test_controller_ssh_and_sbatch_commands_are_stable(slurm_controller, hpc, pr
 
     # Positional contract with scripts/environment-smoke.sbatch and worker.sbatch.
     assert build["args"] == [build["args"][0], str(hpc.base)]
-    for job, environment_id in ((gpu_job, build["args"][0]), (cpu_job, "")):
-        execution_id, env, workdir, request_id, log_level = job["args"]
+    for job, environment_id, gpus in ((gpu_job, build["args"][0], "1"), (cpu_job, "", "0")):
+        execution_id, env, workdir, request_id, log_level, gpu = job["args"]
         assert re.fullmatch(r"[0-9a-f]{32}", execution_id)
         assert re.fullmatch(r"[0-9a-f]{32}", request_id)
-        assert (env, workdir, log_level) == (environment_id, str(hpc.base), "INFO")
+        assert (env, workdir, log_level, gpu) == (environment_id, str(hpc.base), "INFO", gpus)
 
     # The worker runs in the deployed image with a clean environment.
     for call in hpc.calls("apptainer"):
         assert call["image"] == str(hpc.image)
         assert call["clean"] is True
+    # NVIDIA passthrough only for the explicit GPU request.
+    gpu_run, cpu_run = (c for c in hpc.calls("apptainer") if "NEST_GPU_REQUESTED" in c["env"])
+    assert (gpu_run["nv"], gpu_run["env"]["NEST_GPU_REQUESTED"]) == (True, "1")
+    assert (cpu_run["nv"], cpu_run["env"]["NEST_GPU_REQUESTED"]) == (False, "0")
 
 
 def test_batch_job_rpcs_submit_query_and_cancel(slurm_controller, hpc, tmp_path):

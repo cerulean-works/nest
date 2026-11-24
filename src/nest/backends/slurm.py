@@ -833,7 +833,8 @@ class SlurmBackend:
         Args:
             payload (`bytes`): Serialized function and arguments.
             gpu (`int`, *optional*, defaults to `1`): GPU count passed to
-                [`backends.slurm.SlurmBackend.submit`].
+                [`backends.slurm.SlurmBackend.submit`] and to the worker script, which
+                exposes the allocated GPUs to the function only when it is positive.
             cpu (`int`, *optional*, defaults to `0`): CPUs per task passed to
                 [`backends.slurm.SlurmBackend.submit`]; `0` keeps the script's value.
             environment_id (`str`, *optional*): Prepared environment's 64-character
@@ -878,6 +879,9 @@ class SlurmBackend:
             self.config.worker_workdir,
             current_request_id(),
             load_log_level()[0],
+            # The worker enables GPU passthrough only for an explicit request, since the
+            # script's own `#SBATCH` GPU default applies when `gpu` is `0`.
+            str(gpu),
         )
 
         # Submit Slurm job exactly once; an ambiguous outcome is reported, not retried.
