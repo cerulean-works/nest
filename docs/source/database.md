@@ -103,7 +103,7 @@ database enforces exactly one per Project: a unique index allows at most one at
 any moment, even across concurrent transactions, and a deferred constraint trigger
 checks at commit that there is one. A Project and its first Owner are therefore
 created in one transaction, and an Ownership Transfer demotes the old Owner and
-promotes the new one in one transaction. `nest.db.ProjectStore` ([reference](api/db#projects-and-memberships)) applies these rules
+promotes the new one in one transaction. [`db.ProjectStore`] applies these rules
 for every caller:
 
 - Creating a Project makes its creator the Owner.

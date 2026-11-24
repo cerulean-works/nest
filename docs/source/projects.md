@@ -151,7 +151,7 @@ under `/api/projects`. Browsers authenticate with the session cookie, and their
 | Route | Body | Does |
 | --- | --- | --- |
 | `GET /api/projects` | | Lists your Projects with your role |
-| `POST /api/projects` | `name`, optional `organization_id` | Creates a Project you own |
+| `POST /api/projects` | `name`, optional `organization_id` | Creates a Project you own (browser session only; see below) |
 | `GET /api/projects/<id>` | | Describes a Project |
 | `POST /api/projects/<id>/rename` | `name` | Renames it |
 | `POST /api/projects/<id>/delete` | | Deletes it |
@@ -168,6 +168,14 @@ under `/api/projects`. Browsers authenticate with the session cookie, and their
 curl -s -H "Authorization: Bearer $NEST_ACCESS_TOKEN" \
     https://nest.example.com/api/projects
 ```
+
+Nest serves no page that calls `POST /api/projects` yet, and every page and JSON
+response on the Nest origin carries `Content-Security-Policy: default-src 'none'`,
+which also blocks `fetch()` typed into the browser's developer console there. A
+CLI session is refused (`browser_only`). Until a creation page or command exists,
+operators create Projects for Users as described in
+[Create a Project for a User](project-onboarding#create-a-project-for-a-user).
+Restricting creation to platform administrators is planned, not enforced.
 
 Errors are JSON `{"error": ...}`:
 
