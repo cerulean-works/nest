@@ -10,7 +10,9 @@
 # Real Slurm and Apptainer are not exercised; see docs/source/runtime-image.md.
 #
 # NEST_SMOKE_BUILD_FLAGS adds `docker build` flags, such as --build-context
-# overrides for a mirror.
+# overrides for a mirror. NEST_HPC_RUNTIME_PREBUILT=1 tests the image already
+# loaded as NEST_HPC_RUNTIME_IMAGE instead of building it, so CI checks the exact
+# image it publishes (.github/workflows/hpc-runtime-image.yml).
 
 set -euo pipefail
 
@@ -19,7 +21,11 @@ cd "$(dirname "$0")/.."
 image="${NEST_HPC_RUNTIME_IMAGE:-nest-hpc-runtime:test}"
 read -ra extra <<< "${NEST_SMOKE_BUILD_FLAGS:-}"
 
-docker build "${extra[@]}" --target hpc-runtime --tag "$image" .
+if [[ "${NEST_HPC_RUNTIME_PREBUILT:-}" == 1 ]]; then
+    docker image inspect "$image" >/dev/null
+else
+    docker build "${extra[@]}" --target hpc-runtime --tag "$image" .
+fi
 
 echo "=== Tools in $image ==="
 docker run --rm "$image" sh -c '

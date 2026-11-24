@@ -100,7 +100,7 @@ CI uses eight workers: beyond that, wall time stops improving.
 
 ### CI topology
 
-Each pull request runs three workflows concurrently. A new commit cancels the pull
+Each pull request runs four workflows concurrently. A new commit cancels the pull
 request's superseded runs; runs for pushes to `main`, tags and manual dispatches are
 never cancelled.
 
@@ -110,9 +110,13 @@ never cancelled.
 - **Code Quality**: ruff lint, ruff format and ty.
 - **Controller container**: five parallel `smoke (...)` jobs, each on its own
   runner with its own Controller image build: `controller` (Compose file validation,
-  the in-image unittest suite, `smoke_compose.sh`, `smoke_hpc_runtime.sh`),
-  `postgres`, `env-only`, `postgres-upgrade` and `tailnet-ssh`. The `test` job keeps
-  the workflow's single check and fails unless every smoke job succeeded.
+  the in-image unittest suite, `smoke_compose.sh`), `postgres`, `env-only`,
+  `postgres-upgrade` and `tailnet-ssh`. The `test` job keeps the workflow's single
+  check and fails unless every smoke job succeeded.
+- **HPC runtime image**: builds the `hpc-runtime` target once as an OCI archive,
+  runs `smoke_hpc_runtime.sh` against that exact image and records its manifest.
+  Only pushes to `main` and release tags publish to GHCR, from separate jobs; see
+  [Published images](runtime-image#published-images).
 
 To build and test the Compose deployment, with Docker Engine running:
 

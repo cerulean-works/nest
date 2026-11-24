@@ -28,7 +28,7 @@ jobs:
       matrix:
         include:
           - group: controller
-            title: Validate Compose files; test Controller RPCs, Compose SSH credentials and the HPC runtime image
+            title: Validate Compose files; test Controller RPCs and Compose SSH credentials
             script: |
               docker compose -f compose.tailscale.yaml config --quiet
               docker compose -f compose.tailscale-shared.yaml config --quiet
@@ -40,7 +40,8 @@ jobs:
                 --entrypoint python nest-controller:test \
                 -m unittest discover -s /tests -v
               bash tests/smoke_compose.sh
-              bash tests/smoke_hpc_runtime.sh
+              # The HPC runtime image is built and smoke-tested once, as the exact
+              # image it publishes, in hpc-runtime-image.yml.
           - group: postgres
             title: Test Compose default and local-db PostgreSQL deployments, persistence, and backups
             script: bash tests/smoke_compose_postgres.sh
