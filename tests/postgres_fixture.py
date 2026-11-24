@@ -96,6 +96,15 @@ def temporary_database() -> Generator[str]:
             admin.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(name)))
 
 
+# Advisory locks are scoped to a database, but `pg_locks` lists every database on the
+# server. Tests that check a lock was released count only their own database's locks,
+# so throwaway databases of other tests (or other pytest-xdist workers) never leak in.
+ADVISORY_LOCK_COUNT = (
+    "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' "
+    "AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
+)
+
+
 def connect(url: str):
     import psycopg
 
