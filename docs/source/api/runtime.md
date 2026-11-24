@@ -18,6 +18,17 @@ interpreter selects the prepared project environment.
 
 [[autodoc]] worker.main
 
+## GPU check
+
+Before a GPU-requesting call, the worker confirms that the GPUs Slurm assigned are
+usable. See [Run functions on GPUs](../gpus).
+
+[[autodoc]] gpu.check_gpu_access
+
+[[autodoc]] gpu.GpuAccess
+
+[[autodoc]] gpu.GpuUnavailableError
+
 ## User environment runner
 
 The worker invokes this runner in isolated Python mode and supplies a

@@ -23,6 +23,10 @@ except RemoteExecutionError as exc:
 
 The original exception type, message, and remote traceback are preserved.
 
+A `gpu=` function whose allocated GPUs are unusable does not run; it raises
+`RemoteExecutionError` with `remote_type` `nest.gpu.GpuUnavailableError`. See
+[GPU errors](gpus#gpu-errors).
+
 ## Connection and Controller failures
 
 A remote Python exception is different from a failure to reach or run the

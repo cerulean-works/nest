@@ -13,6 +13,8 @@ guide:
     sections:
       - local: project-dependencies
         title: Use project dependencies
+      - local: gpus
+        title: Run functions on GPUs
       - local: remote-errors
         title: Handle remote errors
   - title: Hosting

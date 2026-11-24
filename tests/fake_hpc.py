@@ -7,7 +7,12 @@ then run unmodified:
 
 - `ssh -o BatchMode=yes <host> <command>` runs `<command>` with local bash.
 - `sbatch` runs the batch script synchronously and records its final state.
-- `apptainer exec --bind SRC:DST` rewrites `DST` to `SRC` in the command.
+- `sbatch` emulates the node's GPU allocation: `--gpus-per-node`, or the script's
+  `#SBATCH --gpus-per-node` default, sets `SLURM_GPUS_ON_NODE`, `SLURM_JOB_GPUS`,
+  and `CUDA_VISIBLE_DEVICES` as Slurm does. `FakeHpc.gpu_environment` overrides them.
+- `apptainer exec --bind SRC:DST` rewrites `DST` to `SRC` in the command. `--nv`
+  puts a fake NVIDIA driver (`libcuda.so.1`, built with `cc`) on `LD_LIBRARY_PATH`;
+  `FakeHpc.nvidia_driver` makes it fail or removes it.
 - `uv run ... python` uses the test interpreter, which has Nest installed;
   `uv sync` creates a real virtual environment at `UV_PROJECT_ENVIRONMENT`. Each
   call logs its HOME, uv cache, and Git and SSH environment variables.
@@ -116,10 +121,29 @@ if hold.exists():
 elif Path(script).name.startswith("pending"):
     state_file(job_id).write_text("PENDING")
 else:
+    # Command-line options override the script's #SBATCH defaults, as in Slurm.
+    gpus = options.get("gpus-per-node")
+    if gpus is None:
+        for line in Path(script).read_text().splitlines():
+            if line.startswith("#SBATCH --gpus-per-node="):
+                gpus = line.split("=", 1)[1].strip()
+    env = {**os.environ, "SLURM_JOB_ID": str(job_id)}
+    for name in ("SLURM_GPUS_ON_NODE", "SLURM_JOB_GPUS", "CUDA_VISIBLE_DEVICES"):
+        env.pop(name, None)
+    if gpus and int(gpus) > 0:
+        ids = ",".join(str(i) for i in range(int(gpus)))
+        env.update(SLURM_GPUS_ON_NODE=gpus, SLURM_JOB_GPUS=ids, CUDA_VISIBLE_DEVICES=ids)
+    override = STATE / "gpu-env.json"
+    if override.exists():
+        for name, value in json.loads(override.read_text()).items():
+            if value is None:
+                env.pop(name, None)
+            else:
+                env[name] = value
     with open(STATE / f"job-{job_id}.out", "w") as out:
         code = subprocess.run(
             ["bash", script, *script_args],
-            env={**os.environ, "SLURM_JOB_ID": str(job_id)},
+            env=env,
             stdout=out,
             stderr=subprocess.STDOUT,
         ).returncode
@@ -182,11 +206,13 @@ print(
 args = sys.argv[1:]
 if args.pop(0) != "exec":
     sys.exit("fake apptainer supports only exec")
-clean, extra_env, binds = False, {}, []
+clean, nv, extra_env, binds = False, False, {}, []
 while args[0].startswith("--"):
     flag = args.pop(0)
     if flag == "--cleanenv":
         clean = True
+    elif flag == "--nv":
+        nv = True
     elif flag == "--env":
         key, value = args.pop(0).split("=", 1)
         extra_env[key] = value
@@ -199,10 +225,19 @@ if not Path(image).is_file():
     sys.exit(f"image not found: {image}")
 for source, target in binds:
     command = [part.replace(target, source) for part in command]
-log("apptainer", image=image, env=extra_env, clean=clean)
+log("apptainer", image=image, env=extra_env, clean=clean, nv=nv)
 keep = ("PATH", "HOME", "TMPDIR") + tuple(k for k in os.environ if k.startswith("FAKE_HPC_"))
 env = {k: v for k, v in os.environ.items() if k in keep} if clean else dict(os.environ)
 env.update(extra_env)
+driver = STATE / "nvidia-driver.json"
+driver = json.loads(driver.read_text()) if driver.exists() else {}
+if nv and driver.get("present", True):
+    # Like Apptainer, which binds the host driver libraries and adds them to the path.
+    libs = os.environ["FAKE_HPC_NVIDIA_LIBS"]
+    env["LD_LIBRARY_PATH"] = os.pathsep.join(filter(None, [libs, env.get("LD_LIBRARY_PATH")]))
+    for key in ("init_error", "device_count"):
+        if key in driver:
+            env[f"FAKE_CUDA_{key.upper()}"] = str(driver[key])
 os.execvpe(command[0], command, env)
 """,
     "uv": """
@@ -231,6 +266,52 @@ sys.exit(f"unsupported uv command {args[0]}")
 }
 
 
+_FAKE_LIBCUDA = r"""
+#include <stdlib.h>
+#include <string.h>
+
+static int env_int(const char *name, int fallback) {
+    const char *value = getenv(name);
+    return value && *value ? atoi(value) : fallback;
+}
+
+int cuInit(unsigned int flags) { (void)flags; return env_int("FAKE_CUDA_INIT_ERROR", 0); }
+
+int cuDriverGetVersion(int *version) { *version = 13020; return 0; }
+
+int cuDeviceGetCount(int *count) {
+    const char *visible = getenv("CUDA_VISIBLE_DEVICES");
+    int devices = 0;
+    if (visible && *visible) {
+        devices = 1;
+        for (const char *c = visible; *c; c++) devices += *c == ',';
+    }
+    *count = env_int("FAKE_CUDA_DEVICE_COUNT", devices);
+    return 0;
+}
+
+int cuGetErrorName(int code, const char **name) {
+    *name = code == 100 ? "CUDA_ERROR_NO_DEVICE" : code == 999 ? "CUDA_ERROR_UNKNOWN" : 0;
+    return *name ? 0 : 1;
+}
+"""
+
+
+def build_fake_libcuda(directory: Path) -> Path:
+    """Compiles the fake NVIDIA driver library into `directory`/`libcuda.so.1`."""
+    import subprocess
+
+    directory.mkdir(parents=True, exist_ok=True)
+    source = directory / "libcuda.c"
+    source.write_text(_FAKE_LIBCUDA)
+    compiler = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
+    if compiler is None:
+        raise RuntimeError("FakeHpc needs a C compiler (cc) to build its fake NVIDIA driver")
+    library = directory / "libcuda.so.1"
+    subprocess.run([compiler, "-shared", "-fPIC", "-o", str(library), str(source)], check=True)
+    return library
+
+
 class FakeHpc:
     """A fake Slurm login node rooted in a temporary directory.
 
@@ -257,6 +338,9 @@ class FakeHpc:
         (self.base / "project").mkdir()
         shutil.copytree(REPOSITORY / "scripts", self.base / "project" / "scripts")
 
+        self.nvidia_libs = root / "nvidia"
+        build_fake_libcuda(self.nvidia_libs)
+
         for name, body in _SHIMS.items():
             path = self.bin / name
             path.write_text(
@@ -276,7 +360,39 @@ class FakeHpc:
             "FAKE_HPC_HOST": self.host,
             "FAKE_HPC_STATE": str(self.state),
             "FAKE_HPC_PYTHON": sys.executable,
+            "FAKE_HPC_NVIDIA_LIBS": str(self.nvidia_libs),
         }
+
+    def gpu_environment(self, **variables: str | None) -> None:
+        """Overrides the GPU allocation variables later batch jobs start with.
+
+        Args:
+            **variables (`str | None`): Values such as `CUDA_VISIBLE_DEVICES="GPU-..."`;
+                `None` unsets the variable, as on a cluster that does not set it.
+        """
+        (self.state / "gpu-env.json").write_text(json.dumps(variables))
+
+    def nvidia_driver(
+        self,
+        *,
+        present: bool = True,
+        init_error: int | None = None,
+        device_count: int | None = None,
+    ) -> None:
+        """Configures the fake NVIDIA driver that `apptainer --nv` exposes.
+
+        Args:
+            present (`bool`, *optional*, defaults to `True`): Whether `--nv` finds a driver.
+            init_error (`int`, *optional*): CUDA error code `cuInit` returns.
+            device_count (`int`, *optional*): Devices the driver reports, instead of the
+                number listed in `CUDA_VISIBLE_DEVICES`.
+        """
+        driver: dict[str, object] = {"present": present}
+        if init_error is not None:
+            driver["init_error"] = init_error
+        if device_count is not None:
+            driver["device_count"] = device_count
+        (self.state / "nvidia-driver.json").write_text(json.dumps(driver))
 
     def hang_ssh(self, match: str, *, after: bool = False) -> None:
         """Makes SSH commands containing `match` hang until the caller kills SSH.

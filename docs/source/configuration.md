@@ -524,7 +524,8 @@ call again.
 `@nest.remote(gpu=..., cpu=...)` defaults to `gpu=0`, `cpu=1`. The Slurm
 Controller passes `gpu` to the worker job as `--gpus-per-node` and `cpu` as
 `--cpus-per-task`. A count of `0` uses the worker script's `#SBATCH` directive
-(one CPU in `scripts/worker.sbatch`). Environment builds use the resource
+(one CPU in `scripts/worker.sbatch`). The worker exposes GPUs to the function only
+when `gpu` is positive; see [Run functions on GPUs](gpus). Environment builds use the resource
 counts and time limit in the deployed `scripts/environment-smoke.sbatch`.
 Use `gpu=1` for a smoke test on the team's Nano4 partition.
 Negative counts are rejected before anything is submitted. The local Controller

@@ -284,6 +284,28 @@ class _Base(PostgresTestCase):
 
 
 class SubmissionPathTests(_Base):
+    def test_application_error_settles_as_a_completed_attempt_with_its_traceback(self):
+        # Current contract: the function's exception is its result. The worker writes
+        # the remote error record and exits 0, so Slurm reports COMPLETED and the
+        # registry records the attempt and execution as succeeded; the client raises
+        # RemoteExecutionError from the record. Distinguishing application failure in
+        # the registry is a separate follow-up (issue #73).
+        def train():
+            raise RuntimeError("CUDA error: device-side assert triggered")
+
+        record = self.execute(train)
+        self.assertIs(record["__nest_remote_error_v1__"], True)
+        self.assertEqual(record["type"], "builtins.RuntimeError")
+        self.assertEqual(record["message"], "CUDA error: device-side assert triggered")
+        self.assertIn("in train", record["traceback"])
+        [worker] = self.sbatch_calls()
+        self.assertEqual(self.hpc.job_state(worker["job_id"]), "COMPLETED")
+        [attempt] = self.attempts()
+        self.assertEqual((attempt["status"], attempt["slurm_state"]), ("succeeded", "COMPLETED"))
+        self.assertIsNone(attempt["error_kind"])
+        [execution] = self.sql("SELECT status FROM executions")
+        self.assertEqual(execution["status"], "succeeded")
+
     def test_execute_commits_its_attempt_before_sbatch(self):
         seen = self.spy_on_sbatch()
         self.assertEqual(self.execute(), 42)
