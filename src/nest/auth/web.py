@@ -190,6 +190,11 @@ _SECURITY_HEADERS = {
     "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
 }
 
+# A form POST from a `no-referrer` page carries `Origin: null`, which the
+# same-origin check of a browser-only form route refuses. Pages holding such a
+# form use `same-origin` instead: it still sends no referrer to any other site.
+_FORM_PAGE_HEADERS = {"Referrer-Policy": "same-origin"}
+
 _PAGE = (
     '<!doctype html><html lang="en"><head><meta charset="utf-8">'
     '<meta name="viewport" content="width=device-width, initial-scale=1">'
@@ -689,6 +694,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(
                 HTTPStatus.OK if raw is None else HTTPStatus.BAD_REQUEST,
                 _CODE_PAGE.format(message=html.escape(message), action=CLI_APPROVE_PATH),
+                _FORM_PAGE_HEADERS,
             )
             return
         request = self.app.cli.find(code)
@@ -713,6 +719,7 @@ class _Handler(BaseHTTPRequestHandler):
                 action=CLI_APPROVE_PATH,
                 csrf=_approval_csrf(token, request.id),
             ),
+            _FORM_PAGE_HEADERS,
         )
 
     def _cli_decide(self):
@@ -810,11 +817,9 @@ class _Handler(BaseHTTPRequestHandler):
             _INVITATION_PAGE.format(
                 title=html.escape(title), content=content, done=" data-done" if done else ""
             ),
-            # A form POST from a `no-referrer` page carries `Origin: null`, which
-            # the same-origin check refuses. `same-origin` keeps referrers off
-            # every other site; the token is only ever in the fragment, which
-            # browsers never put in a referrer.
-            headers={"Content-Security-Policy": _INVITATION_CSP, "Referrer-Policy": "same-origin"},
+            # The token is only ever in the fragment, which browsers never put in
+            # a referrer.
+            headers={"Content-Security-Policy": _INVITATION_CSP, **_FORM_PAGE_HEADERS},
         )
 
     def _invitation_message(self, status: int, title: str, message: str, *, done: bool = False):

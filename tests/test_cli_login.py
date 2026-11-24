@@ -556,6 +556,40 @@ class CLISignInFlowTests(_Flow):
         self.assertNotIn("Run and manage jobs", page)
         self.assertIn("NCHC password", page)
 
+    def test_form_pages_send_a_same_origin_referrer_policy(self):
+        """A form POST from a `no-referrer` page carries `Origin: null`, which the
+        approval route refuses; the pages holding its forms use `same-origin`.
+        `test_cli_login_browser` checks this with a real browser."""
+        browser = self.browser()
+        started = self.start()
+        status, headers, _ = self.approval_page(browser, started["user_code"])
+        self.assertEqual((status, headers["Referrer-Policy"]), (200, "same-origin"))
+        status, headers, _ = browser.get(self.base + CLI_APPROVE_PATH)
+        self.assertEqual((status, headers["Referrer-Policy"]), (200, "same-origin"))
+        status, headers, _ = self.approval_page(browser, "nonsense")
+        self.assertEqual((status, headers["Referrer-Policy"]), (400, "same-origin"))
+        # Every other page keeps `no-referrer`: the sign-in redirect, an unknown
+        # code, and the page answering the decision.
+        status, headers, _ = self.approval_page(Browser(), started["user_code"])
+        self.assertEqual((status, headers["Referrer-Policy"]), (303, "no-referrer"))
+        status, headers, _ = self.approval_page(browser, "BCDF-GHJK")
+        self.assertEqual((status, headers["Referrer-Policy"]), (404, "no-referrer"))
+        _, _, page = self.approval_page(browser, started["user_code"])
+        csrf = re.search(r'name="csrf" value="([0-9a-f]+)"', page)
+        assert csrf is not None
+        token = browser.cookies["nest_session"][0]
+        request = urllib.request.Request(
+            self.base + CLI_APPROVE_PATH,
+            data=urlencode(
+                {"code": started["user_code"], "csrf": csrf.group(1), "decision": "deny"}
+            ).encode(),
+            method="POST",
+            headers={"Origin": self.base, "Cookie": f"nest_session={token}"},
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            self.assertIn("CLI sign-in denied", response.read().decode())
+            self.assertEqual(response.headers["Referrer-Policy"], "no-referrer")
+
     def test_approval_page_for_unknown_or_missing_code(self):
         browser = self.browser()
         status, _, page = self.approval_page(browser, "BCDF-GHJK")
@@ -575,9 +609,10 @@ class CLISignInFlowTests(_Flow):
         csrf = re.search(r'name="csrf" value="([0-9a-f]+)"', page)
         assert csrf is not None
         fields = {"code": code, "csrf": csrf.group(1), "decision": "approve"}
-        # A cross-site form post, or one without Origin.
+        # A cross-site form post, or one without a real Origin.
         self.assertEqual(self.submit(browser, fields, origin="https://evil.example")[0], 403)
         self.assertEqual(self.submit(browser, fields, origin=None)[0], 403)
+        self.assertEqual(self.submit(browser, fields, origin="null")[0], 403)
         # A CSRF token of another browser session.
         other = self.browser()
         self.assertEqual(self.submit(other, fields)[0], 403)
