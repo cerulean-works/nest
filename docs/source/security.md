@@ -11,6 +11,14 @@ HPC identity management: every job runs as the Controller's configured HPC accou
 
 Only trusted users should be granted access to the Controller.
 
+**Authentication and authorization are not isolation.** Session authentication
+decides *who* may submit to *which* Project; it does not sandbox what a submitted
+function does. Every Run executes trusted, deserialized Python as the Controller's
+single HPC account, in a work directory shared by all Projects, without an OS
+sandbox or per-user HPC identity. A member of any approved Project can therefore
+read or change what other Projects' Runs leave in that account. Approve only
+Projects whose members you would trust with the account itself.
+
 For the current team deployment, restrict network access using Tailscale Grants / ACLs.
 
 Do not expose the Controller directly to the public Internet.
@@ -193,9 +201,18 @@ changes and bootstrap events are kept in an append-only audit log. See
   HPC account and work directory.
 - No per-user HPC accounts.
 - No automatic project source or data synchronization.
-- No authentication without a database (`NEST_CONTROLLER_AUTH=none`).
-  `NEST_AUTH_TOKEN_FILE` (static service tokens) is reserved and rejected at
-  startup.
+- No authentication without a database (`NEST_CONTROLLER_AUTH=none`, the
+  [local development](local-controller) mode). `NEST_AUTH_TOKEN_FILE` (static
+  service tokens) is reserved and rejected at startup.
+- No OS sandbox or multi-tenant isolation for submitted code (see above).
+- The SDK calls only the synchronous `Execute` RPC (`.remote()` waits for the
+  result). Asynchronous `SubmitJob`, `GetJobStatus` and `CancelJob` are gRPC RPCs
+  for prepared batch scripts, without an SDK wrapper; see
+  [Execution service and RPCs](api/controller).
+- The SDK does not choose an HPC Platform per call: Runs use the Project's
+  default Platform (see [Default Platform](platforms#project-eligibility-and-default-platform)).
+- Projects are created through the Projects API from a browser session; there is
+  no Web UI page or CLI command for it yet.
 - Controller and backend deployment are managed by the host.
 
 ## Execution behavior

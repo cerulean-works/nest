@@ -30,6 +30,11 @@ print(compute.remote())
 
 Nest transfers the project's `pyproject.toml` and `uv.lock` to the Controller.
 
+`project=` names a **uv project directory** on your machine. It is unrelated to
+the Nest Project named by `NEST_PROJECT_ID`, which decides who may run and which
+Slurm account is charged; an authenticated Controller needs both settings when
+you use dependencies.
+
 The HPC backend prepares an isolated Python environment and caches it for reuse.
 
 **Note:** Automatic project source-code synchronization is not yet supported. Project-local modules and data files are not automatically transferred.

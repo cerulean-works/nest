@@ -6,9 +6,15 @@ terminal or passed as an argument. The flow follows the OAuth 2.0 device
 authorization grant ([RFC 8628](https://www.rfc-editor.org/rfc/rfc8628)), so it
 also works on a login node or over SSH, where no browser runs.
 
-`nest login` is optional. A command that needs a Nest session, such as `nest run`,
-signs you in the same way the first time it needs to, through
-[`login.ensure_session`].
+`nest login` is optional. A command that needs a Nest session, such as
+`nest platforms list`, signs you in the same way the first time it needs to,
+through [`login.ensure_session`]. So does `.remote()` when `NEST_AUTH_URL` is set,
+the Controller requires a session, and the program runs in an interactive
+terminal; in a batch job or without a terminal it raises
+`AuthenticationRequiredError` instead, so sign in with `nest login` first.
+
+To use a session for remote calls, also set `NEST_PROJECT_ID`; see
+[Run your first remote function](quickstart).
 
 A Nest session identifies you to Nest only. It is **not** an NCHC SSH password,
 one-time code (MFA) or key, Nest never sends it to an HPC login node, and the

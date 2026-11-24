@@ -18,28 +18,56 @@ The API is experimental and may change before version 1.0.0.
 
 ## Installation
 
-Nest requires Python 3.14 or later.
-
-Install Nest from GitHub:
+Nest requires Python 3.14 or later. Add it to a [uv](https://docs.astral.sh/uv/)
+project from GitHub:
 
 ```bash
-pip install "git+https://github.com/cerulean-works/nest.git@main"
+uv add "nest @ git+https://github.com/cerulean-works/nest@main"
 ```
+
+`uv.lock` pins the commit that `main` pointed to when you added it. To update to
+the current SDK later, run `uv lock --upgrade-package nest && uv sync`. Without
+uv, use `pip install "git+https://github.com/cerulean-works/nest.git@main"`. See
+[Install Nest](docs/source/installation.md) for checking the installed commit and
+how SDK, Controller and HPC runtime versions relate.
 
 A versioned release installation command will be provided when the first Early Access release is tagged.
 
 ## Quick Start
 
-For the team deployment, connect to the authorized Tailscale network or accept
-a Controller node share. This deployment uses plaintext gRPC inside the encrypted
-Tailscale network. Select the address and transport explicitly.
+The team's shared Controller is authenticated (M1): each call carries your Nest
+session and runs in a Project that the operator has approved. The
+[full walkthrough](docs/source/quickstart.md) explains each step; in short:
 
-```bash
-export NEST_CONTROLLER_ADDRESS="nest.cerulean.works:50051"
-export NEST_CONTROLLER_TLS=false
-```
+1. Connect to the authorized Tailscale network, or accept the Controller node share.
+2. Point the SDK at the Controller and at Nest's sign-in (values from your operator):
 
-Create `main.py`:
+   ```bash
+   export NEST_CONTROLLER_ADDRESS="nest.cerulean.works:50051"
+   export NEST_CONTROLLER_TLS=false   # plaintext gRPC inside the encrypted Tailnet
+   export NEST_AUTH_URL="https://nest.example.com"
+   ```
+
+3. Sign in by approving the CLI in a browser, and check the session:
+
+   ```bash
+   uv run nest login
+   uv run nest auth status --check
+   ```
+
+4. Join a Project through an invitation from its Owner or an Admin, or create one,
+   and select it by ID (see [Join or create a Project](docs/source/quickstart.md#4-join-or-create-a-project)):
+
+   ```bash
+   export NEST_PROJECT_ID="<project-id>"
+   ```
+
+5. Ask the operator to approve the Project: Provider approval, an HPC Platform
+   grant and a Slurm account ([Onboard a Project](docs/source/project-onboarding.md)).
+   `uv run nest platforms default --project-id "$NEST_PROJECT_ID"` shows the
+   granted Platform.
+
+Then create `main.py`:
 
 ```python
 import nest
@@ -58,23 +86,35 @@ print(compute.remote(21))  # 42
 Run:
 
 ```bash
-python main.py
+uv run python main.py
 ```
 
 - `.local()` executes the function on your machine.
-- `.remote()` sends the function to the Nest Controller, which schedules execution on the HPC cluster.
+- `.remote()` sends the function to the Nest Controller, which checks your session
+  and Project and schedules execution on the HPC cluster.
 
-### Using a Different Controller
+A refused call raises `AuthenticationRequiredError` (`UNAUTHENTICATED`) or
+`RemoteAccessDeniedError` (`PERMISSION_DENIED`, `NOT_FOUND`) and names the reason;
+see [Access and onboarding errors](docs/source/remote-errors.md#access-and-onboarding-errors).
+
+### Local development without a session
 
 The SDK defaults to a [local Controller](docs/source/local-controller.md) at
-`127.0.0.1:50051`. For a TLS-enabled remote Controller, set its address and enable
-TLS. The client verifies the server certificate with gRPC's default trust roots or
-the PEM roots specified by `NEST_CONTROLLER_TLS_CA_FILE`.
+`127.0.0.1:50051`. A Controller started without a database has no sign-in,
+Projects or authorization, so use it only on loopback:
 
 ```bash
-export NEST_CONTROLLER_ADDRESS="your-controller:50051"
-export NEST_CONTROLLER_TLS=true
+NEST_EXECUTOR=local NEST_CONTROLLER_BIND=127.0.0.1:50051 uv run python -m nest.controller
 ```
+
+In another terminal, with `NEST_CONTROLLER_ADDRESS`, `NEST_CONTROLLER_TLS`,
+`NEST_AUTH_URL` and `NEST_PROJECT_ID` unset, run `uv run python main.py`.
+
+### Using a TLS Controller
+
+For a Controller with its own TLS certificate, set `NEST_CONTROLLER_TLS=true`. The
+client verifies the server certificate with gRPC's default trust roots or the PEM
+roots specified by `NEST_CONTROLLER_TLS_CA_FILE`.
 
 ## Project Dependencies
 
@@ -107,6 +147,8 @@ print(compute.remote())
 ```
 
 Nest transfers the project's `pyproject.toml` and `uv.lock` to the Controller.
+`project=` names this uv project directory; it is unrelated to the Nest Project
+selected by `NEST_PROJECT_ID`.
 
 The HPC backend prepares an isolated Python environment and caches it for reuse.
 
@@ -141,120 +183,27 @@ The original exception type, message, and remote traceback are preserved.
 
 This section is intended for hosts who operate a Nest Controller.
 
-### Docker Compose
+- [Deploy on Dokploy from environment variables](docs/source/dokploy.md) with
+  [compose.dokploy.yaml](compose.dokploy.yaml): the complete M1 Controller
+  (PostgreSQL and migrations, Google sign-in, Project and Platform authorization,
+  the Execution Registry, Tailscale, SSH) configured only from Dokploy's
+  Environment panel.
+- [Deploy with Docker Compose](docs/source/docker-compose.md) with
+  [compose.yaml](compose.yaml), adding [PostgreSQL](docs/source/database.md) and
+  [Google sign-in](docs/source/authentication.md) for authentication, and
+  [Share a Controller over Tailscale](docs/source/tailscale-shared.md) for members
+  on separate Tailnets.
+- [Deploy a Slurm Controller](docs/source/deploy.md) for the HPC work directory
+  (`NEST_SLURM_WORKDIR`), Slurm scripts and runtime, and
+  [Build and roll out the HPC runtime image](docs/source/runtime-image.md) for
+  `images/uv-python314.sif`, which includes Git for `uv.lock` Git dependencies.
+- [Onboard a Project](docs/source/project-onboarding.md): approve it in
+  `NEST_PROVIDER_ALLOWED_PROJECTS`, grant an HPC Platform and link a Slurm account
+  with `nest-db`.
 
-For a Dokploy Controller shared with members on separate Tailscale Tailnets,
-see [Share a Controller over Tailscale](docs/source/tailscale-shared.md). To
-configure a complete Controller (PostgreSQL, Google sign-in, Tailscale, SSH) only
-from Dokploy's Environment panel, without mounted credential files, use
-[compose.dokploy.yaml](compose.dokploy.yaml) and
-[Deploy on Dokploy from environment variables](docs/source/dokploy.md).
-
-Clone this repository and deploy the Controller using [compose.yaml](compose.yaml).
-Follow [Deploy with Docker Compose](docs/source/docker-compose.md) to configure
-the Slurm connection, SSH credentials, and host address, then start the service:
-
-```bash
-docker compose up -d --build --wait
-```
-
-Docker handles the Controller's Python environment, health checks, logs, and
-restart policy. The HPC runtime and work directory below must already exist.
-
-### Requirements
-
-- Python 3.14+
-- Access to the target HPC Login Node via SSH
-- A configured Slurm backend
-- A working Nest runtime and Apptainer environment on HPC
-
-### Configuration
-
-Example:
-
-```bash
-export NEST_EXECUTOR="slurm"
-export NEST_CONTROLLER_BIND="$(tailscale ip -4):50051"
-
-export NEST_SLURM_HOST="<ssh-host>"
-export NEST_SLURM_ACCOUNT="<slurm-account>"
-export NEST_SLURM_WORKDIR="/home/your-user/nest"
-```
-
-Start the Controller:
-
-```bash
-uv run python -m nest.controller
-```
-
-The Controller listens on the configured network address.
-
-The Tailscale binding example requires a locally configured Tailscale network interface.
-
-
-### HPC Work Directory
-
-Nest uses `NEST_SLURM_WORKDIR` to configure the working directory on the HPC cluster.
-
-```bash
-export NEST_SLURM_WORKDIR="/home/your-user/nest"
-```
-
-The path must be absolute and accessible from both the HPC Login Node and Compute Nodes.
-
-Nest expects the following directory structure:
-
-```text
-nest/
-├── images/
-│   └── uv-python314.sif
-├── project/
-│   ├── pyproject.toml
-│   ├── uv.lock
-│   ├── scripts/
-│   └── src/
-│       └── nest/
-├── environments/
-└── jobs/
-```
-
-Directory purposes:
-
-- `images/`: Apptainer images used for remote execution.
-- `project/`: The deployed Nest runtime and Slurm scripts.
-- `environments/`: Cached Python environments for user projects.
-- `jobs/`: Execution inputs, outputs, and temporary files.
-
-The Nest runtime, Slurm scripts, and Apptainer image must be deployed by the host before starting remote executions.
-
-`images/uv-python314.sif` is built from the `hpc-runtime` target of the repository's
-`Dockerfile`, which adds Git, CA certificates and the OpenSSH client so that
-`uv.lock` files with Git dependencies install. See
-[Build and roll out the HPC runtime image](docs/source/runtime-image.md).
-
-The Controller passes the configured working directory to Slurm jobs. Inside Apptainer, this directory is mounted at `/workspace`.
-
-Changing `NEST_SLURM_WORKDIR` does not automatically migrate existing files or deploy the runtime to the new location.
-
-Users do not need to configure this directory. It is managed entirely by the host.
-
-
-### Local Development
-
-For local development without Slurm:
-
-```bash
-export NEST_EXECUTOR="local"
-export NEST_CONTROLLER_BIND="127.0.0.1:50051"
-
-uv run python -m nest.controller
-```
-
-Clients can connect to this Controller by setting:
-
-```bash
-export NEST_CONTROLLER_ADDRESS="127.0.0.1:50051"
-```
+Requirements: Python 3.14+ (or the Controller image), SSH access to the HPC login
+node, a Slurm account, and the Nest runtime and Apptainer image deployed in the
+HPC work directory. Starting the Controller does not deploy the HPC runtime.
 
 ## Logging
 
@@ -272,21 +221,30 @@ Nest currently uses Python object serialization for remote function execution.
 
 Deserializing untrusted Python payloads may execute arbitrary code.
 
-The current Controller does not provide application-level authentication, multi-tenant isolation, or per-user HPC identity management.
+With a database, the Controller authenticates every gRPC call with a Nest session
+from Google sign-in and authorizes it with deny-by-default Project, Provider,
+Platform and Slurm account policy. Without a database (`NEST_CONTROLLER_AUTH=none`,
+for local development) it authenticates nobody.
 
-Only trusted users should be granted access to the Controller.
+Authentication is not isolation: every Run executes as the Controller's single HPC
+account, in a shared work directory, without an OS sandbox or per-user HPC
+identity. Only trusted users should be granted access to the Controller.
 
 For the current team deployment, restrict network access using Tailscale Grants / ACLs.
 
 Do not expose the Controller directly to the public Internet.
 
+See [Security and limitations](docs/source/security.md).
+
 ## Known Limitations
 
 - Experimental API with potential breaking changes.
-- No multi-tenant isolation.
-- No per-user HPC accounts.
+- No multi-tenant isolation or OS sandbox for submitted code.
+- No per-user HPC accounts: all Runs use the Controller's HPC identity.
 - No automatic project source or data synchronization.
-- No application-level authentication.
+- The SDK wraps only the synchronous `Execute` call; `SubmitJob`, `GetJobStatus`
+  and `CancelJob` are available as gRPC RPCs.
+- No authentication without a database; no Web UI or CLI command to create Projects.
 - Controller and backend deployment are managed by the host.
 
 ## Development

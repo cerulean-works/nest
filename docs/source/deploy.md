@@ -2,8 +2,16 @@
 
 This section is intended for hosts who operate a Nest Controller.
 
-For a container deployment, start with [Deploy with Docker Compose](docker-compose).
-The HPC work directory and runtime described below are required for both methods.
+For a container deployment, start with [Deploy on Dokploy from environment
+variables](dokploy) or [Deploy with Docker Compose](docker-compose). The HPC work
+directory and runtime described below are required for every method.
+
+A shared Controller also needs PostgreSQL ([Store Controller records in
+PostgreSQL](database)) and Google sign-in ([Sign in with Google](authentication)):
+with `NEST_DATABASE_URL` set it authenticates every call
+(`NEST_CONTROLLER_AUTH=session`) and admits Slurm submissions through the
+[Execution Registry](execution-registry). The example below without a database is
+the unauthenticated mode; restrict it to trusted networks.
 
 ## Requirements
 
@@ -35,6 +43,12 @@ uv run python -m nest.controller
 The Controller listens on the configured network address.
 
 The Tailscale binding example requires a locally configured Tailscale network interface.
+
+With a database and session authentication, a plaintext Tailnet listener also
+needs `NEST_CONTROLLER_ALLOW_PLAINTEXT=true`, and the operator's UNIX user
+(`NEST_SLURM_SSH_USER`). `NEST_SLURM_ACCOUNT` is then charged only if it is
+registered and linked in the [Slurm Account Registry](slurm-accounts); see
+[Onboard a Project](project-onboarding).
 
 
 ## HPC Work Directory
@@ -90,7 +104,8 @@ The Controller host must be able to run noninteractive SSH commands against
 already exist; starting the Controller does not deploy them.
 
 Review the batch scripts for your cluster's partition, account, time, memory,
-and container requirements before use. From a trusted client, run the
+and container requirements before use. [Onboard a Project](project-onboarding)
+for an authenticated Controller, then, from a trusted client, run the
 [quickstart](quickstart) with `NEST_CONTROLLER_ADDRESS` set to this Controller.
 Set `NEST_CONTROLLER_TLS=false` for the plaintext Tailnet example above, or
 configure the client [TLS settings](configuration#client) for a TLS deployment.

@@ -15,10 +15,14 @@ Controller / OpenSSH -> tailscale:1055 SOCKS5 -> original Tailnet -> HPC TCP 22
 ```
 
 No SDK, SlurmBackend, Worker, or Login Node changes are needed. All callers use
-the **same configured HPC SSH identity**. Nest accepts trusted serialized Python
-and has no application authentication or per-user job authorization. A network
-grant is not an application identity or tenant boundary. Only share with people
-authorized to use that SSH identity and Controller. See [Security](security).
+the **same configured HPC SSH identity**, and Nest accepts trusted serialized
+Python. Tailscale controls who can reach TCP 50051; it is not an application
+identity or tenant boundary. With a database, the Controller also authenticates
+every call with a Nest session and authorizes it by Project (see
+[Authenticated execution](security#authenticated-execution)); without one
+(`NEST_CONTROLLER_AUTH=none`), the network grant is the only access control. Only
+share with people authorized to use that SSH identity and Controller. Members then
+follow [Run your first remote function](quickstart).
 
 ## Forwarding and compatibility
 
@@ -276,6 +280,13 @@ This sends an explicitly empty environment to the existing `Execute` RPC and
 expects Nest's exact `INVALID_ARGUMENT` response. Validation occurs before
 payload deserialization, executor selection, SSH, or Slurm; the probe never
 submits work. A channel-ready check alone only proves a gRPC transport.
+
+The probe sends no Nest session. A Controller with session authentication
+(`NEST_CONTROLLER_AUTH=session`) answers it with `UNAUTHENTICATED` before any
+validation, and the script then prints `FAIL` with that status. An
+`UNAUTHENTICATED` answer naming `nest login` still proves that the Tailnet path
+reaches Nest's handler; check authorization end to end by signing in and running
+the [quickstart](quickstart) from the member's device.
 
 To check the backend independently inside Docker, pass that script via stdin:
 

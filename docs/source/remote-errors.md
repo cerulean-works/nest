@@ -31,11 +31,41 @@ Controller:
 | Exception | What to inspect |
 | --- | --- |
 | `RemoteExecutionError` | The function's remote type, message, and traceback. |
+| `AuthenticationRequiredError` | The Controller needs a Nest session and none was accepted (`UNAUTHENTICATED`). See [Access and onboarding errors](#access-and-onboarding-errors). |
+| `RemoteAccessDeniedError` | The Controller's Project, Provider, Platform or Slurm account policy refused the call (`PERMISSION_DENIED` or `NOT_FOUND`). Nothing ran. |
 | `ConnectionError` | Tailscale connectivity, Controller address, access rules, and whether the Controller is running. |
 | `InfrastructureError` subclasses | SSH, Slurm, or deadline failures; see the table below. |
 | `grpc.RpcError` | `exc.code()` and `exc.details()` for any other Controller failure. |
 | `OSError` | Whether the local project's `pyproject.toml` and `uv.lock` can be read. |
-| `ValueError` | Negative `gpu` or `cpu` counts, or an invalid `NEST_RPC_TIMEOUT`. |
+| `ValueError` | Negative `gpu` or `cpu` counts, or an invalid client setting (`nest.config.ConfigError`), such as `NEST_RPC_TIMEOUT` or a `NEST_PROJECT_ID` that is not a UUID. |
+
+Both access errors are `PermissionError`s. Every access refusal happens before
+anything is submitted, so it is safe to call again once the cause is fixed.
+
+## Access and onboarding errors
+
+An authenticated Controller checks, in this order: your Nest session, the Project
+named by `NEST_PROJECT_ID`, your role in it, the operator's Provider approval, and
+for Slurm runs the Project's HPC Platform and Slurm account. The first check that
+fails ends the call. The message names the reason; the Controller's audit log
+records the same reason for the operator.
+
+| Status and message | Raised as | Cause | Fix |
+| --- | --- | --- | --- |
+| `UNAUTHENTICATED`: *requires a Nest session* | `AuthenticationRequiredError` | `NEST_AUTH_URL` is unset in the process making the call; you never signed in, or the session expired (7 days), was revoked or belongs to another Nest; or your SDK predates session support | Set `NEST_AUTH_URL`, run `nest login`, and check `nest auth status --check` says `accepted by Nest: yes`. If it does and the call is still refused, [update the SDK](installation#update-the-sdk) in the environment that runs the call. |
+| `INVALID_ARGUMENT`: *Name the Project to run in with NEST_PROJECT_ID* | `grpc.RpcError` | `NEST_PROJECT_ID` is unset | [Find your Project ID](quickstart#4-join-or-create-a-project) and export it. |
+| `NOT_FOUND`: *Project not found* | `RemoteAccessDeniedError` | The ID is wrong, you are not (or no longer) a member, or the Project was deleted. A Project you cannot see looks the same as one that does not exist | List your Projects and check the ID; ask an Owner or Admin to invite you. |
+| `PERMISSION_DENIED`: *Not allowed to run.submit: role* | `RemoteAccessDeniedError` | You are a Viewer | Ask an Owner or Admin for the `member` role. |
+| `PERMISSION_DENIED`: *Not allowed to run.submit: scope* | `RemoteAccessDeniedError` | The session lacks the `jobs:run` scope | Sign in again with `nest login`. |
+| `PERMISSION_DENIED`: *Not allowed to run.submit: provider_denied* | `RemoteAccessDeniedError` | The operator has not approved the Project for this Controller's Provider | Ask the operator to [add the Project to `NEST_PROVIDER_ALLOWED_PROJECTS`](project-onboarding). |
+| `NOT_FOUND`: *Platform not found* | `RemoteAccessDeniedError` | The Controller's HPC Platform is not granted to the Project, or is disabled | Ask the operator to [grant the Platform](project-onboarding). `nest platforms default --project-id ...` shows what is granted. |
+| `FAILED_PRECONDITION`: *... [none_authorized]*, *[ambiguous]*, *[default_unavailable]* | `grpc.RpcError` | No Platform is granted; several are and none is the default; or the Project's default Platform is disabled | Operator grants a Platform, or a Project Owner or Admin chooses the [default](platforms#choose-a-projects-default-platform). |
+| `FAILED_PRECONDITION`: *... [platform_not_served]* | `grpc.RpcError` | The Project's Platform is not the one this Controller submits to; Nest never runs it elsewhere | Use the Controller that serves that Platform, or change the Project's default. |
+| `PERMISSION_DENIED`: *... [no_account]*, *[not_granted]* and other Slurm account reasons | `RemoteAccessDeniedError` | No Slurm account is linked to the Project on this Platform, or the account is not permitted for it | Ask the operator to [register and link a Slurm account](slurm-accounts#manage-accounts). |
+
+Do not ask the operator to turn authentication off (`NEST_CONTROLLER_AUTH=none`)
+to work around one of these: that removes every access check for everyone who can
+reach the Controller. Each refusal above has a fix that keeps the checks in place.
 
 ## Infrastructure failures and timeouts
 
