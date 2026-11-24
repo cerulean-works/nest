@@ -20,7 +20,7 @@ from .accounts import (
     HPCIdentity,
     resolve_account,
 )
-from .admin import AdminService, DirectoryUser, Page, ProjectAccess
+from .admin import AdminService, DirectoryUser, Page, ProjectAccess, ProviderPolicy
 from .execution import (
     AllowedProjects,
     DatabaseProviderApprovals,
@@ -116,6 +116,7 @@ __all__ = [
     "ProjectRequiredError",
     "ProjectService",
     "ProviderAuthority",
+    "ProviderPolicy",
     "Target",
     "UnauthenticatedError",
     "decide",

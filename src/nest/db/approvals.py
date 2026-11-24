@@ -10,6 +10,15 @@ transaction that records the attempt.
 An approval is never deleted. A revocation keeps the row with status `revoked`,
 so [`db.ProviderApprovalStore.import_projects`] and restarts can never turn it
 back into an approval; only an explicit [`db.ProviderApprovalStore.approve`] can.
+A revocation of a Project that was never approved in the database, such as one
+still authorized only by `NEST_PROVIDER_ALLOWED_PROJECTS`, records a `revoked`
+tombstone too, so a later import cannot approve it. Every change and import for
+one Provider serializes on a transaction-level advisory lock, so a revocation
+racing the first import is never lost.
+
+With `NEST_PROVIDER_APPROVALS=environment`, recorded revocations still refuse new
+submissions (see [`authz.AllowedProjects`]): a rollback to a saved environment
+list can never restore revoked access.
 """
 
 from __future__ import annotations
@@ -42,6 +51,7 @@ APPROVAL_STATUSES = ("approved", "revoked")
 """Statuses of a [`db.ProviderApproval`]."""
 
 _PROVIDER = re.compile(r"[a-z][a-z0-9_]{0,31}")
+_LOCK = "SELECT pg_advisory_xact_lock(hashtextextended('nest.provider_approvals:' || %s, 0))"
 _COLUMNS = "provider, project_id, status, created_at, updated_at"
 
 
@@ -182,6 +192,58 @@ class ProviderApprovalStore:
             ).fetchone()
         return row is not None
 
+    def is_revoked(self, provider: str | None, project_id: UUID | str) -> bool:
+        """
+        Whether a revocation is recorded for the Project. Used in environment mode,
+        where the database grants nothing but its revocations still refuse.
+
+        Raises:
+            [`db.DatabaseError`]: If the database cannot answer (fail closed).
+        """
+        if provider is None:
+            return False
+        pid = as_uuid(project_id, "project_id")
+        with transaction(self.database, None, "check a Provider revocation") as cursor:
+            row = cursor.execute(
+                "SELECT 1 FROM provider_project_approvals "
+                "WHERE provider = %s AND project_id = %s AND status = 'revoked'",
+                (provider, pid),
+            ).fetchone()
+        return row is not None
+
+    def has_record(self, provider: str | None, project_id: UUID | str) -> bool:
+        """
+        Whether the Project was ever approved or revoked for the Provider in the
+        database, which is what lets a member cancel their own existing Run after a
+        revocation (see [`authz.DatabaseProviderApprovals`]).
+        """
+        if provider is None:
+            return False
+        pid = as_uuid(project_id, "project_id")
+        with transaction(self.database, None, "check a Provider approval record") as cursor:
+            row = cursor.execute(
+                "SELECT 1 FROM provider_project_approvals WHERE provider = %s AND project_id = %s",
+                (provider, pid),
+            ).fetchone()
+        return row is not None
+
+    def export_approved(self, provider: str) -> list[UUID]:
+        """
+        The live Projects currently approved for the Provider, oldest approval
+        first: the only safe value for `NEST_PROVIDER_ALLOWED_PROJECTS` when rolling
+        back, because it excludes every revocation recorded since the cutover.
+        """
+        key = normalize_provider(provider)
+        with transaction(self.database, None, "export Provider approvals") as cursor:
+            rows = cursor.execute(
+                "SELECT a.project_id FROM provider_project_approvals a "
+                "JOIN projects p ON p.id = a.project_id AND p.deleted_at IS NULL "
+                "WHERE a.provider = %s AND a.status = 'approved' "
+                "ORDER BY a.created_at, a.project_id",
+                (key,),
+            ).fetchall()
+        return [row["project_id"] for row in rows]
+
     def get(self, provider: str, project_id: UUID | str) -> ProviderApproval | None:
         """The approval record, approved or revoked, or `None` if there was never one."""
         pid = as_uuid(project_id, "project_id")
@@ -252,10 +314,13 @@ class ProviderApprovalStore:
             raise ValueError("name the operator or the administrator making the change")
         what = "approve a Project for a Provider" if status == "approved" else "revoke an approval"
         with transaction(self.database, conn, what) as cursor:
-            if status == "approved" and (
+            cursor.execute(_LOCK, (key,))
+            # A revocation may name a deleted Project (its tombstone still guards a
+            # restore); an approval needs a live one.
+            live = " AND deleted_at IS NULL" if status == "approved" else ""
+            if (
                 cursor.execute(
-                    "SELECT 1 FROM projects WHERE id = %s AND deleted_at IS NULL FOR KEY SHARE",
-                    (pid,),
+                    f"SELECT 1 FROM projects WHERE id = %s{live} FOR KEY SHARE", (pid,)
                 ).fetchone()
                 is None
             ):
@@ -272,10 +337,13 @@ class ProviderApprovalStore:
                         (key, pid),
                     ).fetchone()
                 else:
+                    # A tombstone even without an approval record, such as for a
+                    # Project still authorized only by the environment list.
                     row = cursor.execute(
-                        "UPDATE provider_project_approvals SET status = 'revoked', "
-                        "updated_at = now() WHERE provider = %s AND project_id = %s "
-                        "AND status = 'approved' RETURNING 1",
+                        "INSERT INTO provider_project_approvals (provider, project_id, status) "
+                        "VALUES (%s, %s, 'revoked') ON CONFLICT (provider, project_id) DO UPDATE "
+                        "SET status = 'revoked', updated_at = now() "
+                        "WHERE provider_project_approvals.status = 'approved' RETURNING 1",
                         (key, pid),
                     ).fetchone()
         changed = row is not None
@@ -328,8 +396,14 @@ class ProviderApprovalStore:
         conn: psycopg.Connection | None = None,
     ) -> bool:
         """
-        Revokes the approval from the next submission on. Running jobs are not
-        cancelled. Returns `False` when the Project was not approved.
+        Revokes the approval from the next submission on, with either approval
+        mode. Running jobs are not cancelled. Records a `revoked` tombstone even
+        when the Project has no approval record yet (for example, one approved
+        only by `NEST_PROVIDER_ALLOWED_PROJECTS`), so no later import approves it.
+        Returns `False` when a revocation was already recorded.
+
+        Raises:
+            [`db.ProjectNotFoundError`]: If there is no such Project.
         """
         return self._set(
             provider,
@@ -375,6 +449,7 @@ class ProviderApprovalStore:
             self.database.connection() as conn,
             transaction(self.database, conn, "import Provider approvals") as cursor,
         ):
+            cursor.execute(_LOCK, (key,))
             live = {
                 row["id"]
                 for row in cursor.execute(
@@ -407,11 +482,16 @@ class ProviderApprovalStore:
                     approved.append(pid)
             if approved and not dry_run:
                 with audit_context(cursor, operator=operator, reason=reason):
-                    cursor.executemany(
-                        "INSERT INTO provider_project_approvals (provider, project_id, status) "
-                        "VALUES (%s, %s, 'approved') ON CONFLICT DO NOTHING",
-                        [(key, pid) for pid in approved],
-                    )
+                    for pid in approved:
+                        # Under the lock no row can appear meanwhile; DO NOTHING
+                        # would still never overwrite a revocation.
+                        inserted = cursor.execute(
+                            "INSERT INTO provider_project_approvals (provider, project_id, "
+                            "status) VALUES (%s, %s, 'approved') ON CONFLICT DO NOTHING "
+                            "RETURNING 1",
+                            (key, pid),
+                        ).fetchone()
+                        assert inserted is not None, "approvals changed under the import lock"
         logger.info(
             "Provider approvals imported provider=%s approved=%s unchanged=%s revoked=%s "
             "dry_run=%s",

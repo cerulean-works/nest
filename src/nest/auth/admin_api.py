@@ -21,6 +21,12 @@ session, identity subject, host, port, host key or HPC credential is returned.
 | `GET` | `/api/admin/platforms/<platform>/accounts` | A Platform's Slurm accounts |
 | `GET` | `/api/admin/provider-approvals?provider&project_id&status&limit&after` | Provider approvals |
 | `POST` | `/api/admin/provider-approvals/approve`, `/revoke` | Provider approval |
+| `GET` | `/api/admin/provider-policy` | Where this Controller takes Provider approvals from |
+
+Every Provider approval answer carries `policy`: the serving Controller's
+`source` (`database`, `environment` or `unknown`), its `provider`, and
+`approvals_effective`, which is `false` unless recorded approvals decide here.
+Recorded revocations refuse new submissions in either mode.
 | `GET` | `/api/admin/audit?limit&before&event&project_id&actor_user_id` | Security audit log |
 """
 
@@ -32,7 +38,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from ..audit import SecurityAuditEvent
-from ..authz import DirectoryUser, Page, Principal, ProjectAccess
+from ..authz import DirectoryUser, Page, Principal, ProjectAccess, ProviderPolicy
 from ..config import ADMIN_API_PATH
 from ..db.accounts import ProjectAccountLink, SlurmAccount
 from ..db.approvals import ProviderApproval
@@ -58,6 +64,7 @@ ADMIN_ROUTES: dict[tuple[str, ...], tuple[str, ...]] = {
     ("provider-approvals",): ("GET",),
     ("provider-approvals", "approve"): ("POST",),
     ("provider-approvals", "revoke"): ("POST",),
+    ("provider-policy",): ("GET",),
     ("audit",): ("GET",),
 }
 """Routes under `ADMIN_API_PATH` and their methods."""
@@ -182,6 +189,16 @@ def audit_json(event: SecurityAuditEvent) -> dict[str, object]:
     }
 
 
+def policy_json(policy: ProviderPolicy | None) -> dict[str, object]:
+    if policy is None:
+        return {"source": "unknown", "provider": None, "approvals_effective": False}
+    return {
+        "source": policy.source,
+        "provider": policy.provider,
+        "approvals_effective": policy.approvals_effective,
+    }
+
+
 def access_json(access: ProjectAccess) -> dict[str, object]:
     return {
         "project": project_json(access.project),
@@ -239,7 +256,8 @@ def admin_api(handler: _Handler, method: str, path: str, who: Principal, body: d
         )
         handler._json(HTTPStatus.CREATED, project_json(project))
     elif route == ("projects", "{id}", "access"):
-        handler._json(HTTPStatus.OK, access_json(service.project_access(who, parts[1])))
+        access = access_json(service.project_access(who, parts[1]))
+        handler._json(HTTPStatus.OK, {**access, "policy": policy_json(service.policy)})
     elif route[:3] == ("projects", "{id}", "platforms"):
         change = service.grant_platform if route[3] == "grant" else service.revoke_platform
         changed = change(
@@ -294,7 +312,8 @@ def admin_api(handler: _Handler, method: str, path: str, who: Principal, body: d
             limit=limit,
             after=after,
         )
-        handler._json(HTTPStatus.OK, _page(page, "provider_approvals", approval_json))
+        answer = _page(page, "provider_approvals", approval_json)
+        handler._json(HTTPStatus.OK, {**answer, "policy": policy_json(service.policy)})
     elif route[0] == "provider-approvals":
         change = service.approve if route[1] == "approve" else service.revoke_approval
         changed = change(
@@ -303,7 +322,9 @@ def admin_api(handler: _Handler, method: str, path: str, who: Principal, body: d
             _text(body, "project_id"),
             reason=_optional_text(body, "reason"),
         )
-        handler._json(HTTPStatus.OK, {"changed": changed})
+        handler._json(HTTPStatus.OK, {"changed": changed, "policy": policy_json(service.policy)})
+    elif route == ("provider-policy",):
+        handler._json(HTTPStatus.OK, policy_json(service.provider_policy(who)))
     else:
         before = query("before")
         page = service.audit_events(

@@ -29,6 +29,7 @@ from .admission import (
 from .audit import AuditLog, audit_interface
 from .auth.web import start_auth_service
 from .authz import Action, Principal
+from .authz.admin import ProviderPolicy
 from .authz.execution import (
     AllowedProjects,
     DatabaseProviderApprovals,
@@ -51,6 +52,7 @@ from .db import (
     DatabaseError,
     JobStore,
     PlatformStore,
+    ProviderApprovalStore,
     bootstrap_state,
     sync_platforms,
     verify,
@@ -1084,7 +1086,8 @@ def build_access(config: ControllerConfig, database: Database | None) -> Executi
             provider_id,
         )
     else:
-        providers = AllowedProjects(config.allowed_projects)
+        # Recorded revocations still refuse: a restored list never regrants them.
+        providers = AllowedProjects(config.allowed_projects, ProviderApprovalStore(database))
         if not config.allowed_projects:
             logger.warning(
                 "NEST_PROVIDER_ALLOWED_PROJECTS is empty: the Provider accepts Runs from no "
@@ -1299,6 +1302,13 @@ def main():
             database,
             bootstrap_admin_email=config.bootstrap_admin_email,
             email=email,
+            provider_policy=(
+                ProviderPolicy(
+                    config.provider_approvals, config.default_platform or config.executor
+                )
+                if config.auth == "session"
+                else None
+            ),
         )
         logger.info(
             "Controller listening address=%s executor=%s slurm_configured=%s tls=%s auth=%s "

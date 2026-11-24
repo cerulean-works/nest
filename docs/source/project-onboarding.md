@@ -132,15 +132,23 @@ in the transaction that records the attempt, so a revocation racing a submission
 either waits for it or refuses it. If the database cannot answer, the submission
 is refused (`UNAVAILABLE`), never treated as approved.
 
-A revocation affects new submissions only: running jobs are not cancelled (cancel
-them with Slurm if you must). It is kept as a record (`status=revoked`), and only
-an explicit `approve` undoes it.
+A revocation affects new submissions only: running jobs are not cancelled, and
+members can still cancel their own existing Runs (`CancelJob` keeps every other
+check: the role, being the submitter, the job's Project and Platform). It is kept
+as a record (`status=revoked`), and only an explicit `approve` undoes it.
+`nest-db provider revoke` also works for a Project that has no database approval
+yet, such as one listed only in `NEST_PROVIDER_ALLOWED_PROJECTS`: it records a
+revocation that every later import keeps.
 
 ### Startup-only list (legacy)
 
 With `NEST_PROVIDER_APPROVALS=environment`, the default while the variable is
-set, the Controller reads the comma-separated list once at start, and a change
-needs a redeploy:
+set, the Controller reads the comma-separated list once at start, and adding a
+Project needs a redeploy. In this mode a database approval does nothing, but a
+revocation recorded with `nest-db provider revoke` (or the privileged API) refuses
+the Project's new submissions at once, even though it is still listed. The
+privileged API reports which mode the Controller is in (`policy.source`), so an
+approval made there is never mistaken for an effective one:
 
 ```ini
 NEST_PROVIDER_ALLOWED_PROJECTS='<project-id-1>,<project-id-2>'
@@ -205,13 +213,23 @@ Nothing is imported implicitly: the Controller never copies
    start, so the two can never be mixed. Check `provider_approvals=database` in
    the `controller.started` record.
 
-**Rollback.** Set `NEST_PROVIDER_ALLOWED_PROJECTS` again (and
-`NEST_PROVIDER_APPROVALS=environment` if you had set it) and redeploy: the
-Controller then ignores the database approvals, which stay recorded for a later
-cutover. Nothing is regranted on the way back or forward: rolling back uses only
-the list you set, and cutting over again uses only the database records,
-including revocations made in the meantime. With several Controllers, switch
-them all; each one decides by its own setting.
+**Rollback.** Never reuse the list you had before the cutover, and never use
+`*`: Projects revoked since then would be listed again. Recompute the list from
+the current database approvals, review it, and roll back every Controller sharing
+the database in the same change:
+
+```bash
+nest-db provider export campus   # approved, live Projects only; revoked ones are left out
+```
+
+Set `NEST_PROVIDER_ALLOWED_PROJECTS` to that value (and
+`NEST_PROVIDER_APPROVALS=environment` if you had set it) and redeploy every
+Controller. As a second safeguard, an environment-mode Controller still refuses
+new submissions from any Project with a recorded revocation, so even a stale list
+cannot restore revoked access. Approvals recorded after the rollback do nothing
+until you cut over again; the privileged API shows `approvals_effective: false`
+for them. Cutting over again uses only the database records, including
+revocations made in the meantime.
 
 ## 2. Grant an HPC Platform
 

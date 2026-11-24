@@ -55,7 +55,7 @@ from .service import (
 
 logger = get_logger("nest.authz.admin")
 
-__all__ = ["AdminService", "DirectoryUser", "Page", "ProjectAccess"]
+__all__ = ["AdminService", "DirectoryUser", "Page", "ProjectAccess", "ProviderPolicy"]
 
 MAX_PAGE = 200
 """Largest page the directory and listings return."""
@@ -109,6 +109,30 @@ class Page[T]:
 
 
 @dataclass(frozen=True)
+class ProviderPolicy:
+    """
+    Where the serving Controller takes Provider approvals from, so an
+    administrator never mistakes a database change for an effective one.
+
+    Attributes:
+        source (`str`): `NEST_PROVIDER_APPROVALS`: `database` (approvals and
+            revocations recorded here decide) or `environment`
+            (`NEST_PROVIDER_ALLOWED_PROJECTS` decides what is approved; recorded
+            revocations still refuse new submissions, recorded approvals do
+            nothing until the cutover).
+        provider (`str | None`): The Provider key this Controller checks.
+    """
+
+    source: str
+    provider: str | None
+
+    @property
+    def approvals_effective(self) -> bool:
+        """Whether an approval recorded in the database lets Runs through here."""
+        return self.source == "database"
+
+
+@dataclass(frozen=True)
 class ProjectAccess:
     """
     Readback of everything that lets a Project's members compute, each granted
@@ -149,6 +173,9 @@ class AdminService:
             Defaults to one on `database`.
         audit ([`audit.AuditLog`], *optional*): Where refusals are recorded.
             Defaults to one on `database`.
+        policy ([`authz.ProviderPolicy`], *optional*): The serving Controller's
+            Provider approval source, reported with every approval readback and
+            change. `None` when it is not known, such as outside the Controller.
     """
 
     def __init__(
@@ -156,8 +183,10 @@ class AdminService:
         database: Database,
         projects: ProjectService | None = None,
         audit: AuditLog | None = None,
+        policy: ProviderPolicy | None = None,
     ):
         self.database = database
+        self.policy = policy
         self.audit = audit or AuditLog(database)
         self.authorizer = (
             projects.authorizer if projects else Authorizer(database, None, self.audit)
@@ -447,6 +476,11 @@ class AdminService:
             )
 
     # Provider approvals --------------------------------------------------------
+
+    def provider_policy(self, principal: Principal) -> ProviderPolicy | None:
+        """The serving Controller's Provider approval source, or `None` if unknown."""
+        self._read(principal, "admin.provider.policy", "read the Provider policy")
+        return self.policy
 
     def list_approvals(
         self,

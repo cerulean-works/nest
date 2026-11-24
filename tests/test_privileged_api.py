@@ -54,6 +54,7 @@ from nest.authz import (
     ExecutionAccess,
     Principal,
     ProjectService,
+    ProviderPolicy,
 )
 from nest.authz.policy import Action
 from nest.config import ConfigError, load_controller_config, load_database_config
@@ -74,6 +75,7 @@ from nest.db import (
     upgrade,
 )
 from nest.db.cli import main as nest_db
+from nest.proto import execution_pb2
 
 OPS: dict[str, Any] = {"operator": "ops-test", "reason": "privileged API tests"}
 
@@ -528,6 +530,111 @@ class ApprovalImportTests(_Base):
         )
         self.assertEqual(self.statuses()[first], "approved")
 
+    def test_revocation_before_the_first_import_is_kept(self):
+        """A Project approved only by the environment list, revoked before any import."""
+        first, second, _ = self.ids
+        self.assertTrue(self.approvals.revoke("nano", first, **OPS))
+        self.assertFalse(self.approvals.revoke("nano", first, **OPS))
+        self.assertEqual(self.statuses(), {first: "revoked"})
+        code, out, _ = self.imported([first, second])
+        self.assertEqual(code, 0)
+        self.assertIn("1 approved, 0 already approved, 1 left revoked", out)
+        self.assertEqual(self.statuses(), {first: "revoked", second: "approved"})
+        # The tombstone is audited like any revocation.
+        [event] = self.audit.events(event="provider.approval.revoked", project_id=first)
+        self.assertEqual(event.actor_operator, OPS["operator"])
+        # A deleted Project can still be revoked; a missing one cannot.
+        with self.assertRaises(ProjectNotFoundError):
+            self.approvals.revoke("nano", uuid.uuid4(), **OPS)
+
+    def test_revocation_racing_the_first_import_is_never_lost(self):
+        first = self.ids[0]
+        locker = connect(self.url)
+        locker.autocommit = False
+        self.addCleanup(locker.close)
+        # A revocation in flight: holds the Provider's lock and an uncommitted tombstone.
+        locker.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended('nest.provider_approvals:' || %s, 0))",
+            ("nano",),
+        )
+        locker.execute("SELECT set_config('nest.audit_operator', 'ops', true)")
+        locker.execute(
+            "INSERT INTO provider_project_approvals (provider, project_id, status) "
+            "VALUES ('nano', %s, 'revoked')",
+            (first,),
+        )
+        outcome: list[Any] = []
+        thread = threading.Thread(
+            target=lambda: outcome.append(self.approvals.import_projects("nano", self.ids, **OPS))
+        )
+        thread.start()
+        time.sleep(0.5)
+        self.assertTrue(thread.is_alive(), "the import must wait for the revocation")
+        locker.commit()
+        thread.join(10)
+        self.assertEqual(outcome[0].revoked, (first,))
+        self.assertEqual(set(outcome[0].approved), set(self.ids[1:]))
+        self.assertEqual(self.statuses()[first], "revoked")
+        # The other order: a revocation waits for an import in flight, then wins.
+        second = self.ids[1]
+        locker.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended('nest.provider_approvals:' || %s, 0))",
+            ("nano",),
+        )
+        revoked: list[bool] = []
+        thread = threading.Thread(
+            target=lambda: revoked.append(self.approvals.revoke("nano", second, **OPS))
+        )
+        thread.start()
+        time.sleep(0.5)
+        self.assertTrue(thread.is_alive(), "the revocation must wait for the import")
+        locker.commit()
+        thread.join(10)
+        self.assertEqual((revoked, self.statuses()[second]), ([True], "revoked"))
+
+    def test_rollback_list_never_restores_revoked_access(self):
+        """Environment mode enforces recorded revocations; export recomputes the list."""
+        first, second, third = self.ids
+        self.imported(self.ids)
+        self.approvals.revoke("nano", second, **OPS)
+        code, out, err = self.run_db("provider", "export", "nano")
+        self.assertEqual(code, 0)
+        self.assertEqual(set(out.strip().split(",")), {str(first), str(third)})
+        self.assertIn("2 approved", err)
+        member = Principal(uuid.uuid4(), "cli", frozenset({"jobs:run"}))
+        # Even a stale rollback list that still names the revoked Project denies it.
+        stale = AllowedProjects([str(i) for i in self.ids], self.approvals)
+        submit = {pid: stale.permits(member, pid, Action.RUN_SUBMIT, "nano") for pid in self.ids}
+        self.assertEqual(submit, {first: True, second: False, third: True})
+        everyone = AllowedProjects(["*"], self.approvals)
+        self.assertFalse(everyone.permits(member, second, Action.RUN_SUBMIT, "nano"))
+        # A database approval grants nothing in environment mode.
+        other = owned_project(self.projects, self.user("other"), "other").id
+        self.approvals.approve("nano", other, **OPS)
+        self.assertFalse(stale.permits(member, other, Action.RUN_SUBMIT, "nano"))
+        # The member may still cancel their own Run in the revoked, listed Project.
+        self.assertTrue(stale.permits(member, second, Action.RUN_CANCEL, "nano"))
+        # The Controller wires the revocation check into environment mode.
+        with mock.patch("nest.controller.environment_platform_id", return_value=uuid.uuid4()):
+            access = build_access(
+                load_controller_config(
+                    {
+                        "NEST_DATABASE_URL": self.url,
+                        "NEST_CONTROLLER_ALLOW_PLAINTEXT": "true",
+                        "NEST_PROVIDER_ALLOWED_PROJECTS": ",".join(str(i) for i in self.ids),
+                    }
+                ),
+                self.db,
+            )
+        assert access is not None
+        providers = access.authorizer.providers
+        assert isinstance(providers, AllowedProjects)
+        # Revocations are per Provider: the one recorded for nano does not refuse local.
+        self.assertTrue(providers.permits(member, second, Action.RUN_SUBMIT, "local"))
+        self.approvals.revoke("local", second, **OPS)
+        self.assertFalse(providers.permits(member, second, Action.RUN_SUBMIT, "local"))
+        self.assertTrue(providers.permits(member, first, Action.RUN_SUBMIT, "local"))
+
     def test_wildcard_invalid_and_missing_ids_import_nothing(self):
         for value, code in (("*", 2), (f"{self.ids[0]},*", 2), ("not-a-uuid", 2), ("", 2)):
             with self.subTest(value=value):
@@ -680,6 +787,29 @@ class DurableAdmissionTests(_AdmissionBase):
         thread.join(10)
         self.assertEqual(revoked, [True])
 
+    def test_own_runs_can_still_be_cancelled_after_revocation(self):
+        mine = self.submit().job_id
+        self.approvals.revoke("nano", self.project, **OPS)
+        self.refused(self.submit)
+        self.stub.CancelJob(
+            execution_pb2.CancelJobRequest(job_id=mine), timeout=10, metadata=self.metadata()
+        )
+        self.assertEqual([c["job_id"] for c in self.hpc.calls("scancel")], [str(mine)])
+        # Never approved, nothing to cancel: the Provider still refuses.
+        member = Principal(self.outsider, "cli", frozenset({"jobs:run"}))
+        providers = DatabaseProviderApprovals(self.db)
+        self.assertFalse(providers.permits(member, self.other, Action.RUN_CANCEL, "nano"))
+        # Another Member's Run stays theirs: the role rule still applies.
+        record = {
+            "project_id": self.project,
+            "submitted_by_user_id": self.owner,
+            "platform_id": self.platform_id,
+            "execution_id": "x",
+        }
+        with self.assertRaises(AccessDeniedError) as caught:
+            self.access.authorize_job(self.principal, Action.RUN_CANCEL, record, mine)
+        self.assertEqual(caught.exception.reason, "not_own_run")
+
     def test_revocation_cancels_no_running_job(self):
         admitted = self.admit()
         self.approvals.revoke("nano", self.project, **OPS)
@@ -734,7 +864,12 @@ class AdminHTTPTests(_Base):
         ).google
         assert config is not None
         sign_in = GoogleSignIn(config, self.db, endpoints=self.fake.endpoints, timeout=5)
-        self.http = start_auth_service(config, self.db, sign_in=sign_in)
+        self.http = start_auth_service(
+            config,
+            self.db,
+            sign_in=sign_in,
+            provider_policy=ProviderPolicy("environment", "nano"),
+        )
         self.addCleanup(self.http.stop)
         self.sessions = SessionStore(self.db)
         self.tokens: list[str] = []
@@ -838,6 +973,30 @@ class AdminHTTPTests(_Base):
         o = self.token(owner)
         self.assertEqual(self.call("GET", f"/api/projects/{pid}", cookie=o)[1]["role"], "owner")
         self.assertEqual(self.call("GET", f"/api/projects/{pid}", cookie=r)[0], 404)
+
+    def test_policy_source_is_reported_with_every_approval_answer(self):
+        """A database approval is never mistaken for an effective one in environment mode."""
+        pid = owned_project(self.projects, self.user("owner"), "lab").id
+        r = self.token(self.root)
+        expected = {"source": "environment", "provider": "nano", "approvals_effective": False}
+        self.assertEqual(self.call("GET", "/api/admin/provider-policy", cookie=r), (200, expected))
+        status, answer = self.call(
+            "POST",
+            "/api/admin/provider-approvals/approve",
+            cookie=r,
+            body={"provider": "nano", "project_id": str(pid), "reason": "r"},
+        )
+        self.assertEqual((status, answer), (200, {"changed": True, "policy": expected}))
+        self.assertEqual(
+            self.call("GET", "/api/admin/provider-approvals", cookie=r)[1]["policy"], expected
+        )
+        self.assertEqual(
+            self.call("GET", f"/api/admin/projects/{pid}/access", cookie=r)[1]["policy"], expected
+        )
+        status, answer = self.call(
+            "GET", "/api/admin/provider-policy", cookie=self.token(self.user("plain"))
+        )
+        self.assertEqual((status, answer["reason"]), (403, "platform_admin_required"))
 
     def test_every_admin_route_is_denied_by_default(self):
         alice = self.user("alice")

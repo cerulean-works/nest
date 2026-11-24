@@ -74,6 +74,7 @@ from ..authz import (
     Principal,
     ProjectPlatforms,
     ProjectService,
+    ProviderPolicy,
 )
 from ..config import (
     ADMIN_API_PATH,
@@ -1821,6 +1822,8 @@ class AuthHTTPServer(ThreadingHTTPServer):
             service. Defaults to one on the Projects service's authorizer.
         admin ([`authz.AdminService`], *optional*): Privileged management API
             service. Defaults to one on the Projects service.
+        provider_policy ([`authz.ProviderPolicy`], *optional*): The Controller's
+            Provider approval source, reported by the default `admin` service.
     """
 
     daemon_threads = True
@@ -1838,6 +1841,7 @@ class AuthHTTPServer(ThreadingHTTPServer):
         email: EmailService | None = None,
         organizations: OrganizationService | None = None,
         admin: AdminService | None = None,
+        provider_policy: ProviderPolicy | None = None,
     ):
         self.sign_in = sign_in
         self.cli = cli or CLISignIn(sign_in.database, sign_in.sessions)
@@ -1857,7 +1861,7 @@ class AuthHTTPServer(ThreadingHTTPServer):
         self.invitations = invitations or InvitationService(
             sign_in.database, self.projects, email, link_base_url=self.origin
         )
-        self.admin = admin or AdminService(sign_in.database, self.projects)
+        self.admin = admin or AdminService(sign_in.database, self.projects, policy=provider_policy)
         super().__init__(address, _Handler)
 
 
@@ -1909,6 +1913,7 @@ def start_auth_service(
     cli: CLISignIn | None = None,
     bootstrap_admin_email: str | None = None,
     email: EmailService | None = None,
+    provider_policy: ProviderPolicy | None = None,
 ) -> AuthService:
     """
     Starts the auth listener when Google sign-in is configured.
@@ -1926,6 +1931,8 @@ def start_auth_service(
             passed to the default [`auth.GoogleSignIn`].
         email ([`mail.EmailService`], *optional*): Email delivery for invitations;
             invitations are shared by link only without it.
+        provider_policy ([`authz.ProviderPolicy`], *optional*): The Controller's
+            Provider approval source, reported by the privileged management API.
 
     Raises:
         `OSError`: If `NEST_AUTH_HTTP_BIND` cannot be bound.
@@ -1936,7 +1943,13 @@ def start_auth_service(
     if database is None:
         raise RuntimeError("Google sign-in needs the database")
     sign_in = sign_in or GoogleSignIn(config, database, bootstrap_admin_email=bootstrap_admin_email)
-    server = AuthHTTPServer(sign_in, _split_bind(config.http_bind), cli=cli, email=email)
+    server = AuthHTTPServer(
+        sign_in,
+        _split_bind(config.http_bind),
+        cli=cli,
+        email=email,
+        provider_policy=provider_policy,
+    )
     thread = threading.Thread(target=server.serve_forever, name="nest-auth-http", daemon=True)
     thread.start()
     service = AuthService(server, thread)

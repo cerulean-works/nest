@@ -55,7 +55,8 @@ credential.
 | `GET` | `/api/admin/platforms` | | Every Platform, including disabled ones |
 | `GET` | `/api/admin/platforms/<platform>/accounts` | | Its registered Slurm accounts |
 | `GET` | `/api/admin/provider-approvals` | `provider`, `project_id`, `status`, `limit`, `after` | `{"provider_approvals": [...], "next_after"}` |
-| `POST` | `/api/admin/provider-approvals/approve`, `/revoke` | `provider`, `project_id`, `reason` | `{"changed": bool}` |
+| `POST` | `/api/admin/provider-approvals/approve`, `/revoke` | `provider`, `project_id`, `reason` | `{"changed": bool, "policy"}` |
+| `GET` | `/api/admin/provider-policy` | | `{"source", "provider", "approvals_effective"}` |
 | `GET` | `/api/admin/audit` | `limit`, `before`, `event`, `project_id`, `actor_user_id` | `{"events": [...], "next_after"}` (newest first; pass `next_after` as `before`) |
 
 A User in the directory has only `id`, `display_name`, `email` (the last verified
@@ -66,6 +67,16 @@ Errors use the Projects API's shapes: `404 not_found`, `404 user_not_found` (the
 Owner is missing or disabled), `404 account_not_found`, `409 platform_not_granted`
 (link an account only after granting its Platform), `409 account_rule`, and `400
 invalid_request`.
+
+Every Provider approval answer (`provider-approvals` list, `approve`, `revoke`,
+and a Project's `access`) carries `policy`, which `GET /api/admin/provider-policy`
+also returns: `{"source": "database" | "environment" | "unknown", "provider",
+"approvals_effective"}` for the Controller serving the request. With
+`environment`, an approval made here is recorded but grants nothing until the
+cutover (`approvals_effective: false`); a revocation refuses new submissions in
+either mode, and a revocation of a Project with no approval record yet is kept as
+a tombstone that later imports respect. With several Controllers, the answer is
+the serving Controller's: keep them on the same setting.
 
 `provider` is the Provider key a Controller records with each decision: its
 default Platform Profile ID (`default` for the `NEST_SLURM_*` form, otherwise the

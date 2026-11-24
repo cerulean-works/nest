@@ -80,25 +80,40 @@ class ProjectRequiredError(ValueError):
 
 class AllowedProjects:
     """
-    The Controller's [`authz.ProviderAuthority`]: its Provider accepts Runs from
-    the Projects the operator listed in `NEST_PROVIDER_ALLOWED_PROJECTS`.
+    The Controller's [`authz.ProviderAuthority`] with `NEST_PROVIDER_APPROVALS=environment`:
+    its Provider accepts Runs from the Projects the operator listed in
+    `NEST_PROVIDER_ALLOWED_PROJECTS`.
 
     Every job still runs as the Controller's single configured HPC account, so the
     approval is the operator's, per Project. No Project role grants it.
 
+    With `revocations`, a revocation recorded in the database
+    ([`db.ProviderApprovalStore.revoke`]) refuses new submissions even for a listed
+    Project, checked at every submission. The database never approves anything in
+    this mode, so a stale or restored list can never regrant revoked access, and
+    if the database cannot answer the submission is refused. Cancelling one's own
+    Run only needs the list.
+
     Args:
         projects (`Iterable[str]`): Project IDs, or `"*"` for every Project.
+        revocations ([`db.ProviderApprovalStore`], *optional*): Where recorded
+            revocations are read. The Controller always passes one.
     """
 
-    def __init__(self, projects: Iterable[str]):
+    def __init__(self, projects: Iterable[str], revocations: ProviderApprovalStore | None = None):
         items = set(projects)
         self.everyone = ALL_PROJECTS in items
         self.projects = frozenset(UUID(p) for p in items if p != ALL_PROJECTS)
+        self.revocations = revocations
 
     def permits(
         self, principal: Principal, project_id: UUID, action: Action, provider: str | None
     ) -> bool:
-        return self.everyone or project_id in self.projects
+        if not (self.everyone or project_id in self.projects):
+            return False
+        if action == Action.RUN_SUBMIT and self.revocations is not None:
+            return not self.revocations.is_revoked(provider, project_id)
+        return True
 
 
 class DatabaseProviderApprovals:
@@ -113,6 +128,14 @@ class DatabaseProviderApprovals:
     check raises [`db.DatabaseError`] and the caller refuses (fail closed): it is
     never treated as approved.
 
+    `run.submit` needs a current approval. `run.cancel` needs only that the
+    Project has an approval record, current or revoked, for this Provider: a
+    revocation stops new submissions but still lets a member cancel their own
+    existing Run. Everything else `run.cancel` needs is unchanged (the member's
+    role, being the Run's submitter, the job recorded for the Project on the
+    served Platform, and that Platform still granted), and a Project never
+    approved cannot cancel anything.
+
     Args:
         database ([`db.Database`]): Open database.
     """
@@ -123,6 +146,8 @@ class DatabaseProviderApprovals:
     def permits(
         self, principal: Principal, project_id: UUID, action: Action, provider: str | None
     ) -> bool:
+        if action == Action.RUN_CANCEL:
+            return self.store.has_record(provider, project_id)
         return self.store.is_approved(provider, project_id)
 
 

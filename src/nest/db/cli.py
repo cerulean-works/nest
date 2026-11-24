@@ -49,6 +49,7 @@ Usage:
     nest-db provider list    [--provider PROVIDER] [--project-id UUID] [--status S]
     nest-db provider approve | revoke PROVIDER --project-id UUID
     nest-db provider import  PROVIDER --project-ids ID,ID [--dry-run]
+    nest-db provider export  PROVIDER   # approved IDs, for a rollback list
     (every change also takes --operator NAME --reason TEXT)
 
     # Projects (see "Onboard a Project"):
@@ -237,6 +238,12 @@ def _provider_parser(commands) -> None:
     imported.add_argument(
         "--dry-run", action="store_true", help="show what would change and write nothing"
     )
+    exported = actions.add_parser(
+        "export",
+        help="print the currently approved Project IDs, comma-separated, for a rollback "
+        "NEST_PROVIDER_ALLOWED_PROJECTS",
+    )
+    exported.add_argument("provider", metavar="PROVIDER")
 
 
 def _provider(database: Database, args: argparse.Namespace) -> int:
@@ -261,6 +268,14 @@ def _provider(database: Database, args: argparse.Namespace) -> int:
                 if len(page) < 500:
                     return 0
                 after = (page[-1].provider, page[-1].project_id)
+        if args.action == "export":
+            ids = store.export_approved(args.provider)
+            print(",".join(str(pid) for pid in ids))
+            print(
+                f"{len(ids)} approved Project(s); revoked and deleted Projects are excluded",
+                file=sys.stderr,
+            )
+            return 0
         if args.action == "import":
             ids = parse_project_ids([args.project_ids])
             result = store.import_projects(
@@ -283,7 +298,11 @@ def _provider(database: Database, args: argparse.Namespace) -> int:
         if not change(args.provider, args.project_id, operator=args.operator, reason=args.reason):
             print(
                 "No change: the Project "
-                + ("is already approved" if args.action == "approve" else "is not approved"),
+                + (
+                    "is already approved"
+                    if args.action == "approve"
+                    else "already has a recorded revocation"
+                ),
                 file=sys.stderr,
             )
             return 1
