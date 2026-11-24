@@ -146,7 +146,10 @@ With `NEST_PROVIDER_APPROVALS=environment`, the default while the variable is
 set, the Controller reads the comma-separated list once at start, and adding a
 Project needs a redeploy. In this mode a database approval does nothing, but a
 revocation recorded with `nest-db provider revoke` (or the privileged API) refuses
-the Project's new submissions at once, even though it is still listed. The
+the Project's new submissions at once, even though it is still listed. Registry
+admission checks for it again in the transaction that records the attempt, so a
+revocation racing a submission either waits for it or refuses it, as in database
+mode. The
 privileged API reports which mode the Controller is in (`policy.source`), so an
 approval made there is never mistaken for an effective one:
 

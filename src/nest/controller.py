@@ -1165,6 +1165,11 @@ def build_admission(
         platform_id,
         audit=access.audit,
         provider_approval=(access.provider_id if config.provider_approvals == "database" else None),
+        # Environment mode: the list approves, but a recorded revocation refuses,
+        # checked again in the attempt transaction.
+        provider_revocations=(
+            access.provider_id if config.provider_approvals == "environment" else None
+        ),
     )
 
 

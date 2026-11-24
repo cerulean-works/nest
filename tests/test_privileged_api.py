@@ -846,6 +846,126 @@ class DurableAdmissionTests(_AdmissionBase):
             legacy.authorize_submit(self.principal, self.project)
 
 
+class EnvironmentModeAdmissionTests(_AdmissionBase):
+    """Registry admission with `NEST_PROVIDER_APPROVALS=environment` (Provider `nano`)."""
+
+    def setUp(self):
+        super().setUp()
+        self.approvals = ProviderApprovalStore(self.db)
+        self.access = ExecutionAccess(
+            self.db,
+            AllowedProjects([str(self.project), str(self.other)], self.approvals),
+            provider_id="nano",
+            platform_id=self.platform_id,
+            audit=self.audit,
+        )
+        self.admission = RegistryAdmission(
+            self.db,
+            self.backend,
+            self.profile,
+            self.platform_id,
+            audit=self.audit,
+            provider_revocations="nano",
+        )
+        self.stub = self.serve(self.admission)
+        self.principal = Principal(self.member, "cli", frozenset({"jobs:run"}))
+
+    def admit(self):
+        return self.admission.admit(
+            self.principal,
+            self.project,
+            SubmissionRequest("batch", workdir="/w", script="s"),
+            execution_id=uuid.uuid4().hex,
+        )
+
+    def test_listed_project_runs_without_any_database_record(self):
+        self.assertTrue(self.submit().job_id)
+        self.assertEqual(self.approvals.list_approvals(provider="nano"), [])
+
+    def test_revocation_after_the_check_is_caught_before_the_attempt(self):
+        # run.submit was authorized from the list; the revocation lands before the attempt.
+        self.approvals.revoke("nano", self.project, **OPS)
+        with self.assertRaises(AdmissionRefusedError) as caught:
+            self.admit()
+        self.assertEqual(caught.exception.reason, "provider_denied")
+        self.assertEqual(self.attempts(), [])
+        self.assert_nothing_sent()
+        error = self.refused(self.submit)
+        self.assertIn("provider_denied", error.details())
+
+    def test_concurrent_attempt_and_revocation_serialize(self):
+        lock = (
+            "SELECT pg_advisory_xact_lock{}(hashtextextended('nest.provider_approvals:' || %s, 0))"
+        )
+        # A revocation in flight, with no prior record: the attempt waits, then is refused.
+        locker = connect(self.url)
+        locker.autocommit = False
+        self.addCleanup(locker.close)
+        locker.execute(lock.format(""), ("nano",))
+        locker.execute("SELECT set_config('nest.audit_operator', 'ops', true)")
+        locker.execute(
+            "INSERT INTO provider_project_approvals (provider, project_id, status) "
+            "VALUES ('nano', %s, 'revoked')",
+            (self.project,),
+        )
+        outcome: list[object] = []
+
+        def admit():
+            try:
+                outcome.append(self.admit())
+            except AdmissionRefusedError as exc:
+                outcome.append(exc)
+
+        thread = threading.Thread(target=admit)
+        thread.start()
+        time.sleep(0.5)
+        self.assertTrue(thread.is_alive(), "the attempt must wait for the revocation")
+        locker.commit()
+        thread.join(10)
+        self.assertIsInstance(outcome[0], AdmissionRefusedError)
+        self.assertEqual(self.attempts(), [])
+        # The other order: an attempt in flight holds the lock shared; a revocation
+        # of the other Project waits for it to commit.
+        locker.execute(lock.format("_shared"), ("nano",))
+        revoked: list[bool] = []
+        thread = threading.Thread(
+            target=lambda: revoked.append(self.approvals.revoke("nano", self.other, **OPS))
+        )
+        thread.start()
+        time.sleep(0.5)
+        self.assertTrue(thread.is_alive(), "the revocation must wait for the attempt")
+        locker.commit()
+        thread.join(10)
+        self.assertEqual(revoked, [True])
+
+    def test_controller_rechecks_revocations_in_either_mode(self):
+        base = {
+            "NEST_EXECUTOR": "slurm",
+            "NEST_SLURM_HOST": "login",
+            "NEST_SLURM_ACCOUNT": "acct",
+            "NEST_SLURM_WORKDIR": "/w",
+            "NEST_SLURM_SSH_USER": "op",
+            "NEST_DATABASE_URL": "postgresql://nest@db.example.internal:5432/nest",
+            "NEST_CONTROLLER_BIND": "127.0.0.1:50051",
+        }
+        access = mock.Mock(provider_id="default")
+        with mock.patch("nest.controller.environment_platform_id", return_value=uuid.uuid4()):
+            listed = build_admission(
+                load_controller_config(
+                    {**base, "NEST_PROVIDER_ALLOWED_PROJECTS": str(uuid.uuid4())}
+                ),
+                self.db,
+                self.backend,
+                access,
+            )
+            durable = build_admission(load_controller_config(base), self.db, self.backend, access)
+        assert listed is not None and durable is not None
+        self.assertEqual((listed.provider_approval, listed.provider_revocations), (None, "default"))
+        self.assertEqual(
+            (durable.provider_approval, durable.provider_revocations), ("default", None)
+        )
+
+
 class AdminHTTPTests(_Base):
     def setUp(self):
         super().setUp()
