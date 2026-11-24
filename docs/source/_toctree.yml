@@ -45,6 +45,8 @@ guide:
         title: Share Projects and manage roles
       - local: invitations
         title: Invite people to a Project
+      - local: console
+        title: Manage Projects in the browser
       - local: platforms
         title: Register HPC Platforms and login nodes
       - local: slurm-accounts

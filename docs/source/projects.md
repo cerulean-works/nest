@@ -8,8 +8,9 @@ any Slurm or Provider account.
 
 Every permission is decided on the Controller by one deny-by-default policy,
 [`authz.decide`], enforced by [`authz.ProjectService`] and [`authz.Authorizer`]
-([reference](api/authz)). Clients, including the Web UI, never decide permissions:
-hiding a button changes nothing on the server.
+([reference](api/authz)). Clients, including the
+[Management Console](console), never decide permissions: hiding a button changes
+nothing on the server.
 
 ## Roles
 

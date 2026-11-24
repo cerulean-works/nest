@@ -32,6 +32,10 @@ It serves these routes and nothing else:
 - `/api/invitations` and below serve the signed-in User's own invitations, and
   `GET`/`POST /invitations/accept` is the browser page that reviews and accepts an
   invitation link (see *Invite people to a Project*).
+- `GET /console` and its two static files serve the browser Management Console
+  (see *Manage Projects in the browser*), which calls the
+  routes above with the session cookies. `GET /auth/google/login?next=console`
+  returns to it after sign-in.
 
 The listener speaks plain HTTP. Put it behind a TLS-terminating reverse proxy that
 serves `NEST_GOOGLE_REDIRECT_URL` and forwards paths unchanged.
@@ -75,6 +79,7 @@ from ..config import (
     AUTH_CLI_PREFIX,
     AUTH_SESSION_PATHS,
     CLI_SCOPES,
+    CONSOLE_PATH,
     INVITATION_PAGE_PATH,
     INVITATIONS_API_PATH,
     ORGANIZATIONS_API_PATH,
@@ -118,6 +123,7 @@ from .cli import (
     format_user_code,
     normalize_user_code,
 )
+from .console import CONSOLE_HEADERS, CONSOLE_INDEX_PATHS, console_asset, console_page
 from .google import SIGN_IN_TTL, GoogleSignIn, SignInError
 
 if TYPE_CHECKING:
@@ -177,6 +183,10 @@ first, so the callback returns to that approval."""
 INVITATION_RETURN_COOKIE = "nest_invitation_return"
 """Cookie set when the invitation page sent the browser to sign in first, so the
 callback returns to that page."""
+
+CONSOLE_RETURN_COOKIE = "nest_console_return"
+"""Cookie set when the Management Console sent the browser to sign in, so the
+callback returns to the Console."""
 
 MAX_BODY_BYTES = 4096
 """Largest request body accepted."""
@@ -382,6 +392,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._dispatch(self._cli_describe)
         elif path == INVITATION_PAGE_PATH:
             self._dispatch(self._invitation_page)
+        elif _is_console(path):
+            self._dispatch(lambda: self._console(path))
         elif _is_api(path):
             self._dispatch(lambda: self._api("GET", path))
         else:
@@ -451,10 +463,15 @@ class _Handler(BaseHTTPRequestHandler):
                     secure=self.app.secure,
                 )
             )
-        elif self._query_value("next") == "invitation":
+        elif self._query_value("next") in ("invitation", "console"):
+            name = (
+                INVITATION_RETURN_COOKIE
+                if self._query_value("next") == "invitation"
+                else CONSOLE_RETURN_COOKIE
+            )
             self._set_cookies.append(
                 _cookie(
-                    INVITATION_RETURN_COOKIE,
+                    name,
                     "1",
                     path=self.app.callback_path,
                     max_age=int(SIGN_IN_TTL),
@@ -507,6 +524,17 @@ class _Handler(BaseHTTPRequestHandler):
                     secure=self.app.secure,
                 )
             )
+        to_console = self._read_cookie(CONSOLE_RETURN_COOKIE) == "1"
+        if to_console:
+            self._set_cookies.append(
+                _cookie(
+                    CONSOLE_RETURN_COOKIE,
+                    "",
+                    path=self.app.callback_path,
+                    max_age=0,
+                    secure=self.app.secure,
+                )
+            )
         try:
             result = self.app.sign_in.finish(
                 state=one("state"),
@@ -531,6 +559,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if to_invitation:
             self._send(HTTPStatus.SEE_OTHER, headers={"Location": INVITATION_PAGE_PATH})
+            return
+        if to_console:
+            self._send(HTTPStatus.SEE_OTHER, headers={"Location": CONSOLE_PATH})
             return
         joined = getattr(result, "joined", ())
         message = f"You are signed in to Nest as {result.identity.email}."
@@ -673,6 +704,22 @@ class _Handler(BaseHTTPRequestHandler):
         """The browser session of the presented session cookie, or `None`."""
         token = self._read_cookie(self.app.session_cookie)
         return self.app.sessions.authenticate(hash_token(token), kind="browser") if token else None
+
+    # Management Console ------------------------------------------------------
+
+    def _console(self, path: str):
+        """The Console page and its static files: no session needed to load them."""
+        if path in CONSOLE_INDEX_PATHS:
+            # The privileged UI is shown only where the G03 management API is served.
+            available = getattr(self.app, "admin", None) is not None
+            self._send(HTTPStatus.OK, console_page(privileged_api=available), CONSOLE_HEADERS)
+            return
+        asset = console_asset(path[len(CONSOLE_PATH) + 1 :])
+        if asset is None:
+            self._fail(HTTPStatus.NOT_FOUND, "Not found", "There is nothing here.")
+            return
+        content, content_type = asset
+        self._send(HTTPStatus.OK, content, CONSOLE_HEADERS, content_type=content_type)
 
     # CLI sign-in: the browser's approval page --------------------------------
 
@@ -1555,6 +1602,10 @@ def _is_api(path: str) -> bool:
             ORGANIZATIONS_API_PATH,
         )
     )
+
+
+def _is_console(path: str) -> bool:
+    return path == CONSOLE_PATH or path.startswith(CONSOLE_PATH + "/")
 
 
 def _parse_int_id(value: str) -> int | None:
