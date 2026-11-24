@@ -24,7 +24,7 @@ approval page never asks for HPC credentials. Configure HPC access separately (s
 
 ## Sign in
 
-For Cerulean-hosted Nest, nothing needs to be set:
+For Cerulean-hosted Nest, `nest login` needs no setting:
 
 ```bash
 nest login
@@ -40,6 +40,14 @@ and check that it shows the code BCDF-GHJK.
 Nest will never ask for your NCHC password or one-time code there.
 Waiting for approval...
 ```
+
+`.remote()` is different: it applies the hosted sign-in on its own only when
+`NEST_CONTROLLER_ADDRESS` is `nest.cerulean.works:50051`. Hosted users who reach
+the Controller by its verified MagicDNS name,
+`nest-controller.tail8e5ba1.ts.net:50051`, set
+`NEST_AUTH_URL=https://auth.nest.cerulean.works` so their calls carry the
+session (see [Run your first remote function](quickstart#2-point-the-sdk-at-the-controller)).
+With it set, `nest login` prints no *Signing in to Cerulean-hosted Nest* line.
 
 For a self-hosted Nest, name its origin; every `nest` command, and `.remote()`,
 then uses it:

@@ -7,18 +7,22 @@ Controller for. In short:
 
 ```bash
 uv add "nest @ git+https://github.com/cerulean-works/nest@main"
-uv run nest login                                    # signs in to https://auth.nest.cerulean.works
-export NEST_CONTROLLER_ADDRESS="nest.cerulean.works:50051"
+export NEST_AUTH_URL="https://auth.nest.cerulean.works"
+export NEST_CONTROLLER_ADDRESS="nest-controller.tail8e5ba1.ts.net:50051"
 export NEST_CONTROLLER_TLS=false                     # plaintext gRPC inside the encrypted Tailnet
 export NEST_PROJECT_ID="<project-id>"
+uv run nest login
 uv run python main.py
 ```
 
-Signing in needs no setting: `nest login` uses the hosted sign-in,
-`https://auth.nest.cerulean.works`, unless you name another Nest. Running a
-function still needs Tailnet access, the two Controller settings, a Project and
-the operator's approval of that Project; the steps below explain each. For a
-self-hosted Nest, see [Use a self-hosted Nest](#use-a-self-hosted-nest).
+All four settings are explicit. `nest-controller.tail8e5ba1.ts.net:50051` is the
+Controller's Tailscale MagicDNS name, the address verified end to end for the
+hosted deployment. Because it is not the address the SDK recognizes as the hosted
+Controller, `.remote()` sends your hosted session only when `NEST_AUTH_URL` names
+the hosted sign-in (see [step 2](#2-point-the-sdk-at-the-controller)). Running a
+function also needs Tailnet access, a Project and the operator's approval of that
+Project; the steps below explain each. For a self-hosted Nest, see
+[Use a self-hosted Nest](#use-a-self-hosted-nest).
 
 To try Nest on one machine without a cluster, a sign-in or a Project, use the
 [local development flow](#local-development-flow-no-session) at the end instead.
@@ -32,8 +36,15 @@ To try Nest on one machine without a cluster, a sign-in or a Project, use the
 | A Google account | You |
 | A Project, and the operator's approval of it | You and the operator (steps 4 and 5) |
 
-The hosted Controller is `nest.cerulean.works:50051` and its sign-in is
-`https://auth.nest.cerulean.works`. Examples below use `<project-id>` as a
+| Hosted value | Setting |
+| --- | --- |
+| Controller (Tailscale MagicDNS) | `NEST_CONTROLLER_ADDRESS=nest-controller.tail8e5ba1.ts.net:50051` |
+| Transport | `NEST_CONTROLLER_TLS=false`, only because the authorized Tailnet encrypts and access-controls the connection |
+| Sign-in | `NEST_AUTH_URL=https://auth.nest.cerulean.works` |
+| Project | `NEST_PROJECT_ID=<project-id>`, a UUID; Nest never picks one |
+
+`nest.cerulean.works:50051` has **not** been verified end to end in this
+deployment; do not use it for gRPC. Examples below use `<project-id>` as a
 placeholder. Never paste a token or credential into a script, a shell history or
 an issue.
 
@@ -44,21 +55,47 @@ device to the authorized Tailnet, or accept the Controller node share the operat
 sent you (see [Share a Controller over Tailscale](tailscale-shared)). Tagged
 devices cannot use shares.
 
+Check that your device resolves and reaches the Controller node before going on:
+
+```bash
+tailscale status | grep nest-controller
+tailscale ping nest-controller.tail8e5ba1.ts.net
+```
+
+Use the MagicDNS name, not a Tailscale IP address. A shared node's `100.x.y.z`
+address is assigned per Tailnet and may differ for you, change if the node is
+re-enrolled, or collide with a device in your own Tailnet, so an IP copied from
+someone else is not a safe setting. If your Tailnet has MagicDNS turned off, the
+`*.ts.net` name may not resolve: turn MagicDNS on, or ask the operator, rather
+than pinning an address. The Controller's Tailscale policy, not the address you
+use, decides whether you may connect.
+
 ## 2. Point the SDK at the Controller
 
 ```bash
-export NEST_CONTROLLER_ADDRESS="nest.cerulean.works:50051"
+export NEST_AUTH_URL="https://auth.nest.cerulean.works"
+export NEST_CONTROLLER_ADDRESS="nest-controller.tail8e5ba1.ts.net:50051"
 export NEST_CONTROLLER_TLS=false
 ```
 
-These two settings stay explicit on purpose. The hosted Controller serves
-plaintext gRPC that only the encrypted, access-controlled Tailnet protects, and
-every call carries your Nest session. A default would send that session in
-plaintext to whatever `nest.cerulean.works` resolves to on networks that are not
-the Tailnet, so the SDK never assumes the hosted address or plaintext: for a
-non-loopback address it refuses to guess. Setting `NEST_CONTROLLER_TLS=false`
-states that you are on the Tailnet. See
+These settings stay explicit on purpose. The hosted Controller serves plaintext
+gRPC that only the encrypted, access-controlled Tailnet protects, and every call
+carries your Nest session. A default would send that session in plaintext to
+whatever a name resolves to on networks that are not the Tailnet, so the SDK
+never assumes a Controller address or plaintext: for a non-loopback address it
+refuses to guess. Setting `NEST_CONTROLLER_TLS=false` states that you are on the
+Tailnet; never set it for a Controller reached over the public Internet. See
 [Why the hosted Controller is not a default](configuration#why-the-hosted-controller-is-not-a-default).
+
+`NEST_AUTH_URL` is required with this address. The SDK's built-in hosted
+sign-in default applies only when `NEST_CONTROLLER_ADDRESS` is exactly
+`nest.cerulean.works:50051` (`nest.config.HOSTED_CONTROLLER_ADDRESS`); for any other
+address, including the MagicDNS name, `.remote()` sends a session only from the
+origin `NEST_AUTH_URL` names. Without it, calls fail with
+`AuthenticationRequiredError` (*requires a Nest session*) even after a
+successful `nest login`. Recognizing the MagicDNS name as the hosted Controller
+would be a product change, tracked separately (G03/G02a); this guide does not
+assume it.
 
 For a Controller with its own TLS certificate, set `NEST_CONTROLLER_TLS=true`
 and, for a private CA, `NEST_CONTROLLER_TLS_CA_FILE=/path/to/ca.pem`. See
@@ -71,7 +108,6 @@ uv run nest login
 ```
 
 ```text
-Signing in to Cerulean-hosted Nest at https://auth.nest.cerulean.works (set NEST_AUTH_URL or pass --url for another Nest).
 To sign in to Nest, open this link in a browser:
 
     https://auth.nest.cerulean.works/auth/cli/approve?code=BCDF-GHJK
@@ -100,8 +136,9 @@ Signed in: https://auth.nest.cerulean.works
 
 The session is stored in `~/.config/nest/credentials.json` (mode `0600`), apart
 from sessions of any other Nest, and refreshed automatically for up to 7 days.
-`.remote()` sends it with every call to the hosted Controller, and to no other
-Controller. It is a Nest session only: it is never
+`.remote()` sends it with every call to the Controller named by
+`NEST_CONTROLLER_ADDRESS` while `NEST_AUTH_URL` names the hosted sign-in, and to
+no Controller otherwise. It is a Nest session only: it is never
 sent to an HPC login node and is not an NCHC password or one-time code. See
 [Sign in from the command line](cli-login).
 
@@ -120,19 +157,20 @@ the Project decides what you may do:
 or an Invite Link (see [Invite people to a Project](invitations)). Open the link,
 sign in with Google, review the Project and role, and press *Accept*.
 
-**Or create one.** Creating a Project needs a browser session; Nest has no page
-or CLI command for it yet. Sign in at `https://auth.nest.cerulean.works/auth/google/login`,
-then, in that tab's developer console on the Nest origin, run:
+**Or ask for a new one.** Nest has no page or CLI command that creates a Project
+yet. The API route that does, `POST /api/projects`, accepts only a browser
+session making a same-origin request, and the Nest origin's pages serve a
+restrictive Content-Security-Policy (`default-src 'none'`) that blocks `fetch()`
+from the developer console, so there is no supported self-service path today. A
+CLI session is refused (`browser_only`). Do not copy session cookies or tokens
+into other tools to work around this.
 
-```js
-await (await fetch("/api/projects", {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ name: "My lab" }),
-})).json();
-```
-
-The answer contains the new Project's `id`, and you are its Owner.
+Instead, send the operator your Nest User ID, which `nest auth status` prints as
+`user:` (it is not secret and contains no email address), and the Project name.
+The operator creates the Project with you as its creator and Owner, recorded in
+the Project audit history (see
+[Create a Project for a User](project-onboarding#create-a-project-for-a-user)).
+As Owner you then invite the rest of your group.
 
 **Find the ID** of the Projects you belong to with your CLI session:
 
@@ -143,7 +181,7 @@ import urllib.request
 
 from nest.login import ensure_session
 
-session = ensure_session()  # the hosted sign-in, unless NEST_AUTH_URL names another
+session = ensure_session()  # the origin NEST_AUTH_URL names (hosted by default)
 request = urllib.request.Request(
     session.auth_url + "/api/projects",
     headers={"Authorization": f"Bearer {session.access_token}"},
@@ -164,7 +202,8 @@ export NEST_PROJECT_ID="<project-id>"
 
 Nest never picks a Project for you, even when you belong to only one: a call
 without `NEST_PROJECT_ID` is refused with *Name the Project to run in with
-NEST_PROJECT_ID*, and nothing runs.
+NEST_PROJECT_ID*, and nothing runs. A value that is not a UUID is rejected by the
+SDK before any call (*NEST_PROJECT_ID must be a Project ID (a UUID)*).
 
 ## 5. Ask the operator to approve the Project
 
@@ -176,9 +215,11 @@ A Project role never grants HPC access by itself. Before the first Run, the
 3. register and link a Slurm account it may charge (`nest-db account link`).
 
 These are operator-only actions, done on the Controller host with database
-credentials; see [Onboard a Project](project-onboarding). Send the operator your
-Project ID and the Slurm account your group should be charged to. Never send them
-your Nest session file.
+credentials; no Project role, including Owner, can perform them. Provider approval
+takes effect only after the operator redeploys the Controller. See
+[Onboard a Project](project-onboarding). Send the operator your Project ID and
+the Slurm account your group should be charged to. Never send them your Nest
+session file or tokens.
 
 Check that a Platform is granted:
 

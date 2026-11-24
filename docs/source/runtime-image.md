@@ -167,6 +167,87 @@ marked ready after a failed build. A partial `.venv` is removed.
 uv and Git output is filtered before it reaches the log: credentials embedded in
 URLs (`https://user:secret@host`) and GitHub tokens are replaced with `***`.
 
+### Updated Controller, old image
+
+Deploying a new Controller, or new `scripts/*.sbatch` in the work directory, does
+**not** change `images/uv-python314.sif`. A site whose SIF predates the
+`hpc-runtime` target keeps an image without Git until the operator replaces the
+file. Symptoms:
+
+- the caller sees `Environment build <job> failed: FAILED`;
+- `env-<job>.out` in the HPC work directory ends with
+  `uv.lock pins Git dependencies, but … has no git executable` and
+  `Environment build failed; the runtime was not marked ready.`;
+- `sacct -j <job>` shows the build job exited with status 3, which
+  `environment-smoke.sbatch` uses only for this check, before uv runs.
+
+PyPI-only lockfiles keep working with such an image, so the failure appears only
+for Projects that pin a Git source. Confirm it on the login node:
+
+```bash
+apptainer exec --cleanenv images/uv-python314.sif git --version   # fails: no git
+sha256sum images/uv-python314.sif
+```
+
+Fix it with a new image, never by installing Git on the host or at job time:
+
+1. Build the canonical image from the commit you deploy
+   ([Build the image](#build-the-image)): `docker build --target hpc-runtime`
+   through `scripts/build-runtime-image.sh`, converted to SIF. This is the
+   reproducible path and the one to record in deployment notes. Nest does not yet
+   publish this image to a registry (GHCR publication is planned, E03a); build it
+   yourself.
+2. Verify it under a temporary name: `git`, `uv` and `python` inside the image on
+   the login node, then `apptainer-smoke.sbatch` on a compute node
+   ([Verify](#verify-the-new-image-before-rollout)).
+3. Drain Nest jobs, keep the old file as `uv-python314.sif.previous`, and swap the
+   new one in with `mv` on the same file system
+   ([Roll out](#roll-out-without-disrupting-jobs)). Back up the old SIF first;
+   do not overwrite it in place.
+4. No cache needs clearing. The runtime ID is derived from the SIF's SHA-256 and
+   the host architecture, so the swapped image's digest selects new runtime
+   directories, and each Project's next call rebuilds once. Record the new
+   SHA-256.
+
+**Site-specific workaround.** Where Docker is not available to build the
+canonical image, an operator may build an image on the cluster with Apptainer
+instead, for example by adding Git to the existing image. Whether this works
+depends on the site: `apptainer build --fakeroot` needs user-namespace and
+subordinate-ID support that not every cluster grants, and some file systems used
+for home directories do not support it. On one site such an incremental repair
+succeeded when built in node-local `/tmp` after the same build failed in the
+shared home directory; the result was then moved into `images/` and verified as
+above. Treat an image built this way as a stopgap: it is not reproducible from
+the repository, its contents are not described by a manifest, and it should be
+replaced by the canonical `hpc-runtime` build. Do not assume other sites allow
+fakeroot, or give compute nodes outbound access to package mirrors or
+github.com; check with the cluster administrators.
+
+## Validation record (2026-11-25)
+
+Live, hosted M1 Mode A deployment, sanitized: no account names, paths, Project
+IDs or credentials are recorded here.
+
+| Check | Result |
+| --- | --- |
+| Sign-in | Google browser sign-in and CLI approval (`nest login`) against `https://auth.nest.cerulean.works` |
+| Authorization | Project membership, operator Platform grant and Slurm account link, and Provider approval (`NEST_PROVIDER_ALLOWED_PROJECTS`) all in place; the call was accepted |
+| Transport | `NEST_CONTROLLER_ADDRESS=nest-controller.tail8e5ba1.ts.net:50051` with `NEST_CONTROLLER_TLS=false` over the authorized Tailnet |
+| Image | The deployed SIF lacked Git; Git builds failed with exit 3 as described [above](#updated-controller-old-image). It was replaced by a site-specific repaired image (built in node-local `/tmp`), not by the canonical `hpc-runtime` build |
+| Result | After the image swap, an authenticated `.remote()` call ran as a Slurm job and returned `[1234567 1234567 1234567]`; the Controller retrieved the result from the cluster |
+
+Not yet verified, so the live acceptance of the Git-enabled runtime (A08) is
+**not** complete:
+
+- a cold-cache build job recorded against the new image's SHA-256, with its
+  `env-<job>.out`;
+- the canonical `hpc-runtime` image deployed in place of the repaired one, with
+  its manifest;
+- the Execution Registry entries and security audit records for the run;
+- negative authorization checks on the live deployment (unapproved Project,
+  missing Platform grant, missing account link, Viewer role);
+- Controller restart and recovery with jobs in flight.
+
 ## Validation record (2026-11-24)
 
 Recorded against `main` at `39635e4` for issue #62.

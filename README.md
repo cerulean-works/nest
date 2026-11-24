@@ -39,28 +39,33 @@ The Cerulean-hosted Controller is authenticated (M1): each call carries your Nes
 session and runs in a Project that the operator has approved. The
 [full walkthrough](docs/source/quickstart.md) explains each step; in short:
 
-1. Sign in by approving the CLI in a browser. No setting is needed: `nest login`
-   uses the hosted sign-in at `https://auth.nest.cerulean.works`.
+1. Connect to the authorized Tailscale network, or accept the Controller node
+   share, and point the SDK at the hosted Controller by its MagicDNS name. These
+   settings stay explicit because the Controller's gRPC is plaintext inside the
+   encrypted Tailnet, and the SDK never assumes that
+   ([why](docs/source/configuration.md#why-the-hosted-controller-is-not-a-default)):
+
+   ```bash
+   export NEST_AUTH_URL="https://auth.nest.cerulean.works"
+   export NEST_CONTROLLER_ADDRESS="nest-controller.tail8e5ba1.ts.net:50051"
+   export NEST_CONTROLLER_TLS=false
+   ```
+
+   `NEST_AUTH_URL` is required with this address: the SDK applies the hosted
+   sign-in on its own only for `nest.cerulean.works:50051`, which has not been
+   verified end to end in this deployment. Use the MagicDNS name rather than a
+   Tailscale IP, which can differ between Tailnets.
+
+2. Sign in by approving the CLI in a browser:
 
    ```bash
    uv run nest login
    uv run nest auth status --check
    ```
 
-2. Connect to the authorized Tailscale network, or accept the Controller node
-   share, and point the SDK at the hosted Controller. These stay explicit because
-   the Controller's gRPC is plaintext inside the encrypted Tailnet, and the SDK
-   never assumes that ([why](docs/source/configuration.md#why-the-hosted-controller-is-not-a-default)):
-
-   ```bash
-   export NEST_CONTROLLER_ADDRESS="nest.cerulean.works:50051"
-   export NEST_CONTROLLER_TLS=false
-   ```
-
-   The SDK sends your hosted session to this Controller only.
-
-3. Join a Project through an invitation from its Owner or an Admin, or create one,
-   and select it by ID (see [Join or create a Project](docs/source/quickstart.md#4-join-or-create-a-project)):
+3. Join a Project through an invitation from its Owner or an Admin, or ask the
+   operator to create one for you, and select it by ID (see
+   [Join or create a Project](docs/source/quickstart.md#4-join-or-create-a-project)):
 
    ```bash
    export NEST_PROJECT_ID="<project-id>"
@@ -112,7 +117,8 @@ export NEST_CONTROLLER_TLS=true
 ```
 
 `--url` wins over `NEST_AUTH_URL`, which wins over the hosted default. Without
-`NEST_AUTH_URL`, a Controller other than the hosted one receives no session. See
+`NEST_AUTH_URL`, a Controller other than `nest.cerulean.works:50051` receives no
+session. See
 [Sign-in origin](docs/source/configuration.md#sign-in-origin).
 
 ### Local development without a session

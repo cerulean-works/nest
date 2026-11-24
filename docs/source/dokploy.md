@@ -79,7 +79,8 @@ NEST_EXECUTOR='slurm'
 # Tailscale encrypts and access-controls the gRPC path, so session tokens may
 # travel without Nest's own TLS. Otherwise set NEST_TLS_CERT and NEST_TLS_KEY.
 NEST_CONTROLLER_ALLOW_PLAINTEXT='true'
-NEST_PROVIDER_ALLOWED_PROJECTS='project-id-1,project-id-2'
+# Project UUIDs (not names), comma-separated. Read only at start: Deploy again after a change.
+NEST_PROVIDER_ALLOWED_PROJECTS='<project-uuid-1>,<project-uuid-2>'
 
 # --- HPC Platforms: the lines of a platforms.env file ---------------------------
 NEST_PLATFORMS_ENV='NEST_PLATFORMS=campus\nNEST_PLATFORM_CAMPUS_NAME=Campus GPU cluster\nNEST_PLATFORM_CAMPUS_OPERATOR=example-university\nNEST_PLATFORM_CAMPUS_LOGIN_NODES=hpc\nNEST_PLATFORM_CAMPUS_SSH_USER=svc-nest\nNEST_PLATFORM_CAMPUS_ACCOUNT=physics\nNEST_PLATFORM_CAMPUS_WORKDIR=/home/svc-nest/nest'
@@ -116,6 +117,36 @@ quarantine* onwards, using `-f compose.dokploy.yaml` in its commands. The review
 `docker/tailscale-serve/serve.json` from the checkout is used unless you set
 `NEST_TAILSCALE_SERVE_CONFIG` to a replacement JSON document. Use single quotes,
 so Compose leaves `${TS_CERT_DOMAIN}` for the sidecar to expand.
+
+## Change a setting such as Provider approval
+
+Dokploy injects the **Environment** panel through Compose: it writes the panel
+to `.env` next to `compose.dokploy.yaml`, and Compose substitutes each
+`${NAME:-}` that a service lists. The Controller reads its settings once, at
+start. To change one, for example to approve a new Project in
+`NEST_PROVIDER_ALLOWED_PROJECTS`:
+
+1. Edit the value in **Environment** and save.
+2. Press **Deploy**. This recreates the containers whose configuration changed;
+   the named volumes, including `tailscale-state` and `postgres-data`, are kept.
+   Restarting a container from Dokploy's container view, or `docker restart`,
+   keeps the environment the container was created with, so the old value stays
+   in effect.
+3. Check what the running Controller received, in the `controller` terminal:
+
+   ```bash
+   printenv NEST_PROVIDER_ALLOWED_PROJECTS
+   nest-db audit list --event controller.started --limit 1
+   ```
+
+   `allowed_projects` in the start record is the number of listed Projects, or
+   `*`. A value that is not a UUID stops the Controller at start with a
+   configuration error naming the variable; read the `controller` logs.
+
+A variable that `compose.dokploy.yaml` does not list never reaches the
+Controller, even if it is in the panel. Provider approval has no API or
+`nest-db` command: dynamic approvals are planned, not implemented. See
+[Onboard a Project](project-onboarding#1-approve-the-project-for-the-provider).
 
 ## How each credential is delivered
 

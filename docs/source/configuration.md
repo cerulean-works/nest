@@ -74,7 +74,7 @@ environment. Prefer the file form where a secret-file mount is available; see
 
 | Variable | Default | Behavior |
 | --- | --- | --- |
-| `NEST_CONTROLLER_ADDRESS` | `127.0.0.1:50051` | Controller `host:port` for each remote call. The hosted Controller, `nest.cerulean.works:50051`, is never a default; see [below](#why-the-hosted-controller-is-not-a-default). |
+| `NEST_CONTROLLER_ADDRESS` | `127.0.0.1:50051` | Controller `host:port` for each remote call. No remote Controller is ever a default. The hosted Controller's verified address is its Tailscale MagicDNS name, `nest-controller.tail8e5ba1.ts.net:50051`; see [below](#why-the-hosted-controller-is-not-a-default). |
 | `NEST_RPC_TIMEOUT` | `900` | Seconds allowed for each `Execute` RPC. Must be a positive number. When it expires, the call raises `RpcTimeoutError`. |
 | `NEST_CONTROLLER_TLS` | `false` for loopback, `true` when a CA file is set | Use a TLS channel with server certificate verification. Accepts `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`. |
 | `NEST_CONTROLLER_TLS_CA_FILE` | Unset | Absolute path to PEM roots for the Controller's certificate. With TLS enabled, an unset file uses gRPC's default trust roots. |
@@ -102,8 +102,12 @@ The CLI and the SDK resolve the sign-in origin the same way
 | --- | --- | --- | --- |
 | 1 | `--url` | yes | not applicable |
 | 2 | `NEST_AUTH_URL` | yes | yes, for any Controller |
-| 3 | Hosted default, `https://auth.nest.cerulean.works` | yes | only when `NEST_CONTROLLER_ADDRESS` is `nest.cerulean.works:50051` |
+| 3 | Hosted default, `https://auth.nest.cerulean.works` | yes | only when `NEST_CONTROLLER_ADDRESS` is exactly `nest.cerulean.works:50051` (`nest.config.HOSTED_CONTROLLER_ADDRESS`); not for the MagicDNS name |
 | - | None | never | no session is sent and no sign-in starts |
+
+Hosted users who connect by the MagicDNS name therefore set
+`NEST_AUTH_URL=https://auth.nest.cerulean.works` explicitly; without it the SDK
+sends no session and the call fails with `AuthenticationRequiredError`.
 
 An empty or blank value counts as unset. An invalid `--url` or `NEST_AUTH_URL` is
 an error (exit status 2, or `ConfigError`); it never falls back to the hosted
@@ -130,16 +134,30 @@ own sign-in origin comes only from `NEST_GOOGLE_REDIRECT_URL`.
 
 ### Why the hosted Controller is not a default
 
-The hosted Controller serves plaintext gRPC on `nest.cerulean.works:50051`; only
-the access-controlled Tailnet encrypts it (see
+The hosted Controller serves plaintext gRPC on port 50051; only the
+access-controlled Tailnet encrypts it (see
 [Share a Controller over Tailscale](tailscale-shared)), and every call carries a
 bearer token. The SDK cannot tell whether a machine is on that Tailnet, and
-outside it the name may resolve to an address that is not the Controller, so a
+outside it a name may resolve to an address that is not the Controller, so a
 default would risk sending sessions in plaintext over an untrusted network. Until
-the hosted Controller serves gRPC with TLS, hosted users set
-`NEST_CONTROLLER_ADDRESS=nest.cerulean.works:50051` and
-`NEST_CONTROLLER_TLS=false` explicitly; the SDK never defaults TLS to `false`.
-`NEST_PROJECT_ID` stays explicit as well: Nest never chooses a Project.
+the hosted Controller serves gRPC with TLS, hosted users set all of these
+explicitly; the SDK never defaults TLS to `false`:
+
+```bash
+export NEST_AUTH_URL="https://auth.nest.cerulean.works"
+export NEST_CONTROLLER_ADDRESS="nest-controller.tail8e5ba1.ts.net:50051"
+export NEST_CONTROLLER_TLS=false
+export NEST_PROJECT_ID="<project-id>"
+```
+
+`nest-controller.tail8e5ba1.ts.net` is the Controller node's MagicDNS name, which
+was verified end to end (sign-in, Project and Platform grants, Provider approval,
+Slurm submission and result retrieval). `nest.cerulean.works:50051`, the address
+built into the SDK as `nest.config.HOSTED_CONTROLLER_ADDRESS`, has not been verified
+end to end in this deployment; do not rely on it for gRPC. Use the MagicDNS name
+rather than a Tailscale IP: a shared node's IP is assigned per Tailnet and is not
+guaranteed to be the same for every recipient. `NEST_PROJECT_ID` stays explicit as
+well: Nest never chooses a Project.
 
 For a non-loopback address, set `NEST_CONTROLLER_TLS=true` or provide a CA file
 to use TLS. Set `NEST_CONTROLLER_TLS=false` explicitly for a plaintext deployment
@@ -166,7 +184,7 @@ on a trusted private network such as an authorized Tailnet.
 | `NEST_CONTROLLER_AUTH` | `session` with `NEST_DATABASE_URL`, otherwise `none` | `session` authenticates every gRPC call with a Nest CLI session and authorizes it with the Project policy (see [Security and limitations](security#authenticated-execution)). Needs `NEST_DATABASE_URL`. `none` serves every caller that can reach the listener. |
 | `NEST_CONTROLLER_ALLOW_PLAINTEXT` | `false` | With `NEST_CONTROLLER_AUTH=session`, a non-loopback listener needs TLS (`NEST_TLS_*`) because every call carries a session token. `true` approves plaintext gRPC on a network that is already encrypted and access-controlled, such as an authorized Tailnet. Ignored with `NEST_CONTROLLER_AUTH=none`. |
 | `NEST_EXECUTION_REGISTRY` | `required` with session authentication, else `legacy` | `required` admits every Slurm submission through the durable Execution Registry, which needs `NEST_CONTROLLER_AUTH=session` and, for a Mode A Platform, its `SSH_USER`. `legacy` keeps the trusted Mode A path that records only `jobs`; it is refused for a Mode B Platform under session authentication. See [Admit submissions through the Execution Registry](execution-registry). |
-| `NEST_PROVIDER_ALLOWED_PROJECTS` | Unset (no Project) | Project IDs, comma-separated, whose members' Runs the Controller's Provider accepts, or `*` for every Project. Every job runs as the Controller's HPC account, so this is the operator's approval; no Project role grants it. Needs `NEST_CONTROLLER_AUTH=session`. |
+| `NEST_PROVIDER_ALLOWED_PROJECTS` | Unset (no Project) | Project IDs, comma-separated, whose members' Runs the Controller's Provider accepts, or `*` for every Project. Every job runs as the Controller's HPC account, so this is the operator's approval; no Project role grants it. Read only at start: after a change, recreate the Controller container (in Dokploy, **Deploy** again). Needs `NEST_CONTROLLER_AUTH=session`. |
 | `NEST_PUBLIC_URL` | Unset | Advertised `grpc://`, `grpcs://`, `http://` or `https://` URL, logged at startup. Must not contain credentials or a query string. With email enabled it is also the base of links in messages, so it is required and must be `https://` (`http://` only for `localhost`). |
 
 The four timing settings accept positive numbers, including fractions.

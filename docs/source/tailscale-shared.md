@@ -24,6 +24,18 @@ every call with a Nest session and authorizes it by Project (see
 share with people authorized to use that SSH identity and Controller. Members then
 follow [Run your first remote function](quickstart).
 
+Give members the shared node's **MagicDNS name**, such as
+`nest-controller.<tailnet>.ts.net:50051` (for Cerulean-hosted Nest,
+`nest-controller.tail8e5ba1.ts.net:50051`), not a `100.x.y.z` address. Recipients
+in other Tailnets reach a shared node by its name in the sharer's Tailnet domain;
+the address their client shows can differ from yours, can change when the node is
+re-enrolled, and is not guaranteed to be free of conflicts with their own
+devices. Recipients need MagicDNS enabled for the name to resolve; `tailscale
+status` on their device shows the shared node and the address it uses there.
+Because the gRPC hop is plaintext inside Tailscale, members set
+`NEST_CONTROLLER_TLS=false` only for this Tailnet name, never for a public
+address.
+
 ## Forwarding and compatibility
 
 The checked-in `docker/tailscale-serve/serve.json` contains:
