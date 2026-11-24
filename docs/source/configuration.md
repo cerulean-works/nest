@@ -74,7 +74,7 @@ environment. Prefer the file form where a secret-file mount is available; see
 
 | Variable | Default | Behavior |
 | --- | --- | --- |
-| `NEST_CONTROLLER_ADDRESS` | `127.0.0.1:50051` | Controller `host:port` for each remote call. |
+| `NEST_CONTROLLER_ADDRESS` | `127.0.0.1:50051` | Controller `host:port` for each remote call. The hosted Controller, `nest.cerulean.works:50051`, is never a default; see [below](#why-the-hosted-controller-is-not-a-default). |
 | `NEST_RPC_TIMEOUT` | `900` | Seconds allowed for each `Execute` RPC. Must be a positive number. When it expires, the call raises `RpcTimeoutError`. |
 | `NEST_CONTROLLER_TLS` | `false` for loopback, `true` when a CA file is set | Use a TLS channel with server certificate verification. Accepts `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`. |
 | `NEST_CONTROLLER_TLS_CA_FILE` | Unset | Absolute path to PEM roots for the Controller's certificate. With TLS enabled, an unset file uses gRPC's default trust roots. |
@@ -88,10 +88,58 @@ where the Controller listens. Invalid client settings raise `nest.config.ConfigE
 
 | Variable | Default | Behavior |
 | --- | --- | --- |
-| `NEST_AUTH_URL` | Unset | Origin of your Nest's sign-in, such as `https://nest.example.com` (the origin of `NEST_GOOGLE_REDIRECT_URL`). Must be `https://` (`http://` only for localhost), with no path, credentials, query or fragment. Read by `nest login` and [`login.ensure_session`]; `--url` overrides it. When set, `.remote()` sends the stored session to the Controller as a bearer token. |
-| `NEST_CLI_CREDENTIALS_FILE` | `$XDG_CONFIG_HOME/nest/credentials.json`, or `~/.config/nest/credentials.json` | Absolute path where the CLI session is kept, mode `0600`. A file other users can read is refused. Holds a Nest session only, never HPC credentials. |
+| `NEST_AUTH_URL` | Unset: the CLI uses `https://auth.nest.cerulean.works`, and `.remote()` uses it only for the hosted Controller | Origin of your Nest's sign-in, such as `https://nest.example.com` (the origin of `NEST_GOOGLE_REDIRECT_URL`). Must be `https://` (`http://` only for localhost), with no path, credentials, query or fragment. Read by `nest login`, `nest auth`, `nest logout`, `nest platforms` and [`login.ensure_session`]; `--url` overrides it. When set, `.remote()` sends that Nest's stored session to the Controller, whatever its address, as a bearer token. |
+| `NEST_CLI_CREDENTIALS_FILE` | `$XDG_CONFIG_HOME/nest/credentials.json`, or `~/.config/nest/credentials.json` | Absolute path where CLI sessions are kept, one per sign-in origin, mode `0600`. A file other users can read is refused. Holds Nest sessions only, never HPC credentials. |
 
 See [Sign in from the command line](cli-login).
+
+### Sign-in origin
+
+The CLI and the SDK resolve the sign-in origin the same way
+([`config.resolve_auth_url`]), first match wins:
+
+| Order | Source | CLI (`nest ...`) | SDK (`.remote()`, [`client.session_metadata`]) |
+| --- | --- | --- | --- |
+| 1 | `--url` | yes | not applicable |
+| 2 | `NEST_AUTH_URL` | yes | yes, for any Controller |
+| 3 | Hosted default, `https://auth.nest.cerulean.works` | yes | only when `NEST_CONTROLLER_ADDRESS` is `nest.cerulean.works:50051` |
+| - | None | never | no session is sent and no sign-in starts |
+
+An empty or blank value counts as unset. An invalid `--url` or `NEST_AUTH_URL` is
+an error (exit status 2, or `ConfigError`); it never falls back to the hosted
+default. `nest auth status --json` reports the origin as `auth_url` and where it
+came from as `auth_url_source` (`--url`, `NEST_AUTH_URL` or `hosted default`).
+
+Sessions are stored per origin, so a session is only ever sent to the origin that
+issued it and to the Controllers that origin applies to. Signing in to, refreshing
+at or signing out of one Nest never replaces, revokes or deletes the session of
+another. A credentials file written by an earlier SDK, holding one session, is
+still read.
+
+To opt out of hosted sign-in:
+
+- **Self-hosted Nest:** set `NEST_AUTH_URL` (or pass `--url`) to your Nest's
+  origin. Nothing contacts the hosted origin.
+- **Local or stateless Controller** (`NEST_CONTROLLER_AUTH=none`): leave
+  `NEST_AUTH_URL` unset and point `NEST_CONTROLLER_ADDRESS` anywhere but the hosted
+  Controller, or leave it at its loopback default. The SDK sends no session and
+  never starts a sign-in, even if you signed in to hosted Nest.
+
+Controller deployment settings never depend on these defaults: the Controller's
+own sign-in origin comes only from `NEST_GOOGLE_REDIRECT_URL`.
+
+### Why the hosted Controller is not a default
+
+The hosted Controller serves plaintext gRPC on `nest.cerulean.works:50051`; only
+the access-controlled Tailnet encrypts it (see
+[Share a Controller over Tailscale](tailscale-shared)), and every call carries a
+bearer token. The SDK cannot tell whether a machine is on that Tailnet, and
+outside it the name may resolve to an address that is not the Controller, so a
+default would risk sending sessions in plaintext over an untrusted network. Until
+the hosted Controller serves gRPC with TLS, hosted users set
+`NEST_CONTROLLER_ADDRESS=nest.cerulean.works:50051` and
+`NEST_CONTROLLER_TLS=false` explicitly; the SDK never defaults TLS to `false`.
+`NEST_PROJECT_ID` stays explicit as well: Nest never chooses a Project.
 
 For a non-loopback address, set `NEST_CONTROLLER_TLS=true` or provide a CA file
 to use TLS. Set `NEST_CONTROLLER_TLS=false` explicitly for a plaintext deployment

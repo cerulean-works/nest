@@ -10,9 +10,12 @@ Usage:
     nest platforms show SLUG [--url URL] [--project-id UUID] [--json]
     nest platforms default --project-id UUID [--url URL] [--json]
 
+Every command talks to the Nest named by `--url`, else `NEST_AUTH_URL`, else the
+Cerulean-hosted Nest at `https://auth.nest.cerulean.works`.
+
 `nest login` is optional: commands that need a Nest session sign in the same way
-when there is none. The session is kept in `NEST_CLI_CREDENTIALS_FILE` (default
-`~/.config/nest/credentials.json`), readable only by you. No command takes a token
+when there is none. Sessions are kept in `NEST_CLI_CREDENTIALS_FILE` (default
+`~/.config/nest/credentials.json`), one per Nest, readable only by you. No command takes a token
 or password as an argument.
 
 `nest platforms` lists only the HPC Platforms granted to your Projects.
@@ -28,10 +31,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from uuid import UUID
 
-from .config import ConfigError, load_cli_auth_config
+from .config import HOSTED_AUTH_URL, ConfigError, is_hosted_controller, load_cli_auth_config
 from .login import (
     AuthError,
     CredentialsFileError,
@@ -59,7 +63,10 @@ def _parser() -> argparse.ArgumentParser:
     url.add_argument(
         "--url",
         metavar="URL",
-        help="Nest's address, such as https://nest.example.com (default: NEST_AUTH_URL)",
+        help=(
+            "Nest's sign-in address, such as https://nest.example.com "
+            f"(default: NEST_AUTH_URL, else {HOSTED_AUTH_URL})"
+        ),
     )
     commands = parser.add_subparsers(dest="command", required=True)
     signin = commands.add_parser(
@@ -196,6 +203,19 @@ def _status(config, args) -> int:
     return 0 if info["signed_in"] else 1
 
 
+def _warn_custom_controller(config) -> None:
+    """Says when the hosted session being created will not reach the configured
+    Controller, which receives only the session of the origin NEST_AUTH_URL names."""
+    address = os.environ.get("NEST_CONTROLLER_ADDRESS", "").strip()
+    if config.url_source == "hosted default" and address and not is_hosted_controller(address):
+        print(
+            f"nest: NEST_CONTROLLER_ADDRESS={address} is not the hosted Controller, so the "
+            "SDK will not send it this hosted session. For a self-hosted Nest, set "
+            "NEST_AUTH_URL to its sign-in address.",
+            file=sys.stderr,
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     """Runs `nest`. Returns the exit status."""
     args = _parser().parse_args(argv)
@@ -206,6 +226,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         if args.command == "login":
+            _warn_custom_controller(config)
             login(config, open_browser=not args.no_browser)
             return 0
         if args.command == "platforms":

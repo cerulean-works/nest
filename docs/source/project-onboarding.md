@@ -30,7 +30,9 @@ Give users these values; none of them is a secret:
 
 - `NEST_CONTROLLER_ADDRESS` and whether to set `NEST_CONTROLLER_TLS=true` or `false`;
 - `NEST_AUTH_URL`: the origin of `NEST_GOOGLE_REDIRECT_URL`, such as
-  `https://nest.example.com`;
+  `https://nest.example.com`. Users of a self-hosted Nest must set it: without it,
+  `nest login` signs in to Cerulean-hosted Nest, and the SDK sends no session to
+  your Controller;
 - how to reach the Controller over Tailscale (Tailnet membership or a node share;
   see [Share a Controller over Tailscale](tailscale-shared)).
 

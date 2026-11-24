@@ -8,7 +8,12 @@ import cloudpickle
 import grpc
 
 from ._logging import current_request_id, get_logger, operation, request_context
-from .config import DEFAULT_CONTROLLER_ADDRESS, ClientConfig, load_client_config
+from .config import (
+    DEFAULT_CONTROLLER_ADDRESS,
+    HOSTED_CONTROLLER_ADDRESS,
+    ClientConfig,
+    load_client_config,
+)
 from .errors import (
     AUTHORIZATION_METADATA,
     ERROR_KIND_METADATA,
@@ -46,7 +51,9 @@ def _channel(config: ClientConfig) -> grpc.Channel:
     return grpc.secure_channel(config.address, grpc.ssl_channel_credentials(roots))
 
 
-def _controller_error(exc: grpc.RpcError, address: str, timeout: float) -> Exception | None:
+def _controller_error(
+    exc: grpc.RpcError, address: str, timeout: float, *, auth_url: str | None = None
+) -> Exception | None:
     """
     Converts a Controller RPC error into a typed Nest exception when possible.
 
@@ -54,6 +61,8 @@ def _controller_error(exc: grpc.RpcError, address: str, timeout: float) -> Excep
         exc (`grpc.RpcError`): Error raised by the stub call.
         address (`str`): Controller address, used in messages.
         timeout (`float`): RPC deadline in seconds, used in messages.
+        auth_url (`str`, *optional*): The sign-in origin whose session was used,
+            used in messages.
 
     Returns:
         `Exception | None`: The exception to raise, or `None` to re-raise `exc`.
@@ -73,9 +82,16 @@ def _controller_error(exc: grpc.RpcError, address: str, timeout: float) -> Excep
 
     status = call.code()
     if status == grpc.StatusCode.UNAUTHENTICATED:
+        if auth_url is None:
+            return AuthenticationRequiredError(
+                f"Nest Controller at {address} requires a Nest session. The SDK sends one "
+                f"only to the hosted Controller ({HOSTED_CONTROLLER_ADDRESS}) or to the Nest "
+                "that NEST_AUTH_URL names: set NEST_AUTH_URL to this Controller's sign-in "
+                "address and run `nest login`."
+            )
         return AuthenticationRequiredError(
-            f"Nest Controller at {address} requires a Nest session. Set NEST_AUTH_URL to "
-            "your Nest's address and run `nest login`."
+            f"Nest Controller at {address} requires a Nest session from {auth_url}. "
+            f"Run `nest login --url {auth_url}` and try again."
         )
     if status in (grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.NOT_FOUND):
         return RemoteAccessDeniedError(
@@ -107,7 +123,9 @@ def _controller_error(exc: grpc.RpcError, address: str, timeout: float) -> Excep
 def _access_token(config: ClientConfig, *, interactive: bool) -> str | None:
     """
     The stored Nest session's access token, refreshed when needed, or `None` when
-    `NEST_AUTH_URL` is unset or no one is signed in and `interactive` is `False`.
+    no sign-in origin applies to this Controller (see [`config.ClientConfig`]) or no
+    one is signed in and `interactive` is `False`. Only the session of
+    `config.auth_url` is read, so a Controller never receives another Nest's session.
     """
     if config.auth_url is None:
         return None
@@ -139,8 +157,9 @@ def session_metadata(
 ) -> tuple[tuple[str, str], ...]:
     """
     Metadata for a direct gRPC call to the Controller, such as `SubmitJob`: the
-    request ID, `NEST_PROJECT_ID`, and, with `NEST_AUTH_URL` set, the Nest session's
-    bearer token, signing in first when `interactive` and no session is stored.
+    request ID, `NEST_PROJECT_ID`, and, when a sign-in origin applies (`NEST_AUTH_URL`,
+    or the hosted origin for the hosted Controller), the Nest session's bearer token,
+    signing in first when `interactive` and no session is stored.
 
     Args:
         config ([`config.ClientConfig`], *optional*): Defaults to the environment.
@@ -172,9 +191,11 @@ def execute_remote(
     Non-loopback addresses require an explicit `NEST_CONTROLLER_TLS` setting or
     `NEST_CONTROLLER_TLS_CA_FILE`.
 
-    With `NEST_AUTH_URL` set, the stored Nest session (see [`login.ensure_session`])
-    is sent as a bearer token, and `NEST_PROJECT_ID` names the Project the call runs
-    in. When the Controller requires a session and none is stored, an interactive
+    With `NEST_AUTH_URL` set, or when `NEST_CONTROLLER_ADDRESS` names the hosted
+    Controller ([`config.HOSTED_CONTROLLER_ADDRESS`], whose sign-in is
+    [`config.HOSTED_AUTH_URL`]), the stored Nest session of that origin (see
+    [`login.ensure_session`]) is sent as a bearer token, and `NEST_PROJECT_ID` names
+    the Project the call runs in. Any other Controller receives no session. When the Controller requires a session and none is stored, an interactive
     terminal signs in through the browser and the call is sent once more; nothing
     ran the first time.
     Otherwise the call is never retried. Only send trusted functions and accept results from
@@ -267,7 +288,7 @@ def execute_remote(
         # Errors raised by stub calls are also `grpc.Call`s, which carry the status.
         status = cast(grpc.Call, exc).code()
         logger.error("Controller RPC failed address=%s status=%s", address, status.name)
-        error = _controller_error(exc, address, timeout)
+        error = _controller_error(exc, address, timeout, auth_url=config.auth_url)
         if error is None:
             raise
         raise error from exc

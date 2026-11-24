@@ -238,7 +238,8 @@ class AuthenticationRequiredError(PermissionError):
     """
     The Controller requires a Nest session and the call presented none it accepts.
 
-    Sign in with `nest login` and set `NEST_AUTH_URL`, so the SDK sends the session.
+    Sign in with `nest login`. The SDK sends the session to the hosted Controller,
+    or to another Controller when `NEST_AUTH_URL` names its sign-in origin.
     """
 
 

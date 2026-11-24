@@ -2,10 +2,12 @@
 Nest sign-in for the command line and the SDK.
 
 A CLI session is approved in a browser: [`login.login`] starts a sign-in at the
-Nest auth URL (`NEST_AUTH_URL`), shows a short code and an approval link, and waits
+Nest auth URL (`--url`, else `NEST_AUTH_URL`, else the Cerulean-hosted
+[`config.HOSTED_AUTH_URL`]), shows a short code and an approval link, and waits
 while the User approves it in a browser where they are signed in to Nest with
 Google. The session is kept in a credentials file readable only by its owner
-(`NEST_CLI_CREDENTIALS_FILE`) and is refreshed as it nears expiry.
+(`NEST_CLI_CREDENTIALS_FILE`), separately for each sign-in origin, and is
+refreshed as it nears expiry.
 
 `nest login` is optional: [`login.ensure_session`] returns a valid session and,
 when there is none, runs the same browser approval inline, so a command such as
@@ -48,6 +50,10 @@ CREDENTIALS_KIND = "nest-cli-session"
 """Marks a credentials file as holding a Nest session, never HPC credentials."""
 
 CREDENTIALS_VERSION = 1
+"""Version of one stored session's record."""
+
+CREDENTIALS_FILE_VERSION = 2
+"""Version of a credentials file holding a list of records, one per sign-in origin."""
 
 START_PATH = "/auth/cli/start"
 TOKEN_PATH = "/auth/cli/token"
@@ -181,10 +187,13 @@ def _secret(value: object) -> str:
 
 class CredentialStore:
     """
-    Keeps one CLI session in a JSON file readable only by its owner.
+    Keeps CLI sessions in a JSON file readable only by its owner, at most one per
+    Nest sign-in origin, so signing in to one Nest never replaces, revokes or
+    discloses the session of another.
 
     The file is written atomically with mode `0600` in a directory created with
-    mode `0700`. A file that other users can read or write is refused.
+    mode `0700`. A file that other users can read or write is refused. A file
+    written by an earlier Nest, holding a single session, is still read.
 
     Args:
         path (`str`): Absolute path of the credentials file.
@@ -193,10 +202,10 @@ class CredentialStore:
     def __init__(self, path: str):
         self.path = path
 
-    def load(self, auth_url: str) -> NestSession | None:
+    def _entries(self) -> dict[str, dict[str, Any]]:
         """
-        Returns the stored session for `auth_url`, or `None` when there is none,
-        it is for another Nest, or it cannot be parsed.
+        The stored sessions' records by origin; empty when there is no file or it
+        cannot be parsed.
 
         Raises:
             [`login.CredentialsFileError`]: If the file is accessible to other users.
@@ -204,7 +213,7 @@ class CredentialStore:
         try:
             fd = os.open(self.path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         except FileNotFoundError:
-            return None
+            return {}
         except OSError as exc:
             raise CredentialsFileError(
                 f"Cannot read the Nest credentials file {self.path}: {exc.strerror}"
@@ -220,26 +229,65 @@ class CredentialStore:
                 data = json.loads(handle.read(_MAX_RESPONSE_BYTES))
             except ValueError, UnicodeDecodeError:
                 logger.warning("Ignoring an unreadable Nest credentials file")
-                return None
+                return {}
         if not isinstance(data, dict) or data.get("kind") != CREDENTIALS_KIND:
-            return None
-        if data.get("version") != CREDENTIALS_VERSION or data.get("auth_url") != auth_url:
+            return {}
+        if data.get("version") == CREDENTIALS_VERSION:
+            records = [data]
+        elif data.get("version") == CREDENTIALS_FILE_VERSION and isinstance(
+            data.get("sessions"), list
+        ):
+            records = data["sessions"]
+        else:
+            return {}
+        entries: dict[str, dict[str, Any]] = {}
+        for record in records:
+            if (
+                isinstance(record, dict)
+                and record.get("kind") == CREDENTIALS_KIND
+                and record.get("version") == CREDENTIALS_VERSION
+                and isinstance(record.get("auth_url"), str)
+            ):
+                entries[record["auth_url"]] = record
+        return entries
+
+    def load(self, auth_url: str) -> NestSession | None:
+        """
+        Returns the stored session for `auth_url`, or `None` when there is none
+        for that Nest or it cannot be parsed. Sessions of other Nests are never
+        returned.
+
+        Raises:
+            [`login.CredentialsFileError`]: If the file is accessible to other users.
+        """
+        record = self._entries().get(auth_url)
+        if record is None:
             return None
         try:
-            return NestSession.from_response(auth_url, data)
+            return NestSession.from_response(auth_url, record)
         except AuthError:
             logger.warning("Ignoring an unreadable Nest credentials file")
             return None
 
-    def save(self, session: NestSession) -> None:
-        """Replaces the stored session atomically."""
+    def _write(self, entries: Mapping[str, Mapping[str, Any]]) -> None:
+        if not entries:
+            self.clear()
+            return
         directory = os.path.dirname(self.path)
         os.makedirs(directory, mode=0o700, exist_ok=True)
         # mkstemp creates the file with mode 0600.
         fd, temporary = tempfile.mkstemp(prefix=".credentials-", dir=directory)
         try:
             with os.fdopen(fd, "w") as handle:
-                json.dump(session.to_json(), handle, indent=2)
+                json.dump(
+                    {
+                        "kind": CREDENTIALS_KIND,
+                        "version": CREDENTIALS_FILE_VERSION,
+                        "sessions": [entries[url] for url in sorted(entries)],
+                    },
+                    handle,
+                    indent=2,
+                )
                 handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -249,8 +297,28 @@ class CredentialStore:
                 os.unlink(temporary)
             raise
 
+    def save(self, session: NestSession) -> None:
+        """Stores `session` atomically, replacing only the session of its origin."""
+        entries = self._entries()
+        entries[session.auth_url] = session.to_json()
+        self._write(entries)
+
+    def remove(self, auth_url: str) -> bool:
+        """
+        Deletes the stored session of `auth_url`, keeping those of other Nests.
+        Returns whether there was one.
+
+        Raises:
+            [`login.CredentialsFileError`]: If the file is accessible to other users.
+        """
+        entries = self._entries()
+        if entries.pop(auth_url, None) is None:
+            return False
+        self._write(entries)
+        return True
+
     def clear(self) -> bool:
-        """Deletes the stored session. Returns whether there was one."""
+        """Deletes the whole file, with every Nest's session. Returns whether there was one."""
         try:
             os.unlink(self.path)
         except FileNotFoundError:
@@ -398,6 +466,12 @@ def login(
     if not link.startswith(config.url + "/"):
         raise AuthError("Nest sent an approval link for another site; not opening it")
 
+    if config.url_source == "hosted default":
+        print(
+            f"Signing in to Cerulean-hosted Nest at {config.url} "
+            "(set NEST_AUTH_URL or pass --url for another Nest).",
+            file=out,
+        )
     print("To sign in to Nest, open this link in a browser:", file=out)
     print(f"\n    {link}\n", file=out)
     print(f"and check that it shows the code {user_code}.", file=out)
@@ -487,7 +561,7 @@ def ensure_session(
                 return refreshed
             logger.info("The stored Nest session has ended")
         if session is not None:
-            store.clear()
+            store.remove(config.url)
     if not interactive:
         raise NotSignedInError("Not signed in to Nest; run nest login")
     return login(config, **login_options)
@@ -510,18 +584,23 @@ class LogoutResult:
 
 def logout(config: CLIAuthConfig | None = None, *, revoke: bool = True) -> LogoutResult:
     """
-    Revokes the stored session at Nest (unless `revoke` is `False`) and deletes it.
+    Revokes the stored session of `config.url` at Nest (unless `revoke` is `False`)
+    and deletes it, keeping the sessions of other Nests.
 
-    The local file is deleted even when Nest cannot be reached, so signing out
-    always ends the session on this machine.
+    The local session is deleted even when Nest cannot be reached, so signing out
+    always ends it on this machine. A credentials file that other users can access
+    is deleted whole, unread.
     """
     config = config or load_cli_auth_config()
     store = CredentialStore(config.credentials_file)
     with store.locked():
+        unsafe = False
         try:
             session = store.load(config.url)
         except CredentialsFileError:
-            session = None
+            # Not trusted, so its sessions are not sent anywhere; deleting it is
+            # the advertised way out.
+            session, unsafe = None, True
         revoked = None
         if session is not None and revoke:
             try:
@@ -531,7 +610,7 @@ def logout(config: CLIAuthConfig | None = None, *, revoke: bool = True) -> Logou
                 revoked = status == 200 and answer.get("signed_out") is True
             except NestUnavailableError:
                 revoked = None
-        removed = store.clear()
+        removed = store.clear() if unsafe else store.remove(config.url)
     if session is not None:
         logger.info("Signed out of Nest session_id=%s", session.session_id)
     return LogoutResult(removed=removed, revoked=revoked)
@@ -546,7 +625,8 @@ def status(config: CLIAuthConfig | None = None, *, check: bool = False) -> dict[
             refreshing it first when its access token has expired.
 
     Returns:
-        `dict`: `signed_in`, `auth_url`, `credentials_file`, and for a stored
+        `dict`: `signed_in`, `auth_url`, `auth_url_source` (one of
+            [`config.AUTH_URL_SOURCES`]), `credentials_file`, and for a stored
             session `user_id`, `session_id`, `scope` and the expiries; with `check`,
             `accepted` too.
     """
@@ -556,6 +636,7 @@ def status(config: CLIAuthConfig | None = None, *, check: bool = False) -> dict[
     info: dict[str, object] = {
         "signed_in": session is not None and session.refreshable(),
         "auth_url": config.url,
+        "auth_url_source": config.url_source,
         "credentials_file": config.credentials_file,
     }
     if session is None:

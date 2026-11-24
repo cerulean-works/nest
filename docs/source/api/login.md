@@ -37,6 +37,10 @@ A [`login.NestSession`] is a Nest identity only, never an HPC credential.
 
 [[autodoc]] config.load_cli_auth_config
 
+[[autodoc]] config.resolve_auth_url
+
+[[autodoc]] config.is_hosted_controller
+
 ## Errors
 
 [[autodoc]] login.AuthError

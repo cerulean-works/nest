@@ -24,7 +24,8 @@ uv run python main.py
 The SDK's default address is `127.0.0.1:50051`; set
 `NEST_CONTROLLER_ADDRESS="127.0.0.1:50051"` explicitly if you prefer. No
 `nest login` or `NEST_PROJECT_ID` is needed, and the SDK sends no session when
-`NEST_AUTH_URL` is unset.
+`NEST_AUTH_URL` is unset, even if you signed in to hosted Nest: only the hosted
+Controller receives the hosted session.
 
 ## What it does and does not do
 
