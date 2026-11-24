@@ -156,6 +156,11 @@ egress. Trust the Docker/Dokploy host and other containers on these networks.
 
 ## Dokploy v0.30.10 configuration
 
+This section uses File Mounts. To enter every credential in Dokploy's Environment
+panel instead, use `compose.dokploy.yaml`
+([Deploy on Dokploy from environment variables](dokploy)); the policy, sharing and
+verification steps on this page still apply.
+
 Select repository deployment, **Compose Type: Docker Compose**, and
 **Compose Path: `./compose.tailscale-shared.yaml`** at the repository root.
 Use Compose v2.20 or newer. Do not combine this file with the other Compose

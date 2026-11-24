@@ -144,7 +144,11 @@ This section is intended for hosts who operate a Nest Controller.
 ### Docker Compose
 
 For a Dokploy Controller shared with members on separate Tailscale Tailnets,
-see [Share a Controller over Tailscale](docs/source/tailscale-shared.md).
+see [Share a Controller over Tailscale](docs/source/tailscale-shared.md). To
+configure a complete Controller (PostgreSQL, Google sign-in, Tailscale, SSH) only
+from Dokploy's Environment panel, without mounted credential files, use
+[compose.dokploy.yaml](compose.dokploy.yaml) and
+[Deploy on Dokploy from environment variables](docs/source/dokploy.md).
 
 Clone this repository and deploy the Controller using [compose.yaml](compose.yaml).
 Follow [Deploy with Docker Compose](docs/source/docker-compose.md) to configure

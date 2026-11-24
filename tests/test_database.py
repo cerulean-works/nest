@@ -213,7 +213,7 @@ class DatabaseConfigTests(unittest.TestCase):
                 "NEST_DATABASE_PASSWORD_FILE": secret,
             }
         )
-        self.assertIn("NEST_DATABASE_URL or NEST_DATABASE_PASSWORD_FILE", text)
+        self.assertIn("only one of NEST_DATABASE_URL, NEST_DATABASE_PASSWORD and", text)
         self.assertNotIn(PASSWORD, text)
 
     def test_conninfo_carries_tls_timeout_and_password_file(self):

@@ -94,9 +94,9 @@ class EmailSender(Protocol):
 def tls_context(config: SMTPConfig) -> ssl.SSLContext:
     """
     Returns the client TLS context for SMTP: certificate and host name checks on,
-    TLS 1.2 or newer, and the system roots or `NEST_SMTP_CA_FILE`.
+    TLS 1.2 or newer, and the system roots or `NEST_SMTP_CA_FILE` / `NEST_SMTP_CA`.
     """
-    context = ssl.create_default_context(cafile=config.ca_file)
+    context = ssl.create_default_context(cafile=config.ca_file, cadata=config.ca_data)
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.check_hostname = True
     context.verify_mode = ssl.CERT_REQUIRED

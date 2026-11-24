@@ -4,6 +4,7 @@ Host hpc
     HostName login.YOUR-TAILNET.ts.net
     User YOUR-HPC-USER
     Port 22
+    # From NEST_SSH_CONFIG instead of a mounted directory: ~/.ssh/id_nest
     IdentityFile ~/.ssh/id_ed25519
     IdentitiesOnly yes
     BatchMode yes

@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .._logging import current_request_id, get_logger, operation
-from ..config import DEFAULT_PARTITION, load_log_level
+from ..config import DEFAULT_PARTITION, child_environ, load_log_level
 from ..errors import (
     ExecutionTimeoutError,
     InfrastructureError,
@@ -415,6 +415,9 @@ class SlurmBackend:
         return subprocess.run(
             [*self._ssh_argv(), command],
             check=False,
+            # Never hand the Controller's credentials to ssh, where a SendEnv setting
+            # could forward them to the Login Node.
+            env=child_environ(),
             input=input,
             capture_output=True,
             timeout=self.config.ssh_timeout,

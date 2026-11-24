@@ -1179,8 +1179,7 @@ def record_start(config: ControllerConfig, database: Database | None) -> None:
 def _add_port(server, config: ControllerConfig) -> int:
     if config.tls is None:
         return server.add_insecure_port(config.bind)
-    with open(config.tls.key_file, "rb") as key, open(config.tls.cert_file, "rb") as cert:
-        credentials = grpc.ssl_server_credentials([(key.read(), cert.read())])
+    credentials = grpc.ssl_server_credentials([config.tls.credentials()])
     return server.add_secure_port(config.bind, credentials)
 
 
@@ -1212,6 +1211,8 @@ def main():
         raise SystemExit(2) from None
     for message in config.warnings:
         logger.warning("Configuration warning: %s", message)
+    if config.tls is not None and config.tls.key_pem is not None:
+        register_secret(config.tls.key_pem.reveal())
 
     try:
         database = open_database(config)

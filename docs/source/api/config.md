@@ -50,8 +50,22 @@ except ConfigError as error:
 
 [[autodoc]] config.ClientConfig
 
+[[autodoc]] config.TLSConfig
+
 ## Secrets
 
 [[autodoc]] config.Secret
 
 [[autodoc]] config.redact_url
+
+[[autodoc]] config.child_environ
+
+## Runtime files
+
+Files generated from direct environment values for tools that read only files.
+
+[[autodoc]] runtime_files.write_private_file
+
+[[autodoc]] runtime_files.materialize_ssh_home
+
+[[autodoc]] runtime_files.normalize_content

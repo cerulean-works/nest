@@ -53,7 +53,6 @@ import math
 import os
 import re
 import stat
-import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from email.headerregistry import Address
@@ -64,6 +63,13 @@ from urllib.parse import parse_qs, urlsplit, urlunsplit
 from uuid import UUID
 
 from ._logging import LOG_LEVELS, parse_log_level
+from .runtime_files import (
+    RuntimeFileError,
+    check_ssh_config,
+    normalize_content,
+    private_directory,
+    write_private_file,
+)
 
 DEFAULT_CONTROLLER_BIND = "127.0.0.1:50051"
 """Listener address used when `NEST_CONTROLLER_BIND` is unset."""
@@ -109,11 +115,15 @@ DEFAULT_DATABASE_POOL_TIMEOUT = 30.0
 DATABASE_SETTINGS = (
     "NEST_DATABASE_URL",
     "NEST_DATABASE_REQUIRED",
+    "NEST_DATABASE_PASSWORD",
     "NEST_DATABASE_PASSWORD_FILE",
     "NEST_DATABASE_SSLMODE",
     "NEST_DATABASE_SSLROOTCERT",
+    "NEST_DATABASE_SSLROOTCERT_DATA",
     "NEST_DATABASE_SSLCERT",
+    "NEST_DATABASE_SSLCERT_DATA",
     "NEST_DATABASE_SSLKEY",
+    "NEST_DATABASE_SSLKEY_DATA",
     "NEST_DATABASE_POOL_MIN_SIZE",
     "NEST_DATABASE_POOL_MAX_SIZE",
     "NEST_DATABASE_CONNECT_TIMEOUT",
@@ -146,6 +156,7 @@ EMAIL_SETTINGS = (
     "NEST_SMTP_USERNAME",
     "NEST_SMTP_PASSWORD",
     "NEST_SMTP_PASSWORD_FILE",
+    "NEST_SMTP_CA",
     "NEST_SMTP_CA_FILE",
     "NEST_SMTP_TIMEOUT",
 )
@@ -248,11 +259,23 @@ RESERVED_SETTINGS = (
 
 SECRET_SETTINGS = (
     "NEST_DATABASE_URL",
+    "NEST_DATABASE_PASSWORD",
+    "NEST_DATABASE_SSLKEY_DATA",
     "NEST_SSH_PRIVATE_KEY",
+    "NEST_TLS_KEY",
     "NEST_SMTP_PASSWORD",
     "NEST_GOOGLE_CLIENT_SECRET",
+    "NEST_TAILSCALE_AUTHKEY",
 )
-"""Variables whose values are never echoed in errors or logs."""
+"""Variables whose values are never echoed in errors or logs, and never passed to
+SSH, local workers, or other child processes (see [`config.child_environ`])."""
+
+PLATFORMS_ENV = "NEST_PLATFORMS_ENV"
+"""Inline HPC Platform settings: the lines of a `platforms.env` file in one value."""
+
+_PLATFORMS_ENV_KEY = re.compile(
+    r"NEST_PLATFORMS|NEST_DEFAULT_PLATFORM|NEST_PLATFORM_[A-Z][A-Z0-9_]*"
+)
 
 _PROVIDER_ID = re.compile(r"[a-z][a-z0-9_]{0,31}")
 _PLATFORM_ID = _PROVIDER_ID
@@ -422,15 +445,34 @@ class SSHPolicy:
 @dataclass(frozen=True)
 class TLSConfig:
     """
-    Controller TLS server credentials.
+    Controller TLS server credentials, each from a file or given inline.
 
     Attributes:
-        cert_file (`str`): PEM certificate chain.
-        key_file (`str`): PEM private key. The path is logged; the contents never are.
+        cert_file (`str | None`): PEM certificate chain file (`NEST_TLS_CERT_FILE`).
+        key_file (`str | None`): PEM private key file (`NEST_TLS_KEY_FILE`). The path
+            is logged; the contents never are.
+        cert_pem (`str | None`): The certificate chain given inline (`NEST_TLS_CERT`).
+        key_pem (`Secret | None`): The private key given inline (`NEST_TLS_KEY`).
     """
 
-    cert_file: str
-    key_file: str
+    cert_file: str | None = None
+    key_file: str | None = None
+    cert_pem: str | None = None
+    key_pem: Secret | None = None
+
+    def credentials(self) -> tuple[bytes, bytes]:
+        """Returns `(private_key, certificate_chain)` as PEM bytes. Never log them."""
+        if self.key_pem is not None:
+            key = self.key_pem.reveal().encode()
+        else:
+            with open(str(self.key_file), "rb") as handle:
+                key = handle.read()
+        if self.cert_pem is not None:
+            cert = self.cert_pem.encode()
+        else:
+            with open(str(self.cert_file), "rb") as handle:
+                cert = handle.read()
+        return key, cert
 
 
 @dataclass(frozen=True)
@@ -444,6 +486,9 @@ class DatabaseConfig:
     Attributes:
         url (`Secret`): libpq connection URL. It may hold a password, so it is
             wrapped; log [`config.DatabaseConfig.redacted_url`] instead.
+        password (`Secret | None`): The password given directly in
+            `NEST_DATABASE_PASSWORD`. It is passed to libpq as its own keyword, never
+            spliced into the URL, so any character is safe.
         password_file (`str | None`): File whose contents are the password.
         sslmode (`str | None`): libpq `sslmode` from `NEST_DATABASE_SSLMODE`. `None`
             keeps the URL's own `sslmode`, or libpq's default (`prefer`). Defaults to
@@ -451,6 +496,11 @@ class DatabaseConfig:
         sslrootcert (`str | None`): CA bundle used to verify the server certificate.
         sslcert (`str | None`): Client certificate for certificate authentication.
         sslkey (`str | None`): Client private key. Must not be readable by others.
+        sslrootcert_data, sslcert_data (`str | None`): The CA bundle and client
+            certificate given inline. libpq needs files, so [`db.Database`] writes them
+            to a private runtime directory.
+        sslkey_data (`Secret | None`): The client private key given inline, written
+            the same way with mode `0600`.
         pool_min_size (`int`): Connections the pool keeps open.
         pool_max_size (`int`): Most connections the pool opens.
         connect_timeout (`float`): Seconds to wait for a new connection.
@@ -463,6 +513,10 @@ class DatabaseConfig:
     sslrootcert: str | None = None
     sslcert: str | None = None
     sslkey: str | None = None
+    password: Secret | None = None
+    sslrootcert_data: str | None = None
+    sslcert_data: str | None = None
+    sslkey_data: Secret | None = None
     pool_min_size: int = DEFAULT_DATABASE_POOL_MIN_SIZE
     pool_max_size: int = DEFAULT_DATABASE_POOL_MAX_SIZE
     connect_timeout: float = DEFAULT_DATABASE_CONNECT_TIMEOUT
@@ -490,10 +544,11 @@ class DatabaseConfig:
         """
         return {
             "url": self.redacted_url,
+            "password": "***" if self.password else None,
             "password_file": self.password_file,
             "sslmode": self.effective_sslmode,
-            "sslrootcert": self.sslrootcert,
-            "sslcert": self.sslcert,
+            "sslrootcert": "inline" if self.sslrootcert_data else self.sslrootcert,
+            "sslcert": "inline" if self.sslcert_data else self.sslcert,
             "pool_min_size": self.pool_min_size,
             "pool_max_size": self.pool_max_size,
         }
@@ -518,6 +573,7 @@ class SMTPConfig:
             connection so a rotated secret applies without a restart.
         ca_file (`str | None`): PEM CA bundle that replaces the system roots, for a
             relay with a private CA. Verification is never disabled.
+        ca_data (`str | None`): The same CA bundle given inline in `NEST_SMTP_CA`.
         timeout (`float`): Seconds for the connection and each SMTP command.
     """
 
@@ -529,6 +585,7 @@ class SMTPConfig:
     password_file: str | None = None
     ca_file: str | None = None
     timeout: float = DEFAULT_SMTP_TIMEOUT
+    ca_data: str | None = None
 
     def read_password(self) -> str | None:
         """Returns the current password, reading the file when one is set. Never log it."""
@@ -584,7 +641,7 @@ class EmailConfig:
             "smtp_username": self.smtp.username,
             "smtp_password": "***" if self.smtp.password else None,
             "smtp_password_file": self.smtp.password_file,
-            "smtp_ca_file": self.smtp.ca_file,
+            "smtp_ca_file": "inline" if self.smtp.ca_data else self.smtp.ca_file,
             "max_attempts": self.max_attempts,
         }
 
@@ -928,12 +985,97 @@ class _Reader:
             self.fail(f"{name} {path!r} is readable by other users; chmod 600 it")
         return path
 
+    def _file_text(self, name: str, path: str) -> str | None:
+        """Reads a file named by setting `name`; reports it, without its contents, if unusable."""
+        try:
+            with open(path, encoding="utf-8") as handle:
+                text = handle.read()
+        except OSError, UnicodeDecodeError:
+            self.fail(f"{name} {path!r} cannot be read as UTF-8 text")
+            return None
+        if not text.strip():
+            self.fail(f"{name} {path!r} is empty")
+            return None
+        return text
+
+    def secret_source(self, direct: str, file: str) -> tuple[str | None, str | None, bool]:
+        """
+        Reads a one-line secret given directly in `direct` or in the file named by `file`.
+
+        Unset and blank values mean unset; surrounding blank space is trimmed. Setting
+        both is an error, as is an empty file or a value with a line break. Messages
+        name the variables and paths, never the value.
+
+        Returns:
+            `tuple[str | None, str | None, bool]`: The direct value, the file path, and
+                whether either was set (even if invalid), for "needs a secret" checks.
+        """
+        raw = self.get(direct)
+        file_set = self.get(file) is not None
+        if raw is not None and file_set:
+            self.fail(f"Set only one of {direct} and {file}")
+            return None, None, True
+        if raw is not None:
+            if "\n" in raw or "\r" in raw:
+                self.fail(f"{direct} must be a single line; remove the line break")
+                return None, None, True
+            return raw, None, True
+        if not file_set:
+            return None, None, False
+        before = len(self.problems)
+        path = self.readable_file(file)
+        if path is None or len(self.problems) > before:
+            return None, None, True
+        text = self._file_text(file, path)
+        if text is not None and "\n" in text.strip():
+            self.fail(f"{file} {path!r} must hold the secret on one line")
+        return None, (path if len(self.problems) == before else None), True
+
+    def content_source(
+        self, direct: str, file: str, *, kind: str | None = None, private: bool = False
+    ) -> tuple[str | None, str | None, bool]:
+        """
+        Reads multiline content (PEM, `known_hosts`) given inline in `direct` or as a file.
+
+        Inline content may use real line breaks or the two characters `\\n`; it is
+        normalized by [`runtime_files.normalize_content`]. `kind` (`"certificate"` or
+        `"private key"`) checks inline content for the matching PEM marker. With
+        `private`, the file must not be readable by group or others. Setting both is
+        an error.
+
+        Returns:
+            `tuple[str | None, str | None, bool]`: The inline content, the file path,
+                and whether either was set.
+        """
+        raw = self.get(direct)
+        file_set = self.get(file) is not None
+        if raw is not None and file_set:
+            self.fail(f"Set only one of {direct} and {file}")
+            return None, None, True
+        if raw is not None:
+            content = normalize_content(raw)
+            marker = _PEM_MARKERS.get(kind or "")
+            if marker is not None and marker not in content:
+                self.fail(f"{direct} does not look like a PEM {kind}")
+                return None, None, True
+            return content, None, True
+        if not file_set:
+            return None, None, False
+        before = len(self.problems)
+        path = self.private_file(file) if private else self.readable_file(file)
+        if path is None or len(self.problems) > before:
+            return None, None, True
+        return None, path, True
+
     def address(self, name: str, default: str) -> str:
         raw = self.get(name) or default
         host, sep, port = raw.rpartition(":")
         if not sep or not host or not port.isdecimal() or not 0 <= int(port) <= 65535:
             self.fail(f"{name} must be host:port, got {raw!r}")
         return raw
+
+
+_PEM_MARKERS = {"certificate": "-----BEGIN CERTIFICATE-----", "private key": "PRIVATE KEY-----"}
 
 
 def _login_nodes(reader: _Reader, name: str, raw: str) -> tuple[LoginNode, ...]:
@@ -1090,24 +1232,28 @@ def _ssh_policy(reader: _Reader, profiles: list[PlatformProfile]) -> SSHPolicy:
                 f"NEST_SSH_MODES_ALLOWED={','.join(allowed)} does not allow"
             )
 
-    known_hosts_file = reader.readable_file("NEST_SSH_KNOWN_HOSTS")
-    known_hosts_data = reader.get("NEST_SSH_KNOWN_HOSTS_DATA")
-    identity_file = reader.private_file("NEST_SSH_IDENTITY_FILE")
-    private_key_raw = reader.get("NEST_SSH_PRIVATE_KEY")
-    if private_key_raw is not None and "PRIVATE KEY-----" not in private_key_raw:
+    known_hosts_data, known_hosts_file, known_hosts_set = reader.content_source(
+        "NEST_SSH_KNOWN_HOSTS_DATA", "NEST_SSH_KNOWN_HOSTS"
+    )
+    private_key, identity_file, key_set = reader.content_source(
+        "NEST_SSH_PRIVATE_KEY", "NEST_SSH_IDENTITY_FILE", private=True
+    )
+    if private_key is not None and "PRIVATE KEY-----" not in private_key:
         reader.fail("NEST_SSH_PRIVATE_KEY does not look like a PEM or OpenSSH private key")
-    if known_hosts_file and known_hosts_data:
-        reader.fail("Set only one of NEST_SSH_KNOWN_HOSTS and NEST_SSH_KNOWN_HOSTS_DATA")
-    if identity_file and private_key_raw:
-        reader.fail("Set only one of NEST_SSH_IDENTITY_FILE and NEST_SSH_PRIVATE_KEY")
+    ssh_config = reader.get("NEST_SSH_CONFIG")
+    if ssh_config is not None:
+        try:
+            check_ssh_config(normalize_content(ssh_config))
+        except RuntimeFileError as exc:
+            reader.fail(str(exc))
 
     if any(p.ssh_mode == "B" for p in profiles):
-        if not (known_hosts_file or known_hosts_data):
+        if not known_hosts_set:
             reader.fail(
                 "Mode B needs verified host keys: set NEST_SSH_KNOWN_HOSTS (file) or "
                 "NEST_SSH_KNOWN_HOSTS_DATA (known_hosts lines)"
             )
-        if not (identity_file or private_key_raw):
+        if not key_set:
             reader.fail(
                 "Mode B needs a key: set NEST_SSH_IDENTITY_FILE (file) or "
                 "NEST_SSH_PRIVATE_KEY (key contents)"
@@ -1117,9 +1263,7 @@ def _ssh_policy(reader: _Reader, profiles: list[PlatformProfile]) -> SSHPolicy:
         known_hosts_file=known_hosts_file,
         known_hosts_data=known_hosts_data,
         identity_file=identity_file,
-        private_key=Secret(private_key_raw.replace("\\n", "\n").strip() + "\n")
-        if private_key_raw
-        else None,
+        private_key=Secret(private_key) if private_key is not None else None,
     )
 
 
@@ -1195,9 +1339,14 @@ def _database(reader: _Reader) -> DatabaseConfig | None:
     if not parts.path.strip("/") and "dbname" not in query:
         reader.fail("NEST_DATABASE_URL must name the database, such as .../nest")
 
-    password_file = reader.readable_file("NEST_DATABASE_PASSWORD_FILE")
-    if password_file and (parts.password or "password" in query):
-        reader.fail("Set the database password in NEST_DATABASE_URL or NEST_DATABASE_PASSWORD_FILE")
+    password, password_file, password_set = reader.secret_source(
+        "NEST_DATABASE_PASSWORD", "NEST_DATABASE_PASSWORD_FILE"
+    )
+    if password_set and (parts.password or "password" in query):
+        reader.fail(
+            "Set the database password in only one of NEST_DATABASE_URL, "
+            "NEST_DATABASE_PASSWORD and NEST_DATABASE_PASSWORD_FILE"
+        )
 
     url_sslmode = query.get("sslmode", [None])[-1]
     if url_sslmode is not None and url_sslmode not in DATABASE_SSLMODES:
@@ -1207,22 +1356,32 @@ def _database(reader: _Reader) -> DatabaseConfig | None:
             "shown); use one of " + ", ".join(DATABASE_SSLMODES)
         )
     sslmode = reader.choice("NEST_DATABASE_SSLMODE", DATABASE_SSLMODES, "")
-    files = {
-        "sslrootcert": reader.readable_file("NEST_DATABASE_SSLROOTCERT"),
-        "sslcert": reader.readable_file("NEST_DATABASE_SSLCERT"),
-        "sslkey": reader.private_file("NEST_DATABASE_SSLKEY"),
-    }
-    for key, variable in (("sslmode", sslmode), *files.items()):
+    files: dict[str, str | None] = {}
+    inline: dict[str, str | None] = {}
+    given: dict[str, bool] = {}
+    for key, kind in (
+        ("sslrootcert", "certificate"),
+        ("sslcert", "certificate"),
+        ("sslkey", "private key"),
+    ):
+        variable = f"NEST_DATABASE_{key.upper()}"
+        inline[key], files[key], given[key] = reader.content_source(
+            f"{variable}_DATA", variable, kind=kind, private=key == "sslkey"
+        )
+    for key, variable in (("sslmode", bool(sslmode)), *given.items()):
         if variable and key in query:
             reader.fail(
                 f"{key} is set in both NEST_DATABASE_URL and NEST_DATABASE_{key.upper()}; keep one"
             )
-    if (files["sslcert"] is None) != (files["sslkey"] is None):
-        reader.fail("Set both NEST_DATABASE_SSLCERT and NEST_DATABASE_SSLKEY, or neither")
-    if files["sslrootcert"] and not sslmode and url_sslmode is None:
+    if given["sslcert"] != given["sslkey"]:
+        reader.fail(
+            "Set both NEST_DATABASE_SSLCERT and NEST_DATABASE_SSLKEY (or their _DATA forms), "
+            "or neither"
+        )
+    if given["sslrootcert"] and not sslmode and url_sslmode is None:
         sslmode = "verify-full"
     effective = sslmode or url_sslmode
-    if files["sslrootcert"] and effective in ("disable", "allow", "prefer"):
+    if given["sslrootcert"] and effective in ("disable", "allow", "prefer"):
         reader.fail(
             f"NEST_DATABASE_SSLROOTCERT is not used with sslmode={effective}; "
             "use verify-full (recommended) or verify-ca"
@@ -1243,12 +1402,16 @@ def _database(reader: _Reader) -> DatabaseConfig | None:
         return None
     return DatabaseConfig(
         url=Secret(raw),
+        password=Secret(password) if password is not None else None,
         password_file=password_file,
         sslmode=sslmode or None,
         pool_min_size=pool_min,
         pool_max_size=pool_max,
         connect_timeout=connect_timeout,
         pool_timeout=pool_timeout,
+        sslrootcert_data=inline["sslrootcert"],
+        sslcert_data=inline["sslcert"],
+        sslkey_data=Secret(inline["sslkey"]) if inline["sslkey"] is not None else None,
         **files,
     )
 
@@ -1349,18 +1512,9 @@ def _email(reader: _Reader, database: DatabaseConfig | None) -> EmailConfig | No
         reader.fail(f"NEST_SMTP_PORT must be at most 65535, got {port}")
 
     username = reader.get("NEST_SMTP_USERNAME")
-    password_raw = reader.get("NEST_SMTP_PASSWORD")
-    before_file = len(reader.problems)
-    password_file = reader.readable_file("NEST_SMTP_PASSWORD_FILE")
-    if len(reader.problems) > before_file:
-        password_file = None
-    if password_raw is not None and reader.get("NEST_SMTP_PASSWORD_FILE") is not None:
-        reader.fail("Set only one of NEST_SMTP_PASSWORD and NEST_SMTP_PASSWORD_FILE")
-    if password_file is not None:
-        with open(password_file) as handle:
-            if not handle.read().strip():
-                reader.fail(f"NEST_SMTP_PASSWORD_FILE {password_file!r} is empty")
-    has_password = password_raw is not None or reader.get("NEST_SMTP_PASSWORD_FILE") is not None
+    password_raw, password_file, has_password = reader.secret_source(
+        "NEST_SMTP_PASSWORD", "NEST_SMTP_PASSWORD_FILE"
+    )
     if username is None and has_password:
         reader.fail("NEST_SMTP_PASSWORD needs NEST_SMTP_USERNAME")
     if username is not None and not has_password:
@@ -1368,7 +1522,9 @@ def _email(reader: _Reader, database: DatabaseConfig | None) -> EmailConfig | No
             "NEST_SMTP_USERNAME needs a password: set NEST_SMTP_PASSWORD_FILE (recommended) "
             "or NEST_SMTP_PASSWORD"
         )
-    ca_file = reader.readable_file("NEST_SMTP_CA_FILE")
+    ca_data, ca_file, _ = reader.content_source(
+        "NEST_SMTP_CA", "NEST_SMTP_CA_FILE", kind="certificate"
+    )
     timeout = reader.seconds("NEST_SMTP_TIMEOUT", DEFAULT_SMTP_TIMEOUT)
 
     max_attempts = reader.integer("NEST_EMAIL_MAX_ATTEMPTS", DEFAULT_EMAIL_MAX_ATTEMPTS, 1)
@@ -1395,6 +1551,7 @@ def _email(reader: _Reader, database: DatabaseConfig | None) -> EmailConfig | No
             password=Secret(password_raw) if password_raw is not None else None,
             password_file=password_file,
             ca_file=ca_file,
+            ca_data=ca_data,
             timeout=timeout,
         ),
         max_attempts=max_attempts,
@@ -1531,23 +1688,14 @@ def _google(reader: _Reader, database: DatabaseConfig | None) -> GoogleAuthConfi
             "NEST_GOOGLE_CLIENT_ID must be the OAuth client ID, such as "
             "'1234-abc.apps.googleusercontent.com'"
         )
-    secret_raw = reader.get("NEST_GOOGLE_CLIENT_SECRET")
-    secret_file_set = reader.get("NEST_GOOGLE_CLIENT_SECRET_FILE") is not None
-    before_file = len(reader.problems)
-    secret_file = reader.readable_file("NEST_GOOGLE_CLIENT_SECRET_FILE")
-    if len(reader.problems) > before_file:
-        secret_file = None
-    if secret_raw is not None and secret_file_set:
-        reader.fail("Set only one of NEST_GOOGLE_CLIENT_SECRET and NEST_GOOGLE_CLIENT_SECRET_FILE")
-    elif secret_raw is None and not secret_file_set:
+    secret_raw, secret_file, secret_set = reader.secret_source(
+        "NEST_GOOGLE_CLIENT_SECRET", "NEST_GOOGLE_CLIENT_SECRET_FILE"
+    )
+    if not secret_set:
         reader.fail(
             "NEST_GOOGLE_CLIENT_ID needs a client secret: set NEST_GOOGLE_CLIENT_SECRET_FILE "
             "(recommended) or NEST_GOOGLE_CLIENT_SECRET"
         )
-    if secret_file is not None:
-        with open(secret_file) as handle:
-            if not handle.read().strip():
-                reader.fail(f"NEST_GOOGLE_CLIENT_SECRET_FILE {secret_file!r} is empty")
     redirect_url = _google_redirect_url(reader)
     http_bind = reader.address("NEST_AUTH_HTTP_BIND", DEFAULT_AUTH_HTTP_BIND)
     sessions = _session_policy(reader)
@@ -1635,6 +1783,7 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
         [`config.ConfigError`]: Listing every missing or invalid setting.
     """
     reader = _Reader(environ)
+    _merge_platforms_env(reader)
     executor = reader.choice("NEST_EXECUTOR", EXECUTORS, "local")
     bind = reader.address("NEST_CONTROLLER_BIND", DEFAULT_CONTROLLER_BIND)
     level, valid_level = load_log_level(reader.environ)
@@ -1662,11 +1811,27 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
 
     ssh = _ssh_policy(reader, list(platforms.values()))
 
-    cert = reader.readable_file("NEST_TLS_CERT_FILE")
-    key = reader.readable_file("NEST_TLS_KEY_FILE")
-    if (reader.get("NEST_TLS_CERT_FILE") is None) != (reader.get("NEST_TLS_KEY_FILE") is None):
-        reader.fail("Set both NEST_TLS_CERT_FILE and NEST_TLS_KEY_FILE, or neither")
-    tls = TLSConfig(cert, key) if cert and key else None
+    cert_pem, cert_file, cert_set = reader.content_source(
+        "NEST_TLS_CERT", "NEST_TLS_CERT_FILE", kind="certificate"
+    )
+    key_pem, key_file, key_set = reader.content_source(
+        "NEST_TLS_KEY", "NEST_TLS_KEY_FILE", kind="private key"
+    )
+    if cert_set != key_set:
+        reader.fail(
+            "Set both NEST_TLS_CERT_FILE and NEST_TLS_KEY_FILE (or NEST_TLS_CERT and "
+            "NEST_TLS_KEY), or neither"
+        )
+    tls = (
+        TLSConfig(
+            cert_file=cert_file,
+            key_file=key_file,
+            cert_pem=cert_pem,
+            key_pem=Secret(key_pem) if key_pem is not None else None,
+        )
+        if (cert_file or cert_pem) and (key_file or key_pem)
+        else None
+    )
 
     public_url = reader.get("NEST_PUBLIC_URL")
     if public_url is not None:
@@ -1710,6 +1875,47 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
         execution_registry=execution_registry,
         **timeouts,
     )
+
+
+def _merge_platforms_env(reader: _Reader) -> None:
+    """
+    Applies `NEST_PLATFORMS_ENV`: the lines of a `platforms.env` file in one value.
+
+    Lines are `NAME=value` with blank lines and `#` comments ignored. Values are
+    literal: one pair of matching surrounding quotes is removed and nothing is
+    expanded. Only `NEST_PLATFORMS`, `NEST_DEFAULT_PLATFORM` and
+    `NEST_PLATFORM_<ID>_<FIELD>` may appear, so no credential can be smuggled in, and
+    a name also set as its own variable is an error rather than silently overridden.
+    """
+    raw = reader.environ.get(PLATFORMS_ENV, "")
+    if not raw.strip():
+        return
+    merged = dict(reader.environ)
+    seen: set[str] = set()
+    for number, line in enumerate(normalize_content(raw).splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()
+        name, sep, value = line.partition("=")
+        name, value = name.strip(), value.strip()
+        if not sep or not _PLATFORMS_ENV_KEY.fullmatch(name):
+            # The line is not echoed: a misplaced line could be a credential.
+            reader.fail(
+                f"{PLATFORMS_ENV} line {number} must be NEST_PLATFORMS=..., "
+                "NEST_DEFAULT_PLATFORM=... or NEST_PLATFORM_<ID>_<FIELD>=..."
+            )
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if name in seen:
+            reader.fail(f"{name} appears more than once in {PLATFORMS_ENV}")
+        elif reader.get(name) is not None:
+            reader.fail(f"{name} is set both in {PLATFORMS_ENV} and as its own variable; keep one")
+        seen.add(name)
+        merged[name] = value
+    reader.environ = merged
 
 
 def _set_names(reader: _Reader, prefix: str, *, exclude: tuple[str, ...] = ()) -> list[str]:
@@ -2110,7 +2316,10 @@ def load_cli_auth_config(
 
 def materialize_ssh_credentials(policy: SSHPolicy) -> tuple[str | None, str | None]:
     """
-    Writes inline Mode B credentials to a private temporary directory.
+    Writes inline Mode B credentials to a new private runtime directory.
+
+    The directory is `0700` and both files are `0600` (see
+    [`runtime_files.write_private_file`]); configured files are used as they are.
 
     Args:
         policy ([`config.SSHPolicy`]): Validated SSH policy.
@@ -2122,16 +2331,44 @@ def materialize_ssh_credentials(policy: SSHPolicy) -> tuple[str | None, str | No
     identity, known_hosts = policy.identity_file, policy.known_hosts_file
     if policy.private_key is None and policy.known_hosts_data is None:
         return identity, known_hosts
-    directory = tempfile.mkdtemp(prefix="nest-ssh-")
-    os.chmod(directory, 0o700)
+    directory = private_directory("nest-ssh-")
     if policy.private_key is not None:
-        identity = os.path.join(directory, "id")
-        fd = os.open(identity, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as handle:
-            handle.write(policy.private_key.reveal())
+        identity = write_private_file(directory, "id", policy.private_key.reveal())
     if policy.known_hosts_data is not None:
-        known_hosts = os.path.join(directory, "known_hosts")
-        with open(known_hosts, "w") as handle:
-            # Allow one entry per line or entries separated by literal "\n".
-            handle.write(policy.known_hosts_data.replace("\\n", "\n").strip() + "\n")
+        known_hosts = write_private_file(
+            directory, "known_hosts", normalize_content(policy.known_hosts_data)
+        )
     return identity, known_hosts
+
+
+CHILD_EXCLUDED_SETTINGS = (
+    *SECRET_SETTINGS,
+    "NEST_SSH_CONFIG",
+    "NEST_SSH_KNOWN_HOSTS_DATA",
+    "NEST_TLS_CERT",
+    "NEST_DATABASE_SSLROOTCERT_DATA",
+    "NEST_DATABASE_SSLCERT_DATA",
+    "NEST_SMTP_CA",
+    PLATFORMS_ENV,
+)
+"""Settings removed from the environment of every child process the Controller starts."""
+
+
+def child_environ(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """
+    Returns a copy of the environment for a child process, without Controller credentials.
+
+    SSH, `scp`, and local worker processes need `PATH`, `HOME` and similar settings,
+    but never the Controller's secrets or inline credential material, which would
+    otherwise be inherited by user code or forwarded by an SSH `SendEnv` setting.
+
+    Args:
+        environ (`Mapping[str, str]`, *optional*): Environment. Defaults to `os.environ`.
+
+    Returns:
+        `dict[str, str]`: The environment without [`config.CHILD_EXCLUDED_SETTINGS`].
+    """
+    env = dict(os.environ if environ is None else environ)
+    for name in CHILD_EXCLUDED_SETTINGS:
+        env.pop(name, None)
+    return env

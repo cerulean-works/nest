@@ -69,7 +69,26 @@ CONTROLLER_SETTINGS = {
     "NEST_SMTP_CA_FILE",
     "NEST_SMTP_TIMEOUT",
     "NEST_BOOTSTRAP_ADMIN_GOOGLE_EMAIL",
+    "NEST_SSH_CONFIG",
+    "NEST_TLS_CERT",
+    "NEST_TLS_KEY",
+    "NEST_DATABASE_PASSWORD",
+    "NEST_DATABASE_SSLROOTCERT_DATA",
+    "NEST_DATABASE_SSLCERT_DATA",
+    "NEST_DATABASE_SSLKEY_DATA",
+    "NEST_SMTP_CA",
+    "NEST_GOOGLE_CLIENT_ID",
+    "NEST_GOOGLE_CLIENT_SECRET",
+    "NEST_GOOGLE_CLIENT_SECRET_FILE",
+    "NEST_GOOGLE_REDIRECT_URL",
+    "NEST_AUTH_HTTP_BIND",
+    "NEST_AUTH_ACCESS_TOKEN_TTL",
+    "NEST_AUTH_REFRESH_TTL",
+    "NEST_AUTH_SESSION_MAX_LIFETIME",
+    "NEST_PLATFORMS_ENV",
 }
+# Variables that only the Dokploy file's sidecar or PostgreSQL may see.
+SIDECAR_ONLY = {"NEST_TAILSCALE_AUTHKEY", "NEST_TAILSCALE_SERVE_CONFIG"}
 COMMAND = shlex.split(os.environ.get("NEST_COMPOSE_COMMAND", "docker compose"))
 
 
@@ -143,11 +162,15 @@ def main():
         for name in ("compose.yaml", "compose-nop.yaml", "compose.tailscale.yaml")
     }
     controllers["compose.tailscale-shared.yaml"] = controller
+    dokploy = render("compose.dokploy.yaml", NEST_TAILSCALE_AUTHKEY="")
+    controllers["compose.dokploy.yaml"] = dokploy["services"]["controller"]
     for name, service in controllers.items():
         assert set(service["environment"]) == CONTROLLER_SETTINGS, (name, service["environment"])
         assert service["environment"]["NEST_CONTROLLER_BIND"] == "0.0.0.0:50051", name
         assert not service.get("secrets"), f"{name}: Controller must not receive the Auth Key"
         assert service["read_only"], name
+        if name == "compose.dokploy.yaml":
+            continue
         assert service["volumes"][0]["target"] == "/run/nest-ssh", name
         assert service["volumes"][0]["read_only"], name
     assert not controllers["compose-nop.yaml"].get("ports")
@@ -171,12 +194,16 @@ def main():
                 "compose.yaml" if overrides else name,
                 overrides=overrides,
                 NEST_PLATFORMS_ENV_FILE=str(platforms_file),
+                NEST_TAILSCALE_AUTHKEY="",
             )["services"]["controller"]
             assert set(service["environment"]) == CONTROLLER_SETTINGS | set(platforms), name
             for key, value in platforms.items():
                 assert service["environment"][key] == value, (name, key)
         for service in controllers.values():
-            assert not any(k.startswith("NEST_PLATFORM") for k in service["environment"])
+            assert not any(
+                k.startswith("NEST_PLATFORM") and k != "NEST_PLATFORMS_ENV"
+                for k in service["environment"]
+            )
     # Mode B renders without .env (render uses --env-file /dev/null), without an SSH
     # directory, and without any Tailscale setting reaching the Controller.
     managed = render(
@@ -264,10 +291,72 @@ def main():
         assert deployed["services"]["tailscale"]["volumes"][1]["source"] == str(
             files / "tailscale/serve"
         )
+    check_dokploy(dokploy)
     print(
         "PASS: rendered Compose isolation, Controller and Platform settings, default and local-db "
         "databases, state reuse, and Dokploy paths"
     )
+
+
+def check_dokploy(dokploy):
+    """The environment-first file needs no host file and keeps state in volumes."""
+    services = dokploy["services"]
+    assert set(services) == {"controller", "tailscale"}, "Optional services need a profile"
+    controller, sidecar = services["controller"], services["tailscale"]
+    assert not controller.get("volumes"), "The Controller must not need a host mount"
+    assert not controller.get("ports") and not sidecar.get("ports")
+    assert not controller.get("secrets"), "Controller must not receive the Auth Key"
+    assert not set(controller["environment"]) & SIDECAR_ONLY
+    assert set(sidecar["environment"]) & {"NEST_TAILSCALE_SERVE_CONFIG"}
+    assert not {k for k in sidecar["environment"] if k.startswith("NEST_")} - SIDECAR_ONLY
+    assert "TS_AUTHKEY" not in sidecar["environment"], "The Auth Key arrives as a file"
+    assert [s["source"] for s in sidecar["secrets"]] == ["tailscale_authkey"]
+    assert dokploy["secrets"]["tailscale_authkey"]["environment"] == "NEST_TAILSCALE_AUTHKEY"
+    assert sidecar["cap_drop"] == ["ALL"]
+    assert sidecar["environment"]["TS_AUTH_ONCE"] == "true"
+    assert {"--shields-up=false", "--ssh=false"} <= set(
+        sidecar["environment"]["TS_EXTRA_ARGS"].split()
+    )
+    [state, serve] = sidecar["volumes"]
+    assert (state["type"], state["source"]) == ("volume", "tailscale-state")
+    assert serve["source"] == str(ROOT / "docker/tailscale-serve") and serve["read_only"]
+    assert controller["read_only"]
+    assert {t.split(":")[0] for t in controller["tmpfs"]} == {"/tmp", "/home/nest/.ssh"}
+    # Google sign-in works without a port: the listener binds all interfaces only
+    # once a client ID is set, so the stray-setting check still passes without it.
+    assert controller["environment"]["NEST_AUTH_HTTP_BIND"] == ""
+    google = render("compose.dokploy.yaml", NEST_TAILSCALE_AUTHKEY="", NEST_GOOGLE_CLIENT_ID="id")[
+        "services"
+    ]["controller"]["environment"]
+    assert google["NEST_AUTH_HTTP_BIND"] == "0.0.0.0:8080"
+    # Optional PostgreSQL and migrations: the password reaches PostgreSQL as a file
+    # from NEST_DATABASE_PASSWORD; only the database settings reach `migrate`.
+    full = render(
+        "compose.dokploy.yaml",
+        profiles=("local-db", "migrate"),
+        NEST_TAILSCALE_AUTHKEY="",
+        NEST_DATABASE_PASSWORD="p@ss:/w?rd#1",
+        NEST_DATABASE_URL="postgresql://nest@postgres:5432/nest",
+    )
+    assert set(full["services"]) == {"controller", "tailscale", "postgres", "migrate"}
+    postgres, migrate = full["services"]["postgres"], full["services"]["migrate"]
+    assert "POSTGRES_PASSWORD" not in postgres["environment"]
+    assert (
+        postgres["environment"]["POSTGRES_PASSWORD_FILE"] == "/run/secrets/nest_database_password"
+    )
+    assert full["secrets"]["nest_database_password"]["environment"] == "NEST_DATABASE_PASSWORD"
+    assert not postgres.get("ports"), "No host port: the server has no TLS"
+    assert postgres["volumes"][0]["source"] == "postgres-data"
+    assert all(k.startswith("NEST_DATABASE_") for k in migrate["environment"])
+    assert migrate["command"] == ["nest-db", "upgrade"]
+    assert not migrate.get("secrets")
+    assert full["services"]["controller"]["environment"]["NEST_DATABASE_PASSWORD"] == (
+        "p@ss:/w?rd#1"
+    )
+    depends = full["services"]["controller"]["depends_on"]
+    assert depends["migrate"]["condition"] == "service_completed_successfully"
+    assert depends["postgres"]["condition"] == "service_healthy"
+    assert not depends["migrate"].get("required", True)
 
 
 if __name__ == "__main__":
