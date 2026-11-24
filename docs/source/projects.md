@@ -153,7 +153,7 @@ under `/api/projects`. Browsers authenticate with the session cookie, and their
 | Route | Body | Does |
 | --- | --- | --- |
 | `GET /api/projects` | | Lists your Projects with your role |
-| `POST /api/projects` | `name`, optional `owner_user_id`, `organization_id`, `reason` | Creates a Project with its Owner (`platform_admin` with a browser session only; see below) |
+| `POST /api/projects` | `name`, `reason`, optional `owner_user_id`, `organization_id` | Creates a Project with its Owner (`platform_admin` with a browser session only; see below) |
 | `GET /api/projects/<id>` | | Describes a Project |
 | `POST /api/projects/<id>/rename` | `name` | Renames it |
 | `POST /api/projects/<id>/delete` | | Deletes it |

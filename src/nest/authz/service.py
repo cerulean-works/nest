@@ -55,6 +55,19 @@ _PLATFORM_ADMIN_QUERY = (
 )
 
 
+def require_reason(reason: str | None) -> str:
+    """
+    The audit reason a privileged change must give: 1 to 1000 characters after
+    trimming.
+
+    Raises:
+        `ValueError`: If it is missing, blank or too long.
+    """
+    if not isinstance(reason, str) or not 1 <= len(reason.strip()) <= 1000:
+        raise ValueError("reason must be 1 to 1000 characters; it is kept in the audit log")
+    return reason.strip()
+
+
 def is_platform_admin(cursor: psycopg.Cursor[dict[str, Any]], user_id: UUID) -> bool:
     """
     Whether the User is an active `platform_admin` now, read in the caller's
@@ -320,7 +333,7 @@ class ProjectService:
         *,
         owner_user_id: UUID | str | None = None,
         organization_id: UUID | str | None = None,
-        reason: str | None = None,
+        reason: str | None,
     ) -> Project:
         """
         Creates a Project and its first Owner atomically. Only an active
@@ -339,7 +352,10 @@ class ProjectService:
                 `platform_admin`, `not_a_member` when the Owner is not in the
                 Organization.
             [`db.UserNotFoundError`]: If the Owner is not an active User.
-            `ValueError`: If an argument is invalid.
+            `ValueError`: If an argument is invalid, including a missing or blank
+                `reason`, which every privileged change must give for the audit
+                log. It is checked after the caller is authorized, so a refused
+                caller learns nothing more.
         """
         from ..db.projects import UserNotFoundError
 
@@ -358,6 +374,7 @@ class ProjectService:
             if not is_platform_admin(cursor, principal.user_id):
                 refused = (Decision(False, "platform_admin_required"), "platform_admin_required")
             else:
+                why = require_reason(reason)
                 active = cursor.execute(
                     "SELECT 1 FROM users WHERE id = %s AND status = 'active' FOR SHARE",
                     (owner,),
@@ -374,7 +391,7 @@ class ProjectService:
                 ):
                     refused = (Decision(False, "not_a_member"), "organization")
                 else:
-                    with audit_context(cursor, actor_user_id=principal.user_id, reason=reason):
+                    with audit_context(cursor, actor_user_id=principal.user_id, reason=why):
                         project = self.store.create_project(
                             name,
                             created_by_user_id=principal.user_id,

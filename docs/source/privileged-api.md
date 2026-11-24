@@ -77,7 +77,9 @@ default Platform Profile ID (`default` for the `NEST_SLURM_*` form, otherwise th
 
 Only an active `platform_admin` may create Projects, through either
 `POST /api/admin/projects` or the existing `POST /api/projects`, which now takes
-the same optional `owner_user_id` and `reason`. The Project and its first Owner
+the same optional `owner_user_id` and the same **required** `reason` (`400
+invalid_request` when it is missing, blank or longer than 1000 characters, checked
+by the service after the caller is authorized, so no entry point can skip it). The Project and its first Owner
 membership are written in one transaction; if the Owner is not an active User,
 nothing is created. The Project's audit history records `project_created` and the
 Owner's `member_added` with the administrator as actor and your reason. An
@@ -109,8 +111,8 @@ table still needs an operator name (migration `0017_provider_project_approvals`)
 
 ## Compatibility
 
-- `POST /api/projects` keeps its request and answer. `role` is present in the
-  answer only when you are the Owner.
+- `POST /api/projects` keeps its answer, and its request now also needs a
+  `reason`. `role` is present in the answer only when you are the Owner.
 - Existing Projects, memberships, invitations and Invite Links are untouched.
 - The routes are additive: clients of the Projects, Platforms, Organizations and
   invitations APIs need no change.

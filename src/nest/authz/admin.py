@@ -45,7 +45,13 @@ from ..db.connection import Database
 from ..db.platforms import Platform, PlatformStore
 from ..db.projects import Project, ProjectNotFoundError, ProjectStore
 from .policy import Decision, Principal
-from .service import AccessDeniedError, Authorizer, ProjectService, is_platform_admin
+from .service import (
+    AccessDeniedError,
+    Authorizer,
+    ProjectService,
+    is_platform_admin,
+    require_reason,
+)
 
 logger = get_logger("nest.authz.admin")
 
@@ -130,9 +136,7 @@ def _limit(limit: int) -> int:
 
 
 def _reason(reason: str | None) -> str:
-    if not isinstance(reason, str) or not 1 <= len(reason.strip()) <= 1000:
-        raise ValueError("reason must be 1 to 1000 characters; it is kept in the audit log")
-    return reason.strip()
+    return require_reason(reason)
 
 
 class AdminService:
@@ -307,12 +311,13 @@ class AdminService:
         Creates a Project with an explicit first Owner, atomically (see
         [`authz.ProjectService.create_project`]). The Owner defaults to the caller.
         """
+        # The reason is checked by ProjectService, after the caller is authorized.
         return self.projects.create_project(
             principal,
             name,
             owner_user_id=owner_user_id,
             organization_id=organization_id,
-            reason=_reason(reason),
+            reason=reason,
         )
 
     def project_access(self, principal: Principal, project_id: UUID | str) -> ProjectAccess:

@@ -389,7 +389,7 @@ class ProjectServiceTests(_Base):
         admin = browser(users["admin"])
         self.denied(lambda: self.service.rename_project(admin, pid, "x"), "not_a_member")
         self.assertEqual(self.service.list_projects(admin), [])
-        self.denied(lambda: self.service.create_project(admin, "new"))
+        self.denied(lambda: self.service.create_project(admin, "new", reason="r"))
 
     def test_cross_project_and_cross_user_isolation(self):
         _, users = self.team()
@@ -423,7 +423,7 @@ class ProjectServiceTests(_Base):
                 self.assertEqual(decision.reason, "not_a_member")
         self.denied(lambda: self.service.rename_project(operator, pid, "x"), "not_a_member")
         # Even as a Project Owner, a Platform Admin needs the Provider's permission.
-        mine = self.service.create_project(operator, "root's").id
+        mine = self.service.create_project(operator, "root's", reason="r").id
         self.assertEqual(
             self.authorizer.check(operator, Action.RUN_SUBMIT, mine).reason, "provider_denied"
         )
@@ -481,7 +481,7 @@ class ProjectServiceTests(_Base):
         reader = cli(users["owner"], "projects:read")
         self.assertEqual(len(self.service.members(reader, pid)), 4)
         self.denied(lambda: self.service.rename_project(reader, pid, "x"), "browser_only")
-        self.denied(lambda: self.service.create_project(reader, "x"), "browser_only")
+        self.denied(lambda: self.service.create_project(reader, "x", reason="r"), "browser_only")
         self.denied(lambda: self.service.members(cli(users["owner"], "jobs:run"), pid), "scope")
         self.denied(lambda: self.service.list_projects(cli(users["owner"])), "scope")
 
@@ -690,7 +690,9 @@ class ProjectsAPITests(_Base):
     def test_browser_session_manages_a_project(self):
         alice, bob = self.admin("alice"), self.user("bob")
         a, b = self.token(alice), self.token(bob)
-        status, created = self.call("POST", "/api/projects", cookie=a, body={"name": "shared"})
+        status, created = self.call(
+            "POST", "/api/projects", cookie=a, body={"name": "shared", "reason": "r"}
+        )
         self.assertEqual(
             (status, created["role"], created["owner_user_id"]), (201, "owner", str(alice))
         )
@@ -727,7 +729,9 @@ class ProjectsAPITests(_Base):
     def test_revoked_membership_is_refused_on_the_next_request(self):
         alice, bob = self.admin("alice"), self.user("bob")
         a, b = self.token(alice), self.token(bob)
-        pid = self.call("POST", "/api/projects", cookie=a, body={"name": "p"})[1]["id"]
+        pid = self.call("POST", "/api/projects", cookie=a, body={"name": "p", "reason": "r"})[1][
+            "id"
+        ]
         self.call(
             "POST",
             f"/api/projects/{pid}/members",
@@ -754,19 +758,21 @@ class ProjectsAPITests(_Base):
         c = self.token(alice, "cli", "projects:read")
         self.assertEqual(self.call("GET", "/api/projects", cookie=c)[0], 401)
         status, body = self.call(
-            "POST", "/api/projects", cookie=a, body={"name": "x"}, origin=False
+            "POST", "/api/projects", cookie=a, body={"name": "x", "reason": "r"}, origin=False
         )
         self.assertEqual((status, body), (403, {"error": "cross_origin"}))
         self.assertEqual(self.store.projects_for_user(alice), [])
 
     def test_cli_bearer_is_scoped(self):
         alice = self.admin("alice")
-        pid = self.call("POST", "/api/projects", cookie=self.token(alice), body={"name": "p"})[1][
-            "id"
-        ]
+        pid = self.call(
+            "POST", "/api/projects", cookie=self.token(alice), body={"name": "p", "reason": "r"}
+        )[1]["id"]
         reader = self.token(alice, "cli", "projects:read")
         self.assertEqual(self.call("GET", f"/api/projects/{pid}/members", bearer=reader)[0], 200)
-        status, body = self.call("POST", "/api/projects", bearer=reader, body={"name": "x"})
+        status, body = self.call(
+            "POST", "/api/projects", bearer=reader, body={"name": "x", "reason": "r"}
+        )
         self.assertEqual((status, body["reason"]), (403, "browser_only"))
         status, body = self.call("POST", f"/api/projects/{pid}/delete", bearer=reader)
         self.assertEqual((status, body["reason"]), (403, "browser_only"))
@@ -777,7 +783,9 @@ class ProjectsAPITests(_Base):
     def test_malformed_requests(self):
         alice = self.admin("alice")
         a = self.token(alice)
-        pid = self.call("POST", "/api/projects", cookie=a, body={"name": "p"})[1]["id"]
+        pid = self.call("POST", "/api/projects", cookie=a, body={"name": "p", "reason": "r"})[1][
+            "id"
+        ]
         for method, path, body, expected in [
             ("GET", "/api/projects/not-a-uuid", None, 404),
             ("GET", f"/api/projects/{pid}/nothing", None, 404),

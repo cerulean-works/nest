@@ -28,6 +28,7 @@ def platform_admin(database: Database) -> Principal:
 
 def owned_project(service: ProjectService, owner: uuid.UUID, name: str, **kwargs) -> Project:
     """A Project with `owner` as its Owner, created by the test administrator."""
+    kwargs.setdefault("reason", "test Project")
     return service.create_project(
         platform_admin(service.database), name, owner_user_id=owner, **kwargs
     )

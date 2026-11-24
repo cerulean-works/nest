@@ -141,12 +141,12 @@ class AdminServiceTests(_Base):
         nano = self.platform()
         before = self.sql("SELECT count(*) FROM projects")
         self.denied(
-            lambda: self.projects.create_project(browser(alice), "mine"),
+            lambda: self.projects.create_project(browser(alice), "mine", reason="r"),
             "platform_admin_required",
         )
         # Not even as the Owner of another Project, nor through the CLI.
         cli = Principal(alice, "cli", frozenset({"projects:read", "jobs:run"}))
-        self.denied(lambda: self.projects.create_project(cli, "mine"), "browser_only")
+        self.denied(lambda: self.projects.create_project(cli, "mine", reason="r"), "browser_only")
         service = self.admin_service
         for name, call in {
             "users": lambda p: service.list_users(p),
@@ -878,6 +878,33 @@ class AdminHTTPTests(_Base):
         status, answer = self.call("POST", "/api/projects", cookie=a, body={"name": "x"})
         self.assertEqual((status, answer["reason"]), (403, "platform_admin_required"))
         self.assertEqual([p.id for p, _ in self.projects.list_projects(browser(alice))], [pid])
+
+    def test_every_project_creation_route_requires_an_audit_reason(self):
+        """Regression: `POST /api/projects` must not let an admin omit the reason."""
+        owner = self.user("owner")
+        r = self.token(self.root)
+        count = self.sql("SELECT count(*) FROM projects")
+        for path in ("/api/projects", "/api/admin/projects"):
+            for reason in (None, "", "   ", "x" * 1001, 7):
+                body: dict[str, object] = {"name": "x", "owner_user_id": str(owner)}
+                if reason is not None:
+                    body["reason"] = reason
+                with self.subTest(path=path, reason=reason):
+                    status, answer = self.call("POST", path, cookie=r, body=body)
+                    self.assertEqual((status, answer), (400, {"error": "invalid_request"}))
+        self.assertEqual(self.sql("SELECT count(*) FROM projects"), count)
+        # The service itself refuses it, so every entry point is covered.
+        with self.assertRaises(ValueError):
+            self.projects.create_project(browser(self.root), "x", reason=None)
+        self.assertEqual(self.sql("SELECT count(*) FROM projects"), count)
+        status, created = self.call(
+            "POST", "/api/projects", cookie=r, body={"name": "x", "reason": "  ticket OPS-7 "}
+        )
+        self.assertEqual(status, 201)
+        [created_event] = [
+            e for e in self.store.audit_history(created["id"]) if e.event == "project_created"
+        ]
+        self.assertEqual(created_event.reason, "ticket OPS-7")
 
     def test_csrf_sessions_and_malformed_requests(self):
         r = self.token(self.root)
