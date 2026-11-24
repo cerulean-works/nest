@@ -34,6 +34,8 @@ jobs:
       NEST_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
       # Fail, rather than skip, if the PostgreSQL tests cannot run.
       NEST_TEST_DATABASE_REQUIRED: "1"
+      # Fail, rather than skip, if the real-browser tests cannot run.
+      NEST_TEST_BROWSER_REQUIRED: "1"
     steps:
       - uses: actions/checkout@v5
       - name: Install the latest version of uv and set the python version
@@ -63,5 +65,7 @@ jobs:
             echo "NEST_TEST_TLS_CA_FILE=$certs/ca.crt"
             echo "NEST_TEST_TLS_OTHER_CA_FILE=$certs/other-ca.crt"
           } >> "$GITHUB_ENV"
+      - name: Install Chromium for the real-browser tests
+        run: uv run --frozen playwright install --with-deps chromium
       - name: Test with python ${{ matrix.python-version }}
         run: uv run --frozen pytest --cov=src/nest

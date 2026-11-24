@@ -248,6 +248,11 @@ that failed, such as `check=ExpiredSignatureError`.
 - **Headers.** Every response carries `Cache-Control: no-store`,
   `Referrer-Policy: no-referrer` (the callback URL holds the code),
   `X-Frame-Options: DENY`, and a `default-src 'none'` content security policy.
+  Pages holding a form that posts to a browser-only route (the CLI approval
+  page, its code entry page, and the invitation page) send
+  `Referrer-Policy: same-origin` instead: browsers send `Origin: null` on a form
+  POST from a `no-referrer` page, and those routes refuse a missing or `null`
+  `Origin`. `same-origin` still sends no referrer to any other site.
 
 ## Rotate the client secret
 

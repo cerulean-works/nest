@@ -55,6 +55,15 @@ Two groups need more than one server:
 CI sets `NEST_TEST_DATABASE_REQUIRED=1`, which turns all of these skips into
 failures.
 
+The real-browser tests (`tests/test_cli_login_browser.py`) also need
+`NEST_TEST_DATABASE_URL`, and a Chromium for Playwright; without one they are
+skipped. CI installs it and sets `NEST_TEST_BROWSER_REQUIRED=1`:
+
+```bash
+uv run playwright install chromium
+uv run pytest tests/test_cli_login_browser.py
+```
+
 To build and test the Compose deployment, with Docker Engine running:
 
 ```bash
