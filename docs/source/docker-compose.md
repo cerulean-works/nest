@@ -153,7 +153,10 @@ For a network-only check, use `ssh hpc 'hostname && id -un'` instead. This does
 not submit a Slurm job. The quickstart below executes a real job in Slurm mode
 and is not needed to validate Tailnet connectivity.
 
-Then run the [quickstart](quickstart) from a trusted client. Set
+With `NEST_DATABASE_URL` set (see [Store records in PostgreSQL](#store-records-in-postgresql)),
+the Controller requires a Nest session for every call; configure
+[Google sign-in](authentication) and [onboard a Project](project-onboarding)
+first. Then run the [quickstart](quickstart) from a trusted client. Set
 `NEST_CONTROLLER_ADDRESS` to the Docker host's selected address and published
 port. For a non-loopback address, configure the client [TLS settings](configuration#client)
 to match the deployment. A successful remote function call verifies the full HPC

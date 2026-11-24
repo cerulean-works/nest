@@ -9,7 +9,7 @@ Google. The session is kept in a credentials file readable only by its owner
 
 `nest login` is optional: [`login.ensure_session`] returns a valid session and,
 when there is none, runs the same browser approval inline, so a command such as
-`nest run` can sign the User in the first time it needs to.
+`nest platforms list` can sign the User in the first time it needs to.
 
 A Nest session identifies a User to Nest only. It is not an NCHC SSH password,
 one-time code or key, and Nest never sends it to an HPC login node; HPC

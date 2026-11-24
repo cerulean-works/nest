@@ -143,15 +143,18 @@ Each host builds the image from its checkout. `NEST_CONTROLLER_IMAGE` already
 allows a prebuilt image. Publishing tagged images to GHCR and pinning by digest
 would make deployments reproducible and remove the build from the host.
 
-### Authenticate callers
+### Authenticate callers (done)
 
-gRPC is plaintext unless `NEST_TLS_CERT_FILE` and `NEST_TLS_KEY_FILE` are set
-(clients then set `NEST_CONTROLLER_TLS` or `NEST_CONTROLLER_TLS_CA_FILE`). Without
-TLS it is protected only by the network, such as Tailscale, between client and host.
-Nest has no application-level authentication, and every caller uses one HPC SSH
-identity (see [Security](security)). `NEST_AUTH_TOKEN_FILE` is reserved for this
-work and rejected at startup until it lands. Accounts will be stored in the
-Controller's PostgreSQL database (see [Store Controller records in
-PostgreSQL](database)) and added to its single migration chain. A multi-user
-deployment needs per-caller authentication and authorization, and eventually
-per-user HPC identities.
+With a database, the Controller authenticates every gRPC call with a Nest CLI
+session from Google sign-in and authorizes it with the Project, Provider, Platform
+and Slurm account policy (`NEST_CONTROLLER_AUTH=session`, the default when
+`NEST_DATABASE_URL` is set). Session tokens travel over TLS (`NEST_TLS_CERT_FILE`
+and `NEST_TLS_KEY_FILE`) or, with `NEST_CONTROLLER_ALLOW_PLAINTEXT=true`, inside an
+encrypted network such as the Tailnet. See
+[Authenticated execution](security#authenticated-execution) and
+[Onboard a Project](project-onboarding).
+
+Still open: every caller uses one HPC SSH identity, Runs are not isolated from one
+another on the cluster, and `NEST_AUTH_TOKEN_FILE` (static service tokens) remains
+reserved and rejected at startup. Per-user HPC identities (Mode B with per-User
+bindings) are future work.

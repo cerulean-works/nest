@@ -27,6 +27,8 @@ guide:
         title: Deploy a Slurm Controller
       - local: runtime-image
         title: Build and roll out the HPC runtime image
+      - local: project-onboarding
+        title: Onboard a Project
       - local: local-controller
         title: Run a local Controller
       - local: database
