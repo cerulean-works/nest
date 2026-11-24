@@ -136,7 +136,6 @@ class CLIAuthConfigTests(unittest.TestCase):
 
     def test_invalid_settings(self):
         for env, expected in [
-            ({}, "NEST_AUTH_URL is required"),
             ({"NEST_AUTH_URL": "http://nest.example.com"}, "must be an https:// URL"),
             ({"NEST_AUTH_URL": "https://u:p@nest.example.com"}, "no credentials"),
             ({"NEST_AUTH_URL": "https://nest.example.com/x?y"}, "must be an origin"),
@@ -214,14 +213,16 @@ class CredentialStoreTests(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         env = {"NEST_AUTH_URL": "", "NEST_CLI_CREDENTIALS_FILE": self.path}
         with unittest.mock.patch.dict(os.environ, env), redirect_stdout(out), redirect_stderr(err):
-            self.assertEqual(nest_cli.main(["auth", "status"]), 2)
+            self.assertEqual(nest_cli.main(["auth", "status", "--url", "ftp://nest"]), 2)
+            self.assertEqual(nest_cli.main(["auth", "status"]), 1)
             self.assertEqual(
                 nest_cli.main(["auth", "status", "--url", "https://nest.example.com"]), 1
             )
             self.assertEqual(
                 nest_cli.main(["logout", "--local", "--url", "https://nest.example.com"]), 0
             )
-        self.assertIn("NEST_AUTH_URL is required", err.getvalue())
+        self.assertIn("--url must be an https:// URL", err.getvalue())
+        self.assertIn("Not signed in to https://auth.nest.cerulean.works", out.getvalue())
         self.assertIn("Not signed in to https://nest.example.com", out.getvalue())
 
     def test_no_command_takes_a_secret_argument(self):
@@ -488,7 +489,8 @@ class CLISignInFlowTests(_Flow):
         info = json.loads(status_run.stdout)
         self.assertTrue(info["accepted"])
         self.assertNotIn("access_token", info)
-        stored = json.loads(Path(self.credentials).read_text())
+        [stored] = json.loads(Path(self.credentials).read_text())["sessions"]
+        self.assertEqual(stored["auth_url"], self.base)
         self.assertNotIn(stored["access_token"], status_run.stdout)
         self.assertNotIn(stored["refresh_token"], status_run.stdout)
 

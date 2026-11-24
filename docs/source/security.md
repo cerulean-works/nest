@@ -37,7 +37,8 @@ permission, which no Project role or Platform Admin role implies.
 
 `NEST_CONTROLLER_AUTH=session`, the default when `NEST_DATABASE_URL` is set, makes
 every gRPC call carry a Nest CLI session (`authorization: Bearer <access token>`,
-sent by the SDK when `NEST_AUTH_URL` is set; see
+sent by the SDK to the hosted Controller, or to any Controller when
+`NEST_AUTH_URL` names the sign-in origin; see
 [Sign in from the command line](cli-login)) and checks it with
 [`authz.ExecutionAccess`], which uses the same [`authz.Authorizer`] as the Projects
 API:

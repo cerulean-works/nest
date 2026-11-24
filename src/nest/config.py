@@ -77,6 +77,20 @@ DEFAULT_CONTROLLER_BIND = "127.0.0.1:50051"
 DEFAULT_CONTROLLER_ADDRESS = "127.0.0.1:50051"
 """Client address used when `NEST_CONTROLLER_ADDRESS` is unset."""
 
+HOSTED_AUTH_URL = "https://auth.nest.cerulean.works"
+"""Sign-in origin of Cerulean-hosted Nest. `nest login` uses it when neither `--url`
+nor `NEST_AUTH_URL` names another Nest, and the SDK uses it only for calls to
+[`config.HOSTED_CONTROLLER_ADDRESS`]."""
+
+HOSTED_CONTROLLER_ADDRESS = "nest.cerulean.works:50051"
+"""gRPC address of the Cerulean-hosted Controller. It is never a default address: it
+serves plaintext gRPC that only the access-controlled Tailnet encrypts, so the SDK
+connects to it only when `NEST_CONTROLLER_ADDRESS` names it and
+`NEST_CONTROLLER_TLS=false` says so explicitly."""
+
+AUTH_URL_SOURCES = ("--url", "NEST_AUTH_URL", "hosted default")
+"""Where [`config.resolve_auth_url`] found the sign-in origin, highest precedence first."""
+
 DEFAULT_RPC_TIMEOUT = 900.0
 DEFAULT_SSH_TIMEOUT = 60.0
 DEFAULT_RESULT_TIMEOUT = 600.0
@@ -896,8 +910,12 @@ class ClientConfig:
         tls_ca_file (`str | None`): PEM roots for TLS. `None` uses gRPC's default roots.
         project_id (`str | None`): `NEST_PROJECT_ID`, the Project calls run in, for
             a Controller with session authentication.
-        auth_url (`str | None`): `NEST_AUTH_URL`, set when the SDK should send the
-            stored Nest session (see [`login.ensure_session`]) with each call.
+        auth_url (`str | None`): The Nest origin whose stored session (see
+            [`login.ensure_session`]) the SDK sends with each call: `NEST_AUTH_URL`,
+            or [`config.HOSTED_AUTH_URL`] for the hosted Controller. `None` sends no
+            session and never starts a sign-in.
+        auth_url_source (`str | None`): Where `auth_url` came from, one of
+            [`config.AUTH_URL_SOURCES`].
     """
 
     address: str = DEFAULT_CONTROLLER_ADDRESS
@@ -906,6 +924,7 @@ class ClientConfig:
     tls_ca_file: str | None = None
     project_id: str | None = None
     auth_url: str | None = None
+    auth_url_source: str | None = None
 
 
 class _Reader:
@@ -2206,13 +2225,9 @@ def load_client_config(environ: Mapping[str, str] | None = None) -> ClientConfig
         except ValueError:
             reader.fail("NEST_PROJECT_ID must be a Project ID (a UUID)")
             project_id = None
-    auth_url = reader.get("NEST_AUTH_URL")
-    if auth_url is not None:
-        try:
-            auth_url = normalize_auth_url(auth_url)
-        except ValueError as exc:
-            reader.fail(f"NEST_AUTH_URL {exc}; got {auth_url!r}")
-            auth_url = None
+    auth_url, source = resolve_auth_url(
+        reader, hosted=address_is_valid and is_hosted_controller(address)
+    )
     if reader.problems:
         raise ConfigError(reader.problems)
     return ClientConfig(
@@ -2222,7 +2237,53 @@ def load_client_config(environ: Mapping[str, str] | None = None) -> ClientConfig
         tls_ca_file=ca_file,
         project_id=project_id,
         auth_url=auth_url,
+        auth_url_source=source,
     )
+
+
+def is_hosted_controller(address: str) -> bool:
+    """Whether `address` (`host:port`) names [`config.HOSTED_CONTROLLER_ADDRESS`]."""
+    host, _, port = address.strip().rpartition(":")
+    hosted_host, _, hosted_port = HOSTED_CONTROLLER_ADDRESS.rpartition(":")
+    return host.lower().removesuffix(".") == hosted_host and port == hosted_port
+
+
+def resolve_auth_url(
+    reader: _Reader, *, url: str | None = None, hosted: bool
+) -> tuple[str | None, str | None]:
+    """
+    Resolves the Nest sign-in origin, for the CLI and the SDK alike.
+
+    Precedence: `url` (the CLI's `--url`), then `NEST_AUTH_URL`, then, only when
+    `hosted`, [`config.HOSTED_AUTH_URL`]. Empty or blank values count as unset. An
+    invalid explicit value is reported to `reader` and never replaced by the hosted
+    default.
+
+    Args:
+        reader (`_Reader`): The environment being validated.
+        url (`str`, *optional*): An explicit origin, such as from `--url`.
+        hosted (`bool`): Whether the hosted default applies: always for the CLI, and
+            for the SDK only when it calls the hosted Controller, so a custom or
+            local Controller never receives a hosted session.
+
+    Returns:
+        `tuple[str | None, str | None]`: The normalized origin and its source (one of
+            [`config.AUTH_URL_SOURCES`]), or `(None, None)` when none applies.
+    """
+    candidates = (
+        (url.strip() if url else None, "--url"),
+        (reader.get("NEST_AUTH_URL"), "NEST_AUTH_URL"),
+    )
+    for raw, source in candidates:
+        if raw:
+            try:
+                return normalize_auth_url(raw), source
+            except ValueError as exc:
+                reader.fail(f"{source} {exc}; got {raw!r}")
+                return None, None
+    if hosted:
+        return HOSTED_AUTH_URL, "hosted default"
+    return None, None
 
 
 @dataclass(frozen=True)
@@ -2231,15 +2292,19 @@ class CLIAuthConfig:
     Where `nest login` signs in and keeps its Nest session.
 
     Attributes:
-        url (`str`): `NEST_AUTH_URL`, the origin serving Nest's sign-in, such as
+        url (`str`): The origin serving Nest's sign-in, such as
             `https://nest.example.com`: the origin of `NEST_GOOGLE_REDIRECT_URL`.
-        credentials_file (`str`): `NEST_CLI_CREDENTIALS_FILE`, where the CLI session
-            is kept, readable only by its owner. Defaults to
-            `$XDG_CONFIG_HOME/nest/credentials.json` (`~/.config/nest/...`).
+            `--url`, then `NEST_AUTH_URL`, then [`config.HOSTED_AUTH_URL`].
+        credentials_file (`str`): `NEST_CLI_CREDENTIALS_FILE`, where CLI sessions
+            are kept, one per sign-in origin, readable only by their owner. Defaults
+            to `$XDG_CONFIG_HOME/nest/credentials.json` (`~/.config/nest/...`).
+        url_source (`str`): Where `url` came from, one of
+            [`config.AUTH_URL_SOURCES`].
     """
 
     url: str
     credentials_file: str
+    url_source: str = "NEST_AUTH_URL"
 
 
 def default_credentials_file(environ: Mapping[str, str] | None = None) -> str:
@@ -2286,6 +2351,9 @@ def load_cli_auth_config(
     """
     Reads and validates the CLI sign-in settings.
 
+    The origin is `url` when given, else `NEST_AUTH_URL`, else
+    [`config.HOSTED_AUTH_URL`] (see [`config.resolve_auth_url`]).
+
     Args:
         environ (`Mapping[str, str]`, *optional*): Environment. Defaults to `os.environ`.
         url (`str`, *optional*): Replaces `NEST_AUTH_URL`, such as from `--url`.
@@ -2294,24 +2362,13 @@ def load_cli_auth_config(
         [`config.ConfigError`]: Listing every invalid setting.
     """
     reader = _Reader(environ)
-    raw = url.strip() if url and url.strip() else reader.get("NEST_AUTH_URL")
-    origin = ""
-    if raw is None:
-        reader.fail(
-            "NEST_AUTH_URL is required to sign in: set it to your Nest's address, such as "
-            "'https://nest.example.com'"
-        )
-    else:
-        try:
-            origin = normalize_auth_url(raw)
-        except ValueError as exc:
-            reader.fail(f"NEST_AUTH_URL {exc}; got {raw!r}")
+    origin, source = resolve_auth_url(reader, url=url, hosted=True)
     path = reader.get("NEST_CLI_CREDENTIALS_FILE") or default_credentials_file(reader.environ)
     if not os.path.isabs(path):
         reader.fail(f"NEST_CLI_CREDENTIALS_FILE must be an absolute path, got {path!r}")
-    if reader.problems:
+    if reader.problems or origin is None or source is None:
         raise ConfigError(reader.problems)
-    return CLIAuthConfig(url=origin, credentials_file=path)
+    return CLIAuthConfig(url=origin, credentials_file=path, url_source=source)
 
 
 def materialize_ssh_credentials(policy: SSHPolicy) -> tuple[str | None, str | None]:

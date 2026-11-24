@@ -8,9 +8,10 @@ also works on a login node or over SSH, where no browser runs.
 
 `nest login` is optional. A command that needs a Nest session, such as
 `nest platforms list`, signs you in the same way the first time it needs to,
-through [`login.ensure_session`]. So does `.remote()` when `NEST_AUTH_URL` is set,
-the Controller requires a session, and the program runs in an interactive
-terminal; in a batch job or without a terminal it raises
+through [`login.ensure_session`]. So does `.remote()` when a sign-in origin
+applies to its Controller (the hosted Controller, or any Controller with
+`NEST_AUTH_URL` set), the Controller requires a session, and the program runs in
+an interactive terminal; in a batch job or without a terminal it raises
 `AuthenticationRequiredError` instead, so sign in with `nest login` first.
 
 To use a session for remote calls, also set `NEST_PROJECT_ID`; see
@@ -23,22 +24,35 @@ approval page never asks for HPC credentials. Configure HPC access separately (s
 
 ## Sign in
 
-Point the CLI at your Nest, then sign in:
+For Cerulean-hosted Nest, nothing needs to be set:
 
 ```bash
-export NEST_AUTH_URL=https://nest.example.com
 nest login
 ```
 
 ```text
+Signing in to Cerulean-hosted Nest at https://auth.nest.cerulean.works (set NEST_AUTH_URL or pass --url for another Nest).
 To sign in to Nest, open this link in a browser:
 
-    https://nest.example.com/auth/cli/approve?code=BCDF-GHJK
+    https://auth.nest.cerulean.works/auth/cli/approve?code=BCDF-GHJK
 
 and check that it shows the code BCDF-GHJK.
 Nest will never ask for your NCHC password or one-time code there.
 Waiting for approval...
 ```
+
+For a self-hosted Nest, name its origin; every `nest` command, and `.remote()`,
+then uses it:
+
+```bash
+export NEST_AUTH_URL=https://nest.example.com   # or: nest login --url https://nest.example.com
+nest login
+```
+
+`--url` wins over `NEST_AUTH_URL`, which wins over the hosted default; see
+[Sign-in origin](configuration#sign-in-origin). When `NEST_CONTROLLER_ADDRESS`
+names a Controller other than the hosted one and no origin is named, `nest login`
+warns that this Controller will not receive the hosted session.
 
 Open the link on any device. If that browser is not signed in to Nest yet, it
 signs in with Google first and comes back to the approval. Check that the page
@@ -94,9 +108,11 @@ with the same lifetimes: a short-lived access token (`NEST_AUTH_ACCESS_TOKEN_TTL
   only by the CLI routes, the Projects API and the Controller's gRPC service (see
   [Authenticated execution](security#authenticated-execution)), never as a browser
   session cookie, and a browser session is never accepted as a CLI token.
-- **Stored privately.** The session is kept in `NEST_CLI_CREDENTIALS_FILE`
-  (default `~/.config/nest/credentials.json`), written atomically with mode `0600`
-  in a `0700` directory. A file that other users can read is refused. Concurrent
+- **Stored privately, per Nest.** Sessions are kept in `NEST_CLI_CREDENTIALS_FILE`
+  (default `~/.config/nest/credentials.json`), one per sign-in origin, written
+  atomically with mode `0600` in a `0700` directory. Signing in to or out of one
+  Nest leaves the others' sessions alone, and a session is sent only to the origin
+  that issued it. A file that other users can read is refused. Concurrent
   Nest commands refresh one at a time under a lock, so they never trip reuse
   detection.
 - **Revocable.** `nest logout`, `nest-db sessions revoke`, and disabling the User
@@ -165,5 +181,5 @@ On the CLI side:
 
 | Variable | Default | Behavior |
 | --- | --- | --- |
-| `NEST_AUTH_URL` | Unset | Origin of your Nest, such as `https://nest.example.com`: the origin of `NEST_GOOGLE_REDIRECT_URL`. `https://` only (`http://` for localhost). `--url` overrides it. |
-| `NEST_CLI_CREDENTIALS_FILE` | `$XDG_CONFIG_HOME/nest/credentials.json` (`~/.config/nest/credentials.json`) | Absolute path of the stored session. |
+| `NEST_AUTH_URL` | Unset: `https://auth.nest.cerulean.works` | Origin of your Nest, such as `https://nest.example.com`: the origin of `NEST_GOOGLE_REDIRECT_URL`. `https://` only (`http://` for localhost). `--url` overrides it. |
+| `NEST_CLI_CREDENTIALS_FILE` | `$XDG_CONFIG_HOME/nest/credentials.json` (`~/.config/nest/credentials.json`) | Absolute path of the stored sessions. |

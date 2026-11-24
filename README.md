@@ -35,34 +35,38 @@ A versioned release installation command will be provided when the first Early A
 
 ## Quick Start
 
-The team's shared Controller is authenticated (M1): each call carries your Nest
+The Cerulean-hosted Controller is authenticated (M1): each call carries your Nest
 session and runs in a Project that the operator has approved. The
 [full walkthrough](docs/source/quickstart.md) explains each step; in short:
 
-1. Connect to the authorized Tailscale network, or accept the Controller node share.
-2. Point the SDK at the Controller and at Nest's sign-in (values from your operator):
-
-   ```bash
-   export NEST_CONTROLLER_ADDRESS="nest.cerulean.works:50051"
-   export NEST_CONTROLLER_TLS=false   # plaintext gRPC inside the encrypted Tailnet
-   export NEST_AUTH_URL="https://nest.example.com"
-   ```
-
-3. Sign in by approving the CLI in a browser, and check the session:
+1. Sign in by approving the CLI in a browser. No setting is needed: `nest login`
+   uses the hosted sign-in at `https://auth.nest.cerulean.works`.
 
    ```bash
    uv run nest login
    uv run nest auth status --check
    ```
 
-4. Join a Project through an invitation from its Owner or an Admin, or create one,
+2. Connect to the authorized Tailscale network, or accept the Controller node
+   share, and point the SDK at the hosted Controller. These stay explicit because
+   the Controller's gRPC is plaintext inside the encrypted Tailnet, and the SDK
+   never assumes that ([why](docs/source/configuration.md#why-the-hosted-controller-is-not-a-default)):
+
+   ```bash
+   export NEST_CONTROLLER_ADDRESS="nest.cerulean.works:50051"
+   export NEST_CONTROLLER_TLS=false
+   ```
+
+   The SDK sends your hosted session to this Controller only.
+
+3. Join a Project through an invitation from its Owner or an Admin, or create one,
    and select it by ID (see [Join or create a Project](docs/source/quickstart.md#4-join-or-create-a-project)):
 
    ```bash
    export NEST_PROJECT_ID="<project-id>"
    ```
 
-5. Ask the operator to approve the Project: Provider approval, an HPC Platform
+4. Ask the operator to approve the Project: Provider approval, an HPC Platform
    grant and a Slurm account ([Onboard a Project](docs/source/project-onboarding.md)).
    `uv run nest platforms default --project-id "$NEST_PROJECT_ID"` shows the
    granted Platform.
@@ -96,6 +100,20 @@ uv run python main.py
 A refused call raises `AuthenticationRequiredError` (`UNAUTHENTICATED`) or
 `RemoteAccessDeniedError` (`PERMISSION_DENIED`, `NOT_FOUND`) and names the reason;
 see [Access and onboarding errors](docs/source/remote-errors.md#access-and-onboarding-errors).
+
+### Self-hosted Nest
+
+Name your Nest's sign-in origin, and your Controller, explicitly:
+
+```bash
+export NEST_AUTH_URL="https://nest.example.com"   # or: nest login --url ...
+export NEST_CONTROLLER_ADDRESS="controller.example.com:50051"
+export NEST_CONTROLLER_TLS=true
+```
+
+`--url` wins over `NEST_AUTH_URL`, which wins over the hosted default. Without
+`NEST_AUTH_URL`, a Controller other than the hosted one receives no session. See
+[Sign-in origin](docs/source/configuration.md#sign-in-origin).
 
 ### Local development without a session
 

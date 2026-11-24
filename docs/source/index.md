@@ -15,8 +15,9 @@ operator has approved for an HPC Platform and a Slurm account.
 
 1. [Install Nest](installation) with Python 3.14 or later, using uv, and keep it
    up to date.
-2. [Run your first remote function](quickstart): connect over Tailscale, point the
-   SDK at the Controller, sign in with `nest login`, choose your Project with
+2. [Run your first remote function](quickstart): sign in with `nest login` (no
+   setting needed for hosted Nest), connect over Tailscale, point the SDK at the
+   Controller, choose your Project with
    `NEST_PROJECT_ID`, and make a first call.
 3. [Use project dependencies](project-dependencies) when your function needs
    packages from a uv project.
