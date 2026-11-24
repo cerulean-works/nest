@@ -4,7 +4,8 @@ Nest is configured only through environment variables. The same names work for a
 native process (`python -m nest.controller`), Docker Compose, and Dokploy. No project
 checkout, YAML or JSON configuration file, or `.env` file is required: Compose reads
 `.env` only as a convenience, and a native process reads only its own environment.
-Credentials stay in files or your platform's secret store, never in the repository.
+Credentials can be given directly in the environment or as files; see
+[Credential sources](#credential-sources). They never belong in the repository.
 
 Every entry point reads settings through `nest.config`. The Controller validates the
 whole environment before it starts listening and reports **every** problem at once,
@@ -18,10 +19,56 @@ ERROR nest.controller pid=7 request_id=- Invalid Nest configuration:
 ```
 
 An empty value means unset. Error messages never repeat secret values
-(`NEST_SSH_PRIVATE_KEY`, `NEST_SMTP_PASSWORD`, `NEST_GOOGLE_CLIENT_SECRET`, the
+(`NEST_DATABASE_PASSWORD`, `NEST_SSH_PRIVATE_KEY`, `NEST_TLS_KEY`,
+`NEST_DATABASE_SSLKEY_DATA`, `NEST_SMTP_PASSWORD`, `NEST_GOOGLE_CLIENT_SECRET`, the
 password and query of `NEST_DATABASE_URL`). The
 Controller logs a redacted `Controller configuration {...}` line at startup, and
-its log handler masks an inline private key if any message ever contains it.
+its log handler masks inline passwords and keys if any message ever contains them.
+
+## Credential sources
+
+Every credential and every file a tool needs can come from either a direct
+environment value or a file. The two forms of a pair are mutually exclusive:
+
+| Direct value | File form | Kind |
+| --- | --- | --- |
+| `NEST_DATABASE_PASSWORD` | `NEST_DATABASE_PASSWORD_FILE` | One-line secret |
+| `NEST_GOOGLE_CLIENT_SECRET` | `NEST_GOOGLE_CLIENT_SECRET_FILE` | One-line secret |
+| `NEST_SMTP_PASSWORD` | `NEST_SMTP_PASSWORD_FILE` | One-line secret |
+| `NEST_TLS_CERT`, `NEST_TLS_KEY` | `NEST_TLS_CERT_FILE`, `NEST_TLS_KEY_FILE` | PEM |
+| `NEST_DATABASE_SSLROOTCERT_DATA`, `NEST_DATABASE_SSLCERT_DATA`, `NEST_DATABASE_SSLKEY_DATA` | `NEST_DATABASE_SSLROOTCERT`, `NEST_DATABASE_SSLCERT`, `NEST_DATABASE_SSLKEY` | PEM |
+| `NEST_SMTP_CA` | `NEST_SMTP_CA_FILE` | PEM |
+| `NEST_SSH_PRIVATE_KEY` | `NEST_SSH_IDENTITY_FILE` | PEM or OpenSSH key |
+| `NEST_SSH_KNOWN_HOSTS_DATA` | `NEST_SSH_KNOWN_HOSTS` | `known_hosts` lines |
+| `NEST_SSH_CONFIG` (container, Mode A) | `config` in the mounted `NEST_SSH_DIR` | SSH configuration |
+| `NEST_PLATFORMS_ENV` | The `NEST_PLATFORM*` variables, or a Compose `env_file` | `NAME=value` lines |
+
+The naming follows one rule: the direct form drops `_FILE`. A path setting named
+after a libpq or OpenSSH option has no `_FILE`, so its direct form adds `_DATA`.
+
+- **Unset and empty** values, including only spaces, mean unset.
+- **Both forms set** is an error naming both variables; the value is never shown.
+- **Files** must be absolute, readable, UTF-8 and not empty. A private key file
+  must not be readable by group or others.
+- **One-line secrets** are trimmed. A line break inside one is an error. Any
+  other character is allowed: the database password goes to libpq as its own
+  keyword, never spliced into `NEST_DATABASE_URL`.
+- **Multiline values** accept real line breaks or the two characters `\n`.
+  Carriage returns are dropped and one final newline is added. Inline PEM must
+  contain the matching `BEGIN CERTIFICATE` or `PRIVATE KEY` marker.
+
+Tools that only read files get private generated copies. libpq's TLS files and
+Mode B SSH files go into a new `0700` directory under the temporary directory
+(tmpfs in the Compose deployments), and the container entrypoint writes Mode A SSH
+files into the tmpfs `~/.ssh` (see
+[Deploy on Dokploy from environment variables](dokploy#how-each-credential-is-delivered)).
+gRPC TLS and the SMTP CA are passed as bytes, so they are never written. SSH,
+`scp` and local workers start without any of these variables in their
+environment.
+
+A direct value is visible to anyone who can inspect the process or container
+environment. Prefer the file form where a secret-file mount is available; see
+[Security trade-offs](dokploy#security-trade-offs).
 
 ## Client
 
@@ -64,8 +111,10 @@ on a trusted private network such as an authorized Tailnet.
 | `NEST_PENDING_BLOCKED_TIMEOUT` | `120` | Seconds a job may stay pending for a reason it cannot outwait, such as `PartitionConfig`, `InvalidQOS`, a per-job limit, or a hold, before the call raises `JobBlockedError`. `0` stops at the first such observation. Set it above `NEST_RESULT_TIMEOUT` to wait for the full deadline instead. |
 | `NEST_PENDING_LIMIT_TIMEOUT` | Unset | Seconds a job may stay pending on a QoS or association usage limit, such as `MaxGRESPerAccount`, before the call raises `JobBlockedError`. `0` stops at the first such observation. Unset waits until `NEST_RESULT_TIMEOUT`, since such limits clear as the account's other jobs finish. |
 | `NEST_CANCEL_BLOCKED_JOBS` | `false` | Whether to `scancel` a job when the call raises `JobBlockedError`. The job is never resubmitted. |
-| `NEST_TLS_CERT_FILE` | Unset | Absolute path to the PEM certificate chain. Set with `NEST_TLS_KEY_FILE` to serve TLS. |
-| `NEST_TLS_KEY_FILE` | Unset | Absolute path to the PEM private key. Both TLS files, or neither. |
+| `NEST_TLS_CERT_FILE` | Unset | Absolute path to the PEM certificate chain. Set with a key to serve TLS. |
+| `NEST_TLS_KEY_FILE` | Unset | Absolute path to the PEM private key. A certificate and a key, or neither. |
+| `NEST_TLS_CERT` | Unset | The certificate chain inline, instead of `NEST_TLS_CERT_FILE`. |
+| `NEST_TLS_KEY` | Unset | The private key inline, instead of `NEST_TLS_KEY_FILE`. A secret: passed to gRPC as bytes, never written to disk or logged. |
 | `NEST_CONTROLLER_AUTH` | `session` with `NEST_DATABASE_URL`, otherwise `none` | `session` authenticates every gRPC call with a Nest CLI session and authorizes it with the Project policy (see [Security and limitations](security#authenticated-execution)). Needs `NEST_DATABASE_URL`. `none` serves every caller that can reach the listener. |
 | `NEST_CONTROLLER_ALLOW_PLAINTEXT` | `false` | With `NEST_CONTROLLER_AUTH=session`, a non-loopback listener needs TLS (`NEST_TLS_*`) because every call carries a session token. `true` approves plaintext gRPC on a network that is already encrypted and access-controlled, such as an authorized Tailnet. Ignored with `NEST_CONTROLLER_AUTH=none`. |
 | `NEST_EXECUTION_REGISTRY` | `required` with session authentication, else `legacy` | `required` admits every Slurm submission through the durable Execution Registry, which needs `NEST_CONTROLLER_AUTH=session` and, for a Mode A Platform, its `SSH_USER`. `legacy` keeps the trusted Mode A path that records only `jobs`; it is refused for a Mode B Platform under session authentication. See [Admit submissions through the Execution Registry](execution-registry). |
@@ -147,7 +196,10 @@ SSH credentials (`NEST_SSH_*`) are Controller-wide and are not per-Platform
 settings.
 
 With Docker Compose, put the Platform settings in an env file; see
-[Deploy with Docker Compose](docker-compose#several-hpc-platforms). The RPC API has
+[Deploy with Docker Compose](docker-compose#several-hpc-platforms). Where no file can
+be mounted, put the same lines in one variable, `NEST_PLATFORMS_ENV` (real line
+breaks or `\n`). Its values are literal, only the Platform names above are
+accepted, and a name also set as its own variable is an error. The RPC API has
 no Platform field yet, so every call uses the default Platform.
 
 **One cluster** can still use the `NEST_SLURM_*` variables, which define the
@@ -225,11 +277,14 @@ This holds for every Platform in Mode B, whichever form defines it.
 | `NEST_SSH_KNOWN_HOSTS` | Unset | Absolute path to verified host keys (Mode B). |
 | `NEST_SSH_KNOWN_HOSTS_DATA` | Unset | The same host keys inline, one `known_hosts` line per line or separated by `\n`. Host keys are public. |
 | `NEST_SSH_IDENTITY_FILE` | Unset | Absolute path to the private key (Mode B). Must not be readable by group or others. |
-| `NEST_SSH_PRIVATE_KEY` | Unset | The private key inline, newlines as `\n`. A secret: it is written to a private temporary file at startup and never logged. |
+| `NEST_SSH_PRIVATE_KEY` | Unset | The private key inline, with real line breaks or `\n`. A secret: in Mode B it is written to a private temporary file at startup; it is never logged. |
+| `NEST_SSH_CONFIG` | Unset | Container only, Mode A: the SSH configuration inline. The entrypoint writes it to `~/.ssh/config`, `NEST_SSH_PRIVATE_KEY` to `~/.ssh/id_nest` and `NEST_SSH_KNOWN_HOSTS_DATA` to `~/.ssh/known_hosts`, all `0600` in tmpfs. It never replaces a different file from the mounted `NEST_SSH_DIR`, and it is refused if it weakens host-key checking. A native Controller uses its user's own `~/.ssh`. |
 
 Mode B needs one host-key source and one key source; set only one of each pair.
 Prefer files or your platform's secret store for the key. An inline key is
 visible to anyone who can inspect the process or container environment.
+In Mode A, `NEST_SSH_PRIVATE_KEY` and `NEST_SSH_KNOWN_HOSTS_DATA` are used only
+together with `NEST_SSH_CONFIG`.
 
 ### Database
 
@@ -243,10 +298,12 @@ for TLS, pooling, migrations, and backups.
 | --- | --- | --- |
 | `NEST_DATABASE_URL` | Unset (stateless) | Externally managed PostgreSQL, such as `postgresql://nest@db.example.internal:5432/nest`. Must name the host and database. A secret: its password and query string are always redacted. |
 | `NEST_DATABASE_REQUIRED` | `false` | `true` makes an unset `NEST_DATABASE_URL` a configuration error. |
-| `NEST_DATABASE_PASSWORD_FILE` | Unset | Absolute path to a file holding the password. Do not also put a password in the URL. |
+| `NEST_DATABASE_PASSWORD` | Unset | The password directly. A secret: passed to libpq as its own keyword, so any character is safe, and never logged. Set only one of the URL password, this, and `NEST_DATABASE_PASSWORD_FILE`. |
+| `NEST_DATABASE_PASSWORD_FILE` | Unset | Absolute path to a file holding the password, on one line. Do not also put a password in the URL. |
 | `NEST_DATABASE_SSLMODE` | URL's `sslmode`, else libpq's `prefer` | One of `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`. Use `verify-full` for remote databases. `verify-full` when only `NEST_DATABASE_SSLROOTCERT` is set. |
 | `NEST_DATABASE_SSLROOTCERT` | Unset | Absolute path to the CA bundle that verifies the server certificate. |
 | `NEST_DATABASE_SSLCERT`, `NEST_DATABASE_SSLKEY` | Unset | Client certificate and key, set together. The key must not be readable by group or others. |
+| `NEST_DATABASE_SSLROOTCERT_DATA`, `NEST_DATABASE_SSLCERT_DATA`, `NEST_DATABASE_SSLKEY_DATA` | Unset | The same PEM files inline. libpq reads only files, so Nest writes them to a private `0700` directory (`0600` files) each time it connects. The key is a secret. Same rules as the file forms, including `verify-full` when a CA is given. |
 | `NEST_DATABASE_POOL_MIN_SIZE` | `1` | Connections kept open. `0` or more. |
 | `NEST_DATABASE_POOL_MAX_SIZE` | `10` | Most connections the pool opens. At least 1 and at least the minimum. |
 | `NEST_DATABASE_CONNECT_TIMEOUT` | `10` | Seconds to establish each connection. |
@@ -277,6 +334,7 @@ TLS, credential rotation, the outbox and retries.
 | `NEST_SMTP_PASSWORD_FILE` | Unset | Absolute path to a file holding the password, such as a mounted secret. Re-read for each connection, so rotation needs no restart. Must not be empty. |
 | `NEST_SMTP_PASSWORD` | Unset | The password inline. A secret: never logged or echoed. Set only one of the two password settings. |
 | `NEST_SMTP_CA_FILE` | Unset (system roots) | Absolute path to a PEM CA bundle for a relay with a private CA. Certificate verification is always on. |
+| `NEST_SMTP_CA` | Unset | The same CA bundle inline. Set only one of the two. |
 | `NEST_SMTP_TIMEOUT` | `30` | Seconds for the connection and each SMTP command. |
 | `NEST_EMAIL_MAX_ATTEMPTS` | `5` | Delivery attempts per message, 1 to 100. |
 | `NEST_EMAIL_RETRY_DELAY` | `60` | Seconds before the first retry after a transient failure; doubles per attempt. |
@@ -328,10 +386,19 @@ deployed batch scripts for memory and cluster-specific settings.
 
 Compose uses the same contract. Each Controller definition passes an explicit list
 of the variables above (all Controller settings except `NEST_PROVIDERS`, the
-`NEST_PROVIDER_<ID>_*` family, and the reserved settings) so unrelated host
-variables never reach the Controller. Unset values become empty, which means unset.
-The container listens on `0.0.0.0:50051` and defaults to Slurm mode. For several
-providers, add their `NEST_PROVIDER_*` variables in an override file.
+`NEST_PROVIDER_<ID>_*` family, the reserved settings and the pending-job timeouts)
+so unrelated host variables never reach the Controller. Unset values become empty,
+which means unset. The container listens on `0.0.0.0:50051` and defaults to Slurm
+mode. Once `NEST_GOOGLE_CLIENT_ID` is set, `NEST_AUTH_HTTP_BIND` defaults to
+`0.0.0.0:8080` inside the container; publish or route that port to your
+TLS-terminating proxy. For several Platforms, use a `platforms.env` file or
+`NEST_PLATFORMS_ENV`.
+
+`compose.dokploy.yaml` is the environment-only deployment: no host file is mounted,
+the Tailscale Auth Key comes from `NEST_TAILSCALE_AUTHKEY` and an optional Serve
+configuration from `NEST_TAILSCALE_SERVE_CONFIG` (both reach only the sidecar), and
+the `local-db` and `migrate` profiles add PostgreSQL and `nest-db upgrade`. See
+[Deploy on Dokploy from environment variables](dokploy).
 
 These variables configure Compose itself:
 

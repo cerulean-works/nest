@@ -1,0 +1,293 @@
+# Environment-first deployment for Dokploy and similar platforms: use this file alone.
+# Every setting and credential comes from the deployment's Environment panel (the
+# .env next to this file); no host file or directory has to be mounted. Durable
+# state lives in named volumes that survive redeploys: the Tailscale node identity
+# (tailscale-state) and, with the local-db profile, PostgreSQL (postgres-data).
+# Self-contained because Dokploy rewrites YAML before Compose resolves it.
+#
+# Optional services are selected with COMPOSE_PROFILES:
+#   local-db  a PostgreSQL server for this deployment (password: NEST_DATABASE_PASSWORD)
+#   migrate   run `nest-db upgrade` once before every Controller start
+# See docs/source/dokploy.md.
+name: nest
+
+services:
+  controller:
+    image: ${NEST_CONTROLLER_IMAGE:-nest-controller:local}
+    build: .
+    pull_policy: build
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 20s
+    # Optional, like every other Controller definition. Without a file, use
+    # NEST_PLATFORMS_ENV for several HPC Platforms.
+    env_file:
+      - path: ${NEST_PLATFORMS_ENV_FILE:-./platforms.env}
+        required: false
+    environment:
+      NEST_CONTROLLER_BIND: 0.0.0.0:50051
+      NEST_EXECUTOR: ${NEST_EXECUTOR:-slurm}
+      NEST_SLURM_HOST: ${NEST_SLURM_HOST:-}
+      NEST_SLURM_ACCOUNT: ${NEST_SLURM_ACCOUNT:-}
+      NEST_SLURM_WORKDIR: ${NEST_SLURM_WORKDIR:-}
+      NEST_LOG_LEVEL: ${NEST_LOG_LEVEL:-INFO}
+      NEST_SSH_TIMEOUT: ${NEST_SSH_TIMEOUT:-}
+      NEST_RESULT_TIMEOUT: ${NEST_RESULT_TIMEOUT:-}
+      NEST_ENVIRONMENT_TIMEOUT: ${NEST_ENVIRONMENT_TIMEOUT:-}
+      NEST_POLL_INTERVAL: ${NEST_POLL_INTERVAL:-}
+      NEST_SLURM_LOGIN_NODES: ${NEST_SLURM_LOGIN_NODES:-}
+      NEST_SLURM_SSH_MODE: ${NEST_SLURM_SSH_MODE:-}
+      NEST_SLURM_SSH_USER: ${NEST_SLURM_SSH_USER:-}
+      NEST_SLURM_PARTITION: ${NEST_SLURM_PARTITION:-}
+      NEST_SLURM_TIME: ${NEST_SLURM_TIME:-}
+      NEST_SSH_MODES_ALLOWED: ${NEST_SSH_MODES_ALLOWED:-}
+      NEST_SSH_KNOWN_HOSTS: ${NEST_SSH_KNOWN_HOSTS:-}
+      NEST_SSH_KNOWN_HOSTS_DATA: ${NEST_SSH_KNOWN_HOSTS_DATA:-}
+      NEST_SSH_IDENTITY_FILE: ${NEST_SSH_IDENTITY_FILE:-}
+      NEST_SSH_PRIVATE_KEY: ${NEST_SSH_PRIVATE_KEY:-}
+      NEST_SSH_CONFIG: ${NEST_SSH_CONFIG:-}
+      NEST_TLS_CERT_FILE: ${NEST_TLS_CERT_FILE:-}
+      NEST_TLS_KEY_FILE: ${NEST_TLS_KEY_FILE:-}
+      NEST_TLS_CERT: ${NEST_TLS_CERT:-}
+      NEST_TLS_KEY: ${NEST_TLS_KEY:-}
+      NEST_PUBLIC_URL: ${NEST_PUBLIC_URL:-}
+      NEST_CONTROLLER_AUTH: ${NEST_CONTROLLER_AUTH:-}
+      NEST_CONTROLLER_ALLOW_PLAINTEXT: ${NEST_CONTROLLER_ALLOW_PLAINTEXT:-}
+      NEST_PROVIDER_ALLOWED_PROJECTS: ${NEST_PROVIDER_ALLOWED_PROJECTS:-}
+      NEST_EXECUTION_REGISTRY: ${NEST_EXECUTION_REGISTRY:-}
+      NEST_DATABASE_URL: ${NEST_DATABASE_URL:-}
+      NEST_DATABASE_REQUIRED: ${NEST_DATABASE_REQUIRED:-}
+      NEST_DATABASE_PASSWORD: ${NEST_DATABASE_PASSWORD:-}
+      NEST_DATABASE_PASSWORD_FILE: ${NEST_DATABASE_PASSWORD_FILE:-}
+      NEST_DATABASE_SSLMODE: ${NEST_DATABASE_SSLMODE:-}
+      NEST_DATABASE_SSLROOTCERT: ${NEST_DATABASE_SSLROOTCERT:-}
+      NEST_DATABASE_SSLCERT: ${NEST_DATABASE_SSLCERT:-}
+      NEST_DATABASE_SSLKEY: ${NEST_DATABASE_SSLKEY:-}
+      NEST_DATABASE_SSLROOTCERT_DATA: ${NEST_DATABASE_SSLROOTCERT_DATA:-}
+      NEST_DATABASE_SSLCERT_DATA: ${NEST_DATABASE_SSLCERT_DATA:-}
+      NEST_DATABASE_SSLKEY_DATA: ${NEST_DATABASE_SSLKEY_DATA:-}
+      NEST_DATABASE_POOL_MIN_SIZE: ${NEST_DATABASE_POOL_MIN_SIZE:-}
+      NEST_DATABASE_POOL_MAX_SIZE: ${NEST_DATABASE_POOL_MAX_SIZE:-}
+      NEST_DATABASE_CONNECT_TIMEOUT: ${NEST_DATABASE_CONNECT_TIMEOUT:-}
+      NEST_DATABASE_POOL_TIMEOUT: ${NEST_DATABASE_POOL_TIMEOUT:-}
+      NEST_EMAIL_ENABLED: ${NEST_EMAIL_ENABLED:-}
+      NEST_EMAIL_PROVIDER: ${NEST_EMAIL_PROVIDER:-}
+      NEST_EMAIL_FROM: ${NEST_EMAIL_FROM:-}
+      NEST_EMAIL_MAX_ATTEMPTS: ${NEST_EMAIL_MAX_ATTEMPTS:-}
+      NEST_EMAIL_RETRY_DELAY: ${NEST_EMAIL_RETRY_DELAY:-}
+      NEST_EMAIL_RETRY_MAX_DELAY: ${NEST_EMAIL_RETRY_MAX_DELAY:-}
+      NEST_EMAIL_POLL_INTERVAL: ${NEST_EMAIL_POLL_INTERVAL:-}
+      NEST_SMTP_HOST: ${NEST_SMTP_HOST:-}
+      NEST_SMTP_PORT: ${NEST_SMTP_PORT:-}
+      NEST_SMTP_STARTTLS: ${NEST_SMTP_STARTTLS:-}
+      NEST_SMTP_IMPLICIT_TLS: ${NEST_SMTP_IMPLICIT_TLS:-}
+      NEST_SMTP_USERNAME: ${NEST_SMTP_USERNAME:-}
+      NEST_SMTP_PASSWORD: ${NEST_SMTP_PASSWORD:-}
+      NEST_SMTP_PASSWORD_FILE: ${NEST_SMTP_PASSWORD_FILE:-}
+      NEST_SMTP_CA_FILE: ${NEST_SMTP_CA_FILE:-}
+      NEST_SMTP_CA: ${NEST_SMTP_CA:-}
+      NEST_SMTP_TIMEOUT: ${NEST_SMTP_TIMEOUT:-}
+      NEST_GOOGLE_CLIENT_ID: ${NEST_GOOGLE_CLIENT_ID:-}
+      NEST_GOOGLE_CLIENT_SECRET: ${NEST_GOOGLE_CLIENT_SECRET:-}
+      NEST_GOOGLE_CLIENT_SECRET_FILE: ${NEST_GOOGLE_CLIENT_SECRET_FILE:-}
+      NEST_GOOGLE_REDIRECT_URL: ${NEST_GOOGLE_REDIRECT_URL:-}
+      # The auth listener must be reachable from outside the container: default to
+      # all interfaces once Google sign-in is enabled (unset otherwise, as required).
+      NEST_AUTH_HTTP_BIND: ${NEST_AUTH_HTTP_BIND:-${NEST_GOOGLE_CLIENT_ID:+0.0.0.0:8080}}
+      NEST_AUTH_ACCESS_TOKEN_TTL: ${NEST_AUTH_ACCESS_TOKEN_TTL:-}
+      NEST_AUTH_REFRESH_TTL: ${NEST_AUTH_REFRESH_TTL:-}
+      NEST_AUTH_SESSION_MAX_LIFETIME: ${NEST_AUTH_SESSION_MAX_LIFETIME:-}
+      NEST_BOOTSTRAP_ADMIN_GOOGLE_EMAIL: ${NEST_BOOTSTRAP_ADMIN_GOOGLE_EMAIL:-}
+      # Inline HPC Platform Profiles: the lines of a platforms.env file in one value.
+      NEST_PLATFORMS_ENV: ${NEST_PLATFORMS_ENV:-}
+    depends_on:
+      tailscale:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+        required: false
+      migrate:
+        condition: service_completed_successfully
+        required: false
+    # No bind mounts. Inline SSH files (Mode A) are written by the entrypoint into the
+    # private tmpfs below; Mode B credentials and inline database TLS files go to /tmp.
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /home/nest/.ssh:mode=0700
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      tailnet:
+        # Keep Serve's backend name stable if Dokploy renames services.
+        aliases: [controller]
+    # gRPC is reached through Tailscale Serve, never through Traefik. For Google
+    # sign-in, add a Dokploy Domain for this service on container port 8080 (HTTPS).
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # One-shot schema upgrade, enabled with the `migrate` profile. It receives only the
+  # database settings. With no pending migration it changes nothing.
+  migrate:
+    profiles: [migrate]
+    image: ${NEST_CONTROLLER_IMAGE:-nest-controller:local}
+    build: .
+    pull_policy: build
+    command: ["nest-db", "upgrade"]
+    restart: "no"
+    environment:
+      NEST_DATABASE_URL: ${NEST_DATABASE_URL:-}
+      NEST_DATABASE_PASSWORD: ${NEST_DATABASE_PASSWORD:-}
+      NEST_DATABASE_PASSWORD_FILE: ${NEST_DATABASE_PASSWORD_FILE:-}
+      NEST_DATABASE_SSLMODE: ${NEST_DATABASE_SSLMODE:-}
+      NEST_DATABASE_SSLROOTCERT: ${NEST_DATABASE_SSLROOTCERT:-}
+      NEST_DATABASE_SSLROOTCERT_DATA: ${NEST_DATABASE_SSLROOTCERT_DATA:-}
+      NEST_DATABASE_SSLCERT: ${NEST_DATABASE_SSLCERT:-}
+      NEST_DATABASE_SSLCERT_DATA: ${NEST_DATABASE_SSLCERT_DATA:-}
+      NEST_DATABASE_SSLKEY: ${NEST_DATABASE_SSLKEY:-}
+      NEST_DATABASE_SSLKEY_DATA: ${NEST_DATABASE_SSLKEY_DATA:-}
+      NEST_DATABASE_CONNECT_TIMEOUT: ${NEST_DATABASE_CONNECT_TIMEOUT:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+        required: false
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /home/nest/.ssh:mode=0700
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - tailnet
+    labels:
+      traefik.enable: "false"
+
+  # Optional PostgreSQL for this deployment, enabled with the `local-db` profile.
+  # Point the Controller at it with NEST_DATABASE_URL=postgresql://nest@postgres:5432/nest.
+  # It publishes no host port; the Controller reaches it on the Compose network.
+  postgres:
+    profiles: [local-db]
+    image: ${NEST_POSTGRES_IMAGE:-postgres:17.12-bookworm}
+    restart: unless-stopped
+    stop_grace_period: 60s
+    environment:
+      POSTGRES_DB: nest
+      POSTGRES_USER: nest
+      POSTGRES_PASSWORD_FILE: /run/secrets/nest_database_password
+      POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale=C.UTF-8 --auth-host=scram-sha-256
+    # The same NEST_DATABASE_PASSWORD the Controller uses, delivered as a file so it
+    # is not in this container's environment or `docker inspect`. PostgreSQL reads
+    # it only when the data volume is first initialized.
+    secrets:
+      - nest_database_password
+    volumes:
+      - type: volume
+        source: postgres-data
+        target: ${NEST_POSTGRES_DATA_DIR:-/var/lib/postgresql/data}
+    shm_size: 256mb
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      tailnet:
+        aliases: [postgres]
+    labels:
+      traefik.enable: "false"
+    healthcheck:
+      test: ["CMD", "pg_isready", "--host=127.0.0.1", "--username=nest", "--dbname=nest"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  tailscale:
+    image: ${NEST_TAILSCALE_IMAGE:-tailscale/tailscale:v1.104.4}
+    restart: unless-stopped
+    # Chooses the auth key and Serve configuration, then runs the image's own
+    # containerboot. Values are only tested and copied literally, never evaluated.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        key=/run/secrets/tailscale_authkey
+        if [ -s "$$key" ]; then export TS_AUTHKEY="file:$$key"; else unset TS_AUTHKEY; fi
+        if [ -n "$${NEST_TAILSCALE_SERVE_CONFIG:-}" ]; then
+          umask 077
+          printf '%s\n' "$$NEST_TAILSCALE_SERVE_CONFIG" > /run/nest-serve/serve.json
+          export TS_SERVE_CONFIG=/run/nest-serve/serve.json
+        fi
+        unset NEST_TAILSCALE_SERVE_CONFIG
+        exec /usr/local/bin/containerboot
+    environment:
+      TS_AUTH_ONCE: "true"
+      TS_HOSTNAME: ${NEST_TAILSCALE_HOSTNAME:-nest-controller}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_USERSPACE: "true"
+      TS_ACCEPT_DNS: "false"
+      TS_SOCKS5_SERVER: ":1055"
+      # Existing state needs a one-time `tailscale set`; see the deployment guide.
+      TS_EXTRA_ARGS: --advertise-tags=tag:nest-controller --accept-routes=false --shields-up=false --ssh=false
+      TS_SERVE_CONFIG: /etc/tailscale/serve/serve.json
+      # Optional replacement for the reviewed serve.json in this checkout.
+      NEST_TAILSCALE_SERVE_CONFIG: ${NEST_TAILSCALE_SERVE_CONFIG:-}
+      TS_ENABLE_HEALTH_CHECK: "true"
+      TS_LOCAL_ADDR_PORT: 127.0.0.1:9002
+    # NEST_TAILSCALE_AUTHKEY as a file only this container sees. It is used only
+    # while the node has no state; it may be set empty after the first enrollment.
+    secrets:
+      - tailscale_authkey
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      # The reviewed default from the repository checkout, not an operator file.
+      - type: bind
+        source: ./docker/tailscale-serve
+        target: /etc/tailscale/serve
+        read_only: true
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /run/nest-serve:mode=0700
+    networks:
+      tailnet:
+        aliases: [tailscale]
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      traefik.enable: "false"
+    healthcheck:
+      test: [CMD, wget, -q, --spider, http://127.0.0.1:9002/healthz]
+      interval: 10s
+      timeout: 3s
+      start_period: 30s
+      retries: 6
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  tailnet:
+    driver: bridge
+
+volumes:
+  # Tailscale node identity and keys: losing it enrolls a new node.
+  tailscale-state:
+  # Survives redeploys and `docker compose down`; only `down --volumes` deletes it.
+  postgres-data:
+
+secrets:
+  tailscale_authkey:
+    environment: NEST_TAILSCALE_AUTHKEY
+  nest_database_password:
+    environment: NEST_DATABASE_PASSWORD

@@ -17,6 +17,7 @@ from psycopg_pool import ConnectionPool, PoolTimeout
 
 from .._logging import get_logger, register_secret
 from ..config import DatabaseConfig
+from ..runtime_files import private_directory, write_private_file
 
 logger = get_logger("nest.db")
 
@@ -77,9 +78,12 @@ class Database:
         self.application_name = application_name
         self._pool: ConnectionPool | None = None
         self._password: str | None = None
-        if config.password_file:
+        if config.password is not None:
+            self._password = config.password.reveal()
+        elif config.password_file:
             with open(config.password_file) as handle:
                 self._password = handle.read().strip()
+        self._ssl_files = self._ssl_paths(config)
         parts = urlsplit(config.url.reveal())
         self._secrets = [
             value
@@ -93,9 +97,7 @@ class Database:
             for value in (
                 parts.hostname,
                 parts.port,
-                config.sslrootcert,
-                config.sslcert,
-                config.sslkey,
+                *self._ssl_files.values(),
                 config.password_file,
             )
             if value
@@ -103,7 +105,35 @@ class Database:
         for secret in (self._password, parts.password):
             if secret:
                 register_secret(secret)
+        if config.sslkey_data is not None:
+            register_secret(config.sslkey_data.reveal())
         self._pool_filter = _ScrubFilter(self.scrub)
+
+    @staticmethod
+    def _ssl_paths(config: DatabaseConfig) -> dict[str, str]:
+        """
+        Returns libpq's TLS file settings, writing inline values to private files.
+
+        libpq accepts only paths, so a CA bundle, client certificate or client key
+        given in a `NEST_DATABASE_*_DATA` setting is written to a new `0700` runtime
+        directory (mode `0600` files) each time the database is opened.
+        """
+        paths = {
+            key: value
+            for key in ("sslrootcert", "sslcert", "sslkey")
+            if (value := getattr(config, key)) is not None
+        }
+        inline = {
+            "sslrootcert": config.sslrootcert_data,
+            "sslcert": config.sslcert_data,
+            "sslkey": config.sslkey_data.reveal() if config.sslkey_data is not None else None,
+        }
+        if any(inline.values()):
+            directory = private_directory("nest-db-tls-")
+            for key, content in inline.items():
+                if content is not None:
+                    paths[key] = write_private_file(directory, key, content)
+        return paths
 
     def conninfo(self) -> str:
         """
@@ -117,10 +147,9 @@ class Database:
             # Text columns always decode as str, even on a SQL_ASCII server.
             "client_encoding": "UTF8",
         }
-        for key in ("sslmode", "sslrootcert", "sslcert", "sslkey"):
-            value = getattr(self.config, key)
-            if value is not None:
-                settings[key] = value
+        if self.config.sslmode is not None:
+            settings["sslmode"] = self.config.sslmode
+        settings.update(self._ssl_files)
         if self._password is not None:
             settings["password"] = self._password
         return make_conninfo(self.config.url.reveal(), **settings)

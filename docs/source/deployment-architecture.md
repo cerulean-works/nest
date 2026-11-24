@@ -13,9 +13,10 @@ HPC access, or Slurm, and none submits a job.
 
 | Check | Command | What it proves |
 | --- | --- | --- |
-| Compose rendering | `python tests/check_shared_compose.py` | All four Compose files render; the Controller definitions pass the same `NEST_*` settings, never receive the Auth Key, and mount SSH files read-only; the shared deployment publishes no host ports. |
+| Compose rendering | `python tests/check_shared_compose.py` | All Compose files render; the five Controller definitions pass the same `NEST_*` settings and never receive the Auth Key; file-based ones mount SSH files read-only; the shared and Dokploy deployments publish no host ports; the Dokploy file mounts no host file into the Controller, sends the Auth Key and PostgreSQL password only as secret files, and passes `migrate` only database settings. |
 | Controller image | `docker run … -m unittest discover -s /tests` | RPCs, shutdown, the SSH SOCKS5 template, and the no-job gRPC probe work inside the image. |
 | Local Compose deployment | `bash tests/smoke_compose.sh` | `compose.yaml` builds, starts healthy, copies SSH files privately without changing the host copy, executes calls, and stops cleanly. |
+| Environment-only deployment | `bash tests/smoke_compose_env.sh` | `compose.dokploy.yaml` runs from a Dokploy-style `.env` alone: PostgreSQL and `nest-db upgrade`/`verify` with a URL-hostile `NEST_DATABASE_PASSWORD`; Mode A SSH files generated `0600` in tmpfs; inline gRPC TLS; Google sign-in from a direct secret; no secret in logs; restart and recreation regenerate files; database rows and the Tailscale node identity survive. |
 | Controller-to-Login-Node SSH | `bash tests/smoke_tailnet_ssh.sh` | See below. |
 | Repository hygiene | `uv run pytest tests/test_deployment_hygiene.py` | No private keys, Tailscale keys, or tokens are tracked; credential locations are ignored by Git and excluded from the image; no tracked file disables SSH host-key verification. |
 
@@ -64,7 +65,9 @@ credentials; follow the checks in the deployment guides.
 ## Roadmap: environment-variable-first deployment
 
 The Controller reads its configuration only from `NEST_*` environment variables.
-The deployment mostly follows that. These are the remaining gaps, most important first.
+Every credential and generated file can now come from the environment too
+(`compose.dokploy.yaml`, [Deploy on Dokploy from environment variables](dokploy)).
+These are the remaining gaps, most important first.
 
 ### Expose the hardcoded Slurm defaults (done)
 
@@ -76,8 +79,8 @@ builds receive no `--time` and keep the limit in `scripts/environment-smoke.sbat
 
 ### Keep the Controller definitions from drifting
 
-The Controller service is defined three times: in `compose.yaml`,
-`compose-nop.yaml`, and `compose.tailscale-shared.yaml`.
+The Controller service is defined four times: in `compose.yaml`,
+`compose-nop.yaml`, `compose.tailscale-shared.yaml` and `compose.dokploy.yaml`.
 `compose.tailscale.yaml` extends `compose.yaml`. The shared file is self-contained
 because Dokploy rewrites YAML before Compose sees it. Each file passes an explicit
 allowlist of `NEST_*` variables, so a new setting must be added to all of them.

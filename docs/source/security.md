@@ -113,25 +113,34 @@ be refused; that is never the check. None of these interfaces exists yet.
 ## Deployment credentials
 
 Keep SSH keys, `known_hosts`, and the Tailscale Auth Key in the ignored `ssh/` and
-`secrets/` directories or Dokploy File Mounts, never in Git, `.env`, or Compose
-YAML. Keep `StrictHostKeyChecking yes` with a verified `known_hosts`; never use
+`secrets/` directories, Dokploy File Mounts, or the deployment platform's
+environment settings ([Deploy on Dokploy from environment variables](dokploy)),
+never in Git, a committed `.env`, or Compose YAML. Keep `StrictHostKeyChecking yes` with a verified `known_hosts`; never use
 `accept-new`, `no`, or `/dev/null` to work around a host-key error. The test suite
 fails if a tracked file contains a private key or token, or weakens host-key
 verification. See [Deployment validation and roadmap](deployment-architecture).
 
-Mode B (managed SSH, see [configuration](configuration)) can take the key from
-`NEST_SSH_PRIVATE_KEY` for platforms without file mounts. Set it from the
-platform's secret store or the deploying shell, never in `.env` or Git. The
-Controller writes it to a private temporary file, never logs it, and masks it
-in its own log output. It remains visible to anyone who can inspect the
-container's environment, so prefer `NEST_SSH_IDENTITY_FILE` where a secret
-file mount is available. Mode B always uses `StrictHostKeyChecking=yes` and
-ignores every SSH configuration file.
+Every credential can also be given directly in the environment
+([Credential sources](configuration#credential-sources)): the database password,
+the Google client secret, the SMTP password, gRPC and database TLS keys, SSH keys,
+`known_hosts`, Mode A SSH configuration, and in `compose.dokploy.yaml` the
+Tailscale Auth Key. Set them from the platform's secret store or environment
+panel, never in Git. Nest never logs them, masks them in its own log output,
+and keeps them out of SSH, `scp` and local worker processes, so user code, Slurm
+jobs and login nodes never receive them. Files that OpenSSH or libpq need are
+generated in private tmpfs directories (`0700`, files `0600`) with literal writes
+that never replace an existing file. Direct values remain visible through
+`docker inspect`, `/proc/<pid>/environ` and the platform's stored settings to
+anyone with that access, so prefer the `*_FILE` forms where a secret-file mount is
+available; see [Security trade-offs](dokploy#security-trade-offs). Mode B always
+uses `StrictHostKeyChecking=yes` and ignores every SSH configuration file. Inline
+Mode A SSH configuration that weakens host-key checking is refused.
 
 The Controller database (see [Store Controller records in PostgreSQL](database))
 holds job metadata, not payloads or credentials. Connect to it with
-`NEST_DATABASE_SSLMODE=verify-full` and a CA file, keep its password in
-`NEST_DATABASE_PASSWORD_FILE` rather than the URL, and store backups encrypted.
+`NEST_DATABASE_SSLMODE=verify-full` and a CA, keep its password in
+`NEST_DATABASE_PASSWORD_FILE` or `NEST_DATABASE_PASSWORD` rather than the URL, and
+store backups encrypted.
 Nest redacts the URL's password and query string in every error and log line.
 The optional `local-db` Compose profile reads a generated password from a file
 and publishes PostgreSQL on `127.0.0.1` only, with no setting to change the

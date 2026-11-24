@@ -1,4 +1,3 @@
-import os
 import subprocess
 import sys
 import tempfile
@@ -10,6 +9,7 @@ from typing import Any
 import cloudpickle
 
 from ._logging import current_request_id, get_logger
+from .config import child_environ
 
 logger = get_logger(__name__)
 
@@ -45,7 +45,8 @@ def execute(func: Callable, *args: Any, **kwargs: Any) -> Any:
         # Execute in another Python process
         started = time.monotonic()
         logger.info("Local worker starting job_dir=%s", tmpdir)
-        env = os.environ.copy()
+        # User code runs in this process: it never inherits Controller credentials.
+        env = child_environ()
         env["NEST_REQUEST_ID"] = current_request_id()
         try:
             subprocess.run(

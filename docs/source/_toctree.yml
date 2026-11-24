@@ -21,6 +21,8 @@ guide:
         title: Deploy with Docker Compose
       - local: tailscale-shared
         title: Share a Controller over Tailscale
+      - local: dokploy
+        title: Deploy on Dokploy from environment variables
       - local: deploy
         title: Deploy a Slurm Controller
       - local: local-controller

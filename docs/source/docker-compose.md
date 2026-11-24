@@ -409,7 +409,11 @@ connection; the sidecar does not publish gRPC into your personal Tailnet.
 
 ### Dokploy
 
-Use the existing repository deployment with **Compose Type: Docker Compose**
+To configure everything from Dokploy's Environment panel without File Mounts, use
+`compose.dokploy.yaml` instead; see
+[Deploy on Dokploy from environment variables](dokploy).
+
+For the file-based outbound sidecar, use the existing repository deployment with **Compose Type: Docker Compose**
 (not Docker Stack) and set **Compose Path: `./compose.tailscale.yaml`**. The
 inherited `compose.yaml` must remain in the checkout. No custom deployment
 command or replacement Dockerfile is required.
