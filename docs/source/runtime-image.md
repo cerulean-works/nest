@@ -2,7 +2,8 @@
 
 This page is for hosts who operate a Nest Controller. It covers the Apptainer
 image at `images/uv-python314.sif` in the [HPC work directory](deploy#hpc-work-directory):
-what it contains, how to build and verify it, and how to replace it safely.
+what it contains, where CI publishes it, how to build and verify it, and how to
+replace it safely.
 
 ## What the image contains
 
@@ -26,6 +27,171 @@ soon as `uv.lock` pins a Git source, such as
 `six @ git+https://github.com/benjaminp/six@<commit>`. uv then reports
 `Git executable not found`. The build script now detects this case before
 running uv; see [Diagnostics](#diagnostics).
+
+## Published images
+
+The `HPC runtime image` workflow (`.github/workflows/hpc-runtime-image.yml`) builds
+the `hpc-runtime` target for `linux/amd64` once per run, smoke-tests that exact
+image, and records its build manifest. What it does depends on the event:
+
+| Event | Builds and tests | Publishes | Credentials |
+| --- | --- | --- | --- |
+| Pull request, including forks | Yes | No | Read-only `contents` token, no secrets |
+| Manual run (`workflow_dispatch`) | Yes | No | Read-only `contents` token, no secrets |
+| Push to `main` (a merged, reviewed change) | Yes | `sha-<commit>` and `main` | `packages: write`, `id-token: write` and `attestations: write`, only in the publish job, which runs no build |
+| Push of a `v*` tag | No | `<tag>`, pointing at the digest `main` already published for that commit | `packages: write`, only in the promote job |
+
+Images are published to `ghcr.io/cerulean-works/nest-hpc-runtime`:
+
+- **`sha-<40-character commit>`** is immutable: once pushed it is never repointed.
+  A rerun that finds it at the same digest does nothing; one that finds a different
+  digest fails, because a rebuild of the same commit is not bit-identical.
+- **`v<version>`** is immutable and never rebuilt. The promote job checks that the
+  tagged commit is on `main`, that its `sha-` tag exists, and that the digest has
+  provenance from this workflow on `refs/heads/main`, then adds the tag.
+- **`main`** is a convenience tag. It moves only to a digest that already has a
+  `sha-` tag, and only when the run's commit is still the tip of `main`.
+
+Deploy by digest (`@sha256:…`), not by tag. A tag tells you where to look; the
+digest is what you verify, pull and record.
+
+The first push to `main` after this workflow lands creates the package. A
+package created by a workflow is private unless the organization's settings say
+otherwise, and its visibility, linked repository and access are organization
+decisions that CI never changes. The publish job reports the package's actual
+visibility and linked repository in its run summary. Until an organization owner
+has reviewed that, treat the namespace and visibility as unverified.
+
+### What a run records
+
+The build job writes `hpc-runtime.manifest.json` (artifact `hpc-runtime-manifest`,
+kept 30 days) and the same fields to the run summary. It is produced by
+`scripts/runtime_image_manifest.py` from the tested OCI archive:
+
+| Field | Meaning |
+| --- | --- |
+| `digest` | The OCI image index digest that is published and pulled |
+| `platform`, `platform_manifest` | `linux/amd64` and its per-platform manifest digest |
+| `source.commit`, `source.run` | The commit (also the `org.opencontainers.image.revision` label) and the workflow run |
+| `base_images` | The digests `python:3.14-slim-bookworm` and `ghcr.io/astral-sh/uv:0.13.1` were pinned to for this build |
+| `tools`, `debian_packages` | Python, uv, Git and OpenSSH versions and the Debian package versions, read from inside the image |
+| `compatibility` | The Nest version and the SHA-256 of `Dockerfile`, `worker.sbatch`, `environment-smoke.sbatch` and `apptainer-smoke.sbatch` at that commit |
+| `attestations` | Whether the image carries an SBOM (SPDX) and SLSA provenance; the build fails without both |
+
+The image is tested with, and compatible with, the Controller and the batch
+scripts from the same commit. A later Controller is compatible as long as
+`Dockerfile`, `worker.sbatch` and `environment-smoke.sbatch` keep the same
+requirements; compare `compatibility.files_sha256` when in doubt, and use the
+image from the commit you deploy when they differ.
+
+On `main`, the OCI archive itself is also kept for 30 days as the
+`hpc-runtime-oci` artifact of the run, for the
+[archive alternative](#pull-from-an-approved-archive).
+
+### Verify a published image
+
+Before deploying a digest, check where it came from. With the GitHub CLI and
+access to the package:
+
+```bash
+digest=sha256:<digest from the run summary or manifest>
+gh attestation verify oci://ghcr.io/cerulean-works/nest-hpc-runtime@$digest \
+  --repo cerulean-works/nest \
+  --signer-workflow cerulean-works/nest/.github/workflows/hpc-runtime-image.yml \
+  --source-ref refs/heads/main
+docker buildx imagetools inspect ghcr.io/cerulean-works/nest-hpc-runtime@$digest \
+  --format '{{json .Provenance}}' > provenance.json
+docker buildx imagetools inspect ghcr.io/cerulean-works/nest-hpc-runtime@$digest \
+  --format '{{json .SBOM}}' > sbom.json
+```
+
+The release and provenance policy is:
+
+1. Deploy only digests that `gh attestation verify` accepts with the signer
+   workflow above and `--source-ref refs/heads/main`. Pull request builds are
+   never published, so a digest without that provenance did not come from here.
+2. The digest's `org.opencontainers.image.revision` label, the `sha-` tag and the
+   manifest's `source.commit` must name the same commit, and that commit must be
+   the Controller commit you deploy or one whose `compatibility` hashes match it.
+3. A release tag must resolve to the same digest as `sha-<its commit>`. If it does
+   not, stop and report it; do not deploy either.
+4. Never deploy by `main` alone. Resolve it to a digest, verify the digest, and
+   record the digest.
+5. Published tags are never deleted or overwritten by CI. Removing a bad image
+   is a deliberate, reviewed action by a package administrator.
+
+### Pull by digest on the login node
+
+Where site policy allows the login node to reach `ghcr.io`, Apptainer can build a
+SIF directly from the registry image, without Docker, root or `--fakeroot`.
+Build it into a temporary directory and move only the finished file into place:
+
+```bash
+cd <workdir>/images
+digest=sha256:<verified digest>
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/nest-runtime.XXXXXX")
+APPTAINER_CACHEDIR="$tmp/cache" APPTAINER_TMPDIR="$tmp" \
+  apptainer pull "$tmp/uv-python314.sif" \
+  "docker://ghcr.io/cerulean-works/nest-hpc-runtime@$digest"
+mv "$tmp/uv-python314.sif" uv-python314.sif.new
+rm -rf "$tmp"
+sha256sum uv-python314.sif.new
+```
+
+The node-local temporary directory avoids file systems that cannot hold
+Apptainer's build files, and a private cache keeps the pull from reusing or
+leaving layers in a shared one. Then [verify](#verify-the-new-image-before-rollout)
+and [roll out](#roll-out-without-disrupting-jobs) `uv-python314.sif.new` as for a
+locally built image.
+
+If the package is private, the pull needs a read-only registry credential
+(`apptainer registry login docker://ghcr.io` with a token limited to
+`read:packages`). Keep it in the operator's own Apptainer configuration, never in
+the work directory, a batch script, a Project or a log. If a credential on the
+login node is not acceptable, use an archive instead.
+
+### Pull from an approved archive
+
+Where the login node cannot or may not reach `ghcr.io`, transfer an archive.
+On a workstation with skopeo:
+
+```bash
+digest=sha256:<verified digest>
+skopeo copy --override-os linux --override-arch amd64 \
+  "docker://ghcr.io/cerulean-works/nest-hpc-runtime@$digest" \
+  docker-archive:nest-hpc-runtime.docker.tar:nest-hpc-runtime:candidate
+sha256sum nest-hpc-runtime.docker.tar
+scp nest-hpc-runtime.docker.tar <login-node>:<workdir>/images/
+```
+
+On the login node, convert it as for a [locally built image](#build-the-image):
+`apptainer build uv-python314.sif.new docker-archive://nest-hpc-runtime.docker.tar`.
+Record the archive's SHA-256 next to the digest so the transfer can be checked.
+The run's `hpc-runtime-oci` artifact is an alternative source of the same image;
+check that `tar -xOf hpc-runtime.oci.tar index.json` names the verified digest.
+Use whichever transfer path the site has approved.
+
+### Record the deployment
+
+The OCI digest and the SIF's SHA-256 are different values and identify
+different things: the digest names the registry image; the SIF's SHA-256 names
+the converted file on the cluster and is the image half of every environment's
+runtime ID. Converting the same digest twice can yield different SIF hashes.
+Record both:
+
+| Field | Example source |
+| --- | --- |
+| OCI digest | Run summary, `hpc-runtime.manifest.json` `digest` |
+| Source commit | Manifest `source.commit`, image label |
+| Provenance check | Output of `gh attestation verify` |
+| Archive SHA-256 (if used) | `sha256sum` of the transferred archive |
+| SIF SHA-256 | `sha256sum images/uv-python314.sif.new`, and the `apptainer-smoke.sbatch` output |
+| Compute-node smoke | Job ID and result of `apptainer-smoke.sbatch` |
+| Activated / previous | Date of the rename, SHA-256 of `uv-python314.sif.previous` |
+
+No published image has been validated on real compute nodes yet. That
+validation, and the first publication's package visibility, stay pending until an
+operator records the evidence above; CI exercises the image in Docker only.
 
 ## Build the image
 
@@ -97,7 +263,7 @@ runtime directories are left in place.
    with `Environment is not ready`; its caller can retry.
 2. Keep the current image for rollback, then swap the new one in with a rename on
    the same file system. Never copy over the deployed file in place; a rename
-   leaves running containers on the old file.
+   is atomic for new jobs and leaves running containers on the old file.
 
    ```bash
    cd <workdir>/images
@@ -167,6 +333,23 @@ marked ready after a failed build. A partial `.venv` is removed.
 uv and Git output is filtered before it reaches the log: credentials embedded in
 URLs (`https://user:secret@host`) and GitHub tokens are replaced with `***`.
 
+### Publication and pull failures
+
+| Message | Cause | Fix |
+| --- | --- | --- |
+| `no linux/amd64 image (found: …)` | The archive was built for another platform | Build with `--platform linux/amd64`, matching the compute nodes |
+| `label org.opencontainers.image.revision is …, expected …` | The image was not built from the run's commit | Rebuild from a clean checkout; never publish it |
+| `no sbom or provenance attestation` | The builder could not attach attestations (for example the plain `docker` driver without the containerd image store) | Use a `docker-container` Buildx builder, as the workflow does |
+| `tool check failed (exit …)` | Python, uv, Git, OpenSSH or the CA bundle is missing in the image | Fix the `hpc-runtime` target; the smoke test shows which tool |
+| `Archive digest … differs from the build's …` | The archive on disk is not the one Buildx produced | Rerun the job; do not publish the archive |
+| `immutable tag … already resolves to …` | A `sha-` or release tag already points at another digest, usually from a rebuild of the same commit | Leave the published tag; if it must change, a package administrator removes it after review |
+| `is …, expected the reviewed digest …` | The image being tagged is not the tested or verified one | Stop; find which run produced each digest |
+| `could not inspect …` with `denied` or `unauthorized` | The registry login failed or the token lacks package access; on a first publication, the organization may not allow workflows to create packages | Check the package's Actions access, or ask an organization owner |
+| `No published …:sha-<commit>` in the promote job | The tag was pushed before `main` published that commit | Wait for the `main` run, then rerun the promote job |
+| `gh attestation verify` fails | The digest has no provenance from this workflow on `main` | Do not deploy it |
+| `apptainer pull` fails with `unauthorized` | The package is private | Use a read-only credential or the archive path |
+| `apptainer pull` fails with a connection or TLS error | The login node cannot reach `ghcr.io` | Use the archive path; do not weaken TLS verification |
+
 ### Updated Controller, old image
 
 Deploying a new Controller, or new `scripts/*.sbatch` in the work directory, does
@@ -194,9 +377,10 @@ Fix it with a new image, never by installing Git on the host or at job time:
 1. Build the canonical image from the commit you deploy
    ([Build the image](#build-the-image)): `docker build --target hpc-runtime`
    through `scripts/build-runtime-image.sh`, converted to SIF. This is the
-   reproducible path and the one to record in deployment notes. Nest does not yet
-   publish this image to a registry (GHCR publication is planned, E03a); build it
-   yourself.
+   reproducible path and the one to record in deployment notes. CI also
+   [publishes](#published-images) this image from `main`; a verified published
+   digest, pulled [by digest](#pull-by-digest-on-the-login-node) or from an
+   [approved archive](#pull-from-an-approved-archive), is equivalent.
 2. Verify it under a temporary name: `git`, `uv` and `python` inside the image on
    the login node, then `apptainer-smoke.sbatch` on a compute node
    ([Verify](#verify-the-new-image-before-rollout)).
@@ -258,7 +442,7 @@ Recorded against `main` at `39635e4` for issue #62.
 | Image without Git is diagnosed | `EXPECT=no-git bash tests/hpc_runtime_flow.sh` in that image exited 3 with the Git diagnostic; no runtime was marked ready | Local Docker |
 | Build and worker scripts with real uv and Git | `tests/hpc_runtime_flow.sh` passed with uv 0.13.1, Git 2.43.0 and CPython 3.14.8, using the `apptainer exec` emulator: cold build from empty caches installed `iniconfig==2.1.0` and `six==1.17.0` from commit `ebd9b3af…`; `worker.sbatch` imported both in the user environment; a no-project call returned its result; a second build hit the cache; a changed image rebuilt under a new runtime ID and left the old one ready; an unreachable Git source failed with the hint, no credentials in the log, and no ready runtime | Local host, not the image |
 | Fake-cluster regressions | `tests/test_runtime_e2e.py`: credential-isolated Git environment, missing-Git diagnostic, PyPI-only builds without Git, sanitized failure output, image change invalidation | `pytest`, every pull request |
-| `hpc-runtime` image build and in-image flow | `tests/smoke_hpc_runtime.sh` | CI (`Controller container` workflow); the local sandbox could not reach Debian mirrors |
+| `hpc-runtime` image build and in-image flow | `tests/smoke_hpc_runtime.sh` | CI (originally the `Controller container` workflow, now `HPC runtime image`); the local sandbox could not reach Debian mirrors |
 
 The local base image digest was
 `python@sha256:b3239c3decf32ac32957604130bb546bcd5a4c8952070ed02ebfa2dd5cc1114b`

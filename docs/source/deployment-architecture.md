@@ -139,9 +139,14 @@ all; give it a `--host` mode that runs only the SSH checks.
 
 ### Publish versioned images
 
-Each host builds the image from its checkout. `NEST_CONTROLLER_IMAGE` already
-allows a prebuilt image. Publishing tagged images to GHCR and pinning by digest
-would make deployments reproducible and remove the build from the host.
+Each host builds the Controller image from its checkout. `NEST_CONTROLLER_IMAGE`
+already allows a prebuilt image. Publishing tagged images to GHCR and pinning by
+digest would make deployments reproducible and remove the build from the host.
+
+The HPC runtime image already follows this model: CI publishes it from `main` to
+`ghcr.io/cerulean-works/nest-hpc-runtime` with immutable commit tags, an SBOM and
+provenance; see [Published images](runtime-image#published-images). Staging and
+activating it on a cluster remain operator steps.
 
 ### Authenticate callers (done)
 

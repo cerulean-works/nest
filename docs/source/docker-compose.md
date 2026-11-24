@@ -454,7 +454,9 @@ project name. Do not run `up` manually alongside a Dokploy-managed stack.
 
 The `Controller container` workflow builds the image, runs Controller integration
 tests inside it, and checks a complete Compose deployment on pull requests and
-pushes to `main`. Run the same checks locally with:
+pushes to `main`. The HPC runtime image is tested separately by the
+`HPC runtime image` workflow; see [Published images](runtime-image#published-images).
+Run the same checks locally with:
 
 ```bash
 docker build -t nest-controller:test .

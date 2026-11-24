@@ -9,42 +9,73 @@ on:
 permissions:
   contents: read
 
+# A new commit on a pull request cancels that pull request's superseded run. Pushes to
+# main and manual runs get a group of their own (the run ID), so they are never cancelled.
 concurrency:
-  group: controller-container-${{ github.ref }}
-  cancel-in-progress: true
+  group: controller-container-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  test:
+  # The smoke groups are independent, so each runs on its own runner with its own
+  # image build (about 10 seconds); separate runners also keep their Compose projects,
+  # ports, networks and volumes apart. Groups are balanced by measured duration.
+  smoke:
+    name: smoke (${{ matrix.group }})
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: controller
+            title: Validate Compose files; test Controller RPCs and Compose SSH credentials
+            script: |
+              docker compose -f compose.tailscale.yaml config --quiet
+              docker compose -f compose.tailscale-shared.yaml config --quiet
+              NEST_TAILSCALE_AUTHKEY= docker compose -f compose.dokploy.yaml config --quiet
+              python tests/check_shared_compose.py
+              docker run --rm --volume "$PWD/tests:/tests:ro" \
+                --volume "$PWD/docker:/docker:ro" \
+                --volume "$PWD/scripts:/scripts:ro" \
+                --entrypoint python nest-controller:test \
+                -m unittest discover -s /tests -v
+              bash tests/smoke_compose.sh
+              # The HPC runtime image is built and smoke-tested once, as the exact
+              # image it publishes, in hpc-runtime-image.yml.
+          - group: postgres
+            title: Test Compose default and local-db PostgreSQL deployments, persistence, and backups
+            script: bash tests/smoke_compose_postgres.sh
+          - group: env-only
+            title: Test the environment-only (Dokploy) deployment without mounted credentials
+            script: bash tests/smoke_compose_env.sh
+          - group: postgres-upgrade
+            title: Test the documented PostgreSQL 17 to 18 upgrade and rollback
+            script: bash tests/smoke_compose_postgres_upgrade.sh
+          - group: tailnet-ssh
+            title: Test Controller-to-Login-Node SSH through the Tailnet proxy path
+            script: bash tests/smoke_tailnet_ssh.sh
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Validate the optional Tailnet and Dokploy Compose configurations
-        run: |
-          docker compose -f compose.tailscale.yaml config --quiet
-          docker compose -f compose.tailscale-shared.yaml config --quiet
-          NEST_TAILSCALE_AUTHKEY= docker compose -f compose.dokploy.yaml config --quiet
-          python tests/check_shared_compose.py
       - name: Build the Controller image with Compose
         env:
           NEST_CONTROLLER_IMAGE: nest-controller:test
         run: docker compose build --pull controller
-      - name: Test Controller RPCs, shutdown, and SSH proxy
+      - name: ${{ matrix.title }}
         run: |
-          docker run --rm --volume "$PWD/tests:/tests:ro" \
-            --volume "$PWD/docker:/docker:ro" \
-            --volume "$PWD/scripts:/scripts:ro" \
-            --entrypoint python nest-controller:test \
-            -m unittest discover -s /tests -v
-      - name: Test Compose deployment and SSH credentials
-        run: bash tests/smoke_compose.sh
-      - name: Test Compose default and local-db PostgreSQL deployments, persistence, and backups
-        run: bash tests/smoke_compose_postgres.sh
-      - name: Test the environment-only (Dokploy) deployment without mounted credentials
-        run: bash tests/smoke_compose_env.sh
-      - name: Test the documented PostgreSQL 17 to 18 upgrade and rollback
-        run: bash tests/smoke_compose_postgres_upgrade.sh
-      - name: Test Controller-to-Login-Node SSH through the Tailnet proxy path
-        run: bash tests/smoke_tailnet_ssh.sh
-      - name: Test the HPC runtime image with a Git-based uv dependency
-        run: bash tests/smoke_hpc_runtime.sh
+          set -euo pipefail
+          ${{ matrix.script }}
+
+  # Keeps the single `test` check this workflow always reported. It fails unless every
+  # smoke group succeeded, including when a group failed, was cancelled or never ran.
+  test:
+    if: always()
+    needs: smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every smoke group to pass
+        env:
+          RESULT: ${{ needs.smoke.result }}
+        run: |
+          echo "smoke groups: $RESULT"
+          test "$RESULT" = success

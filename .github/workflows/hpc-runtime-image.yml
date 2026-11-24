@@ -1,0 +1,301 @@
+name: HPC runtime image
+
+# Builds the Dockerfile's `hpc-runtime` target for linux/amd64 once, smoke-tests
+# that exact image, and records its OCI digest and build manifest. Only pushes to
+# `main` publish it to GHCR, and release tags only re-tag a digest `main` already
+# published. Pull requests build and test with a read-only token and no secrets.
+# See docs/source/runtime-image.md.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions: {}
+
+# Superseded pull request runs are cancelled. Every push gets its own run, so each
+# main commit publishes its own immutable tag; see "Move the main convenience tag".
+concurrency:
+  group: >-
+    hpc-runtime-image-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/cerulean-works/nest-hpc-runtime
+  PLATFORM: linux/amd64
+
+jobs:
+  build:
+    name: Build and smoke-test the HPC runtime image
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      digest: ${{ steps.manifest.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install skopeo
+        run: command -v skopeo || { sudo apt-get update && sudo apt-get install -y skopeo; }
+
+      - name: Pin base images to their current digests
+        run: |
+          # Every external image the Dockerfile names (FROM and COPY --from) is
+          # resolved once and passed as a digest-pinned build context, so the
+          # manifest records exactly what was built on.
+          mkdir -p "$RUNNER_TEMP/runtime"
+          : > "$RUNNER_TEMP/runtime/contexts"
+          : > "$RUNNER_TEMP/runtime/bases"
+          grep -oE '^FROM [^ ]+|--from=[^ ]+' Dockerfile |
+            sed -E 's/^FROM //; s/^--from=//' | grep -E '[:/]' | sort -u |
+            while read -r ref; do
+              digest=$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}')
+              echo "$ref -> $digest"
+              echo "--build-context=$ref=docker-image://$ref@$digest" >> "$RUNNER_TEMP/runtime/contexts"
+              echo "--base=$ref@$digest" >> "$RUNNER_TEMP/runtime/bases"
+            done
+
+      - name: Build the image as an OCI archive with SBOM and provenance
+        run: |
+          docker buildx create --name nest-runtime --driver docker-container --use
+          mapfile -t contexts < "$RUNNER_TEMP/runtime/contexts"
+          docker buildx build \
+            --platform "$PLATFORM" \
+            --target hpc-runtime \
+            "${contexts[@]}" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --provenance mode=max \
+            --sbom true \
+            --metadata-file "$RUNNER_TEMP/runtime/build-metadata.json" \
+            --output "type=oci,dest=$RUNNER_TEMP/runtime/hpc-runtime.oci.tar" \
+            .
+
+      - name: Load the built archive into Docker
+        run: |
+          skopeo copy --override-os linux --override-arch amd64 \
+            "oci-archive:$RUNNER_TEMP/runtime/hpc-runtime.oci.tar" \
+            docker-daemon:nest-hpc-runtime:ci
+
+      - name: Test the HPC runtime image with a Git-based uv dependency
+        env:
+          NEST_HPC_RUNTIME_IMAGE: nest-hpc-runtime:ci
+          NEST_HPC_RUNTIME_PREBUILT: "1"
+        run: bash tests/smoke_hpc_runtime.sh
+
+      - name: Record the digest and build manifest
+        id: manifest
+        run: |
+          out="$RUNNER_TEMP/runtime"
+          mapfile -t bases < "$out/bases"
+          python3 scripts/runtime_image_manifest.py "$out/hpc-runtime.oci.tar" \
+            --output "$out/hpc-runtime.manifest.json" \
+            --summary "$out/summary.md" \
+            --image nest-hpc-runtime:ci \
+            --image-name "$IMAGE" \
+            --platform "$PLATFORM" \
+            --commit "$GITHUB_SHA" \
+            --ref "$GITHUB_REF" \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --require-attestations \
+            "${bases[@]}"
+          digest=$(jq -r .digest "$out/hpc-runtime.manifest.json")
+          built=$(jq -r '."containerimage.digest"' "$out/build-metadata.json")
+          if [[ "$digest" != "$built" ]]; then
+            echo "::error::Archive digest $digest differs from the build's $built"
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          cat "$out/summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the build manifest
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hpc-runtime-manifest
+          path: ${{ runner.temp }}/runtime/hpc-runtime.manifest.json
+          retention-days: 30
+
+      - name: Upload the tested OCI archive for publication
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hpc-runtime-oci
+          path: |
+            ${{ runner.temp }}/runtime/hpc-runtime.oci.tar
+            ${{ runner.temp }}/runtime/hpc-runtime.manifest.json
+          retention-days: 30
+          compression-level: 0
+
+  publish:
+    name: Publish the HPC runtime image to GHCR
+    needs: build
+    # Only reviewed code on main publishes; pull requests, forks and manual runs never do.
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      github.repository == 'cerulean-works/nest'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      DIGEST: ${{ needs.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the tested OCI archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: hpc-runtime-oci
+          path: ${{ runner.temp }}/runtime
+
+      - name: Install skopeo
+        run: command -v skopeo || { sudo apt-get update && sudo apt-get install -y skopeo; }
+
+      - name: Log in to GHCR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Check the GHCR package
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Report the package's actual namespace, visibility and linked repository.
+          # A missing package is created private by the first push; changing its
+          # visibility is an organization decision and is never done here.
+          package="/orgs/$GITHUB_REPOSITORY_OWNER/packages/container/${IMAGE##*/}"
+          if info=$(gh api "$package" --jq '"\(.visibility) \(.repository.full_name // "unlinked") \(.html_url)"' 2>"$RUNNER_TEMP/package.err"); then
+            echo "Package: $info"
+            echo "Package (visibility, repository, URL): \`$info\`" >> "$GITHUB_STEP_SUMMARY"
+          elif grep -q 'HTTP 404' "$RUNNER_TEMP/package.err"; then
+            echo "Package does not exist yet; this push creates it."
+            echo "NEST_RUNTIME_PACKAGE_ABSENT=1" >> "$GITHUB_ENV"
+            echo "Package: not found before this push (created by it)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::Could not read the package metadata: $(cat "$RUNNER_TEMP/package.err")"
+          fi
+
+      - name: Push the immutable commit tag
+        run: |
+          scripts/publish-runtime-tag.sh "oci-archive:$RUNNER_TEMP/runtime/hpc-runtime.oci.tar" \
+            "$IMAGE" "sha-$GITHUB_SHA" "$DIGEST"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ needs.build.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Move the main convenience tag
+        run: |
+          # Only the current tip of main moves `main`, so a slower older run
+          # cannot repoint it backwards. Its immutable sha- tag stays published.
+          tip=$(git ls-remote "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" refs/heads/main | cut -f1)
+          if [[ "$tip" != "$GITHUB_SHA" ]]; then
+            echo "main is now at $tip; leaving the main tag for that run."
+            exit 0
+          fi
+          scripts/publish-runtime-tag.sh --move "docker://$IMAGE@$DIGEST" "$IMAGE" main "$DIGEST"
+
+      - name: Summarize
+        run: |
+          {
+            echo "### Published"
+            echo
+            echo "- \`$IMAGE@$DIGEST\`"
+            echo "- Tags: \`sha-$GITHUB_SHA\` (immutable), \`main\` (convenience, if this is the tip)"
+            echo
+            echo "Pull by digest on the login node:"
+            echo
+            echo '```'
+            echo "apptainer pull uv-python314.sif.new docker://$IMAGE@$DIGEST"
+            echo '```'
+            echo
+            echo "Verify provenance:"
+            echo
+            echo '```'
+            echo "gh attestation verify oci://$IMAGE@$DIGEST --repo $GITHUB_REPOSITORY \\"
+            echo "  --signer-workflow $GITHUB_REPOSITORY/.github/workflows/hpc-runtime-image.yml --source-ref refs/heads/main"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io
+
+  promote:
+    name: Promote a release tag to its published digest
+    # A release tag never rebuilds: it re-tags the digest main published for the
+    # same commit, after checking the commit is on main and the digest's provenance.
+    if: >-
+      github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') &&
+      github.repository == 'cerulean-works/nest'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+      attestations: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check the tagged commit is on main
+        id: commit
+        run: |
+          commit=$(git rev-parse "$GITHUB_REF^{commit}")
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$commit" FETCH_HEAD; then
+            echo "::error::$GITHUB_REF_NAME ($commit) is not on main; only reviewed main commits are released."
+            exit 1
+          fi
+          echo "sha=$commit" >> "$GITHUB_OUTPUT"
+
+      - name: Install skopeo
+        run: command -v skopeo || { sudo apt-get update && sudo apt-get install -y skopeo; }
+
+      - name: Log in to GHCR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Resolve and verify the published digest
+        id: digest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMIT: ${{ steps.commit.outputs.sha }}
+        run: |
+          if ! raw=$(skopeo inspect --raw "docker://$IMAGE:sha-$COMMIT"); then
+            echo "::error::No published $IMAGE:sha-$COMMIT. Wait for the main run of $COMMIT to publish it, then re-run this job."
+            exit 1
+          fi
+          digest="sha256:$(printf '%s' "$raw" | sha256sum | cut -d' ' -f1)"
+          gh attestation verify "oci://$IMAGE@$digest" --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/hpc-runtime-image.yml" \
+            --source-ref refs/heads/main
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Push the immutable release tag
+        env:
+          DIGEST: ${{ steps.digest.outputs.digest }}
+        run: |
+          scripts/publish-runtime-tag.sh "docker://$IMAGE@$DIGEST" "$IMAGE" "$GITHUB_REF_NAME" "$DIGEST"
+          echo "Released \`$IMAGE:$GITHUB_REF_NAME\` -> \`$IMAGE@$DIGEST\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io
