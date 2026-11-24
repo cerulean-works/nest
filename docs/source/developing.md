@@ -64,6 +64,56 @@ uv run playwright install chromium
 uv run pytest tests/test_cli_login_browser.py
 ```
 
+### Run the tests in parallel
+
+The development dependencies include `pytest-xdist`. Without options pytest runs the
+suite serially; `--numprocesses` (`-n`) spreads tests over worker processes:
+
+```bash
+uv run pytest                          # serial
+uv run pytest --numprocesses 8         # 8 workers, as in CI
+uv run pytest --numprocesses 8 --cov=src/nest --durations 20
+```
+
+Coverage from every worker is combined into one report. The suite is worker-safe:
+each PostgreSQL test creates its own randomly named database (and any login role it
+needs), servers listen on free ports, and temporary files go to per-test directories.
+Checks that read server-wide views, such as `pg_locks`, filter to the test's own
+database (`ADVISORY_LOCK_COUNT` in `tests/postgres_fixture.py`), so other workers'
+databases never leak in. Keep new tests that way; a test that genuinely cannot share
+the server belongs in its own group rather than behind retries or longer timeouts.
+
+Most tests wait on subprocesses, servers and PostgreSQL rather than the CPU, so more
+workers than cores still help. Measured on a 4-vCPU machine, the same commit and test
+set (852 tests) with coverage:
+
+| Workers | Wall time |
+| ------- | --------- |
+| serial  | 409 s     |
+| 2       | 226 s     |
+| 4       | 136 s     |
+| 6       | 96 s      |
+| 8       | 88 s      |
+| 12      | 84 s      |
+
+CI uses eight workers: beyond that, wall time stops improving.
+
+### CI topology
+
+Each pull request runs three workflows concurrently. A new commit cancels the pull
+request's superseded runs; runs for pushes to `main`, tags and manual dispatches are
+never cancelled.
+
+- **Tests** (`test (3.14)`): one job with PostgreSQL 17, a TLS PostgreSQL, the
+  PostgreSQL 17 client tools and Chromium, running the full suite with coverage on
+  eight workers.
+- **Code Quality**: ruff lint, ruff format and ty.
+- **Controller container**: five parallel `smoke (...)` jobs, each on its own
+  runner with its own Controller image build: `controller` (Compose file validation,
+  the in-image unittest suite, `smoke_compose.sh`, `smoke_hpc_runtime.sh`),
+  `postgres`, `env-only`, `postgres-upgrade` and `tailnet-ssh`. The `test` job keeps
+  the workflow's single check and fails unless every smoke job succeeded.
+
 To build and test the Compose deployment, with Docker Engine running:
 
 ```bash

@@ -23,6 +23,7 @@ import grpc
 import psycopg
 from postgres_fixture import (
     ADMIN_URL,
+    ADVISORY_LOCK_COUNT,
     PG_BIN,
     REQUIRED,
     TLS_CA_FILE,
@@ -472,9 +473,7 @@ class MigrationTests(PostgresTestCase):
         self.assertEqual(sorted(status.applied), [1])
         self.assertEqual([m.version for m in status.pending], [2])
         # The lock was released, so a fixed chain can be applied.
-        lock = self.conn.execute(
-            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'"
-        ).fetchone()
+        lock = self.conn.execute(ADVISORY_LOCK_COUNT).fetchone()
         self.assertEqual(lock, (0,))
 
     def test_concurrent_upgrades_apply_each_migration_once(self):
