@@ -336,6 +336,168 @@ def test_failed_environment_build_aborts_without_running_worker(slurm_controller
     assert _worker_jobs(hpc) == []
 
 
+# Git-based dependencies in the HPC runtime image
+
+GIT_LOCK = """\
+version = 1
+requires-python = ">=3.14"
+
+[[package]]
+name = "six"
+version = "1.17.0"
+source = { git = "https://github.com/benjaminp/six?rev=ebd9b3af#ebd9b3af90247b8858d415a05e96e9ee61e48d07" }
+"""
+
+
+def _runtimes(hpc):
+    return sorted((hpc.base / "environments").glob("*/runtimes/*"))
+
+
+def _remove_git_from_image(hpc):
+    (hpc.bin / "git").write_text("#!/bin/sh\necho 'git: not found' >&2\nexit 127\n")
+    (hpc.bin / "git").chmod(0o755)
+
+
+def test_environment_build_isolates_git_from_operator_credentials(slurm_controller, hpc, project):
+    (project / "uv.lock").write_text(GIT_LOCK)
+
+    @nest.remote(project=project)
+    def ping():
+        return "pong"
+
+    assert ping.remote() == "pong"
+    [sync] = [c for c in hpc.calls("uv") if c["argv"][0] == "sync"]
+    env = sync["env"]
+    [runtime] = _runtimes(hpc)
+    # An empty per-build home hides ~/.netrc, ~/.gitconfig and stored credentials.
+    assert env["HOME"] == str(runtime / ".build-home")
+    assert not (runtime / ".build-home").exists()
+    # uv keeps its usual cache and Python installations under the real home.
+    assert env["UV_CACHE_DIR"].endswith("/.cache/uv")
+    assert not env["UV_CACHE_DIR"].startswith(str(runtime))
+    assert env["GIT_CONFIG_GLOBAL"] == "/dev/null"
+    assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+    assert "SSH_AUTH_SOCK" not in env
+    ssh = env["GIT_SSH_COMMAND"].split()
+    for option in (
+        "BatchMode=yes",
+        "StrictHostKeyChecking=yes",
+        "IdentityAgent=none",
+        "PubkeyAuthentication=no",
+        "GSSAPIAuthentication=no",
+    ):
+        assert option in ssh
+    assert ssh[1:3] == ["-F", "/dev/null"]
+
+
+def test_git_dependency_without_git_in_image_fails_with_diagnostic(slurm_controller, hpc, project):
+    (project / "uv.lock").write_text(GIT_LOCK)
+    _remove_git_from_image(hpc)
+
+    @nest.remote(project=project)
+    def ping():
+        return "pong"
+
+    with pytest.raises(grpc.RpcError) as caught:
+        ping.remote()
+    error = cast(grpc.Call, caught.value)
+    assert error.code() == grpc.StatusCode.INTERNAL
+    assert re.fullmatch(r"Environment build \d+ failed: FAILED", error.details())
+    [build] = _build_jobs(hpc)
+    output = hpc.job_output(build["job_id"])
+    assert "uv.lock pins Git dependencies, but" in output
+    assert "has no git executable" in output
+    assert "hpc-runtime target" in output
+    assert "the runtime was not marked ready" in output
+    # The build stops before uv, and nothing is marked ready or executed.
+    assert [c for c in hpc.calls("uv") if c["argv"][0] == "sync"] == []
+    assert not list((hpc.base / "environments").glob("*/runtimes/*/.ready"))
+    assert _worker_jobs(hpc) == []
+
+
+def test_pypi_only_environment_does_not_need_git(slurm_controller, hpc, project):
+    _remove_git_from_image(hpc)
+
+    @nest.remote(project=project)
+    def ping():
+        return "pong"
+
+    assert ping.remote() == "pong"
+    assert "Environment ready" in hpc.job_output(_build_jobs(hpc)[0]["job_id"])
+
+
+def test_failed_git_build_is_sanitized_and_not_ready(slurm_controller, hpc, project):
+    (project / "uv.lock").write_text(GIT_LOCK)
+    (hpc.bin / "uv").write_text(
+        "#!/bin/sh\n"
+        'mkdir -p "$UV_PROJECT_ENVIRONMENT/lib"\n'
+        "echo \"fatal: unable to access 'https://nest:hunter2@git.example/six/'\" >&2\n"
+        "echo 'token ghp_abcdefghijklmnop0123456789 rejected' >&2\n"
+        "exit 1\n"
+    )
+
+    @nest.remote(project=project)
+    def ping():
+        return "pong"
+
+    with pytest.raises(grpc.RpcError) as caught:
+        ping.remote()
+    assert "hunter2" not in cast(grpc.Call, caught.value).details()
+    output = hpc.job_output(_build_jobs(hpc)[0]["job_id"])
+    assert "hunter2" not in output
+    assert "abcdefghijklmnop" not in output
+    assert "https://***@git.example/six/" in output
+    assert "uv sync failed with exit status 1" in output
+    assert "Compute nodes must reach each Git host" in output
+    assert "private" in output
+    # A partial environment is removed and never marked ready.
+    [runtime] = _runtimes(hpc)
+    assert not (runtime / ".ready").exists()
+    assert not (runtime / ".venv").exists()
+    assert not (runtime / ".build-home").exists()
+    assert _worker_jobs(hpc) == []
+
+
+def test_failed_pypi_build_has_no_git_hint(slurm_controller, hpc, project):
+    (hpc.bin / "uv").write_text("#!/bin/sh\necho 'resolution failed' >&2\nexit 2\n")
+
+    @nest.remote(project=project)
+    def ping():
+        return "pong"
+
+    with pytest.raises(grpc.RpcError):
+        ping.remote()
+    output = hpc.job_output(_build_jobs(hpc)[0]["job_id"])
+    assert "uv sync failed with exit status 2" in output
+    assert "Git" not in output
+
+
+def test_changed_image_invalidates_runtime_cache(slurm_controller, hpc, project):
+    @nest.remote(project=project)
+    def where():
+        import sys
+
+        return sys.prefix
+
+    first = where.remote()
+    hpc.image.write_bytes(b"rebuilt apptainer image with git")
+    second = where.remote()
+
+    # Same dependency files, new runtime: rebuilt beside the old one, not over it.
+    builds = _build_jobs(hpc)
+    assert len(builds) == 2
+    assert builds[0]["args"][0] == builds[1]["args"][0]
+    assert "Environment cache miss" in hpc.job_output(builds[1]["job_id"])
+    old, new = Path(first).parent, Path(second).parent
+    assert old != new and old.parent == new.parent
+    assert (old / ".ready").exists() and (new / ".ready").exists()
+
+    # The new image is then a cache hit.
+    assert where.remote() == second
+    assert len(_build_jobs(hpc)) == 2
+
+
 # Controller-owned SSH backward compatibility
 
 

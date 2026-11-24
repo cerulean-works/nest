@@ -6,6 +6,24 @@ COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY src/ ./src/
 RUN uv sync --locked --no-dev --no-editable --compile-bytecode
 
+# HPC runtime image, converted to `images/uv-python314.sif` on the cluster. It runs
+# `uv sync` for user environments and `uv run` for the deployed Nest runtime, so it
+# carries the same Python and uv as the Controller, plus Git (uv's Git dependency
+# sources), CA certificates (verified HTTPS) and the OpenSSH client (ssh:// Git
+# URLs). Build it with `docker build --target hpc-runtime`; see
+# docs/source/runtime-image.md. It is not the default target.
+FROM python:3.14-slim-bookworm AS hpc-runtime
+
+LABEL org.opencontainers.image.source="https://github.com/cerulean-works/nest"
+LABEL org.opencontainers.image.description="Nest HPC runtime (Python, uv and Git) for Apptainer"
+
+COPY --from=ghcr.io/astral-sh/uv:0.13.1 /uv /uvx /usr/local/bin/
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git openssh-client \
+    && rm -rf /var/lib/apt/lists/*
+
+CMD ["python"]
+
 FROM python:3.14-slim-bookworm
 
 LABEL org.opencontainers.image.source="https://github.com/cerulean-works/nest"
