@@ -196,8 +196,9 @@ uv run python main.py
   Project role and the operator's approvals, submits a Slurm job on your Project's
   Platform and Slurm account, and waits for the result.
 
-`gpu` requests GPUs per node and `cpu` CPUs per task; `0` (the default) omits the
-Slurm option. `.remote()` is synchronous: it returns the result or raises an
+`gpu` requests GPUs per node (default `0`) and `cpu` CPUs per task (default `1`).
+Setting either to `0` omits its Slurm option, so the worker script's own setting
+applies. `.remote()` is synchronous: it returns the result or raises an
 error, and has a 900-second deadline (`NEST_RPC_TIMEOUT`).
 
 If the call is refused, see
