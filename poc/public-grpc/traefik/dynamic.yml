@@ -1,0 +1,28 @@
+# H06 PoC: Traefik dynamic configuration (file provider). On Dokploy, the same
+# router and service go in /etc/dokploy/traefik/dynamic/, with
+# `tls: {certResolver: letsencrypt}` instead of the staging certificate below.
+http:
+  routers:
+    nest-grpc:
+      entryPoints: [websecure]
+      # Only the Nest gRPC services; everything else on this host name is 404.
+      rule: >-
+        Host(`grpc.staging.nest.invalid`) &&
+        (PathPrefix(`/nest.ExecutionService/`) || PathPrefix(`/nest.poc.TransportProbe/`))
+      service: nest-grpc
+      tls: {}
+  services:
+    nest-grpc:
+      loadBalancer:
+        # h2c: plaintext HTTP/2 on the private network to the origin.
+        servers:
+          - url: h2c://origin:50061
+
+tls:
+  certificates:
+    - certFile: /certs/server.crt
+      keyFile: /certs/server.key
+  options:
+    default:
+      minVersion: VersionTLS12
+      alpnProtocols: [h2]

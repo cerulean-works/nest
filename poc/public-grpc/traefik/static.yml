@@ -1,0 +1,34 @@
+# H06 PoC: Traefik v3 as the TLS edge (topology C). Staging only.
+#
+# Mirrors what a Dokploy-managed Traefik needs for public gRPC. The `websecure`
+# entry point changes Traefik v3's defaults, which would cut the blocking Execute:
+#   readTimeout  60s default -> 0 (unbounded). Traefik counts the whole request,
+#                including a client stream, against it.
+#   idleTimeout  180s default -> 1200s, above the SDK's 900 s Execute deadline.
+# On a shared Dokploy Traefik these are entry-point-wide settings: they apply to
+# every application on :443, which is the main operational cost of topology C.
+entryPoints:
+  websecure:
+    address: ":8443"
+    http2:
+      maxConcurrentStreams: 100
+    transport:
+      respondingTimeouts:
+        readTimeout: 0s
+        writeTimeout: 0s
+        idleTimeout: 1200s
+
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: false
+
+# Method, path, status and duration only; no headers, so no bearer token.
+accessLog:
+  fields:
+    defaultMode: keep
+    headers:
+      defaultMode: drop
+
+log:
+  level: INFO

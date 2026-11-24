@@ -1,0 +1,102 @@
+# H06 PoC: Envoy as a dedicated gRPC gateway (topology D). Staging only.
+#
+# Terminates public TLS on :8443 (published as :443 on a staging host), offers ALPN
+# h2 only, routes only the Nest gRPC services, and forwards them over h2c to the
+# private origin (`origin:50061`, on a network the public cannot reach).
+#
+# Timeouts are chosen for today's blocking Execute (SDK deadline NEST_RPC_TIMEOUT,
+# 900 s by default) and are bounded by the client's own grpc-timeout:
+#   - route timeout 0s: Envoy's 15 s default would cut every Execute and stream.
+#   - max_stream_duration.grpc_timeout_header_max 3600s: honor the client deadline,
+#     capped at one hour.
+#   - stream_idle_timeout 1200s: a silent Execute sends no bytes until it returns.
+# The access log records method, gRPC status, sizes and duration, never headers
+# (authorization) or bodies.
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }
+
+static_resources:
+  listeners:
+    - name: public_grpc
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8443 }
+      per_connection_buffer_limit_bytes: 1048576
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                alpn_protocols: ["h2"]
+                tls_params:
+                  tls_minimum_protocol_version: TLSv1_2
+                tls_certificates:
+                  - certificate_chain: { filename: /certs/server.crt }
+                    private_key: { filename: /certs/server.key }
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: public_grpc
+                codec_type: HTTP2
+                stream_idle_timeout: 1200s
+                request_timeout: 0s
+                http2_protocol_options:
+                  max_concurrent_streams: 100
+                  connection_keepalive:
+                    interval: 30s
+                    timeout: 10s
+                # Clients cannot inject routing or identity headers.
+                use_remote_address: true
+                strip_any_host_port: true
+                access_log:
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                      log_format:
+                        text_format_source:
+                          inline_string: "[%START_TIME%] %REQ(:PATH)% grpc=%GRPC_STATUS% http=%RESPONSE_CODE% flags=%RESPONSE_FLAGS% rx=%BYTES_RECEIVED% tx=%BYTES_SENT% ms=%DURATION%\n"
+                route_config:
+                  name: nest
+                  virtual_hosts:
+                    - name: nest
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/nest.ExecutionService/", grpc: {} }
+                          route: &origin_route
+                            cluster: origin
+                            timeout: 0s
+                            max_stream_duration:
+                              grpc_timeout_header_max: 3600s
+                        - match: { prefix: "/nest.poc.TransportProbe/", grpc: {} }
+                          route: *origin_route
+                        # Reflection, health and anything else are not public.
+                        - match: { prefix: "/" }
+                          direct_response: { status: 404 }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    - name: origin
+      type: STRICT_DNS
+      connect_timeout: 5s
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          # No upstream PING keepalive. grpcio servers (the Controller included)
+          # accept a PING without data only every 5 minutes by default and answer
+          # more with GOAWAY "too_many_pings", which kills a silent Execute
+          # (measured: UNAVAILABLE after 158 s and 257 s with 30 s PINGs). The
+          # gateway-to-origin hop is a local Docker network with no NAT to keep open.
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: origin
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: origin, port_value: 50061 }
