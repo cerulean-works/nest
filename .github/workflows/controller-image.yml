@@ -34,6 +34,7 @@ jobs:
           docker run --rm --volume "$PWD/tests:/tests:ro" \
             --volume "$PWD/docker:/docker:ro" \
             --volume "$PWD/scripts:/scripts:ro" \
+            --volume "$PWD/poc:/poc:ro" \
             --entrypoint python nest-controller:test \
             -m unittest discover -s /tests -v
       - name: Test Compose deployment and SSH credentials
