@@ -18,6 +18,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import psycopg
+from admin_fixture import owned_project, platform_admin
 from fake_oidc import CLIENT_ID, CLIENT_SECRET, FakeGoogle
 from postgres_fixture import PostgresTestCase, connect
 from test_google_auth import free_port
@@ -239,7 +240,7 @@ class _Base(PostgresTestCase):
     def team(self):
         """A Project with an Owner, an Admin, a Member and a Viewer, and an outsider."""
         users = {role: self.user(role) for role in (*ROLES, "outsider")}
-        project = self.service.create_project(browser(users["owner"]), "shared")
+        project = owned_project(self.service, users["owner"], "shared")
         for role in ("admin", "member", "viewer"):
             self.service.add_member(browser(users["owner"]), project.id, users[role], role)
         return project.id, users
@@ -260,8 +261,8 @@ class _Base(PostgresTestCase):
 class ProjectServiceTests(_Base):
     def test_creator_is_owner_and_users_share_many_projects(self):
         alice, bob = self.user("alice"), self.user("bob")
-        first = self.service.create_project(browser(alice), "first")
-        second = self.service.create_project(browser(bob), "second")
+        first = owned_project(self.service, alice, "first")
+        second = owned_project(self.service, bob, "second")
         self.assertEqual(first.owner_user_id, alice)
         self.service.add_member(browser(alice), first.id, bob, "member")
         self.service.add_member(browser(bob), second.id, alice, "viewer")
@@ -276,7 +277,10 @@ class ProjectServiceTests(_Base):
         self.service.transfer_ownership(browser(users["owner"]), pid, users["member"])
         project, role = self.service.get_project(browser(users["member"]), pid)
         self.assertEqual((project.id, project.owner_user_id, role), (pid, users["member"], "owner"))
-        self.assertEqual(project.created_by_user_id, users["owner"])
+        # The administrator who created it is recorded as creator, and is no member.
+        creator = platform_admin(self.db).user_id
+        self.assertEqual(project.created_by_user_id, creator)
+        self.assertIsNone(self.store.role_of(pid, creator))
         self.service.rename_project(browser(users["member"]), pid, "renamed")
         self.assertEqual(self.project(pid).id, pid)
 
@@ -389,7 +393,7 @@ class ProjectServiceTests(_Base):
 
     def test_cross_project_and_cross_user_isolation(self):
         _, users = self.team()
-        other = self.service.create_project(browser(users["outsider"]), "elsewhere")
+        other = owned_project(self.service, users["outsider"], "elsewhere")
         owner = browser(users["owner"])
         for call in (
             lambda: self.service.get_project(owner, other.id),
@@ -484,9 +488,9 @@ class ProjectServiceTests(_Base):
     def test_organization_needs_membership(self):
         alice, bob = self.user("alice"), self.user("bob")
         org = self.identities.create_organization("lab", created_by_user_id=alice)
-        project = self.service.create_project(browser(alice), "lab project", organization_id=org)
+        project = owned_project(self.service, alice, "lab project", organization_id=org)
         self.assertEqual(project.organization_id, org)
-        self.denied(lambda: self.service.create_project(browser(bob), "x", organization_id=org))
+        self.denied(lambda: owned_project(self.service, bob, "x", organization_id=org))
         # An Organization role grants no Project role.
         self.denied(lambda: self.service.get_project(browser(alice), uuid.uuid4()))
 
@@ -533,11 +537,12 @@ class ProjectAuditTests(_Base):
             for e in reversed(self.store.audit_history(pid))
         ]
         o, a, m, v = (users[r] for r in ROLES)
+        creator = platform_admin(self.db).user_id
         self.assertEqual(
             events,
             [
-                ("project_created", None, None, None, o),
-                ("member_added", o, None, "owner", o),
+                ("project_created", None, None, None, creator),
+                ("member_added", o, None, "owner", creator),
                 ("member_added", a, None, "admin", o),
                 ("member_added", m, None, "member", o),
                 ("member_added", v, None, "viewer", o),
@@ -677,8 +682,13 @@ class ProjectsAPITests(_Base):
             with exc:
                 return exc.code, json.loads(exc.read() or b"{}")
 
+    def admin(self, name: str) -> uuid.UUID:
+        user = self.user(name)
+        self.identities.grant_platform_role(user, operator="tests", reason="create Projects")
+        return user
+
     def test_browser_session_manages_a_project(self):
-        alice, bob = self.user("alice"), self.user("bob")
+        alice, bob = self.admin("alice"), self.user("bob")
         a, b = self.token(alice), self.token(bob)
         status, created = self.call("POST", "/api/projects", cookie=a, body={"name": "shared"})
         self.assertEqual(
@@ -715,7 +725,7 @@ class ProjectsAPITests(_Base):
         self.assertEqual(self.call("GET", f"/api/projects/{pid}", cookie=b)[0], 404)
 
     def test_revoked_membership_is_refused_on_the_next_request(self):
-        alice, bob = self.user("alice"), self.user("bob")
+        alice, bob = self.admin("alice"), self.user("bob")
         a, b = self.token(alice), self.token(bob)
         pid = self.call("POST", "/api/projects", cookie=a, body={"name": "p"})[1]["id"]
         self.call(
@@ -750,7 +760,7 @@ class ProjectsAPITests(_Base):
         self.assertEqual(self.store.projects_for_user(alice), [])
 
     def test_cli_bearer_is_scoped(self):
-        alice = self.user("alice")
+        alice = self.admin("alice")
         pid = self.call("POST", "/api/projects", cookie=self.token(alice), body={"name": "p"})[1][
             "id"
         ]
@@ -765,7 +775,7 @@ class ProjectsAPITests(_Base):
         self.assertEqual((status, body["reason"]), (403, "scope"))
 
     def test_malformed_requests(self):
-        alice = self.user("alice")
+        alice = self.admin("alice")
         a = self.token(alice)
         pid = self.call("POST", "/api/projects", cookie=a, body={"name": "p"})[1]["id"]
         for method, path, body, expected in [

@@ -31,11 +31,12 @@ from .auth.web import start_auth_service
 from .authz import Action, Principal
 from .authz.execution import (
     AllowedProjects,
+    DatabaseProviderApprovals,
     ExecutionAccess,
     ProjectRequiredError,
     UnauthenticatedError,
 )
-from .authz.service import AccessDeniedError
+from .authz.service import AccessDeniedError, ProviderAuthority
 from .backends.slurm import SlurmBackend, SlurmConfig, environment_id, new_execution_id
 from .config import (
     ConfigError,
@@ -1073,11 +1074,22 @@ def build_access(config: ControllerConfig, database: Database | None) -> Executi
             "NEST_CONTROLLER_AUTH=session without Google sign-in: no one can obtain a Nest "
             "session, so every RPC is refused"
         )
-    if not config.allowed_projects:
-        logger.warning(
-            "NEST_PROVIDER_ALLOWED_PROJECTS is empty: the Provider accepts Runs from no "
-            "Project, so every submission is refused"
+    provider_id = config.default_platform or config.executor
+    providers: ProviderAuthority
+    if config.provider_approvals == "database":
+        providers = DatabaseProviderApprovals(database)
+        logger.info(
+            "Provider approvals are read from the database at every submission "
+            "(NEST_PROVIDER_APPROVALS=database) provider=%s",
+            provider_id,
         )
+    else:
+        providers = AllowedProjects(config.allowed_projects)
+        if not config.allowed_projects:
+            logger.warning(
+                "NEST_PROVIDER_ALLOWED_PROJECTS is empty: the Provider accepts Runs from no "
+                "Project, so every submission is refused"
+            )
     platform_id = None
     if config.platform is not None:
         try:
@@ -1087,8 +1099,8 @@ def build_access(config: ControllerConfig, database: Database | None) -> Executi
             logger.error("%s; every Platform-bound RPC is refused", exc)
     return ExecutionAccess(
         database,
-        AllowedProjects(config.allowed_projects),
-        provider_id=config.default_platform or config.executor,
+        providers,
+        provider_id=provider_id,
         platform_id=platform_id,
     )
 
@@ -1143,7 +1155,14 @@ def build_admission(
             "Controller does not have: every submission to it is refused",
             config.platform.id,
         )
-    return RegistryAdmission(database, backend, config.platform, platform_id, audit=access.audit)
+    return RegistryAdmission(
+        database,
+        backend,
+        config.platform,
+        platform_id,
+        audit=access.audit,
+        provider_approval=(access.provider_id if config.provider_approvals == "database" else None),
+    )
 
 
 def record_start(config: ControllerConfig, database: Database | None) -> None:
@@ -1162,6 +1181,7 @@ def record_start(config: ControllerConfig, database: Database | None) -> None:
             "allowed_projects": (
                 "*" if "*" in config.allowed_projects else len(config.allowed_projects)
             ),
+            "provider_approvals": config.provider_approvals,
             "executor": config.executor,
             "default_platform": config.default_platform,
             # Kept for audit consumers written before HPC Platforms; same value.

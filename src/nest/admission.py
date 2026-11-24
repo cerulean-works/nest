@@ -66,6 +66,7 @@ from .db.executions import (
     HPCPrincipal,
     IdempotencyConflictError,
     PlatformUnavailableError,
+    ProviderNotApprovedError,
     ResolvedOption,
 )
 from .db.platforms import (
@@ -313,6 +314,11 @@ class RegistryAdmission:
         identities ([`admission.HPCIdentitySource`], *optional*): Defaults to
             [`admission.ControllerIdentitySource`] for `profile`.
         audit ([`audit.AuditLog`], *optional*): Defaults to one on `database`.
+        provider_approval (`str`, *optional*): With durable Provider approvals
+            (`NEST_PROVIDER_APPROVALS=database`), the Provider whose approval of the
+            Project is checked again in the transaction that records the attempt
+            ([`db.ExecutionRegistry.begin_attempt`]), so a revocation between the
+            `run.submit` check and the attempt is never missed.
     """
 
     def __init__(
@@ -324,8 +330,10 @@ class RegistryAdmission:
         *,
         identities: HPCIdentitySource | None = None,
         audit: AuditLog | None = None,
+        provider_approval: str | None = None,
     ):
         self.registry = ExecutionRegistry(database)
+        self.provider_approval = provider_approval
         self.audit = audit or AuditLog(database)
         self.catalog = PlatformCatalog(database, self.audit)
         self.accounts = AccountResolver(database, self.audit)
@@ -469,7 +477,12 @@ class RegistryAdmission:
                 options=options,
                 source_digest=request.source_digest,
                 environment_digest=request.environment_digest,
+                provider=self.provider_approval,
             )
+        except ProviderNotApprovedError as exc:
+            raise AdmissionRefusedError(
+                "provider_denied", str(exc), grpc.StatusCode.PERMISSION_DENIED
+            ) from None
         except ExecutionClosedError as exc:
             raise AdmissionRefusedError(
                 "execution_closed", str(exc), grpc.StatusCode.ALREADY_EXISTS

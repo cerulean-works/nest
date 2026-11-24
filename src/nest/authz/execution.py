@@ -38,6 +38,7 @@ from uuid import UUID
 from .._logging import get_logger
 from ..audit import AuditLog
 from ..config import ALL_PROJECTS
+from ..db.approvals import ProviderApprovalStore
 from ..db.connection import Database
 from ..db.identity import hash_token
 from ..db.sessions import SessionStore
@@ -52,6 +53,7 @@ __all__ = [
     "AUTHORIZATION_METADATA",
     "PROJECT_METADATA",
     "AllowedProjects",
+    "DatabaseProviderApprovals",
     "ExecutionAccess",
     "JobAccess",
     "ProjectRequiredError",
@@ -97,6 +99,31 @@ class AllowedProjects:
         self, principal: Principal, project_id: UUID, action: Action, provider: str | None
     ) -> bool:
         return self.everyone or project_id in self.projects
+
+
+class DatabaseProviderApprovals:
+    """
+    The Controller's [`authz.ProviderAuthority`] with `NEST_PROVIDER_APPROVALS=database`:
+    its Provider accepts Runs from the Projects approved for it in PostgreSQL
+    (`provider_project_approvals`, see [`db.ProviderApprovalStore`]).
+
+    Every check reads the database now; nothing is cached, so a grant or a
+    revocation applies from the next submission on every Controller replica
+    sharing the database, with no restart. When the database cannot answer, the
+    check raises [`db.DatabaseError`] and the caller refuses (fail closed): it is
+    never treated as approved.
+
+    Args:
+        database ([`db.Database`]): Open database.
+    """
+
+    def __init__(self, database: Database):
+        self.store = ProviderApprovalStore(database)
+
+    def permits(
+        self, principal: Principal, project_id: UUID, action: Action, provider: str | None
+    ) -> bool:
+        return self.store.is_approved(provider, project_id)
 
 
 @dataclass(frozen=True)

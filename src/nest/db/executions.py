@@ -133,6 +133,10 @@ class AccountNotPermittedError(ExecutionRegistryError):
     """The Slurm account is not an active account linked to the Project for the mode."""
 
 
+class ProviderNotApprovedError(ExecutionRegistryError):
+    """The Provider no longer accepts Runs from the execution's Project (G03)."""
+
+
 @dataclass(frozen=True)
 class HPCPrincipal:
     """
@@ -538,6 +542,7 @@ class ExecutionRegistry:
         source_digest: str | None = None,
         environment_digest: str | None = None,
         runtime_digest: str | None = None,
+        provider: str | None = None,
     ) -> Attempt:
         """
         Durably records a new `submitting` attempt before anything is submitted.
@@ -563,6 +568,10 @@ class ExecutionRegistry:
             options (`Mapping[str, ResolvedOption]`): Every resolved option.
             source_digest, environment_digest, runtime_digest (`str`, *optional*):
                 `sha256:<hex>` digests of what is submitted.
+            provider (`str`, *optional*): With durable Provider approvals, the
+                Provider whose approval of the Project is checked again here, and
+                share-locked like the Platform grant, so a revocation that commits
+                first refuses the attempt and one that comes later waits for it.
 
         Raises:
             [`db.executions.ExecutionNotFoundError`]: If the execution does not exist.
@@ -573,6 +582,8 @@ class ExecutionRegistry:
                 disabled or not granted to the execution's Project.
             [`db.executions.AccountNotPermittedError`]: If the account may not be
                 charged by the Project in the endpoint's mode.
+            [`db.executions.ProviderNotApprovedError`]: If `provider` no longer
+                approves the Project.
             [`db.EndpointNotApprovedError`]: If the login node no longer matches an
                 approved endpoint of the Platform.
             [`db.DatabaseError`]: If the database refuses a row.
@@ -596,6 +607,19 @@ class ExecutionRegistry:
             if live is not None:
                 raise AttemptInFlightError(
                     f"Attempt {live['attempt_number']} is still {live['status']}"
+                )
+            if provider is not None and (
+                cursor.execute(
+                    "SELECT 1 FROM provider_project_approvals a "
+                    "JOIN projects p ON p.id = a.project_id AND p.deleted_at IS NULL "
+                    "WHERE a.provider = %s AND a.project_id = %s AND a.status = 'approved' "
+                    "FOR SHARE OF a",
+                    (provider, execution["project_id"]),
+                ).fetchone()
+                is None
+            ):
+                raise ProviderNotApprovedError(
+                    f"Provider {provider!r} no longer accepts Runs from this Project"
                 )
             _check_endpoint(cursor, endpoint, execution["project_id"])
             _check_account(

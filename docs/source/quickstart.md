@@ -210,13 +210,16 @@ SDK before any call (*NEST_PROJECT_ID must be a Project ID (a UUID)*).
 A Project role never grants HPC access by itself. Before the first Run, the
 **operator** must, for your Project ID:
 
-1. approve it for the Controller's Provider (`NEST_PROVIDER_ALLOWED_PROJECTS`);
+1. approve it for the Controller's Provider (`nest-db provider approve`, or the
+   startup-only `NEST_PROVIDER_ALLOWED_PROJECTS`);
 2. grant it an HPC Platform (`nest-db platform grant`); and
 3. register and link a Slurm account it may charge (`nest-db account link`).
 
-These are operator-only actions, done on the Controller host with database
-credentials; no Project role, including Owner, can perform them. Provider approval
-takes effect only after the operator redeploys the Controller. See
+These are operator or platform administrator actions, done with database
+credentials or through the [privileged management API](privileged-api); no
+Project role, including Owner, can perform them. With durable approvals
+(`NEST_PROVIDER_APPROVALS=database`) the approval applies from your next Run;
+with `NEST_PROVIDER_ALLOWED_PROJECTS` only after the operator redeploys. See
 [Onboard a Project](project-onboarding). Send the operator your Project ID and
 the Slurm account your group should be charged to. Never send them your Nest
 session file or tokens.

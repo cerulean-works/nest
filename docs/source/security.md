@@ -45,7 +45,7 @@ API:
 
 | RPC | Needs | Refused as |
 | --- | --- | --- |
-| `Execute`, `SubmitJob` | `run.submit` in the Project named by `NEST_PROJECT_ID`, a `jobs:run` scope, a Project the operator approved in `NEST_PROVIDER_ALLOWED_PROJECTS`, and for Slurm the served Platform eligible for the Project | `NOT_FOUND` when not a member or the Platform is not eligible, `PERMISSION_DENIED` for the role, scope or Provider |
+| `Execute`, `SubmitJob` | `run.submit` in the Project named by `NEST_PROJECT_ID`, a `jobs:run` scope, a Project approved for the Controller's Provider (durable approvals with `NEST_PROVIDER_APPROVALS=database`, or `NEST_PROVIDER_ALLOWED_PROJECTS`), and for Slurm the served Platform eligible for the Project | `NOT_FOUND` when not a member or the Platform is not eligible, `PERMISSION_DENIED` for the role, scope or Provider |
 | `GetJobStatus` | `run.read` in the job's recorded Project, and the job's Platform (the served one) still eligible for it | `NOT_FOUND` |
 | `CancelJob` | `run.cancel` in the job's recorded Project, being its submitter, and the job's Platform still eligible | `NOT_FOUND`, or `PERMISSION_DENIED` for someone else's Run |
 
@@ -55,8 +55,13 @@ API:
 - Each submission records its Project and submitter with the job. A job recorded
   without a Project, such as one from before authentication, cannot be read or
   cancelled through an authenticated Controller.
-- Unauthorized access is denied by default: with no `NEST_PROVIDER_ALLOWED_PROJECTS`
-  no Run is accepted, and without Google sign-in nobody can obtain a session.
+- Unauthorized access is denied by default: with no Provider approval no Run is
+  accepted, and without Google sign-in nobody can obtain a session. Durable
+  approvals are read at every submission with no cache, and when the database
+  cannot answer the call is refused (`UNAVAILABLE`), never treated as approved.
+- Only an active `platform_admin` may create Projects, and the
+  [privileged management API](privileged-api) serves administrators' browser
+  sessions only. Being an administrator grants no Project role or compute.
 - Session tokens travel only over TLS (`NEST_TLS_CERT_FILE` and `NEST_TLS_KEY_FILE`)
   or a loopback listener. On a network that is already encrypted and
   access-controlled, such as an authorized Tailnet, the operator approves plaintext

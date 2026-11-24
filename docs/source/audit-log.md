@@ -31,6 +31,8 @@ platform role history in `platform_audit_events` (see
 | `platform.changed` | Trigger | An HPC Platform is registered or its name, operator metadata, status or default changes (the names of the changed columns). |
 | `platform.login_node.changed` | Trigger | A login node is approved, changed or removed, with its endpoint, modes, priority, status and host-key pin reference. Health observations are not recorded. |
 | `platform.grant.added`, `platform.grant.removed` | Trigger | A Project is granted a Platform or loses the grant. |
+| `provider.approval.granted`, `provider.approval.revoked` | Trigger | A Project is approved for a Provider (`resource_id`), including by `nest-db provider import`, or the approval is revoked. |
+| `project.create`, `admin.*` | Controller | A refused Project creation or [privileged management API](privileged-api) call (outcome `denied`), such as `platform_admin_required` or `browser_only`. Successful changes are recorded by the triggers above, with the administrator as actor and the reason as `note`. |
 | `project.default_platform.set`, `project.default_platform.cleared` | Trigger | A Project Owner or Admin chooses or clears the Project's default Platform, or the grant it pointed to is revoked. |
 | `organization.created`, `organization.renamed`, `organization.deleted` | Trigger | An Organization is created, renamed or deleted. |
 | `organization.member.added`, `organization.member.role_changed`, `organization.member.removed` | Trigger | An Organization membership changes, with the old and new roles. |

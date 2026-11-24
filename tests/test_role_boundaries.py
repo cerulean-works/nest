@@ -419,7 +419,8 @@ class RestartTests(_RoleBase):
                 "UPDATE users SET status = 'disabled', disabled_at = now() WHERE id = %s",
                 (user_id,),
             )
-            self.assertEqual([m.label for m in upgrade(conn)], ["0016_platform_role_boundaries"])
+            applied = [m.label for m in upgrade(conn)]
+            self.assertEqual(applied[0], "0016_platform_role_boundaries")
             verify(conn)
             self.assertEqual(
                 conn.execute(
