@@ -57,7 +57,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from email.headerregistry import Address
 from email.utils import parseaddr
-from ipaddress import ip_address
+from ipaddress import IPv4Network, IPv6Network, ip_address, ip_network
 from types import MappingProxyType
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 from uuid import UUID
@@ -765,6 +765,168 @@ class GoogleAuthConfig:
         }
 
 
+DEFAULT_GRPC_MAX_WORKERS = 4
+DEFAULT_GRPC_MAX_CONCURRENT_RPCS = 32
+DEFAULT_GRPC_MAX_MESSAGE_BYTES = 4 * 1024 * 1024
+"""gRPC's own default receive limit, which the SDK also uses (see the H06 contract)."""
+MAX_GRPC_MESSAGE_BYTES = 64 * 1024 * 1024
+DEFAULT_GRPC_MAX_METADATA_BYTES = 16 * 1024
+DEFAULT_GRPC_PEER_RATE = 600
+DEFAULT_GRPC_USER_RATE = 300
+
+DEFAULT_LIMIT_ACTIVE_PER_USER = 8
+DEFAULT_LIMIT_ACTIVE_PER_PROJECT = 32
+DEFAULT_LIMIT_ACTIVE_PER_PLATFORM = 128
+DEFAULT_LIMIT_CPU_PER_REQUEST = 128
+DEFAULT_LIMIT_GPU_PER_REQUEST = 8
+DEFAULT_LIMIT_CPU_PER_PROJECT = 512
+DEFAULT_LIMIT_GPU_PER_PROJECT = 16
+DEFAULT_LIMIT_WALLTIME = "1-00:00:00"
+DEFAULT_LIMIT_SUBMISSIONS_PER_MINUTE = 30
+DEFAULT_LIMIT_ENVIRONMENT_BUILDS = 2
+MAX_LIMIT = 1_000_000
+"""Upper bound of every count limit: a limit is always bounded, never unlimited."""
+
+
+def slurm_time_seconds(value: str) -> int | None:
+    """
+    The length of a Slurm `--time` value in seconds, or `None` if it is not one.
+
+    Accepts Slurm's forms `M`, `M:S`, `H:M:S`, `D-H`, `D-H:M` and `D-H:M:S`.
+    `UNLIMITED`, `INFINITE` and anything else are not a bounded time, so `None`.
+    """
+    value = value.strip()
+    if not _SLURM_TIME.fullmatch(value):
+        return None
+    days = 0
+    if "-" in value:
+        day_text, value = value.split("-", 1)
+        days = int(day_text)
+        parts = [int(p) for p in value.split(":")]
+        hours, minutes, seconds = (parts + [0, 0])[:3]
+    else:
+        parts = [int(p) for p in value.split(":")]
+        if len(parts) == 1:
+            hours, minutes, seconds = 0, parts[0], 0
+        elif len(parts) == 2:
+            hours, minutes, seconds = 0, parts[0], parts[1]
+        else:
+            hours, minutes, seconds = parts
+    return ((days * 24 + hours) * 60 + minutes) * 60 + seconds
+
+
+Network = IPv4Network | IPv6Network
+
+
+@dataclass(frozen=True)
+class RpcPolicy:
+    """
+    Bounds and abuse controls of the gRPC listener (H07). See *Public API security*.
+
+    Attributes:
+        max_workers (`int`): `NEST_GRPC_MAX_WORKERS`: RPC worker threads.
+        max_concurrent_rpcs (`int`): `NEST_GRPC_MAX_CONCURRENT_RPCS`: RPCs running
+            or queued at once; more are refused with `RESOURCE_EXHAUSTED`. At least
+            `max_workers`.
+        max_message_bytes (`int`): `NEST_GRPC_MAX_MESSAGE_BYTES`: largest request or
+            response message, after decompression.
+        max_metadata_bytes (`int`): `NEST_GRPC_MAX_METADATA_BYTES`: largest request
+            metadata.
+        peer_rate (`int`): `NEST_GRPC_RATE_LIMIT_PER_PEER`: calls per minute from one
+            client address, before authentication. `0` turns it off.
+        user_rate (`int`): `NEST_GRPC_RATE_LIMIT_PER_USER`: calls per minute by one
+            authenticated Nest User. `0` turns it off.
+        allowed_peers (`tuple[Network, ...]`): `NEST_GRPC_ALLOWED_PEERS`: when set,
+            only connections from these networks (the gateway's) are served.
+        trusted_proxies (`tuple[Network, ...]`): `NEST_GRPC_TRUSTED_PROXIES`: the
+            gateways whose `x-forwarded-for` names the client address. Without
+            one, `x-forwarded-for` is ignored.
+        local_execution (`bool`): `NEST_CONTROLLER_LOCAL_EXECUTION`: whether an
+            authenticated Controller with `NEST_EXECUTOR=local` may deserialize and
+            run calls in its own process. Defaults to true only on a loopback
+            listener.
+    """
+
+    max_workers: int = DEFAULT_GRPC_MAX_WORKERS
+    max_concurrent_rpcs: int = DEFAULT_GRPC_MAX_CONCURRENT_RPCS
+    max_message_bytes: int = DEFAULT_GRPC_MAX_MESSAGE_BYTES
+    max_metadata_bytes: int = DEFAULT_GRPC_MAX_METADATA_BYTES
+    peer_rate: int = DEFAULT_GRPC_PEER_RATE
+    user_rate: int = DEFAULT_GRPC_USER_RATE
+    allowed_peers: tuple[Network, ...] = ()
+    trusted_proxies: tuple[Network, ...] = ()
+    local_execution: bool = True
+
+    def summary(self) -> dict[str, object]:
+        return {
+            "max_workers": self.max_workers,
+            "max_concurrent_rpcs": self.max_concurrent_rpcs,
+            "max_message_bytes": self.max_message_bytes,
+            "max_metadata_bytes": self.max_metadata_bytes,
+            "peer_rate": self.peer_rate,
+            "user_rate": self.user_rate,
+            "allowed_peers": [str(n) for n in self.allowed_peers],
+            "trusted_proxies": [str(n) for n in self.trusted_proxies],
+            "local_execution": self.local_execution,
+        }
+
+
+@dataclass(frozen=True)
+class AdmissionLimits:
+    """
+    Server-enforced trusted-pilot admission limits (F02a), checked by the Execution
+    Registry in the transaction that records each attempt. See *Admission limits*.
+
+    Every limit is a positive bound; none can be turned off.
+
+    Attributes:
+        active_per_user, active_per_project, active_per_platform (`int`):
+            `NEST_LIMIT_ACTIVE_PER_USER`, `_PER_PROJECT`, `_PER_PLATFORM`: live
+            attempts (submitting, submitted, running or unknown) at once.
+        cpu_per_request, gpu_per_request (`int`): `NEST_LIMIT_CPU_PER_REQUEST`,
+            `NEST_LIMIT_GPU_PER_REQUEST`: largest `cpu` and `gpu` count asked for.
+        cpu_per_project, gpu_per_project (`int`): `NEST_LIMIT_CPU_PER_PROJECT`,
+            `NEST_LIMIT_GPU_PER_PROJECT`: CPUs and GPUs reserved by a Project's live
+            attempts together.
+        walltime_seconds (`int`): `NEST_LIMIT_WALLTIME` (a Slurm time): longest
+            `--time` an attempt may run with.
+        submissions_per_minute (`int`): `NEST_LIMIT_SUBMISSIONS_PER_MINUTE`: new
+            attempts one User may start in any 60 seconds, across replicas.
+        environment_builds (`int`): `NEST_LIMIT_ENVIRONMENT_BUILDS`: environment
+            builds one Controller runs at once.
+    """
+
+    active_per_user: int = DEFAULT_LIMIT_ACTIVE_PER_USER
+    active_per_project: int = DEFAULT_LIMIT_ACTIVE_PER_PROJECT
+    active_per_platform: int = DEFAULT_LIMIT_ACTIVE_PER_PLATFORM
+    cpu_per_request: int = DEFAULT_LIMIT_CPU_PER_REQUEST
+    gpu_per_request: int = DEFAULT_LIMIT_GPU_PER_REQUEST
+    cpu_per_project: int = DEFAULT_LIMIT_CPU_PER_PROJECT
+    gpu_per_project: int = DEFAULT_LIMIT_GPU_PER_PROJECT
+    walltime_seconds: int = slurm_time_seconds(DEFAULT_LIMIT_WALLTIME) or 86_400
+    submissions_per_minute: int = DEFAULT_LIMIT_SUBMISSIONS_PER_MINUTE
+    environment_builds: int = DEFAULT_LIMIT_ENVIRONMENT_BUILDS
+
+    def __post_init__(self) -> None:
+        for name, value in self.summary().items():
+            if not isinstance(value, int) or not 1 <= value <= MAX_LIMIT * 100:
+                raise ValueError(f"Admission limit {name} must be a positive bound, got {value!r}")
+
+    def summary(self) -> dict[str, int]:
+        return {
+            "active_per_user": self.active_per_user,
+            "active_per_project": self.active_per_project,
+            "active_per_platform": self.active_per_platform,
+            "cpu_per_request": self.cpu_per_request,
+            "gpu_per_request": self.gpu_per_request,
+            "cpu_per_project": self.cpu_per_project,
+            "gpu_per_project": self.gpu_per_project,
+            "walltime_seconds": self.walltime_seconds,
+            "submissions_per_minute": self.submissions_per_minute,
+            "environment_builds": self.environment_builds,
+        }
+
+
 @dataclass(frozen=True)
 class ControllerConfig:
     """
@@ -821,6 +983,9 @@ class ControllerConfig:
             records only the `jobs` table). `required` is the default with session
             authentication, and the only choice for a Mode B Platform under it;
             `legacy` is the only choice without session authentication.
+        rpc ([`config.RpcPolicy`]): gRPC listener bounds and abuse controls (H07).
+        limits ([`config.AdmissionLimits`]): Admission limits the Execution
+            Registry enforces (F02a); unused on the legacy path.
 
     `providers`, `default_provider`, and `provider` are deprecated read-only aliases
     of `platforms`, `default_platform`, and `platform`.
@@ -850,6 +1015,8 @@ class ControllerConfig:
     allowed_projects: frozenset[str] = frozenset()
     provider_approvals: str = "environment"
     execution_registry: str = "legacy"
+    rpc: RpcPolicy = field(default_factory=RpcPolicy)
+    limits: AdmissionLimits = field(default_factory=AdmissionLimits)
     warnings: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -918,6 +1085,8 @@ class ControllerConfig:
             "allowed_projects": sorted(self.allowed_projects),
             "provider_approvals": self.provider_approvals,
             "execution_registry": self.execution_registry,
+            "rpc": self.rpc.summary(),
+            "limits": self.limits.summary(),
         }
 
 
@@ -1906,6 +2075,8 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
     execution_registry = _execution_registry(
         reader, auth, platforms.get(default_platform) if default_platform else None
     )
+    rpc = _rpc_policy(reader, bind, auth, executor)
+    limits = _admission_limits(reader)
     _reserved(reader)
 
     if reader.problems:
@@ -1929,6 +2100,8 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
         allowed_projects=allowed_projects,
         provider_approvals=provider_approvals,
         execution_registry=execution_registry,
+        rpc=rpc,
+        limits=limits,
         **timeouts,
     )
 
@@ -2238,6 +2411,114 @@ def _execution_registry(reader: _Reader, auth: str, platform: PlatformProfile | 
             "which every execution attempt records as its HPC identity"
         )
     return mode
+
+
+def _networks(reader: _Reader, name: str) -> tuple[Network, ...]:
+    """Reads a comma-separated list of IP addresses or CIDR networks."""
+    networks: list[Network] = []
+    for item in (reader.get(name) or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            networks.append(ip_network(item, strict=False))
+        except ValueError:
+            reader.fail(f"{name} has {item[:60]!r}, which is not an IP address or CIDR network")
+    return tuple(networks)
+
+
+def _bounded(reader: _Reader, name: str, default: int, *, minimum: int = 1) -> int:
+    value = reader.integer(name, default, minimum)
+    if value > MAX_LIMIT:
+        reader.fail(f"{name} must be at most {MAX_LIMIT}, got {value}")
+        return default
+    return value
+
+
+def _rpc_policy(reader: _Reader, bind: str, auth: str, executor: str) -> RpcPolicy:
+    """Reads the `NEST_GRPC_*` listener bounds and `NEST_CONTROLLER_LOCAL_EXECUTION`."""
+    workers = _bounded(reader, "NEST_GRPC_MAX_WORKERS", DEFAULT_GRPC_MAX_WORKERS)
+    if workers > 256:
+        reader.fail(f"NEST_GRPC_MAX_WORKERS must be at most 256, got {workers}")
+    concurrent = _bounded(
+        reader, "NEST_GRPC_MAX_CONCURRENT_RPCS", max(DEFAULT_GRPC_MAX_CONCURRENT_RPCS, workers)
+    )
+    if concurrent < workers:
+        reader.fail(
+            f"NEST_GRPC_MAX_CONCURRENT_RPCS ({concurrent}) must be at least "
+            f"NEST_GRPC_MAX_WORKERS ({workers})"
+        )
+    message = reader.integer("NEST_GRPC_MAX_MESSAGE_BYTES", DEFAULT_GRPC_MAX_MESSAGE_BYTES, 1024)
+    if message > MAX_GRPC_MESSAGE_BYTES:
+        reader.fail(
+            f"NEST_GRPC_MAX_MESSAGE_BYTES must be at most {MAX_GRPC_MESSAGE_BYTES}, got {message}"
+        )
+    metadata = reader.integer("NEST_GRPC_MAX_METADATA_BYTES", DEFAULT_GRPC_MAX_METADATA_BYTES, 1024)
+    if metadata > 64 * 1024:
+        reader.fail(f"NEST_GRPC_MAX_METADATA_BYTES must be at most 65536, got {metadata}")
+    local_raw = reader.get("NEST_CONTROLLER_LOCAL_EXECUTION")
+    local = reader.boolean(
+        "NEST_CONTROLLER_LOCAL_EXECUTION", auth != "session" or _is_loopback_address(bind)
+    )
+    if local_raw is not None and executor != "local":
+        reader.fail("NEST_CONTROLLER_LOCAL_EXECUTION applies only to NEST_EXECUTOR=local")
+    return RpcPolicy(
+        max_workers=workers,
+        max_concurrent_rpcs=concurrent,
+        max_message_bytes=message,
+        max_metadata_bytes=metadata,
+        peer_rate=_bounded(
+            reader, "NEST_GRPC_RATE_LIMIT_PER_PEER", DEFAULT_GRPC_PEER_RATE, minimum=0
+        ),
+        user_rate=_bounded(
+            reader, "NEST_GRPC_RATE_LIMIT_PER_USER", DEFAULT_GRPC_USER_RATE, minimum=0
+        ),
+        allowed_peers=_networks(reader, "NEST_GRPC_ALLOWED_PEERS"),
+        trusted_proxies=_networks(reader, "NEST_GRPC_TRUSTED_PROXIES"),
+        local_execution=local,
+    )
+
+
+def _admission_limits(reader: _Reader) -> AdmissionLimits:
+    """Reads the `NEST_LIMIT_*` admission limits (F02a); every one is a positive bound."""
+    walltime_raw = reader.get("NEST_LIMIT_WALLTIME") or DEFAULT_LIMIT_WALLTIME
+    walltime = slurm_time_seconds(walltime_raw)
+    if walltime is None or walltime <= 0:
+        reader.fail(
+            "NEST_LIMIT_WALLTIME must be a bounded Slurm time such as 04:00:00 or 1-00:00:00, "
+            f"got {walltime_raw!r}"
+        )
+        walltime = AdmissionLimits.walltime_seconds
+    return AdmissionLimits(
+        active_per_user=_bounded(
+            reader, "NEST_LIMIT_ACTIVE_PER_USER", DEFAULT_LIMIT_ACTIVE_PER_USER
+        ),
+        active_per_project=_bounded(
+            reader, "NEST_LIMIT_ACTIVE_PER_PROJECT", DEFAULT_LIMIT_ACTIVE_PER_PROJECT
+        ),
+        active_per_platform=_bounded(
+            reader, "NEST_LIMIT_ACTIVE_PER_PLATFORM", DEFAULT_LIMIT_ACTIVE_PER_PLATFORM
+        ),
+        cpu_per_request=_bounded(
+            reader, "NEST_LIMIT_CPU_PER_REQUEST", DEFAULT_LIMIT_CPU_PER_REQUEST
+        ),
+        gpu_per_request=_bounded(
+            reader, "NEST_LIMIT_GPU_PER_REQUEST", DEFAULT_LIMIT_GPU_PER_REQUEST
+        ),
+        cpu_per_project=_bounded(
+            reader, "NEST_LIMIT_CPU_PER_PROJECT", DEFAULT_LIMIT_CPU_PER_PROJECT
+        ),
+        gpu_per_project=_bounded(
+            reader, "NEST_LIMIT_GPU_PER_PROJECT", DEFAULT_LIMIT_GPU_PER_PROJECT
+        ),
+        walltime_seconds=walltime,
+        submissions_per_minute=_bounded(
+            reader, "NEST_LIMIT_SUBMISSIONS_PER_MINUTE", DEFAULT_LIMIT_SUBMISSIONS_PER_MINUTE
+        ),
+        environment_builds=_bounded(
+            reader, "NEST_LIMIT_ENVIRONMENT_BUILDS", DEFAULT_LIMIT_ENVIRONMENT_BUILDS
+        ),
+    )
 
 
 def _is_loopback_address(address: str) -> bool:

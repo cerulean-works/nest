@@ -32,6 +32,17 @@ default [`admission.ControllerIdentitySource`] therefore refuses every Mode B
 submission (`hpc_binding_unavailable`), and even a verified binding is refused at
 the transport step (`mode_b_transport_unavailable`): the Controller's own SSH
 credentials are never used for a User's Mode B job.
+
+Admission limits (F02a): with [`config.AdmissionLimits`], step 5 also rechecks the
+submitter's session and membership and reserves the attempt's CPUs, GPUs and
+walltime against per-User, per-Project and per-Platform bounds, atomically with
+the attempt (see [`db.ExecutionRegistry.begin_attempt`]). The reservation is held
+while the attempt is live and released only when it reaches a final state:
+`succeeded`, `failed` (including a failure known to precede `sbatch`) or
+`cancelled`. A timeout, a lost RPC or a restart never releases it, and neither does
+`unknown`. [`admission.RegistryAdmission.settle`] polls Slurm for live attempts
+nobody is waiting on, so a finished job's reservation is released even when no
+client asks for its status.
 """
 
 from __future__ import annotations
@@ -39,7 +50,8 @@ from __future__ import annotations
 import hashlib
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Generator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any, Protocol
@@ -53,10 +65,11 @@ from .authz.accounts import AccountResolution, AccountResolutionError, AccountRe
 from .authz.platforms import PlatformCatalog, PlatformResolutionError, PlatformSelection
 from .authz.policy import Principal
 from .backends.slurm import SlurmBackend
-from .config import PlatformProfile
+from .config import AdmissionLimits, PlatformProfile, slurm_time_seconds
 from .db.connection import Database, DatabaseError
 from .db.executions import (
     AccountNotPermittedError,
+    AdmissionLimitError,
     Attempt,
     AttemptInFlightError,
     Execution,
@@ -67,7 +80,11 @@ from .db.executions import (
     IdempotencyConflictError,
     PlatformUnavailableError,
     ProviderNotApprovedError,
+    Reservation,
     ResolvedOption,
+    Submitter,
+    SubmitterNotAuthorizedError,
+    check_request_limits,
 )
 from .db.platforms import (
     EndpointNotApprovedError,
@@ -83,6 +100,7 @@ logger = get_logger("nest.admission")
 __all__ = [
     "Admission",
     "AdmissionRefusedError",
+    "BuildSlot",
     "ControllerIdentitySource",
     "DuplicateSubmissionError",
     "HPCIdentitySource",
@@ -136,11 +154,35 @@ class AdmissionRefusedError(Exception):
     """
 
     def __init__(
-        self, reason: str, message: str, code: grpc.StatusCode = grpc.StatusCode.FAILED_PRECONDITION
+        self,
+        reason: str,
+        message: str,
+        code: grpc.StatusCode = grpc.StatusCode.FAILED_PRECONDITION,
+        details: Mapping[str, Any] | None = None,
     ):
         self.reason = reason
         self.code = code
+        self.details = dict(details or {})
         super().__init__(message)
+
+
+_PER_REQUEST_LIMITS = frozenset(
+    {"cpu_per_request", "gpu_per_request", "walltime", "walltime_unbounded"}
+)
+
+
+def _limit_refusal(exc: AdmissionLimitError) -> AdmissionRefusedError:
+    """A refusal for an admission limit: per-request bounds are the caller's to fix."""
+    return AdmissionRefusedError(
+        f"limit_{exc.reason}",
+        str(exc),
+        (
+            grpc.StatusCode.FAILED_PRECONDITION
+            if exc.reason in _PER_REQUEST_LIMITS
+            else grpc.StatusCode.RESOURCE_EXHAUSTED
+        ),
+        {"limit": exc.limit, "current": exc.current, "requested": exc.requested},
+    )
 
 
 class DuplicateSubmissionError(Exception):
@@ -301,6 +343,20 @@ class Admission:
         return self.execution.execution_id
 
 
+class BuildSlot:
+    """An environment-build slot; [`admission.BuildSlot.release`] is idempotent."""
+
+    def __init__(self, semaphore: threading.BoundedSemaphore | None):
+        self._semaphore = semaphore
+        self._lock = threading.Lock()
+
+    def release(self) -> None:
+        with self._lock:
+            semaphore, self._semaphore = self._semaphore, None
+        if semaphore is not None:
+            semaphore.release()
+
+
 class RegistryAdmission:
     """
     Admits a Controller's submissions through the Execution Registry and records
@@ -314,6 +370,9 @@ class RegistryAdmission:
         identities ([`admission.HPCIdentitySource`], *optional*): Defaults to
             [`admission.ControllerIdentitySource`] for `profile`.
         audit ([`audit.AuditLog`], *optional*): Defaults to one on `database`.
+        limits ([`config.AdmissionLimits`], *optional*): Admission limits (F02a)
+            checked and reserved with every attempt. Without them nothing is
+            reserved, as before F02a.
         provider_approval (`str`, *optional*): With durable Provider approvals
             (`NEST_PROVIDER_APPROVALS=database`), the Provider whose approval of the
             Project is checked again in the transaction that records the attempt
@@ -335,8 +394,14 @@ class RegistryAdmission:
         audit: AuditLog | None = None,
         provider_approval: str | None = None,
         provider_revocations: str | None = None,
+        limits: AdmissionLimits | None = None,
     ):
         self.registry = ExecutionRegistry(database)
+        self.limits = limits
+        self._builds = threading.BoundedSemaphore(limits.environment_builds) if limits else None
+        # Attempts an RPC of this Controller is still waiting on; settle() skips them.
+        self._waiting: set[int] = set()
+        self._waiting_lock = threading.Lock()
         self.provider_approval = provider_approval
         self.provider_revocations = provider_revocations
         self.audit = audit or AuditLog(database)
@@ -397,7 +462,13 @@ class RegistryAdmission:
                 resource_type="execution",
                 resource_id=execution_id,
                 reason=exc.reason,
-                details={"kind": request.kind, "platform_id": str(self.platform_id)},
+                details={
+                    "kind": request.kind,
+                    "platform_id": str(self.platform_id),
+                    "gpu": request.gpu,
+                    "cpu": request.cpu,
+                    **exc.details,
+                },
             )
             raise
 
@@ -459,6 +530,17 @@ class RegistryAdmission:
             )
         partition = request.partition or self.profile.partition
         time_limit = request.time or self.profile.time
+        reservation = Reservation(
+            cpu=request.cpu,
+            gpu=request.gpu,
+            walltime_seconds=slurm_time_seconds(time_limit) if time_limit else None,
+        )
+        if self.limits is not None:
+            try:
+                # Before anything is registered: a request no limit could admit.
+                check_request_limits(self.limits, reservation)
+            except AdmissionLimitError as exc:
+                raise _limit_refusal(exc) from None
         options = self._options(request, selection, resolution, partition, time_limit)
         try:
             execution, created = self.registry.register(
@@ -484,7 +566,16 @@ class RegistryAdmission:
                 environment_digest=request.environment_digest,
                 provider=self.provider_approval,
                 provider_revocations=self.provider_revocations,
+                submitter=Submitter(principal.user_id, principal.session_id),
+                reservation=reservation if self.limits is not None else None,
+                limits=self.limits,
             )
+        except AdmissionLimitError as exc:
+            raise _limit_refusal(exc) from None
+        except SubmitterNotAuthorizedError as exc:
+            raise AdmissionRefusedError(
+                "submitter_not_authorized", str(exc), grpc.StatusCode.PERMISSION_DENIED
+            ) from None
         except ProviderNotApprovedError as exc:
             raise AdmissionRefusedError(
                 "provider_denied", str(exc), grpc.StatusCode.PERMISSION_DENIED
@@ -515,10 +606,24 @@ class RegistryAdmission:
             "mode": mode,
             "account": resolution.account_name,
             "account_origin": resolution.origin,
+            "cpu": reservation.cpu,
+            "gpu": reservation.gpu,
+            "walltime_seconds": reservation.walltime_seconds,
+            "reserved": self.limits is not None,
         }
         logger.info(
             "Submission admitted " + " ".join(f"{key}=%s" for key in details),
             *details.values(),
+        )
+        self.audit.record(
+            "execution.admit",
+            "succeeded",
+            actor_user_id=principal.user_id,
+            session_id=principal.session_id,
+            project_id=project_id,
+            resource_type="execution",
+            resource_id=execution.execution_id,
+            details={**details, "platform_id": str(platform.id), "kind": request.kind},
         )
         return Admission(
             execution,
@@ -617,6 +722,42 @@ class RegistryAdmission:
             options["script"] = ResolvedOption.requested(request.script)
             options["script_args"] = ResolvedOption.requested(list(request.script_args))
         return options
+
+    # Bounds -------------------------------------------------------------------
+
+    def environment_slot(self) -> BuildSlot:
+        """
+        Takes one of this Controller's environment-build slots
+        (`NEST_LIMIT_ENVIRONMENT_BUILDS`) without waiting for one. Release it with
+        [`admission.BuildSlot.release`] once the build is over.
+
+        Raises:
+            [`admission.AdmissionRefusedError`]: `limit_environment_builds` with
+                `RESOURCE_EXHAUSTED` when every slot is taken.
+        """
+        if self._builds is None:
+            return BuildSlot(None)
+        if not self._builds.acquire(blocking=False):
+            assert self.limits is not None
+            raise AdmissionRefusedError(
+                "limit_environment_builds",
+                f"This Controller is already building {self.limits.environment_builds} "
+                "environments; nothing was submitted, retry shortly",
+                grpc.StatusCode.RESOURCE_EXHAUSTED,
+                {"limit": self.limits.environment_builds},
+            )
+        return BuildSlot(self._builds)
+
+    @contextmanager
+    def waiting(self, admission: Admission) -> Generator[None]:
+        """Marks an attempt as followed by an RPC of this Controller, for `settle`."""
+        with self._waiting_lock:
+            self._waiting.add(admission.attempt.id)
+        try:
+            yield
+        finally:
+            with self._waiting_lock:
+                self._waiting.discard(admission.attempt.id)
 
     # Lifecycle ----------------------------------------------------------------
 
@@ -783,6 +924,50 @@ class RegistryAdmission:
 
     # Recovery -----------------------------------------------------------------
 
+    SETTLE_BATCH = 50
+    """Most live attempts one [`admission.RegistryAdmission.settle`] queries Slurm for."""
+
+    def settle(self, older_than: timedelta) -> int:
+        """
+        Applies Slurm's state to `submitted` and `running` attempts of the served
+        Platform that no RPC of this Controller is waiting on and that have not
+        changed for `older_than`, so a finished job releases its reservation even
+        when no client asks for its status.
+
+        Only a state Slurm reports settles an attempt. A failed query, a job Slurm
+        no longer knows (`UNKNOWN`), and attempts without a job ID (`submitting`,
+        `unknown`) are left as they are, so a reservation that may still be in use
+        is never released.
+
+        Returns:
+            `int`: How many attempts were queried.
+        """
+        now = time.time()
+        with self._waiting_lock:
+            waiting = set(self._waiting)
+        candidates = [
+            attempt
+            for attempt in self.registry.live_attempts(self.platform_id)
+            if attempt.status in ("submitted", "running")
+            and attempt.slurm_job_id is not None
+            and attempt.id not in waiting
+            and now - attempt.updated_at.timestamp() > older_than.total_seconds()
+        ][: self.SETTLE_BATCH]
+        for attempt in candidates:
+            assert attempt.slurm_job_id is not None
+            try:
+                state = self.backend.status(attempt.slurm_job_id)
+            except InfrastructureError as exc:
+                logger.warning(
+                    "Live attempt not settled attempt_id=%s job_id=%s kind=%s",
+                    attempt.id,
+                    attempt.slurm_job_id,
+                    exc.kind,
+                )
+                continue
+            self.observe({"attempt_id": attempt.id}, state)
+        return len(candidates)
+
     def recover(self, older_than: timedelta) -> list[Attempt]:
         """
         Marks attempts interrupted before a Slurm job ID arrived as `unknown`, for
@@ -806,12 +991,22 @@ class RegistryAdmission:
 class RecoverySweeper:
     """
     Runs [`admission.RegistryAdmission.recover`] at start and then every `interval`
-    seconds on a daemon thread, until stopped. A failed sweep is logged and retried.
+    seconds on a daemon thread, until stopped, followed by
+    [`admission.RegistryAdmission.settle`] when `settle_after` is given. A failed
+    sweep is logged and retried.
     """
 
-    def __init__(self, admission: RegistryAdmission, older_than: timedelta, interval: float):
+    def __init__(
+        self,
+        admission: RegistryAdmission,
+        older_than: timedelta,
+        interval: float,
+        *,
+        settle_after: timedelta | None = None,
+    ):
         self.admission = admission
         self.older_than = older_than
+        self.settle_after = settle_after
         self.interval = interval
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="nest-recovery", daemon=True)
@@ -821,6 +1016,13 @@ class RecoverySweeper:
             self.admission.recover(self.older_than)
         except DatabaseError as exc:
             logger.error("Execution recovery sweep failed: %s", exc)
+            return
+        if self.settle_after is None:
+            return
+        try:
+            self.admission.settle(self.settle_after)
+        except DatabaseError as exc:
+            logger.error("Execution settle sweep failed: %s", exc)
 
     def _run(self) -> None:
         while not self._stop.wait(self.interval):

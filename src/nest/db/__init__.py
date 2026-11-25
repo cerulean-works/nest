@@ -49,6 +49,7 @@ from .cli_logins import (
 from .connection import Database, DatabaseError
 from .executions import (
     AccountNotPermittedError,
+    AdmissionLimitError,
     Attempt,
     AttemptInFlightError,
     Execution,
@@ -61,7 +62,10 @@ from .executions import (
     InvalidTransitionError,
     PlatformUnavailableError,
     ProviderNotApprovedError,
+    Reservation,
     ResolvedOption,
+    Submitter,
+    SubmitterNotAuthorizedError,
 )
 from .identity import (
     Identity,
@@ -145,6 +149,7 @@ __all__ = [
     "AccessGrant",
     "AccountLinkNotFoundError",
     "AccountNotPermittedError",
+    "AdmissionLimitError",
     "AlreadyInvitedError",
     "ApprovalImport",
     "Attempt",
@@ -218,6 +223,7 @@ __all__ = [
     "ProviderApprovalStore",
     "ProviderNotApprovedError",
     "QueuedEmail",
+    "Reservation",
     "ResolvedOption",
     "Rotation",
     "SchemaStatus",
@@ -228,6 +234,8 @@ __all__ = [
     "SlurmAccountError",
     "SlurmAccountNotFoundError",
     "SlurmAccountStore",
+    "Submitter",
+    "SubmitterNotAuthorizedError",
     "TooManyPendingCLILoginsError",
     "TooManyPendingSignInsError",
     "User",
