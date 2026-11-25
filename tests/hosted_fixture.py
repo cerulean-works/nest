@@ -77,6 +77,24 @@ class CertificateAuthority:
             .not_valid_before(now - timedelta(minutes=5))
             .not_valid_after(now + timedelta(days=1))
             .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+            # Python 3.13+ verifies with VERIFY_X509_STRICT, which needs these.
+            .add_extension(
+                x509.KeyUsage(
+                    digital_signature=True,
+                    content_commitment=False,
+                    key_encipherment=False,
+                    data_encipherment=False,
+                    key_agreement=False,
+                    key_cert_sign=True,
+                    crl_sign=True,
+                    encipher_only=False,
+                    decipher_only=False,
+                ),
+                critical=True,
+            )
+            .add_extension(
+                x509.SubjectKeyIdentifier.from_public_key(self.key.public_key()), critical=False
+            )
             .sign(self.key, hashes.SHA256())
         )
 
@@ -100,6 +118,13 @@ class CertificateAuthority:
                 x509.SubjectAlternativeName([x509.DNSName(n) for n in names]), critical=False
             )
             .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+            .add_extension(
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(self.key.public_key()),
+                critical=False,
+            )
+            .add_extension(
+                x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False
+            )
             .sign(self.key, hashes.SHA256())
         )
         chain = certificate.public_bytes(serialization.Encoding.PEM) + self.pem

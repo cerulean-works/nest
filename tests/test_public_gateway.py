@@ -527,6 +527,18 @@ class EnvoyGatewayTests(_Base):
             time.sleep(0.2)
         self.fail(f"Envoy did not become ready: {self.log.read_text()[-4000:]}")
 
+    def access_log(self, *expected: str) -> str:
+        """Envoy's log once it holds every expected line. Envoy writes access-log
+        entries asynchronously, so a just-finished call may not be there yet."""
+        deadline = time.monotonic() + 10
+        while True:
+            log = self.log.read_text()
+            if all(line in log for line in expected) or time.monotonic() > deadline:
+                for line in expected:
+                    self.assertIn(line, log)
+                return log
+            time.sleep(0.2)
+
     def store_session(self, user_id, token):
         now = datetime.now(UTC)
         CredentialStore(str(self.home / "nest" / "credentials.json")).save(
@@ -553,7 +565,8 @@ class EnvoyGatewayTests(_Base):
         with mock.patch.dict(os.environ, environment, clear=True):
             return execute_remote(answer_42, RESOURCES, None)
 
-    def stub(self) -> execution_pb2_grpc.ExecutionServiceStub:
+    def gateway_stub(self) -> execution_pb2_grpc.ExecutionServiceStub:
+        """A stub through the edge. (`_Base.setUp` sets `self.stub` to a direct one.)"""
         channel = grpc.secure_channel(
             f"localhost:{self.edge.port}", grpc.ssl_channel_credentials(self.ca.pem)
         )
@@ -590,13 +603,12 @@ class EnvoyGatewayTests(_Base):
         self.assertEqual(len(admits), 1)
         # The gateway's x-forwarded-for, from the PROXY header, names the client.
         self.assertEqual(admits[0].details.get("client_address"), CLIENT)
-        log = self.log.read_text()
-        self.assertIn("/nest.ExecutionService/Execute", log)
+        log = self.access_log("/nest.ExecutionService/Execute")
         self.assertIn("/nest.ExecutionService/ListEligibleProjects", log)
         self.assertNotIn(self.token_member, log)
 
     def test_client_cannot_choose_its_audited_address(self):
-        self.stub().Execute(
+        self.gateway_stub().Execute(
             execution_pb2.ExecuteRequest(payload=cloudpickle.dumps((answer_42, (), {}))),
             timeout=60,
             metadata=self.metadata(x_forwarded_for="198.51.100.66"),
@@ -608,7 +620,7 @@ class EnvoyGatewayTests(_Base):
 
     def test_unauthenticated_and_unknown_paths_are_refused_before_anything_runs(self):
         with self.assertRaises(grpc.RpcError) as caught:
-            self.stub().ListEligibleProjects(
+            self.gateway_stub().ListEligibleProjects(
                 execution_pb2.ListEligibleProjectsRequest(), timeout=30
             )
         error = cast(grpc.Call, caught.exception)
@@ -640,7 +652,7 @@ class EnvoyGatewayTests(_Base):
         codes = []
         for _ in range(4):
             try:
-                self.stub().ListEligibleProjects(
+                self.gateway_stub().ListEligibleProjects(
                     execution_pb2.ListEligibleProjectsRequest(),
                     timeout=30,
                     metadata=self.metadata(),
