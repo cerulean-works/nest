@@ -217,6 +217,9 @@ the auth listener."""
 INVITATION_PAGE_PATH = "/invitations/accept"
 """Browser page where a signed-in User reviews and accepts an invitation link."""
 
+CONSOLE_PATH = "/console"
+"""Root of the browser Management Console served by the auth listener."""
+
 CLI_SCOPES: dict[str, str] = {
     "jobs:run": "Run and manage jobs in your Projects",
     "projects:read": "See your Projects and their members",
@@ -1671,6 +1674,12 @@ def _google_redirect_url(reader: _Reader) -> str | None:
     ):
         reader.fail(
             f"NEST_GOOGLE_REDIRECT_URL must not use {parts.path}, an invitation route; "
+            f"use a callback path such as {_REDIRECT_EXAMPLE!r}"
+        )
+        return None
+    if parts.path == CONSOLE_PATH or parts.path.startswith(CONSOLE_PATH + "/"):
+        reader.fail(
+            f"NEST_GOOGLE_REDIRECT_URL must not use {parts.path}, a Management Console route; "
             f"use a callback path such as {_REDIRECT_EXAMPLE!r}"
         )
         return None
