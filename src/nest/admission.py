@@ -64,7 +64,13 @@ from .audit import AuditLog
 from .authz.accounts import AccountResolution, AccountResolutionError, AccountResolver, HPCIdentity
 from .authz.platforms import PlatformCatalog, PlatformResolutionError, PlatformSelection
 from .authz.policy import Principal
-from .backends.slurm import SlurmBackend
+from .backends.slurm import (
+    ENVIRONMENT_BUILD_CPUS,
+    ENVIRONMENT_BUILD_GPUS,
+    ENVIRONMENT_BUILD_TIME,
+    SlurmBackend,
+    worker_allocation,
+)
 from .config import AdmissionLimits, PlatformProfile, slurm_time_seconds
 from .db.connection import Database, DatabaseError
 from .db.executions import (
@@ -337,6 +343,9 @@ class Admission:
     selection: PlatformSelection
     resolution: AccountResolution
     details: Mapping[str, Any] = field(default_factory=dict)
+    bounded: bool = False
+    """Whether the job must be submitted pinned to its reservation (one node, one task,
+    explicit CPUs); see [`backends.slurm.SlurmBackend.submit_payload`]."""
 
     @property
     def execution_id(self) -> str:
@@ -530,11 +539,18 @@ class RegistryAdmission:
             )
         partition = request.partition or self.profile.partition
         time_limit = request.time or self.profile.time
-        reservation = Reservation(
-            cpu=request.cpu,
-            gpu=request.gpu,
-            walltime_seconds=slurm_time_seconds(time_limit) if time_limit else None,
-        )
+        reservation = self._reservation(request, time_limit)
+        if (
+            self.limits is not None
+            and request.kind == "batch"
+            and (self.limits.batch_scripts == "refuse")
+        ):
+            raise AdmissionRefusedError(
+                "limit_batch_scripts_unbounded",
+                "This Controller admits no SubmitJob batch scripts: their own #SBATCH "
+                "directives can allocate more than any admission limit, so they cannot be "
+                "bounded (NEST_LIMIT_BATCH_SCRIPTS=refuse). Nothing was submitted",
+            )
         if self.limits is not None:
             try:
                 # Before anything is registered: a request no limit could admit.
@@ -610,6 +626,7 @@ class RegistryAdmission:
             "gpu": reservation.gpu,
             "walltime_seconds": reservation.walltime_seconds,
             "reserved": self.limits is not None,
+            "quota_enforced": self.limits is not None and reservation.bounded,
         }
         logger.info(
             "Submission admitted " + " ".join(f"{key}=%s" for key in details),
@@ -635,7 +652,31 @@ class RegistryAdmission:
             selection,
             resolution,
             details,
+            bounded=self.limits is not None and reservation.bounded,
         )
+
+    @staticmethod
+    def _reservation(request: SubmissionRequest, time_limit: str | None) -> Reservation:
+        """
+        What the job is allocated, not just what was asked for.
+
+        `Execute`: the worker runs on one node as one task, with the request's GPUs
+        and CPUs or the worker script's defaults where it asks for `0` (the default
+        GPU is allocated even for a CPU-only call). With an environment, a build may
+        run first with its own allocation, so the larger of the two is reserved.
+        `SubmitJob`: only what was requested, marked not bounded.
+        """
+        walltime = slurm_time_seconds(time_limit) if time_limit else None
+        if request.kind == "batch":
+            return Reservation(
+                cpu=request.cpu, gpu=request.gpu, walltime_seconds=walltime, bounded=False
+            )
+        gpu, cpu = worker_allocation(request.gpu, request.cpu)
+        if request.environment_digest is not None:
+            build = slurm_time_seconds(ENVIRONMENT_BUILD_TIME)
+            gpu, cpu = max(gpu, ENVIRONMENT_BUILD_GPUS), max(cpu, ENVIRONMENT_BUILD_CPUS)
+            walltime = max(walltime, build) if walltime and build else walltime
+        return Reservation(cpu=cpu, gpu=gpu, walltime_seconds=walltime)
 
     def _check_repeat(self, execution: Execution, project_id: UUID) -> None:
         """Decides what a repeated idempotency key may do. Never resubmits blindly."""
@@ -894,6 +935,47 @@ class RegistryAdmission:
                 error_kind=kind,
                 error_message=message,
             ),
+        )
+
+    def build_unknown(self, admission: Admission, exc: Exception, build_job_id: int | None):
+        """
+        Records an environment build whose job may still be running (its submission
+        or wait timed out, or its status could not be read) as `unknown`, so the
+        attempt keeps its reservation, on every replica and across restarts, until
+        an operator confirms the build is over (`nest-db execution reconcile
+        --not-submitted`; the worker never ran). Never raises.
+        """
+        kind = exc.kind if isinstance(exc, InfrastructureError) else "internal"
+        job = f"environment build job {build_job_id}" if build_job_id else "an environment build"
+        message = (
+            f"{job} may still be running ({kind}: {exc}); the worker was not submitted. "
+            "Reconcile with --not-submitted once Slurm shows the build finished."
+        )
+        logger.error(
+            "Environment build outcome unknown execution_id=%s attempt_id=%s build_job_id=%s",
+            admission.execution_id,
+            admission.attempt.id,
+            build_job_id,
+        )
+        self._write(
+            "unknown",
+            admission,
+            lambda: self.registry.finish_attempt(
+                admission.attempt.id,
+                "unknown",
+                error_kind="environment_build_unknown",
+                error_message=message,
+            ),
+        )
+        self.audit.record(
+            "execution.environment_build_unknown",
+            "failed",
+            project_id=admission.execution.project_id,
+            actor_user_id=admission.execution.owner_user_id,
+            resource_type="execution",
+            resource_id=admission.execution_id,
+            reason=kind,
+            details={"attempt_id": admission.attempt.id, "build_job_id": build_job_id},
         )
 
     # Job operations -----------------------------------------------------------

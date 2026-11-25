@@ -181,13 +181,18 @@ class Reservation:
     What an attempt reserves while it is live.
 
     Attributes:
-        cpu, gpu (`int`): Requested counts (`0` when not requested).
+        cpu, gpu (`int`): CPUs per task and GPUs per node the job is allocated (one
+            node, one task), including the batch script's defaults.
         walltime_seconds (`int | None`): The `--time` it is submitted with.
+        bounded (`bool`): Whether the job's allocation is pinned to `cpu` and `gpu`.
+            `False` for a `SubmitJob` script, whose own directives Nest cannot
+            bound: the counts are then only what was requested.
     """
 
     cpu: int = 0
     gpu: int = 0
     walltime_seconds: int | None = None
+    bounded: bool = True
 
 
 @dataclass(frozen=True)
@@ -391,7 +396,8 @@ def _reserve(
             )
     cursor.execute(
         "INSERT INTO execution_reservations (attempt_id, project_id, owner_user_id, "
-        "platform_id, cpu, gpu, walltime_seconds, limits) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+        "platform_id, cpu, gpu, walltime_seconds, bounded, limits) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
         (
             attempt_id,
             execution["project_id"],
@@ -400,6 +406,7 @@ def _reserve(
             reservation.cpu,
             reservation.gpu,
             reservation.walltime_seconds,
+            reservation.bounded,
             _jsonb(limits.summary()),
         ),
     )
@@ -1295,7 +1302,7 @@ class ExecutionRegistry:
         with transaction(self.database, None, "read an admission reservation") as cursor:
             return cursor.execute(
                 "SELECT r.attempt_id, r.project_id, r.owner_user_id, r.platform_id, r.cpu, "
-                "r.gpu, r.walltime_seconds, r.limits, r.created_at, a.status, "
+                "r.gpu, r.walltime_seconds, r.bounded, r.limits, r.created_at, a.status, "
                 "a.status = ANY(%s) AS held FROM execution_reservations r "
                 "JOIN execution_attempts a ON a.id = r.attempt_id WHERE r.attempt_id = %s",
                 (list(LIVE_ATTEMPT_STATUSES), attempt_id),

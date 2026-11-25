@@ -28,11 +28,53 @@ Full GPU-hour accounting and showback are F02b (M3).
 | `NEST_LIMIT_GPU_PER_REQUEST` | 8 | `gpu` of one request | `FAILED_PRECONDITION` (`limit_gpu_per_request`) |
 | `NEST_LIMIT_WALLTIME` | `1-00:00:00` | the `--time` of one request (or the Platform default) | `FAILED_PRECONDITION` (`limit_walltime`; `limit_walltime_unbounded` for `UNLIMITED` or no time) |
 | `NEST_LIMIT_ENVIRONMENT_BUILDS` | 2 | environment builds one Controller runs at once | `RESOURCE_EXHAUSTED` (`limit_environment_builds`) |
+| `NEST_LIMIT_BATCH_SCRIPTS` | `trusted` | how `SubmitJob` batch scripts are admitted; see [Batch scripts](#batch-scripts) | `FAILED_PRECONDITION` (`limit_batch_scripts_unbounded`) with `refuse` |
 
 Every limit is a positive bound of at most 1,000,000 (`NEST_LIMIT_WALLTIME` is a
 bounded Slurm time); none can be switched off, and an invalid value stops the
 Controller at start with every problem listed. A live attempt is one that is
 `submitting`, `submitted`, `running` or `unknown`.
+
+## What is reserved
+
+Limits count what Slurm is asked to allocate, not only the counts in the RPC.
+
+- **`Execute`.** The Controller pins the worker job with `--nodes=1 --ntasks=1` and
+  an explicit `--cpus-per-task`, which override the worker script's own counts.
+  It reserves the request's GPUs per node and CPUs, or the worker script's
+  defaults where the request asks for `0`: **1 GPU and 1 CPU**. A CPU-only call
+  therefore holds, and is charged, one GPU, because `scripts/worker.sbatch`
+  requests one and Nest does not pass `--gpus-per-node=0`, whose meaning varies
+  between sites. That GPU is not visible to the function (see
+  [Run functions on GPUs](gpus)). Changing this is E04's site-supported
+  zero-GPU policy.
+- **`Execute` with an environment.** A cache miss runs the build job
+  (`scripts/environment-smoke.sbatch`: one node, 1 GPU, 12 CPUs, 10 minutes)
+  before the worker, within the same attempt. Since admission cannot know in
+  advance whether the cache is warm, it reserves the larger of the two
+  allocations: at least 1 GPU, 12 CPUs and 10 minutes.
+- **`SubmitJob`.** See [Batch scripts](#batch-scripts).
+
+The per-request bounds (`*_PER_REQUEST`, `WALLTIME`) apply to these effective
+values too, so a request that asks for nothing can still exceed a per-request
+CPU bound below 12 when it needs an environment build.
+
+### Batch scripts
+
+A `SubmitJob` script is a file on the cluster whose own `#SBATCH` directives
+(`--nodes`, `--ntasks-per-node`, `--gres`, `--gpus`, `--array`, `--mem`, ...)
+can allocate far more than the request's `gpu` and `cpu`. Command-line flags
+override only the same options, and Nest does not read the script, so no
+admission limit can bound its allocation. Nest therefore makes no claim to:
+
+- `NEST_LIMIT_BATCH_SCRIPTS=trusted` (the default, which keeps the existing
+  private deployment's `SubmitJob` working): batch jobs are admitted. They count
+  against the active-attempt and per-minute limits, and reserve the counts they
+  asked for, but the reservation is recorded with `bounded = false` and the
+  audit record with `quota_enforced: false`. The CPU and GPU sums do not bound
+  what those jobs hold.
+- `NEST_LIMIT_BATCH_SCRIPTS=refuse`: every `SubmitJob` is refused before anything
+  is registered. **Set this for a bounded pilot.** `Execute` is unaffected.
 
 Memory is not limited: Nest's API has no memory request, so Slurm's partition
 defaults decide it. Repeated requests are bounded by the per-minute limit and the
@@ -76,6 +118,8 @@ however many times that state is observed:
 | --- | --- | --- |
 | Job completed, failed, timed out in Slurm, or was cancelled, as Slurm reports | `succeeded`, `failed`, `cancelled` | released |
 | Refused by Slurm, or SSH failed before `sbatch` | `failed` | released |
+| Environment build failed in Slurm, or nothing was built (staging or readiness check failed before a build job) | `failed` | released |
+| Environment build timed out, its status could not be read, or its `sbatch` outcome is unknown | `unknown` (`environment_build_unknown`) | **held** until reconciled: the build job may still run |
 | Client cancelled or its deadline passed before a side effect | `failed` (`client_gone`) | released |
 | `sbatch` may have run but no job ID arrived | `unknown` | **held** until `nest-db execution reconcile` |
 | Controller stopped before a job ID arrived | `unknown` after recovery | **held** until reconciled |
@@ -99,9 +143,14 @@ Controller is waiting on, at most 50 per sweep ([`admission.RegistryAdmission.se
   recorded `succeeded` (issue #73); the reservation is released either way.
 - Cancelling the Slurm job of an abandoned `Execute`, and short RPCs that do not
   hold a thread while a job runs, are C04 (detached execution).
-- Environment-build slots are per Controller replica and held in memory; the
-  durable per-User and per-Project limits bound builds across replicas, since
-  every build belongs to an admitted attempt.
+- Environment-build slots are per Controller replica and held in memory, and are
+  freed once the build call returns. What bounds builds across replicas and
+  restarts is the attempt's durable reservation, which covers the build's
+  allocation and stays held (`unknown`) whenever the build may still be running.
+  The build's Slurm job ID is in the attempt's `error_message` and in the
+  `execution.environment_build_unknown` audit record. Once Slurm shows that job
+  finished, reconcile with `nest-db execution reconcile ATTEMPT --not-submitted`
+  (the worker never ran).
 - The legacy path (`NEST_EXECUTION_REGISTRY=legacy`) enforces no admission
   limits; the Controller says so at start. Use it only for trusted Mode A.
 

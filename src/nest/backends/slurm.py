@@ -64,6 +64,17 @@ _SQUEUE_FORMAT = "%T|%r|%P|%q|%a"
 _REQ_TRES = re.compile(r"(?:^|\s)ReqTRES=(\S+)")
 """Requested trackable resources in `scontrol show job --oneliner` output."""
 
+WORKER_DEFAULT_GPUS = 1
+"""GPUs per node `scripts/worker.sbatch` requests when the Controller passes none."""
+WORKER_DEFAULT_CPUS = 1
+"""CPUs per task `scripts/worker.sbatch` requests when the Controller passes none."""
+ENVIRONMENT_BUILD_GPUS = 1
+"""GPUs per node `scripts/environment-smoke.sbatch` (the environment build) requests."""
+ENVIRONMENT_BUILD_CPUS = 12
+"""CPUs per task the environment build requests."""
+ENVIRONMENT_BUILD_TIME = "00:10:00"
+"""Time limit of the environment build."""
+
 PENDING_QUEUED = "queued"
 """Pending reason category: normal queue congestion that clears on its own."""
 
@@ -365,6 +376,44 @@ def environment_id(pyproject_toml: bytes, uv_lock: bytes) -> str:
     return hasher.hexdigest()
 
 
+def worker_allocation(gpu: int, cpu: int) -> tuple[int, int]:
+    """
+    The GPUs per node and CPUs per task a worker job holds for a request: the
+    request, or `scripts/worker.sbatch`'s default where it asks for `0`.
+    """
+    return (gpu or WORKER_DEFAULT_GPUS, cpu or WORKER_DEFAULT_CPUS)
+
+
+class BuildProgress:
+    """
+    Follows one environment build for [`backends.slurm.SlurmBackend.prepare_environment_bytes`].
+
+    Attributes:
+        started (`bool`): A build submission began, so a build job may exist.
+        job_id (`int | None`): The build's Slurm job ID, once `sbatch` returned it.
+        done (`bool`): The build job reached a final state Slurm reported.
+    """
+
+    def __init__(self) -> None:
+        self.started = False
+        self.job_id: int | None = None
+        self.done = False
+
+    def submitting(self) -> None:
+        self.started = True
+
+    def submitted(self, job_id: int) -> None:
+        self.job_id = job_id
+
+    def finished(self) -> None:
+        self.done = True
+
+    @property
+    def may_be_running(self) -> bool:
+        """Whether a build job may exist that Slurm has not reported finished."""
+        return self.started and not self.done
+
+
 class SlurmBackend:
     """Stages files and manages Slurm jobs through noninteractive SSH commands."""
 
@@ -541,6 +590,7 @@ class SlurmBackend:
         time: str | None = None,
         inherit_time: bool = True,
         script_args: tuple[str, ...] = (),
+        single_task: bool = False,
     ) -> int:
         """
         Submits a batch script from a remote working directory exactly once.
@@ -567,6 +617,9 @@ class SlurmBackend:
                 `time` omits the flag, so the script's `#SBATCH --time` applies.
             script_args (`tuple[str, ...]`, *optional*, defaults to `()`): Arguments
                 appended after the script path.
+            single_task (`bool`, *optional*, defaults to `False`): Pass `--nodes=1`
+                and `--ntasks=1`, which override the script's own node and task
+                counts, so the job holds at most one node and one task.
 
         Returns:
             `int`: Job ID parsed from the last line of `sbatch --parsable` output.
@@ -596,6 +649,9 @@ class SlurmBackend:
             f"--account={account or self.config.account}",
             f"--partition={partition or self.config.partition}",
         ]
+
+        if single_task:
+            args.extend(("--nodes=1", "--ntasks=1"))
 
         if gpu > 0:
             args.append(f"--gpus-per-node={gpu}")
@@ -822,6 +878,7 @@ class SlurmBackend:
         account: str | None = None,
         partition: str | None = None,
         time: str | None = None,
+        bounded: bool = False,
     ) -> tuple[int, str]:
         """
         Stages a serialized call and submits the deployed worker batch script once.
@@ -845,6 +902,11 @@ class SlurmBackend:
                 [`backends.slurm.SlurmBackend.submit`]; unset uses the configured
                 defaults, as before. The registry-backed Controller passes the values
                 it resolved and recorded.
+            bounded (`bool`, *optional*, defaults to `False`): Pin the allocation to
+                [`backends.slurm.worker_allocation`]: one node, one task, and an
+                explicit `--cpus-per-task`, so the job holds exactly what admission
+                reserved. With `gpu` `0` the worker's own GPU default still applies,
+                and is reserved.
 
         Returns:
             `tuple[int, str]`: Submitted job ID and remote execution directory.
@@ -890,11 +952,12 @@ class SlurmBackend:
                 workdir=self.config.worker_workdir,
                 script="project/scripts/worker.sbatch",
                 gpu=gpu,
-                cpu=cpu,
+                cpu=(worker_allocation(gpu, cpu)[1] if bounded else cpu),
                 account=account,
                 partition=partition,
                 time=time,
                 script_args=script_args,
+                single_task=bounded,
             )
         except SubmissionUnknownError as exc:
             logger.error(
@@ -1454,6 +1517,7 @@ class SlurmBackend:
         uv_lock: bytes,
         gpu: int = 0,
         cpu: int = 0,
+        progress: BuildProgress | None = None,
     ) -> str:
         """
         Stages dependency files and reuses or builds their runtime environment.
@@ -1469,6 +1533,9 @@ class SlurmBackend:
                 build job. `0` keeps the script's value.
             cpu (`int`, *optional*, defaults to `0`): CPUs per task for a required
                 build job; `0` keeps the script's value.
+            progress ([`backends.slurm.BuildProgress`], *optional*): Told when a
+                build job may exist and when it has finished, so a caller can tell a
+                build that may still be running from one that is over.
 
         Returns:
             `str`: Remote environment directory after its runtime is ready.
@@ -1490,11 +1557,17 @@ class SlurmBackend:
             return env_dir
 
         logger.info("Runtime cache miss environment_id=%s", Path(env_dir).name)
+        if progress is not None:
+            progress.submitting()
         job_id = self.build_environment(env_dir, gpu=gpu, cpu=cpu)
+        if progress is not None:
+            progress.submitted(job_id)
         logger.info(
             "Environment build submitted job_id=%s environment_id=%s", job_id, Path(env_dir).name
         )
         self.wait_environment(job_id)
+        if progress is not None:
+            progress.finished()
 
         if not self.environment_ready(env_dir):
             raise InfrastructureError(

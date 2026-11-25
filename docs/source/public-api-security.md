@@ -140,6 +140,7 @@ NEST_CONTROLLER_AUTH=session
 NEST_CONTROLLER_ALLOW_PLAINTEXT=true            # h2c on the internal network only
 NEST_GRPC_ALLOWED_PEERS=<origin network CIDR>   # plus the Tailnet range while it serves
 NEST_GRPC_TRUSTED_PROXIES=<Envoy's address on that network>
+NEST_LIMIT_BATCH_SCRIPTS=refuse                 # batch scripts cannot be quota-bounded
 ```
 
 Safe defaults apply without any of these settings, and the existing Tailnet

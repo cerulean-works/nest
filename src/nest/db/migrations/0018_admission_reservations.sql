@@ -28,8 +28,15 @@ CREATE TABLE execution_reservations (
     project_id        uuid NOT NULL REFERENCES projects (id) ON DELETE RESTRICT,
     owner_user_id     uuid NOT NULL REFERENCES users (id) ON DELETE RESTRICT,
     platform_id       uuid NOT NULL REFERENCES hpc_platforms (id) ON DELETE RESTRICT,
+    -- What the job is allocated: the request, or the batch script's default where
+    -- the request asks for none, and for an environment build the larger of the
+    -- build's and the worker's allocation.
     cpu               integer NOT NULL CHECK (cpu >= 0),
     gpu               integer NOT NULL CHECK (gpu >= 0),
+    -- false when Nest cannot bound what the job allocates (a SubmitJob script's
+    -- own #SBATCH directives, under NEST_LIMIT_BATCH_SCRIPTS=trusted, or a
+    -- reservation backfilled below): cpu and gpu are then only what was asked for.
+    bounded           boolean NOT NULL DEFAULT true,
     -- The --time the attempt was submitted with; NULL only for a reservation
     -- backfilled below from an attempt admitted before this migration.
     walltime_seconds  integer CHECK (walltime_seconds > 0),
@@ -69,7 +76,7 @@ CREATE TRIGGER execution_reservations_no_truncate BEFORE TRUNCATE ON execution_r
 -- Attempts already live when this migration runs hold what they asked for, so
 -- the first admission after the upgrade counts them too.
 INSERT INTO execution_reservations
-    (attempt_id, project_id, owner_user_id, platform_id, cpu, gpu, limits, created_at)
+    (attempt_id, project_id, owner_user_id, platform_id, cpu, gpu, bounded, limits, created_at)
 SELECT a.id, e.project_id, e.owner_user_id, a.platform_id,
        COALESCE((SELECT (o.value #>> '{}')::integer FROM execution_attempt_options o
                  WHERE o.attempt_id = a.id AND o.name = 'cpu'
@@ -77,6 +84,6 @@ SELECT a.id, e.project_id, e.owner_user_id, a.platform_id,
        COALESCE((SELECT (o.value #>> '{}')::integer FROM execution_attempt_options o
                  WHERE o.attempt_id = a.id AND o.name = 'gpu'
                    AND jsonb_typeof(o.value) = 'number'), 0),
-       '{"backfilled": true}'::jsonb, a.created_at
+       false, '{"backfilled": true}'::jsonb, a.created_at
 FROM execution_attempts a JOIN executions e USING (execution_id)
 WHERE a.status IN ('submitting', 'submitted', 'running', 'unknown');

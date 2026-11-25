@@ -784,6 +784,9 @@ DEFAULT_LIMIT_GPU_PER_PROJECT = 16
 DEFAULT_LIMIT_WALLTIME = "1-00:00:00"
 DEFAULT_LIMIT_SUBMISSIONS_PER_MINUTE = 30
 DEFAULT_LIMIT_ENVIRONMENT_BUILDS = 2
+BATCH_SCRIPT_MODES = ("trusted", "refuse")
+"""`NEST_LIMIT_BATCH_SCRIPTS`: how admission treats `SubmitJob` scripts, whose own
+`#SBATCH` directives Nest cannot bound."""
 MAX_LIMIT = 1_000_000
 """Upper bound of every count limit: a limit is always bounded, never unlimited."""
 
@@ -894,6 +897,13 @@ class AdmissionLimits:
             attempts one User may start in any 60 seconds, across replicas.
         environment_builds (`int`): `NEST_LIMIT_ENVIRONMENT_BUILDS`: environment
             builds one Controller runs at once.
+        batch_scripts (`str`): `NEST_LIMIT_BATCH_SCRIPTS`. A `SubmitJob` script's own
+            `#SBATCH` directives (nodes, tasks, `--gres`, arrays, ...) can allocate
+            more than the request says, and Nest does not read them, so its
+            allocation cannot be bounded. `trusted` (the default, as before F02a)
+            admits batch jobs, counts them against the active-attempt limits, and
+            records their reservation as not quota-enforced (`bounded=false`);
+            `refuse` refuses every `SubmitJob`, for a bounded pilot.
     """
 
     active_per_user: int = DEFAULT_LIMIT_ACTIVE_PER_USER
@@ -906,13 +916,20 @@ class AdmissionLimits:
     walltime_seconds: int = slurm_time_seconds(DEFAULT_LIMIT_WALLTIME) or 86_400
     submissions_per_minute: int = DEFAULT_LIMIT_SUBMISSIONS_PER_MINUTE
     environment_builds: int = DEFAULT_LIMIT_ENVIRONMENT_BUILDS
+    batch_scripts: str = "trusted"
 
     def __post_init__(self) -> None:
-        for name, value in self.summary().items():
+        for name, value in self.bounds().items():
             if not isinstance(value, int) or not 1 <= value <= MAX_LIMIT * 100:
                 raise ValueError(f"Admission limit {name} must be a positive bound, got {value!r}")
+        if self.batch_scripts not in BATCH_SCRIPT_MODES:
+            raise ValueError(f"batch_scripts must be one of {', '.join(BATCH_SCRIPT_MODES)}")
 
-    def summary(self) -> dict[str, int]:
+    def summary(self) -> dict[str, object]:
+        return {**self.bounds(), "batch_scripts": self.batch_scripts}
+
+    def bounds(self) -> dict[str, int]:
+        """The numeric limits by name."""
         return {
             "active_per_user": self.active_per_user,
             "active_per_project": self.active_per_project,
@@ -2518,6 +2535,7 @@ def _admission_limits(reader: _Reader) -> AdmissionLimits:
         environment_builds=_bounded(
             reader, "NEST_LIMIT_ENVIRONMENT_BUILDS", DEFAULT_LIMIT_ENVIRONMENT_BUILDS
         ),
+        batch_scripts=reader.choice("NEST_LIMIT_BATCH_SCRIPTS", BATCH_SCRIPT_MODES, "trusted"),
     )
 
 

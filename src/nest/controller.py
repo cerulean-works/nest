@@ -39,7 +39,13 @@ from .authz.execution import (
     UnauthenticatedError,
 )
 from .authz.service import AccessDeniedError, ProviderAuthority
-from .backends.slurm import SlurmBackend, SlurmConfig, environment_id, new_execution_id
+from .backends.slurm import (
+    BuildProgress,
+    SlurmBackend,
+    SlurmConfig,
+    environment_id,
+    new_execution_id,
+)
 from .config import (
     ConfigError,
     ControllerConfig,
@@ -69,6 +75,7 @@ from .errors import (
     InfrastructureError,
     QueueTimeoutError,
     RemoteCommandError,
+    SlurmJobError,
     SubmissionUnknownError,
 )
 from .executor import execute
@@ -512,6 +519,7 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
     def _run_registry_execution(self, request, context, admission_service, admission, slot):
         backend = admission.backend
         submitted = False
+        build = BuildProgress()
         try:
             environment = None
             if request.HasField("environment"):
@@ -520,9 +528,20 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                     context, admission_service, admission, "the environment build"
                 )
                 logger.info("Preparing Python environment")
-                env_dir = backend.prepare_environment_bytes(
-                    pyproject_toml=env.pyproject_toml, uv_lock=env.uv_lock
-                )
+                try:
+                    env_dir = backend.prepare_environment_bytes(
+                        pyproject_toml=env.pyproject_toml, uv_lock=env.uv_lock, progress=build
+                    )
+                except (InfrastructureError, RuntimeError, ValueError) as exc:
+                    if build.may_be_running and not isinstance(exc, SlurmJobError):
+                        # The build job may still hold its allocation: keep the
+                        # reservation (unknown) rather than release it as failed.
+                        logger.exception("Environment build outcome unknown")
+                        admission_service.build_unknown(admission, exc, build.job_id)
+                        if isinstance(exc, InfrastructureError):
+                            _abort_infrastructure(context, exc, execution_id=admission.execution_id)
+                        context.abort(grpc.StatusCode.INTERNAL, _status_details(str(exc)))
+                    raise
                 environment = env_dir.rsplit("/", 1)[-1]
                 logger.info("Environment ready environment_id=%s", environment)
             # The build slot is only needed for the build itself.
@@ -537,6 +556,7 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 account=admission.account,
                 partition=admission.partition,
                 time=admission.time,
+                bounded=admission.bounded,
             )
             submitted = True
             logger.info("Worker submitted job_id=%s job_dir=%s", job_id, job_dir)

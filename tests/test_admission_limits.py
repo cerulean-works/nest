@@ -19,9 +19,11 @@ import uuid
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime, timedelta
 from io import StringIO
+from pathlib import Path
 from typing import cast
 from unittest import mock
 
+import cloudpickle
 import grpc
 import psycopg
 from fake_hpc import FakeHpc
@@ -34,7 +36,15 @@ from nest.admission import (
     SubmissionRequest,
 )
 from nest.authz import Principal
-from nest.backends.slurm import SlurmBackend, SlurmConfig
+from nest.backends.slurm import (
+    ENVIRONMENT_BUILD_CPUS,
+    ENVIRONMENT_BUILD_GPUS,
+    ENVIRONMENT_BUILD_TIME,
+    WORKER_DEFAULT_CPUS,
+    WORKER_DEFAULT_GPUS,
+    SlurmBackend,
+    SlurmConfig,
+)
 from nest.config import AdmissionLimits, ConfigError, load_controller_config, slurm_time_seconds
 from nest.db import executions as executions_module
 from nest.db import hash_token
@@ -46,13 +56,14 @@ from nest.db.executions import (
     check_request_limits,
 )
 from nest.db.identity import lock_session_family
+from nest.errors import ExecutionTimeoutError, SlurmJobError, SSHError, SubmissionUnknownError
 from nest.proto import execution_pb2
 
 LIMITS = AdmissionLimits(
     active_per_user=2,
     active_per_project=3,
     active_per_platform=4,
-    cpu_per_request=8,
+    cpu_per_request=16,  # an environment build holds 12
     gpu_per_request=2,
     cpu_per_project=12,
     gpu_per_project=3,
@@ -204,7 +215,7 @@ class LimitTests(_LimitsBase):
 
     def test_per_request_bounds_are_refused_before_registration(self):
         for label, kwargs, reason in (
-            ("cpu", {"cpu": 9}, "limit_cpu_per_request"),
+            ("cpu", {"cpu": 17}, "limit_cpu_per_request"),
             ("gpu", {"gpu": 3}, "limit_gpu_per_request"),
             ("walltime", {"time": "02:00:00"}, "limit_walltime"),
             ("unlimited", {"time": "UNLIMITED"}, "limit_walltime_unbounded"),
@@ -658,12 +669,265 @@ class EnvironmentBuildTests(_LimitsBase):
         self.admission.environment_slot().release()
 
 
+class EffectiveAllocationTests(_LimitsBase):
+    """Reservations match what Slurm is asked to allocate, not just the RPC's counts."""
+
+    def admit_directly(self, admission=None, **request):
+        principal = Principal(self.member, "cli", frozenset({"jobs:run"}), None)
+        return (admission or self.admission).admit(
+            principal,
+            self.project,
+            SubmissionRequest("execution", **request),
+            execution_id=uuid.uuid4().hex,
+        )
+
+    def reservation_of_latest(self) -> dict:
+        [attempt] = self.attempts()[-1:]
+        reservation = self.registry.reservation(attempt["id"])
+        assert reservation is not None
+        return reservation
+
+    def test_cpu_only_execute_is_pinned_and_reserves_the_worker_defaults(self):
+        self.assertEqual(self.execute(), 42)
+        [worker] = self.sbatch_calls()
+        self.assertIn("--nodes=1", worker["flags"])
+        self.assertIn("--ntasks=1", worker["flags"])
+        self.assertIn(f"--cpus-per-task={WORKER_DEFAULT_CPUS}", worker["flags"])
+        self.assertFalse(any(f.startswith("--gpus") for f in worker["flags"]))
+        reservation = self.reservation_of_latest()
+        # The worker script's default GPU is allocated even for a CPU-only call.
+        self.assertEqual(
+            (reservation["gpu"], reservation["cpu"], reservation["bounded"]),
+            (WORKER_DEFAULT_GPUS, WORKER_DEFAULT_CPUS, True),
+        )
+
+    def test_explicit_counts_are_passed_and_reserved(self):
+        response = self.stub.Execute(
+            execution_pb2.ExecuteRequest(
+                payload=cloudpickle.dumps((lambda: 1, (), {})), gpu=2, cpu=4
+            ),
+            timeout=60,
+            metadata=self.metadata(),
+        )
+        self.assertEqual(cloudpickle.loads(response.result), 1)
+        [worker] = self.sbatch_calls()
+        for flag in ("--nodes=1", "--ntasks=1", "--gpus-per-node=2", "--cpus-per-task=4"):
+            self.assertIn(flag, worker["flags"])
+        reservation = self.reservation_of_latest()
+        self.assertEqual((reservation["gpu"], reservation["cpu"]), (2, 4))
+
+    def test_default_gpus_count_against_the_project_limit(self):
+        admission = self.limited_admission(
+            limits=AdmissionLimits(gpu_per_project=2, active_per_user=10)
+        )
+        self.admit_directly(admission)
+        self.admit_directly(admission)
+        with self.assertRaises(AdmissionRefusedError) as caught:
+            self.admit_directly(admission)  # asks for no GPU, but would hold one
+        self.assertEqual(caught.exception.reason, "limit_gpu_per_project")
+
+    def test_environment_reserves_the_larger_of_build_and_worker(self):
+        admission = self.limited_admission(limits=AdmissionLimits(active_per_user=10))
+        self.admit_directly(admission, environment_digest="sha256:" + "a" * 64)
+        reservation = self.reservation_of_latest()
+        self.assertEqual(
+            (reservation["gpu"], reservation["cpu"], reservation["walltime_seconds"]),
+            (
+                ENVIRONMENT_BUILD_GPUS,
+                ENVIRONMENT_BUILD_CPUS,
+                slurm_time_seconds(ENVIRONMENT_BUILD_TIME),
+            ),
+        )
+        # A request beyond the build's allocation is reserved as asked.
+        self.admit_directly(admission, environment_digest="sha256:" + "b" * 64, gpu=2, cpu=1)
+        reservation = self.reservation_of_latest()
+        self.assertEqual((reservation["gpu"], reservation["cpu"]), (2, ENVIRONMENT_BUILD_CPUS))
+
+    def test_script_defaults_match_the_reserved_constants(self):
+        scripts = Path(__file__).resolve().parents[1] / "scripts"
+
+        def directives(name):
+            lines = (scripts / name).read_text().splitlines()
+            return dict(
+                line.removeprefix("#SBATCH --").split("=", 1)
+                for line in lines
+                if line.startswith("#SBATCH --") and "=" in line
+            )
+
+        worker = directives("worker.sbatch")
+        self.assertEqual(int(worker["gpus-per-node"]), WORKER_DEFAULT_GPUS)
+        self.assertEqual(int(worker["cpus-per-task"]), WORKER_DEFAULT_CPUS)
+        build = directives("environment-smoke.sbatch")
+        self.assertEqual(int(build["gpus-per-node"]), ENVIRONMENT_BUILD_GPUS)
+        self.assertEqual(int(build["cpus-per-task"]), ENVIRONMENT_BUILD_CPUS)
+        self.assertEqual(build["time"], ENVIRONMENT_BUILD_TIME)
+        self.assertEqual(build["nodes"], "1")
+        for script in (worker, build):
+            self.assertNotIn("ntasks", script)
+            self.assertNotIn("array", script)
+
+
+class BatchScriptTests(_LimitsBase):
+    def write_multi_node_script(self):
+        workdir = Path(self.batch_dir())
+        (workdir / "wide.sbatch").write_text(
+            "#!/bin/bash\n#SBATCH --nodes=4\n#SBATCH --ntasks-per-node=8\n"
+            "#SBATCH --gres=gpu:8\necho wide\n"
+        )
+        return str(workdir)
+
+    def submit_wide(self):
+        return self.stub.SubmitJob(
+            execution_pb2.SubmitJobRequest(
+                workdir=self.write_multi_node_script(), script="wide.sbatch", gpu=1, cpu=1
+            ),
+            timeout=60,
+            metadata=self.metadata(),
+        )
+
+    def test_refuse_mode_fails_closed_for_every_batch_script(self):
+        self.admission = self.limited_admission(limits=AdmissionLimits(batch_scripts="refuse"))
+        self.stub = self.serve(self.admission)
+        for call in (self.submit_wide, self.batch):
+            error = self.refused(call)
+            self.assertEqual(error.code(), grpc.StatusCode.FAILED_PRECONDITION)
+            self.assertIn("limit_batch_scripts_unbounded", error.details())
+        self.assert_nothing_sent()
+        self.assertEqual(self.sql("SELECT count(*) AS n FROM executions"), [{"n": 0}])
+        # Execute is still bounded and admitted.
+        self.assertEqual(self.execute(), 42)
+
+    def test_trusted_mode_admits_but_never_claims_the_quota(self):
+        job = self.submit_wide()
+        [sbatch] = self.sbatch_calls()
+        # Nothing pretends to pin a script Nest cannot bound.
+        self.assertNotIn("--nodes=1", sbatch["flags"])
+        self.assertIn("--gpus-per-node=1", sbatch["flags"])
+        [attempt] = self.attempts()
+        self.assertEqual(attempt["slurm_job_id"], job.job_id)
+        reservation = self.registry.reservation(attempt["id"])
+        assert reservation is not None
+        self.assertFalse(reservation["bounded"])
+        self.assertEqual((reservation["gpu"], reservation["cpu"]), (1, 1))
+        [admitted] = [
+            e for e in self.audit.events(event="execution.admit") if e.outcome == "succeeded"
+        ]
+        self.assertIs(admitted.details["quota_enforced"], False)
+
+    def test_trusted_batch_jobs_still_count_against_active_limits(self):
+        self.hpc.hold_jobs("RUNNING")
+        self.submit_wide()
+        self.submit_wide()
+        error = self.refused(self.submit_wide)
+        self.assertIn("limit_active_per_user", error.details())
+
+
+ENV_ID = "c" * 64
+
+
+class EnvironmentBuildLifecycleTests(_LimitsBase):
+    """A build that may still run keeps its reservation; only terminal evidence frees it."""
+
+    def setUp(self):
+        super().setUp()
+        self.env_dir = f"{self.hpc.base}/environments/{ENV_ID}"
+        self.mocks = {}
+        for name, value in (
+            ("stage_environment_bytes", self.env_dir),
+            ("environment_ready", False),
+            ("build_environment", 777),
+        ):
+            patcher = mock.patch.object(SlurmBackend, name, return_value=value)
+            self.mocks[name] = patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def fail_wait(self, error):
+        patcher = mock.patch.object(SlurmBackend, "wait_environment", side_effect=error)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def execute_with_environment(self):
+        return self.refused(
+            lambda: self.stub.Execute(
+                execution_pb2.ExecuteRequest(
+                    payload=b"x",
+                    environment=execution_pb2.EnvironmentFiles(
+                        pyproject_toml=b"[project]\nname='x'\n", uv_lock=b"version = 1\n"
+                    ),
+                ),
+                timeout=60,
+                metadata=self.metadata(),
+            )
+        )
+
+    def assert_held_unknown(self, build_job_id):
+        [held] = self.held()
+        self.assertEqual(held["status"], "unknown")
+        self.assertEqual(
+            (held["gpu"], held["cpu"]), (ENVIRONMENT_BUILD_GPUS, ENVIRONMENT_BUILD_CPUS)
+        )
+        [attempt] = self.attempts()
+        self.assertEqual(attempt["error_kind"], "environment_build_unknown")
+        self.assertIsNone(attempt["slurm_job_id"])
+        [event] = self.audit.events(event="execution.environment_build_unknown")
+        self.assertEqual(event.details["build_job_id"], build_job_id)
+        self.assertEqual(self.sbatch_calls(), [])  # the worker was never submitted
+        return held
+
+    def test_build_timeout_keeps_the_reservation_across_replicas_and_restart(self):
+        self.fail_wait(ExecutionTimeoutError("build still running", job_id=777))
+        error = self.execute_with_environment()
+        self.assertEqual(error.code(), grpc.StatusCode.DEADLINE_EXCEEDED)
+        held = self.assert_held_unknown(777)
+        # Another replica (and a restarted Controller) counts it.
+        replica = self.limited_admission(db=self.open_database())
+        RecoverySweeper(
+            replica, timedelta(seconds=1), interval=3600, settle_after=timedelta(0)
+        ).sweep()
+        self.assertEqual(len(self.held()), 1)
+        self.hpc.hold_jobs("RUNNING")
+        self.batch(stub=self.serve(replica))
+        error = self.refused(lambda: self.batch(stub=self.serve(replica)))
+        self.assertIn("limit_active_per_user", error.details())
+        # Only an operator's terminal evidence releases it.
+        code, _, err = self.nest_db(
+            "execution", "reconcile", str(held["attempt_id"]), "--not-submitted"
+        )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.held()), 1)
+
+    def test_lost_build_status_keeps_the_reservation(self):
+        self.fail_wait(SSHError("Connection closed by remote host"))
+        error = self.execute_with_environment()
+        self.assertEqual(error.code(), grpc.StatusCode.UNAVAILABLE)
+        self.assert_held_unknown(777)
+
+    def test_unknown_build_submission_keeps_the_reservation(self):
+        self.mocks["build_environment"].side_effect = SubmissionUnknownError("sbatch timed out")
+        error = self.execute_with_environment()
+        self.assertEqual(error.code(), grpc.StatusCode.UNKNOWN)
+        self.assert_held_unknown(None)
+
+    def test_failed_build_releases(self):
+        self.fail_wait(SlurmJobError("build FAILED", job_id=777))
+        self.execute_with_environment()
+        self.assertEqual(self.held(), [])
+        [attempt] = self.attempts()
+        self.assertEqual(attempt["status"], "failed")
+
+    def test_failure_before_any_build_job_releases(self):
+        self.mocks["stage_environment_bytes"].side_effect = SSHError("unreachable")
+        self.execute_with_environment()
+        self.assertEqual(self.held(), [])
+        self.mocks["build_environment"].assert_not_called()
+
+
 class LimitConfigTests(unittest.TestCase):
     def test_defaults_are_bounded(self):
         limits = load_controller_config({}).limits
         self.assertEqual(limits, AdmissionLimits())
         self.assertEqual(limits.walltime_seconds, 86_400)
-        for value in limits.summary().values():
+        for value in limits.bounds().values():
             self.assertGreater(value, 0)
 
     def test_settings_are_read_and_validated(self):
