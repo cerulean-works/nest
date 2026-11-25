@@ -72,8 +72,8 @@ CLIENT = "203.0.113.7"
 """The client address the stand-in edge proxy announces by PROXY protocol."""
 
 
-def answer_42():
-    return 42
+# A lambda is pickled by value: the worker on the (fake) cluster cannot import tests.
+answer_42 = lambda: 42
 
 
 def render(out: Path, **env) -> subprocess.CompletedProcess:

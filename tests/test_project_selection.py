@@ -49,8 +49,8 @@ AUTH_URL = "https://nest.example.com"
 RESOURCES = types.SimpleNamespace(gpu=0, cpu=0)
 
 
-def answer_42():
-    return 42
+# A lambda is pickled by value: the worker on the (fake) cluster cannot import tests.
+answer_42 = lambda: 42
 
 
 class _Selection(HostedCase):
@@ -373,7 +373,7 @@ class EligibilityTests(_Base):
                 execution_pb2.ListEligibleProjectsRequest(), timeout=30
             )
         self.assertEqual(cast(grpc.Call, caught.exception).code(), grpc.StatusCode.UNAUTHENTICATED)
-        scopeless = self.token(self.member, scope="")
+        scopeless = self.token(self.member, scope="profile:read")
         with self.assertRaises(grpc.RpcError) as caught:
             self.eligible(scopeless)
         self.assertEqual(
@@ -381,6 +381,7 @@ class EligibilityTests(_Base):
         )
         open_service = ExecutionService(self.backend, executor="slurm")
         context = mock.Mock()
+        context.invocation_metadata.return_value = ()
         response = open_service.ListEligibleProjects(
             execution_pb2.ListEligibleProjectsRequest(), context
         )
