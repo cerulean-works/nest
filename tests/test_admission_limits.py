@@ -435,6 +435,35 @@ class LifecycleTests(_LimitsBase):
         # A recently changed attempt, or one an RPC here waits on, is left alone.
         self.assertEqual(self.admission.settle(timedelta(hours=1)), 0)
 
+    def test_settle_rotates_past_jobs_that_stay_pending_or_unreadable(self):
+        self.admission = self.limited_admission(
+            limits=AdmissionLimits(
+                active_per_user=100,
+                active_per_project=100,
+                submissions_per_minute=100,
+                gpu_per_project=1000,
+            )
+        )
+        self.stub = self.serve(self.admission)
+        self.admission.SETTLE_BATCH = 3
+        self.hpc.hold_jobs("PENDING")
+        stuck = [self.batch().job_id for _ in range(7)]
+        (self.hpc.state / f"job-{stuck[0]}.state").unlink()  # Slurm forgot it: UNKNOWN
+        self.hpc.hold_jobs("COMPLETED")
+        done = self.batch().job_id  # the newest attempt, behind every stuck one
+        self.assertEqual(self.hpc.job_state(done), "COMPLETED")
+        sweeps = 0
+        while len(self.held()) > len(stuck) and sweeps < 5:
+            self.admission.settle(timedelta(0))
+            sweeps += 1
+        # 8 eligible attempts, 3 per sweep: the completed one is reached in 3 sweeps.
+        self.assertLessEqual(sweeps, 3)
+        held = self.held()
+        self.assertEqual(len(held), len(stuck))  # only the completed job was released
+        self.assertTrue(all(r["status"] == "submitted" for r in held))
+        [finished] = [a for a in self.attempts() if a["slurm_job_id"] == done]
+        self.assertEqual(finished["status"], "succeeded")
+
     def test_execute_timeout_keeps_the_job_reserved(self):
         self.hpc.hold_jobs("RUNNING")
         backend = SlurmBackend(

@@ -134,7 +134,7 @@ running. To release reservations of jobs that finished while nobody asked for
 their status, the recovery sweeper (every 5 minutes) also queries Slurm for
 `submitted` and `running` attempts of the served Platform that have not changed
 for `NEST_RESULT_TIMEOUT` + 2 × `NEST_SSH_TIMEOUT` + 60 s and that no RPC of this
-Controller is waiting on, at most 50 per sweep ([`admission.RegistryAdmission.settle`]).
+Controller is waiting on, at most 50 per sweep, each sweep resuming after the last attempt the previous one queried, so jobs that stay pending or unreadable never keep later ones from being settled ([`admission.RegistryAdmission.settle`]).
 
 ### Remaining lifecycle limitations
 

@@ -413,6 +413,9 @@ class RegistryAdmission:
         self.registry = ExecutionRegistry(database)
         self.limits = limits
         self._builds = threading.BoundedSemaphore(limits.environment_builds) if limits else None
+        # Where the next settle() resumes, so a batch of jobs that stay pending or
+        # unreadable never starves later ones.
+        self._settle_cursor = 0
         # Attempts an RPC of this Controller is still waiting on; settle() skips them.
         self._waiting: set[int] = set()
         self._waiting_lock = threading.Lock()
@@ -1027,20 +1030,33 @@ class RegistryAdmission:
         `unknown`) are left as they are, so a reservation that may still be in use
         is never released.
 
+        Each sweep queries at most `SETTLE_BATCH` attempts, resuming after the last
+        one the previous sweep queried and wrapping around, so every eligible
+        attempt is queried within a bounded number of sweeps however many stay
+        pending or unreadable.
+
         Returns:
             `int`: How many attempts were queried.
         """
         now = time.time()
         with self._waiting_lock:
             waiting = set(self._waiting)
-        candidates = [
-            attempt
-            for attempt in self.registry.live_attempts(self.platform_id)
-            if attempt.status in ("submitted", "running")
-            and attempt.slurm_job_id is not None
-            and attempt.id not in waiting
-            and now - attempt.updated_at.timestamp() > older_than.total_seconds()
-        ][: self.SETTLE_BATCH]
+        eligible = sorted(
+            (
+                attempt
+                for attempt in self.registry.live_attempts(self.platform_id)
+                if attempt.status in ("submitted", "running")
+                and attempt.slurm_job_id is not None
+                and attempt.id not in waiting
+                and now - attempt.updated_at.timestamp() > older_than.total_seconds()
+            ),
+            key=lambda attempt: attempt.id,
+        )
+        cursor = self._settle_cursor
+        ordered = [a for a in eligible if a.id > cursor] + [a for a in eligible if a.id <= cursor]
+        candidates = ordered[: self.SETTLE_BATCH]
+        if candidates:
+            self._settle_cursor = candidates[-1].id
         for attempt in candidates:
             assert attempt.slurm_job_id is not None
             try:
