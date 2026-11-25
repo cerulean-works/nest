@@ -87,6 +87,10 @@ def render(out: Path, **env) -> subprocess.CompletedProcess:
     )
 
 
+@unittest.skipUnless(
+    (GATEWAY / "gateway-entrypoint.sh").is_file(),
+    "requires the repository's deploy/public-grpc files (absent in the Controller image)",
+)
 class GatewayConfigurationTests(unittest.TestCase):
     def setUp(self):
         self.out = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -162,6 +166,10 @@ class GatewayConfigurationTests(unittest.TestCase):
         self.assertIn("/run/certs/fullchain.pem", (self.out / "certificate-sds.yaml").read_text())
         self.assertNotRegex(text, r"@[A-Z][A-Z_]*@")
 
+    def test_localhost_is_accepted_for_local_tests(self):
+        text = self.rendered(NEST_GRPC_PUBLIC_HOST="localhost")
+        self.assertIn('server_names: ["localhost"]', text)
+
     def test_unsafe_or_malformed_values_are_refused(self):
         cases = {
             "unset edge": {},
@@ -172,6 +180,10 @@ class GatewayConfigurationTests(unittest.TestCase):
             "injected name": {
                 "NEST_GRPC_EDGE_PROXY": "10.0.1.7/32",
                 "NEST_GRPC_PUBLIC_HOST": 'x"]\nadmin: {',
+            },
+            "single-label name": {
+                "NEST_GRPC_EDGE_PROXY": "10.0.1.7/32",
+                "NEST_GRPC_PUBLIC_HOST": "controller",
             },
             "bad upstream": {"NEST_GRPC_EDGE_PROXY": "10.0.1.7/32", "NEST_GRPC_UPSTREAM": "a|b:1"},
             "bad port": {"NEST_GRPC_EDGE_PROXY": "10.0.1.7/32", "NEST_GRPC_LISTEN_PORT": "70000"},

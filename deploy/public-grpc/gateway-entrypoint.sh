@@ -44,7 +44,10 @@ admin=${NEST_GRPC_ADMIN_PORT:-9901}
 certs=${NEST_GRPC_CERT_DIR:-/certs}
 template=${NEST_GRPC_TEMPLATE:-$here/envoy.yaml.template}
 
-echo "$host" | grep -Eqx '[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+' \
+# A dotted DNS name, or the reserved name localhost (RFC 6761) for local tests:
+# it can never get a public certificate. Other single-label names are refused.
+[ "$host" = localhost ] \
+    || echo "$host" | grep -Eqx '[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+' \
     || fail "NEST_GRPC_PUBLIC_HOST must be a DNS name, got '$host'"
 
 [ -n "$edge" ] || fail "set NEST_GRPC_EDGE_PROXY to the edge proxy's address, such as 10.0.1.7/32"

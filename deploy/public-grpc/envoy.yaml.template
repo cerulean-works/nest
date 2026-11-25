@@ -20,6 +20,11 @@
 # Per-address and per-User limits, authentication, Project authorization and
 # registry admission stay in the Controller, which reads the client address from
 # the x-forwarded-for this Envoy appends.
+# File-based SDS (the reloadable certificate below) requires a node id and cluster.
+node:
+  id: nest-grpc-gateway
+  cluster: nest-grpc-gateway
+
 admin:
   address:
     socket_address: { address: 127.0.0.1, port_value: @ADMIN_PORT@ }
