@@ -146,11 +146,37 @@ chosen.origin  # "explicit", "project_default", "mode_b_user_default", ...
 
 [[autodoc]] authz.AccountResolutionError
 
+## Platform administration
+
+See [Use the privileged management API](../privileged-api).
+
+```python
+from nest.authz import AdminService
+
+admin = AdminService(database)
+project = admin.create_project(
+    principal, "Chemistry", owner_user_id=owner_id, reason="onboard chemistry; ticket OPS-12"
+)
+admin.grant_platform(principal, project.id, "nano4", reason="OPS-12")
+admin.approve(principal, "nano4", project.id, reason="OPS-12")
+admin.project_access(principal, project.id)  # grants, account links, approvals
+```
+
+[[autodoc]] authz.AdminService
+
+[[autodoc]] authz.DirectoryUser
+
+[[autodoc]] authz.ProjectAccess
+
+[[autodoc]] authz.Page
+
 ## Provider authority
 
 [[autodoc]] authz.ProviderAuthority
 
 [[autodoc]] authz.DenyAllProviders
+
+[[autodoc]] authz.DatabaseProviderApprovals
 
 [[autodoc]] authz.AllowedProjects
 

@@ -238,29 +238,38 @@ class ProjectStore:
         name: str,
         *,
         created_by_user_id: UUID | str,
+        owner_user_id: UUID | str | None = None,
         organization_id: UUID | str | None = None,
         conn: psycopg.Connection | None = None,
     ) -> Project:
         """
-        Creates a Project with its creator as Owner, in one transaction.
+        Creates a Project and its first Owner, in one transaction.
 
         Args:
             name (`str`): Display name, 1 to 200 characters.
-            created_by_user_id (`UUID`): The creator, who becomes the first Owner.
+            created_by_user_id (`UUID`): The creator, recorded for audit.
+            owner_user_id (`UUID`, *optional*): The first Owner. Defaults to the
+                creator. A different Owner makes the creator no member at all.
             organization_id (`UUID`, *optional*): Organization to file it under.
             conn (`psycopg.Connection`, *optional*): Transaction to join.
 
         Raises:
-            [`db.UserNotFoundError`]: If the creator does not exist.
+            [`db.UserNotFoundError`]: If the creator or the Owner does not exist.
             `ValueError`: If the name is empty or too long.
         """
         creator = as_uuid(created_by_user_id, "created_by_user_id")
+        owner = as_uuid(owner_user_id, "owner_user_id") if owner_user_id else creator
         org = as_uuid(organization_id, "organization_id") if organization_id else None
         if not 1 <= len(name.strip()) <= 200:
             raise ValueError("The Project name must be 1 to 200 characters")
         with transaction(self.database, conn, "create a Project") as cursor:
             if cursor.execute("SELECT 1 FROM users WHERE id = %s", (creator,)).fetchone() is None:
                 raise UserNotFoundError("The creating User does not exist")
+            if (
+                owner != creator
+                and cursor.execute("SELECT 1 FROM users WHERE id = %s", (owner,)).fetchone() is None
+            ):
+                raise UserNotFoundError("The Owner does not exist")
             row = cursor.execute(
                 "INSERT INTO projects (name, organization_id, created_by_user_id) "
                 "VALUES (%s, %s, %s) RETURNING id",
@@ -270,11 +279,36 @@ class ProjectStore:
             cursor.execute(
                 "INSERT INTO project_memberships (project_id, user_id, role) "
                 "VALUES (%s, %s, 'owner')",
-                (row["id"], creator),
+                (row["id"], owner),
             )
             project = self._project(cursor, row["id"])
         logger.info("Project created project_id=%s", project.id)
         return project
+
+    def list_projects(
+        self,
+        *,
+        limit: int = 50,
+        after: UUID | str | None = None,
+        include_deleted: bool = False,
+    ) -> list[Project]:
+        """
+        Every Project, oldest first, for platform administration. Pages by the
+        last Project ID of the previous page (`after`).
+        """
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        cursor_id = as_uuid(after, "after") if after else None
+        with transaction(self.database, None, "list Projects") as cursor:
+            rows = cursor.execute(
+                f"SELECT {_PROJECT_COLUMNS} FROM {_PROJECT_FROM} "
+                "WHERE (%(deleted)s OR p.deleted_at IS NULL) "
+                "AND (%(after)s::uuid IS NULL OR (p.created_at, p.id) > "
+                "     (SELECT created_at, id FROM projects WHERE id = %(after)s)) "
+                "ORDER BY p.created_at, p.id LIMIT %(limit)s",
+                {"deleted": include_deleted, "after": cursor_id, "limit": limit},
+            ).fetchall()
+        return [Project(**row) for row in rows]
 
     def get_project(
         self, project_id: UUID | str, *, include_deleted: bool = False

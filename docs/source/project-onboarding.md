@@ -6,14 +6,14 @@ commands; they follow [Run your first remote function](quickstart) and send you
 their Project ID.
 
 A Project role never grants HPC access. Before members of a Project can run
-anything, you approve it in three independent places. Platform grants and
-account links are recorded in the [security audit log](audit-log); the Provider
-approval is a deployment setting, and each Controller start records how many
-Projects it lists (`controller.started`):
+anything, you approve it in three independent places, each checked at every new
+submission and none implying another. Every change to them is recorded in the
+[security audit log](audit-log). A `platform_admin` can make all three through
+the [privileged management API](privileged-api) instead of `nest-db`:
 
 | Step | Grants | Interface | Refusal a user sees without it |
 | --- | --- | --- | --- |
-| 1. Provider approval | The Controller's Provider accepts the Project's Runs | `NEST_PROVIDER_ALLOWED_PROJECTS`, read at start | `PERMISSION_DENIED` `provider_denied` |
+| 1. Provider approval | The Controller's Provider accepts the Project's Runs | `nest-db provider approve` (durable, `NEST_PROVIDER_APPROVALS=database`), or `NEST_PROVIDER_ALLOWED_PROJECTS` read at start | `PERMISSION_DENIED` `provider_denied` |
 | 2. Platform grant | The Project may use an HPC Platform | `nest-db platform grant` | `NOT_FOUND` *Platform not found*, or `FAILED_PRECONDITION` `none_authorized` |
 | 3. Slurm account link | Which Slurm account the Project's jobs charge | `nest-db account register` and `link` | `PERMISSION_DENIED` `no_account` |
 
@@ -49,105 +49,118 @@ Give users these values; none of them is a secret:
 
 | Actor | Can | Cannot |
 | --- | --- | --- |
-| Any signed-in User | Become a User at first Google sign-in (no per-user provisioning); accept invitations; through the Projects API with a **browser** session, create a Project they own | Create a Project from the CLI (`browser_only`); grant themselves a Platform, account or Provider approval |
+| Any signed-in User | Become a User at first Google sign-in (no per-user provisioning); accept invitations | Create a Project (`platform_admin_required`); use the privileged management API; grant themselves a Platform, account or Provider approval |
 | Project Owner | Everything an Admin can, plus transfer ownership and delete the Project | Grant a Platform, link a Slurm account, or approve the Project for a Provider |
 | Project Admin | Invite, add existing Users (`POST /api/projects/<id>/members`), change non-Owner roles, choose the default among granted Platforms | Assign `owner`; anything HPC-side |
-| `platform_admin` | Manage Nest administration (see [Bootstrap and recover platform administration](platform-admin)) | Nothing in a Project or on the cluster by that role alone: it grants no Project role, Platform, Slurm account or UNIX identity |
-| Operator (database credentials and deployment settings) | `nest-db` Platform grants and account links, `NEST_PROVIDER_ALLOWED_PROJECTS`, and the audited Project creation below | Bypass the one-Owner rule, audit triggers or soft-delete: the database enforces them for every writer |
+| `platform_admin` | With a browser session, through the [privileged management API](privileged-api): create Projects with an explicit Owner, read the User directory and audit log, grant Platforms, link registered Slurm accounts, approve Projects for a Provider | Act in a Project or on the cluster by that role alone: it grants no Project role, Platform, Slurm account or UNIX identity. Register Platforms, login nodes or Slurm accounts (operator CLI only) |
+| Operator (database credentials and deployment settings) | Everything in `nest-db`, including `nest-db project create`, Provider approvals and their import, and the deployment settings | Bypass the one-Owner rule, audit triggers or soft-delete: the database enforces them for every writer |
 
 The **creator** of a Project (`projects.created_by_user_id`) is recorded for audit
 and never changes; the **Owner** is the current `owner` membership and changes
-only by transfer. A Project is created with its creator as Owner.
-
-Restricting Project creation to platform administrators is planned and **not**
-enforced: today any active User with a browser session may call
-`POST /api/projects`. In practice, Nest serves no page that does so, and the Nest
-origin's Content-Security-Policy (`default-src 'none'`) blocks running `fetch()`
-from the browser's developer console there, so hosted users ask the operator.
-Do not relax the CSP, the same-origin check or the CSRF protections to enable a
-console workaround.
+only by transfer. Only an active `platform_admin` (through Nest) or an operator
+(`nest-db project create`) creates Projects, every time with an explicit Owner;
+an ordinary signed-in User is refused at every entry point, including
+`POST /api/projects`. Do not relax the CSP, the same-origin check or the CSRF
+protections to work around it.
 
 ## Create a Project for a User
-
-Until Nest has a Project creation page or command, create the Project as an
-operator through [`db.ProjectStore`], inside an audit context that names you and
-your reason. The database's audit triggers record `project_created` and the
-creator's `member_added` (role `owner`), with the creator as actor and your
-operator name and reason, exactly as for other operator changes.
 
 1. Ask the User to sign in once (`nest login`) and send you the User ID that
    `nest auth status` prints as `user:`. It is not secret. Do not collect email
    addresses or session files for this. (`nest-db admin find-user --email ...`
-   also finds a User ID, if you already have the address.)
-2. In the Controller's environment (Dokploy terminal of the `controller`
-   service, or `docker compose exec -T controller ...`), run:
+   or `GET /api/admin/users?email=...` also finds a User ID, if you already have
+   the address.)
+2. Create the Project with that User as its Owner, either as a `platform_admin`
+   through `POST /api/admin/projects` (see
+   [Use the privileged management API](privileged-api)), or as an operator in the
+   Controller's environment (Dokploy terminal of the `controller` service, or
+   `docker compose exec -T controller ...`):
 
    ```bash
-   OWNER_USER_ID='<user-id>' PROJECT_NAME='Chemistry lab' \
-   OPERATOR='ops-alice' REASON='onboard the chemistry lab' \
-   python - <<'EOF'
-   import os
-
-   from nest.config import load_database_config
-   from nest.db import Database, IdentityStore, ProjectStore
-   from nest.db._transaction import audit_context, transaction
-   from nest.db.migrate import verify
-
-   owner, name = os.environ["OWNER_USER_ID"], os.environ["PROJECT_NAME"]
-   database = Database(load_database_config(), application_name="nest-ops")
-   database.open()
-   try:
-       with database.connection() as conn:
-           verify(conn)
-       user = IdentityStore(database).get_user(owner)
-       if user is None or user.status != "active":
-           raise SystemExit("The owner is not an active Nest User; ask them to sign in first")
-       with (
-           database.connection() as conn,
-           transaction(database, conn, "create a Project") as cursor,
-           audit_context(cursor, operator=os.environ["OPERATOR"], reason=os.environ["REASON"]),
-       ):
-           project = ProjectStore(database).create_project(name, created_by_user_id=owner, conn=conn)
-       print(f"project_id={project.id} owner={owner}")
-   finally:
-       database.close()
-   EOF
+   nest-db project create --name "Chemistry lab" --owner-user-id '<user-id>' \
+       --operator ops-alice --reason "onboard the chemistry lab"
    ```
 
    ```text
    project_id=5c2ec1df-... owner=c4d48ca8-...
    ```
 
+   The Project and its Owner are created in one transaction, and nothing is
+   created if the Owner is not an active User (exit status 1). The database's
+   audit triggers record `project_created` and the Owner's `member_added` (role
+   `owner`) with your operator name and reason.
+
 3. Send the Project ID to the User. They are its Owner and invite the others
    (see [Invite people to a Project](invitations)). Then continue with the three
    approvals below.
 
-`nest.db._transaction` is internal: this recipe is the supported fallback for the
-current release and will be replaced by a supported command. Check it against the
-installed version before use. Never insert into `projects` or
-`project_memberships` with plain SQL without setting the audit context.
+Never insert into `projects` or `project_memberships` with plain SQL without
+setting the audit context.
 
 Run `nest-db` where the Controller's `NEST_DATABASE_*` settings are available: a
 Dokploy terminal of the `controller` service, `docker compose exec controller
 nest-db ...`, or a host with the same environment. Every change takes
-`--operator` and `--reason`, which the audit log keeps.
+`--operator` and `--reason`, which the audit log keeps. The examples below use:
+
+```bash
+PROJECT='<project-id>'
+ops=(--operator ops-alice --reason "onboard the chemistry lab")
+```
 
 ## 1. Approve the Project for the Provider
 
 Every Run executes as the Controller's single HPC account, so accepting a Project
-is the operator's decision. Add its ID to the comma-separated list and restart or
-redeploy the Controller:
+is the operator's decision. The Provider is the Controller's default Platform
+Profile ID (`default` for the `NEST_SLURM_*` form, otherwise the `NEST_PLATFORMS`
+ID), or `local`.
+
+### Durable approvals (recommended)
+
+With `NEST_PROVIDER_APPROVALS=database`, the default whenever
+`NEST_PROVIDER_ALLOWED_PROJECTS` is unset, approvals live in PostgreSQL:
+
+```bash
+nest-db provider approve campus --project-id "$PROJECT" "${ops[@]}"
+nest-db provider list --project-id "$PROJECT"
+```
+
+A `platform_admin` can do the same with `POST /api/admin/provider-approvals/approve`.
+An approval or revocation applies from the next submission on every Controller
+sharing the database: nothing is cached, nothing is redeployed, and a Controller
+restart changes nothing. Registry admission checks the approval again, locked,
+in the transaction that records the attempt, so a revocation racing a submission
+either waits for it or refuses it. If the database cannot answer, the submission
+is refused (`UNAVAILABLE`), never treated as approved.
+
+A revocation affects new submissions only: running jobs are not cancelled, and
+members can still cancel their own existing Runs (`CancelJob` keeps every other
+check: the role, being the submitter, the job's Project and Platform). It is kept
+as a record (`status=revoked`), and only an explicit `approve` undoes it.
+`nest-db provider revoke` also works for a Project that has no database approval
+yet, such as one listed only in `NEST_PROVIDER_ALLOWED_PROJECTS`: it records a
+revocation that every later import keeps.
+
+### Startup-only list (legacy)
+
+With `NEST_PROVIDER_APPROVALS=environment`, the default while the variable is
+set, the Controller reads the comma-separated list once at start, and adding a
+Project needs a redeploy. In this mode a database approval does nothing, but a
+revocation recorded with `nest-db provider revoke` (or the privileged API) refuses
+the Project's new submissions at once, even though it is still listed. Registry
+admission checks for it again in the transaction that records the attempt, so a
+revocation racing a submission either waits for it or refuses it, as in database
+mode. The
+privileged API reports which mode the Controller is in (`policy.source`), so an
+approval made there is never mistaken for an effective one:
 
 ```ini
 NEST_PROVIDER_ALLOWED_PROJECTS='<project-id-1>,<project-id-2>'
 ```
 
-The Controller reads the list only at start. `*` accepts every Project; prefer an
-explicit list. With the list empty, every submission is refused, and the
-Controller logs a warning at start. A value that is not a UUID, or `*` mixed with
-IDs, stops the Controller with a configuration error naming the variable.
-Approvals are not dynamic: there is no API or `nest-db` command for them, and
-nothing changes until the Controller restarts with the new value.
+`*` accepts every Project; prefer an explicit list. With the list empty, every
+submission is refused, and the Controller logs a warning at start. A value that
+is not a UUID, or `*` mixed with IDs, stops the Controller with a configuration
+error naming the variable.
 
 **Where the value comes from.** Every Compose file passes the variable to the
 `controller` service as `NEST_PROVIDER_ALLOWED_PROJECTS: ${NEST_PROVIDER_ALLOWED_PROJECTS:-}`,
@@ -169,9 +182,57 @@ docker compose -p YOUR_APP exec controller printenv NEST_PROVIDER_ALLOWED_PROJEC
 nest-db audit list --event controller.started --limit 1
 ```
 
-The `controller.started` record's `allowed_projects` detail is the number of
-listed Projects (or `*`). If a user still sees `provider_denied` after this, the
-Project ID they send (`NEST_PROJECT_ID`) is not the one you listed.
+The `controller.started` record's `provider_approvals` detail is the mode, and
+`allowed_projects` the number of listed Projects (or `*`). If a user still sees
+`provider_denied` after this, the Project ID they send (`NEST_PROJECT_ID`) is not
+the one you approved.
+
+### Move Provider approvals to the database
+
+Nothing is imported implicitly: the Controller never copies
+`NEST_PROVIDER_ALLOWED_PROJECTS` into the database, at start or otherwise.
+
+1. Upgrade the schema (`nest-db upgrade`, migration
+   `0017_provider_project_approvals`). The upgrade creates no approval and
+   changes no Platform grant or account link.
+2. Import the listed IDs explicitly. Preview first; `*` is refused, so list every
+   Project you want to keep:
+
+   ```bash
+   nest-db provider import campus --project-ids "$(printenv NEST_PROVIDER_ALLOWED_PROJECTS)" \
+       --dry-run "${ops[@]}"
+   nest-db provider import campus --project-ids "$(printenv NEST_PROVIDER_ALLOWED_PROJECTS)" \
+       "${ops[@]}"
+   ```
+
+   The import is one transaction and idempotent: an approved Project stays as it
+   is, a Project with a recorded revocation **stays revoked** (it is listed as
+   `left revoked`; approve it explicitly if that is really intended), and if any
+   ID is not a live Project, nothing is written. Running it again changes
+   nothing.
+3. Cut over: unset `NEST_PROVIDER_ALLOWED_PROJECTS` (or set
+   `NEST_PROVIDER_APPROVALS=database` and unset it) and redeploy. A Controller
+   with `NEST_PROVIDER_APPROVALS=database` and the variable still set refuses to
+   start, so the two can never be mixed. Check `provider_approvals=database` in
+   the `controller.started` record.
+
+**Rollback.** Never reuse the list you had before the cutover, and never use
+`*`: Projects revoked since then would be listed again. Recompute the list from
+the current database approvals, review it, and roll back every Controller sharing
+the database in the same change:
+
+```bash
+nest-db provider export campus   # approved, live Projects only; revoked ones are left out
+```
+
+Set `NEST_PROVIDER_ALLOWED_PROJECTS` to that value (and
+`NEST_PROVIDER_APPROVALS=environment` if you had set it) and redeploy every
+Controller. As a second safeguard, an environment-mode Controller still refuses
+new submissions from any Project with a recorded revocation, so even a stale list
+cannot restore revoked access. Approvals recorded after the rollback do nothing
+until you cut over again; the privileged API shows `approvals_effective: false`
+for them. Cutting over again uses only the database records, including
+revocations made in the meantime.
 
 ## 2. Grant an HPC Platform
 
@@ -180,7 +241,6 @@ environment (`NEST_PLATFORMS`, or the `NEST_SLURM_*` form, whose Platform is
 `default`) has the profile ID as its slug:
 
 ```bash
-ops=(--operator ops-alice --reason "onboard the chemistry lab")
 nest-db platform list
 nest-db platform grant campus --project-id "$PROJECT" "${ops[@]}"
 ```
@@ -233,7 +293,7 @@ for the Project. Tell the kinds of failure apart before changing anything:
 | `ConfigError`: *NEST_PROJECT_ID must be a Project ID (a UUID)*, or `INVALID_ARGUMENT` *Name the Project to run in* | Client setting; nothing reached the Controller's checks | The user's `NEST_PROJECT_ID` |
 | `UNAUTHENTICATED` *requires a Nest session* | Sign-in | The user's `NEST_AUTH_URL` and `nest login` |
 | `NOT_FOUND` *Project not found* | Membership: wrong ID, not a member, or deleted | Invitation, or the ID |
-| `PERMISSION_DENIED` *run.submit: provider_denied* | Provider approval (step 1) | `NEST_PROVIDER_ALLOWED_PROJECTS` and a redeploy |
+| `PERMISSION_DENIED` *run.submit: provider_denied* | Provider approval (step 1) | `nest-db provider approve`, or `NEST_PROVIDER_ALLOWED_PROJECTS` and a redeploy |
 | `NOT_FOUND` *Platform not found*, `FAILED_PRECONDITION` `none_authorized` / `platform_not_served` | Platform grant (step 2) | `nest-db platform grant` |
 | `PERMISSION_DENIED` `no_account`, `not_granted` | Slurm account (step 3) | `nest-db account link` |
 | `Environment build <job> failed`, `RemoteExecutionError`, Slurm or SSH errors | Runtime, after every authorization check passed | [Runtime image diagnostics](runtime-image#diagnostics), the job logs |
@@ -250,7 +310,9 @@ nest-db account unlink campus chem --project-id "$PROJECT" "${ops[@]}"
 nest-db platform revoke campus --project-id "$PROJECT" "${ops[@]}"
 ```
 
-Remove the ID from `NEST_PROVIDER_ALLOWED_PROJECTS` and restart. To remove one
+Revoke the Provider approval with `nest-db provider revoke campus --project-id
+"$PROJECT" "${ops[@]}"` (or remove the ID from `NEST_PROVIDER_ALLOWED_PROJECTS`
+and redeploy). Revocations refuse new submissions; running jobs are not cancelled. To remove one
 person, a Project Owner or Admin removes their membership; to stop a User
 everywhere, revoke their sessions with `nest-db sessions revoke --user-id ...`
 (see [Revoke sessions](authentication#revoke-sessions)).

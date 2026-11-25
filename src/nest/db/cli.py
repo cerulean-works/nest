@@ -45,6 +45,17 @@ Usage:
     nest-db account native-default PLATFORM --project-id UUID --allow | --forbid
     (every change also takes --operator NAME --reason TEXT)
 
+    # Durable Provider approvals (see "Onboard a Project"):
+    nest-db provider list    [--provider PROVIDER] [--project-id UUID] [--status S]
+    nest-db provider approve | revoke PROVIDER --project-id UUID
+    nest-db provider import  PROVIDER --project-ids ID,ID [--dry-run]
+    nest-db provider export  PROVIDER   # approved IDs, for a rollback list
+    (every change also takes --operator NAME --reason TEXT)
+
+    # Projects (see "Onboard a Project"):
+    nest-db project create --name NAME --owner-user-id UUID [--organization-id UUID]
+                           --operator NAME --reason TEXT
+
     # Execution Registry recovery (see "Execution Registry"):
     nest-db execution list [--platform PLATFORM]
     nest-db execution reconcile ATTEMPT_ID --slurm-job-id N | --not-submitted
@@ -75,7 +86,9 @@ from .._logging import configure_logging
 from ..audit import AuditLog
 from ..config import ConfigError, load_database_config
 from ..errors import DatabaseUnavailableError
+from ._transaction import audit_context, transaction
 from .accounts import ProjectAccountLink, SlurmAccount, SlurmAccountStore
+from .approvals import ProviderApprovalStore, parse_project_ids
 from .bootstrap import audit_events, bootstrap_state
 from .connection import Database, DatabaseError
 from .executions import Attempt, ExecutionRegistry, ExecutionRegistryError
@@ -89,7 +102,7 @@ from .platforms import (
     PlatformNotFoundError,
     PlatformStore,
 )
-from .projects import ProjectNotFoundError
+from .projects import ProjectNotFoundError, ProjectStore, UserNotFoundError
 from .sessions import SessionStore
 
 
@@ -159,6 +172,8 @@ def _parser() -> argparse.ArgumentParser:
     _platform_parser(commands)
     _account_parser(commands)
     _execution_parser(commands)
+    _provider_parser(commands)
+    _project_parser(commands)
 
     security = commands.add_parser(
         "audit",
@@ -176,6 +191,184 @@ def _parser() -> argparse.ArgumentParser:
     events.add_argument("--limit", type=int, default=50)
     audit_actions.add_parser("verify", help="seal new records, then check the hash chain")
     return parser
+
+
+def _change_parent() -> argparse.ArgumentParser:
+    change = argparse.ArgumentParser(add_help=False)
+    change.add_argument(
+        "--operator", required=True, help="who is making the change, for the audit log"
+    )
+    change.add_argument("--reason", required=True, help="why, for the audit log")
+    return change
+
+
+def _provider_parser(commands) -> None:
+    provider = commands.add_parser(
+        "provider",
+        help="manage durable Provider approvals of Projects",
+        description=(
+            "Provider approvals read by Controllers with NEST_PROVIDER_APPROVALS=database "
+            "at every submission. PROVIDER is the Controller's Platform Profile ID (such as "
+            "default), or local. Authenticated by the database credentials in NEST_DATABASE_*; "
+            "every change is audited with the operator name, the reason and the PostgreSQL role."
+        ),
+    )
+    actions = provider.add_subparsers(dest="action", required=True)
+    change = _change_parent()
+    listing = actions.add_parser("list", help="list approval records")
+    listing.add_argument("--provider")
+    listing.add_argument("--project-id", type=UUID, metavar="UUID")
+    listing.add_argument("--status", choices=("approved", "revoked"))
+    for name, verb in (("approve", "approve"), ("revoke", "revoke the approval of")):
+        item = actions.add_parser(name, parents=[change], help=f"{verb} a Project")
+        item.add_argument("provider", metavar="PROVIDER")
+        item.add_argument("--project-id", required=True, type=UUID, metavar="UUID")
+    imported = actions.add_parser(
+        "import",
+        parents=[change],
+        help="approve explicit Project IDs, such as NEST_PROVIDER_ALLOWED_PROJECTS",
+    )
+    imported.add_argument("provider", metavar="PROVIDER")
+    imported.add_argument(
+        "--project-ids",
+        required=True,
+        metavar="ID,ID",
+        help="comma-separated Project IDs; '*' is refused",
+    )
+    imported.add_argument(
+        "--dry-run", action="store_true", help="show what would change and write nothing"
+    )
+    exported = actions.add_parser(
+        "export",
+        help="print the currently approved Project IDs, comma-separated, for a rollback "
+        "NEST_PROVIDER_ALLOWED_PROJECTS",
+    )
+    exported.add_argument("provider", metavar="PROVIDER")
+
+
+def _provider(database: Database, args: argparse.Namespace) -> int:
+    """Runs one `nest-db provider` action on an open, verified database."""
+    store = ProviderApprovalStore(database)
+    try:
+        if args.action == "list":
+            after = None
+            while True:
+                page = store.list_approvals(
+                    provider=args.provider,
+                    project_id=args.project_id,
+                    status=args.status,
+                    limit=500,
+                    after=after,
+                )
+                for approval in page:
+                    print(
+                        f"{approval.provider} project={approval.project_id} "
+                        f"status={approval.status} since={approval.updated_at.isoformat()}"
+                    )
+                if len(page) < 500:
+                    return 0
+                after = (page[-1].provider, page[-1].project_id)
+        if args.action == "export":
+            ids = store.export_approved(args.provider)
+            print(",".join(str(pid) for pid in ids))
+            print(
+                f"{len(ids)} approved Project(s); revoked and deleted Projects are excluded",
+                file=sys.stderr,
+            )
+            return 0
+        if args.action == "import":
+            ids = parse_project_ids([args.project_ids])
+            result = store.import_projects(
+                args.provider, ids, operator=args.operator, reason=args.reason, dry_run=args.dry_run
+            )
+            verb = "would approve" if result.dry_run else "approved"
+            for pid in result.approved:
+                print(f"{verb} {pid}")
+            for pid in result.unchanged:
+                print(f"already approved {pid}")
+            for pid in result.revoked:
+                print(f"left revoked {pid} (approve it explicitly if intended)")
+            print(
+                f"{len(result.approved)} {verb}, {len(result.unchanged)} already approved, "
+                f"{len(result.revoked)} left revoked"
+                + (" (dry run: nothing written)" if result.dry_run else "")
+            )
+            return 0
+        change = store.approve if args.action == "approve" else store.revoke
+        if not change(args.provider, args.project_id, operator=args.operator, reason=args.reason):
+            print(
+                "No change: the Project "
+                + (
+                    "is already approved"
+                    if args.action == "approve"
+                    else "already has a recorded revocation"
+                ),
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            f"Project {args.project_id} "
+            + ("approved for" if args.action == "approve" else "no longer approved for")
+            + f" Provider {args.provider}"
+        )
+        return 0
+    except ProjectNotFoundError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+
+
+def _project_parser(commands) -> None:
+    project = commands.add_parser(
+        "project",
+        help="create Projects as an operator",
+        description=(
+            "Operator Project creation. The Owner must be an active User (they sign in once "
+            "first). Authenticated by the database credentials in NEST_DATABASE_*; the "
+            "creation is audited with the operator name, the reason and the PostgreSQL role."
+        ),
+    )
+    actions = project.add_subparsers(dest="action", required=True)
+    create = actions.add_parser(
+        "create", parents=[_change_parent()], help="create a Project with its Owner"
+    )
+    create.add_argument("--name", required=True)
+    create.add_argument("--owner-user-id", required=True, type=UUID, metavar="UUID")
+    create.add_argument("--organization-id", type=UUID, metavar="UUID")
+
+
+def _project(database: Database, args: argparse.Namespace) -> int:
+    """Runs `nest-db project create` on an open, verified database."""
+    owner = args.owner_user_id
+    try:
+        with (
+            database.connection() as conn,
+            transaction(database, conn, "create a Project") as cursor,
+        ):
+            active = cursor.execute(
+                "SELECT 1 FROM users WHERE id = %s AND status = 'active' FOR SHARE", (owner,)
+            ).fetchone()
+            if active is None:
+                raise UserNotFoundError(
+                    "The Owner is not an active Nest User; ask them to sign in first"
+                )
+            with audit_context(cursor, operator=args.operator, reason=args.reason):
+                project = ProjectStore(database).create_project(
+                    args.name,
+                    created_by_user_id=owner,
+                    organization_id=args.organization_id,
+                    conn=conn,
+                )
+    except UserNotFoundError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    print(f"project_id={project.id} owner={owner}")
+    return 0
 
 
 def _execution_parser(commands) -> None:
@@ -785,7 +978,16 @@ def main(argv: list[str] | None = None) -> int:
         print(exc, file=sys.stderr)
         return 2
     database = Database(config, application_name="nest-db")
-    if args.command in ("admin", "sessions", "audit", "platform", "account", "execution"):
+    if args.command in (
+        "admin",
+        "sessions",
+        "audit",
+        "platform",
+        "account",
+        "execution",
+        "provider",
+        "project",
+    ):
         try:
             database.open()
         except DatabaseError as exc:
@@ -801,6 +1003,8 @@ def main(argv: list[str] | None = None) -> int:
                 "platform": _platform,
                 "account": _account,
                 "execution": _execution,
+                "provider": _provider,
+                "project": _project,
             }[args.command]
             return action(database, args)
         except MigrationError as exc:

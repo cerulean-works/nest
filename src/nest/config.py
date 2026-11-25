@@ -210,6 +210,10 @@ PLATFORMS_API_PATH = "/api/platforms"
 ORGANIZATIONS_API_PATH = "/api/organizations"
 """Root of the Organizations API served by the auth listener."""
 
+ADMIN_API_PATH = "/api/admin"
+"""Root of the privileged management API (platform administrators only) served by
+the auth listener."""
+
 INVITATION_PAGE_PATH = "/invitations/accept"
 """Browser page where a signed-in User reviews and accepts an invitation link."""
 
@@ -236,10 +240,19 @@ CONTROLLER_AUTH_SETTINGS = (
     "NEST_CONTROLLER_AUTH",
     "NEST_CONTROLLER_ALLOW_PLAINTEXT",
     "NEST_PROVIDER_ALLOWED_PROJECTS",
+    "NEST_PROVIDER_APPROVALS",
     "NEST_EXECUTION_REGISTRY",
 )
 """gRPC authentication, transport and Provider approval settings, read by
 [`config.load_controller_config`]."""
+
+PROVIDER_APPROVAL_MODES = ("database", "environment")
+"""`NEST_PROVIDER_APPROVALS` values: `database` reads Provider approvals from
+PostgreSQL at every submission (`nest-db provider`, or the privileged management
+API), so they change without a redeploy; `environment` keeps the startup-only list in
+`NEST_PROVIDER_ALLOWED_PROJECTS`. The default is `environment` while
+`NEST_PROVIDER_ALLOWED_PROJECTS` is set, so an existing deployment keeps its
+approvals unchanged until the operator cuts over, and `database` otherwise."""
 
 EXECUTION_REGISTRY_MODES = ("required", "legacy")
 """`NEST_EXECUTION_REGISTRY` values: `required` admits every Slurm submission through
@@ -796,7 +809,12 @@ class ControllerConfig:
             session tokens may be accepted without TLS.
         allowed_projects (`frozenset[str]`): `NEST_PROVIDER_ALLOWED_PROJECTS`:
             Project IDs whose members' Runs the Controller's Provider accepts, or
-            `{"*"}` for every Project. Empty, the default, accepts none.
+            `{"*"}` for every Project. Empty, the default, accepts none. Used only
+            with `provider_approvals="environment"`.
+        provider_approvals (`str`): `NEST_PROVIDER_APPROVALS`: `database` (durable
+            approvals read at every submission; see
+            [`authz.DatabaseProviderApprovals`]) or `environment`
+            (`allowed_projects`, read at start). See [`config.PROVIDER_APPROVAL_MODES`].
         execution_registry (`str`): `NEST_EXECUTION_REGISTRY`: `required` (every
             Slurm submission is admitted through the Execution Registry; see
             [`admission.RegistryAdmission`]) or `legacy` (the trusted Mode A path that
@@ -830,6 +848,7 @@ class ControllerConfig:
     auth: str = "none"
     allow_plaintext: bool = False
     allowed_projects: frozenset[str] = frozenset()
+    provider_approvals: str = "environment"
     execution_registry: str = "legacy"
     warnings: tuple[str, ...] = ()
 
@@ -897,6 +916,7 @@ class ControllerConfig:
             "auth": self.auth,
             "allow_plaintext": self.allow_plaintext,
             "allowed_projects": sorted(self.allowed_projects),
+            "provider_approvals": self.provider_approvals,
             "execution_registry": self.execution_registry,
         }
 
@@ -1637,6 +1657,12 @@ def _google_redirect_url(reader: _Reader) -> str | None:
             f"use a callback path such as {_REDIRECT_EXAMPLE!r}"
         )
         return None
+    if parts.path == ADMIN_API_PATH or parts.path.startswith(ADMIN_API_PATH + "/"):
+        reader.fail(
+            f"NEST_GOOGLE_REDIRECT_URL must not use {parts.path}, a privileged management API "
+            f"route; use a callback path such as {_REDIRECT_EXAMPLE!r}"
+        )
+        return None
     if parts.path == PLATFORMS_API_PATH or parts.path.startswith(PLATFORMS_API_PATH + "/"):
         reader.fail(
             f"NEST_GOOGLE_REDIRECT_URL must not use {parts.path}, a Platforms API route; "
@@ -1876,6 +1902,7 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
     google = _google(reader, database)
     bootstrap_admin_email = _bootstrap_admin_email(reader, database)
     auth, allow_plaintext, allowed_projects = _controller_auth(reader, database, bind, tls)
+    provider_approvals = _provider_approvals(reader, auth)
     execution_registry = _execution_registry(
         reader, auth, platforms.get(default_platform) if default_platform else None
     )
@@ -1900,6 +1927,7 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
         auth=auth,
         allow_plaintext=allow_plaintext,
         allowed_projects=allowed_projects,
+        provider_approvals=provider_approvals,
         execution_registry=execution_registry,
         **timeouts,
     )
@@ -2145,6 +2173,32 @@ def _controller_auth(
             reader.fail("NEST_PROVIDER_ALLOWED_PROJECTS needs NEST_CONTROLLER_AUTH=session")
         allow_plaintext = False
     return auth, allow_plaintext, frozenset(projects)
+
+
+def _provider_approvals(reader: _Reader, auth: str) -> str:
+    """
+    Reads `NEST_PROVIDER_APPROVALS`.
+
+    Never imports `NEST_PROVIDER_ALLOWED_PROJECTS` into the database, and never
+    combines the two: with `database`, a leftover list is refused rather than
+    silently ignored or treated as approved.
+    """
+    listed = reader.get("NEST_PROVIDER_ALLOWED_PROJECTS") is not None
+    raw = reader.get("NEST_PROVIDER_APPROVALS")
+    if auth != "session":
+        if raw is not None:
+            reader.fail("NEST_PROVIDER_APPROVALS needs NEST_CONTROLLER_AUTH=session")
+        return "environment"
+    mode = reader.choice(
+        "NEST_PROVIDER_APPROVALS", PROVIDER_APPROVAL_MODES, "environment" if listed else "database"
+    )
+    if mode == "database" and listed:
+        reader.fail(
+            "NEST_PROVIDER_APPROVALS=database reads approvals from the database and never "
+            "from NEST_PROVIDER_ALLOWED_PROJECTS: import the listed Projects with "
+            "`nest-db provider import`, then unset NEST_PROVIDER_ALLOWED_PROJECTS"
+        )
+    return mode
 
 
 def _execution_registry(reader: _Reader, auth: str, platform: PlatformProfile | None) -> str:

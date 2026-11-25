@@ -456,9 +456,11 @@ class SlurmAccountStore:
         name: str,
         *,
         modes: Iterable[str],
-        operator: str,
-        reason: str,
+        operator: str | None = None,
+        reason: str | None = None,
         default: bool = False,
+        actor_user_id: UUID | None = None,
+        conn: psycopg.Connection | None = None,
     ) -> ProjectAccountLink:
         """
         Lets a Project charge one of a Platform's accounts, or changes the modes
@@ -470,6 +472,9 @@ class SlurmAccountStore:
             name (`str`): The account, looked up only on this Platform.
             modes (`Iterable[str]`): `A` and/or `B`. A chargeback account is `A` only.
             default (`bool`): Make it the Project x Platform default.
+            operator, actor_user_id: Who makes the change: an operator, or an
+                active `platform_admin` acting through Nest.
+            conn (`psycopg.Connection`, *optional*): Transaction to join.
 
         Raises:
             [`db.PlatformNotGrantedError`]: If the Project is not granted the Platform.
@@ -480,7 +485,7 @@ class SlurmAccountStore:
         """
         pid = as_uuid(project_id, "project_id")
         wanted = _modes(modes)
-        with transaction(self.database, None, "link a Slurm account") as cursor:
+        with transaction(self.database, conn, "link a Slurm account") as cursor:
             found = PlatformStore._find(cursor, platform, lock=True)
             account = self._find(cursor, found, name, lock=True)
             self._require_grant(cursor, pid, found)
@@ -491,7 +496,9 @@ class SlurmAccountStore:
                 )
             if default and not account.active:
                 raise SlurmAccountError("A disabled Slurm account cannot be a Project default")
-            with audit_context(cursor, operator=operator, reason=reason):
+            with audit_context(
+                cursor, operator=operator, actor_user_id=actor_user_id, reason=reason
+            ):
                 if default:
                     cursor.execute(
                         "UPDATE project_platform_accounts SET is_default = false, "
@@ -519,7 +526,15 @@ class SlurmAccountStore:
         return ProjectAccountLink(pid, found.id, account, tuple(wanted), default)
 
     def unlink_project(
-        self, project_id: UUID | str, platform: UUID | str, name: str, *, operator: str, reason: str
+        self,
+        project_id: UUID | str,
+        platform: UUID | str,
+        name: str,
+        *,
+        operator: str | None = None,
+        reason: str | None = None,
+        actor_user_id: UUID | None = None,
+        conn: psycopg.Connection | None = None,
     ) -> None:
         """
         Stops a Project charging an account. Jobs already recorded keep it.
@@ -528,10 +543,12 @@ class SlurmAccountStore:
             [`db.AccountLinkNotFoundError`]: If the account was not linked.
         """
         pid = as_uuid(project_id, "project_id")
-        with transaction(self.database, None, "unlink a Slurm account") as cursor:
+        with transaction(self.database, conn, "unlink a Slurm account") as cursor:
             found = PlatformStore._find(cursor, platform, lock=True)
             account = self._find(cursor, found, name)
-            with audit_context(cursor, operator=operator, reason=reason):
+            with audit_context(
+                cursor, operator=operator, actor_user_id=actor_user_id, reason=reason
+            ):
                 row = cursor.execute(
                     "DELETE FROM project_platform_accounts WHERE project_id = %s "
                     "AND platform_id = %s AND slurm_account_id = %s RETURNING project_id",

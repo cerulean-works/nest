@@ -133,6 +133,20 @@ accounts.link_project(project_id, "nano4", "chem", modes=["A", "B"], default=Tru
 
 [[autodoc]] db.PlatformNotGrantedError
 
+## Provider approvals
+
+See [Onboard a Project](../project-onboarding#1-approve-the-project-for-the-provider).
+
+[[autodoc]] db.ProviderApprovalStore
+
+[[autodoc]] db.ProviderApproval
+
+[[autodoc]] db.ApprovalImport
+
+[[autodoc]] db.parse_project_ids
+
+[[autodoc]] db.normalize_provider
+
 ## Execution registry
 
 See [Execution registry](../database#execution-registry). Register a logical
@@ -189,6 +203,8 @@ registry.record_submission(attempt.id, slurm_job_id)
 [[autodoc]] db.PlatformUnavailableError
 
 [[autodoc]] db.AccountNotPermittedError
+
+[[autodoc]] db.ProviderNotApprovedError
 
 ## Users and identities
 

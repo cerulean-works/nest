@@ -79,8 +79,10 @@ NEST_EXECUTOR='slurm'
 # Tailscale encrypts and access-controls the gRPC path, so session tokens may
 # travel without Nest's own TLS. Otherwise set NEST_TLS_CERT and NEST_TLS_KEY.
 NEST_CONTROLLER_ALLOW_PLAINTEXT='true'
-# Project UUIDs (not names), comma-separated. Read only at start: Deploy again after a change.
-NEST_PROVIDER_ALLOWED_PROJECTS='<project-uuid-1>,<project-uuid-2>'
+# Provider approvals. Prefer durable ones (no redeploy; see "Onboard a Project"):
+# leave NEST_PROVIDER_ALLOWED_PROJECTS unset and approve with `nest-db provider approve`.
+# Or the startup-only list of Project UUIDs (not names), comma-separated:
+# NEST_PROVIDER_ALLOWED_PROJECTS='<project-uuid-1>,<project-uuid-2>'
 
 # --- HPC Platforms: the lines of a platforms.env file ---------------------------
 NEST_PLATFORMS_ENV='NEST_PLATFORMS=campus\nNEST_PLATFORM_CAMPUS_NAME=Campus GPU cluster\nNEST_PLATFORM_CAMPUS_OPERATOR=example-university\nNEST_PLATFORM_CAMPUS_LOGIN_NODES=hpc\nNEST_PLATFORM_CAMPUS_SSH_USER=svc-nest\nNEST_PLATFORM_CAMPUS_ACCOUNT=physics\nNEST_PLATFORM_CAMPUS_WORKDIR=/home/svc-nest/nest'
@@ -144,8 +146,10 @@ start. To change one, for example to approve a new Project in
    configuration error naming the variable; read the `controller` logs.
 
 A variable that `compose.dokploy.yaml` does not list never reaches the
-Controller, even if it is in the panel. Provider approval has no API or
-`nest-db` command: dynamic approvals are planned, not implemented. See
+Controller, even if it is in the panel. With durable Provider approvals
+(`NEST_PROVIDER_APPROVALS=database`, the default once
+`NEST_PROVIDER_ALLOWED_PROJECTS` is unset) approving a Project needs no
+redeploy at all. See
 [Onboard a Project](project-onboarding#1-approve-the-project-for-the-provider).
 
 ## How each credential is delivered

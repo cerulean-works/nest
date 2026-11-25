@@ -331,8 +331,9 @@ configuration, so a typo is reported with all other problems at once.
 With a database, the Controller also requires a Nest session on every gRPC call
 (`NEST_CONTROLLER_AUTH=session`). A non-loopback listener then needs TLS, or
 `NEST_CONTROLLER_ALLOW_PLAINTEXT=true` on an already-encrypted network such as an
-authorized Tailnet, and `NEST_PROVIDER_ALLOWED_PROJECTS` must list the Projects
-whose Runs it accepts. Set `NEST_CONTROLLER_AUTH=none` to keep an unauthenticated
+authorized Tailnet, and each Project whose Runs it accepts must be approved for
+its Provider (`nest-db provider approve`, or `NEST_PROVIDER_ALLOWED_PROJECTS`; see
+[Onboard a Project](project-onboarding#1-approve-the-project-for-the-provider)). Set `NEST_CONTROLLER_AUTH=none` to keep an unauthenticated
 Controller. See [Authenticated execution](security#authenticated-execution).
 
 ### TLS

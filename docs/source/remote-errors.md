@@ -62,16 +62,17 @@ records the same reason for the operator.
 | `NOT_FOUND`: *Project not found* | `RemoteAccessDeniedError` | The ID is wrong, you are not (or no longer) a member, or the Project was deleted. A Project you cannot see looks the same as one that does not exist | List your Projects and check the ID; ask an Owner or Admin to invite you. |
 | `PERMISSION_DENIED`: *Not allowed to run.submit: role* | `RemoteAccessDeniedError` | You are a Viewer | Ask an Owner or Admin for the `member` role. |
 | `PERMISSION_DENIED`: *Not allowed to run.submit: scope* | `RemoteAccessDeniedError` | The session lacks the `jobs:run` scope | Sign in again with `nest login`. |
-| `PERMISSION_DENIED`: *Not allowed to run.submit: provider_denied* | `RemoteAccessDeniedError` | The operator has not approved the Project for this Controller's Provider | Ask the operator to [add the Project to `NEST_PROVIDER_ALLOWED_PROJECTS`](project-onboarding). |
+| `PERMISSION_DENIED`: *Not allowed to run.submit: provider_denied* | `RemoteAccessDeniedError` | The operator has not approved the Project for this Controller's Provider, or revoked the approval | Ask the operator or a platform administrator to [approve the Project for the Provider](project-onboarding#1-approve-the-project-for-the-provider). |
 | `NOT_FOUND`: *Platform not found* | `RemoteAccessDeniedError` | The Controller's HPC Platform is not granted to the Project, or is disabled | Ask the operator to [grant the Platform](project-onboarding). `nest platforms default --project-id ...` shows what is granted. |
 | `FAILED_PRECONDITION`: *... [none_authorized]*, *[ambiguous]*, *[default_unavailable]* | `grpc.RpcError` | No Platform is granted; several are and none is the default; or the Project's default Platform is disabled | Operator grants a Platform, or a Project Owner or Admin chooses the [default](platforms#choose-a-projects-default-platform). |
 | `FAILED_PRECONDITION`: *... [platform_not_served]* | `grpc.RpcError` | The Project's Platform is not the one this Controller submits to; Nest never runs it elsewhere | Use the Controller that serves that Platform, or change the Project's default. |
 | `PERMISSION_DENIED`: *... [no_account]*, *[not_granted]* and other Slurm account reasons | `RemoteAccessDeniedError` | No Slurm account is linked to the Project on this Platform, or the account is not permitted for it | Ask the operator to [register and link a Slurm account](slurm-accounts#manage-accounts). |
 
 Every error in this table is raised before a Slurm job is submitted. `provider_denied`
-in particular means the Project is not in the Controller's
-`NEST_PROVIDER_ALLOWED_PROJECTS` as of its last start: the operator must add it
-and redeploy, and there is no self-service approval. Errors raised after these
+in particular means the Project is not approved for the Controller's Provider:
+with `NEST_PROVIDER_APPROVALS=database` the next submission after an approval
+succeeds, with no redeploy; with the startup-only `NEST_PROVIDER_ALLOWED_PROJECTS`
+the operator must add the ID and redeploy. There is no self-service approval. Errors raised after these
 checks pass, such as `Environment build <job> failed` or a
 `RemoteExecutionError`, are [infrastructure or runtime failures](#infrastructure-failures-and-timeouts),
 not access problems.

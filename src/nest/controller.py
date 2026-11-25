@@ -29,13 +29,15 @@ from .admission import (
 from .audit import AuditLog, audit_interface
 from .auth.web import start_auth_service
 from .authz import Action, Principal
+from .authz.admin import ProviderPolicy
 from .authz.execution import (
     AllowedProjects,
+    DatabaseProviderApprovals,
     ExecutionAccess,
     ProjectRequiredError,
     UnauthenticatedError,
 )
-from .authz.service import AccessDeniedError
+from .authz.service import AccessDeniedError, ProviderAuthority
 from .backends.slurm import SlurmBackend, SlurmConfig, environment_id, new_execution_id
 from .config import (
     ConfigError,
@@ -50,6 +52,7 @@ from .db import (
     DatabaseError,
     JobStore,
     PlatformStore,
+    ProviderApprovalStore,
     bootstrap_state,
     sync_platforms,
     verify,
@@ -1073,11 +1076,23 @@ def build_access(config: ControllerConfig, database: Database | None) -> Executi
             "NEST_CONTROLLER_AUTH=session without Google sign-in: no one can obtain a Nest "
             "session, so every RPC is refused"
         )
-    if not config.allowed_projects:
-        logger.warning(
-            "NEST_PROVIDER_ALLOWED_PROJECTS is empty: the Provider accepts Runs from no "
-            "Project, so every submission is refused"
+    provider_id = config.default_platform or config.executor
+    providers: ProviderAuthority
+    if config.provider_approvals == "database":
+        providers = DatabaseProviderApprovals(database)
+        logger.info(
+            "Provider approvals are read from the database at every submission "
+            "(NEST_PROVIDER_APPROVALS=database) provider=%s",
+            provider_id,
         )
+    else:
+        # Recorded revocations still refuse: a restored list never regrants them.
+        providers = AllowedProjects(config.allowed_projects, ProviderApprovalStore(database))
+        if not config.allowed_projects:
+            logger.warning(
+                "NEST_PROVIDER_ALLOWED_PROJECTS is empty: the Provider accepts Runs from no "
+                "Project, so every submission is refused"
+            )
     platform_id = None
     if config.platform is not None:
         try:
@@ -1087,8 +1102,8 @@ def build_access(config: ControllerConfig, database: Database | None) -> Executi
             logger.error("%s; every Platform-bound RPC is refused", exc)
     return ExecutionAccess(
         database,
-        AllowedProjects(config.allowed_projects),
-        provider_id=config.default_platform or config.executor,
+        providers,
+        provider_id=provider_id,
         platform_id=platform_id,
     )
 
@@ -1143,7 +1158,19 @@ def build_admission(
             "Controller does not have: every submission to it is refused",
             config.platform.id,
         )
-    return RegistryAdmission(database, backend, config.platform, platform_id, audit=access.audit)
+    return RegistryAdmission(
+        database,
+        backend,
+        config.platform,
+        platform_id,
+        audit=access.audit,
+        provider_approval=(access.provider_id if config.provider_approvals == "database" else None),
+        # Environment mode: the list approves, but a recorded revocation refuses,
+        # checked again in the attempt transaction.
+        provider_revocations=(
+            access.provider_id if config.provider_approvals == "environment" else None
+        ),
+    )
 
 
 def record_start(config: ControllerConfig, database: Database | None) -> None:
@@ -1162,6 +1189,7 @@ def record_start(config: ControllerConfig, database: Database | None) -> None:
             "allowed_projects": (
                 "*" if "*" in config.allowed_projects else len(config.allowed_projects)
             ),
+            "provider_approvals": config.provider_approvals,
             "executor": config.executor,
             "default_platform": config.default_platform,
             # Kept for audit consumers written before HPC Platforms; same value.
@@ -1279,6 +1307,13 @@ def main():
             database,
             bootstrap_admin_email=config.bootstrap_admin_email,
             email=email,
+            provider_policy=(
+                ProviderPolicy(
+                    config.provider_approvals, config.default_platform or config.executor
+                )
+                if config.auth == "session"
+                else None
+            ),
         )
         logger.info(
             "Controller listening address=%s executor=%s slurm_configured=%s tls=%s auth=%s "

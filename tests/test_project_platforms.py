@@ -21,6 +21,7 @@ from datetime import UTC, datetime, timedelta
 from unittest import mock
 
 import psycopg
+from admin_fixture import owned_project
 from fake_oidc import CLIENT_ID, CLIENT_SECRET, FakeGoogle
 from postgres_fixture import connect
 from test_google_auth import free_port
@@ -566,7 +567,7 @@ class OrganizationTests(_PolicyBase):
     def test_organization_roles_grant_no_project_role_or_platform(self):
         org = self.orgs.create_organization(browser(self.erin), "Erin's group")
         self.orgs.add_member(browser(self.erin), org.id, self.bob, "org_admin")
-        filed = self.service.create_project(browser(self.erin), "filed", organization_id=org.id)
+        filed = owned_project(self.service, self.erin, "filed", organization_id=org.id)
         self.store.grant_project("hpc3", filed.id, **OPS)
         # Bob administers the Organization but is not a member of its Project.
         with self.assertRaises(AccessDeniedError):
