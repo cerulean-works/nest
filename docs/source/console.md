@@ -3,7 +3,7 @@
 The Management Console is a browser page on the Controller's auth listener, at
 `https://<your Nest>/console`. With it, a signed-in User can see their Projects and
 manage members, invitations and roles without the CLI. Platform administrators also
-get the privileged pages once the privileged management API (G03) is available.
+get the privileged pages, which use the privileged management API (G03).
 
 The Console is a client of the same JSON routes as the CLI. It makes no permission
 decisions: the Controller checks every request against the
@@ -24,14 +24,14 @@ use, but hiding a control changes nothing on the server.
 | Recent membership changes (Project audit) | Project detail | Owner, Admin | Supported |
 | Your pending invitations: accept, decline | `/console#/invitations` | Any signed-in User | Supported |
 | Join with an invitation link or Invite Link | `/console#/invitations` | Any signed-in User | Supported |
-| User directory (paged), create a Project with an explicit Owner | `/console#/admin` | `platform_admin` | Gated on G03 |
-| Project access: Platform grants, Slurm account links, Provider approvals | `/console#/admin/projects/<id>` | `platform_admin` | Gated on G03 |
+| User directory (paged), create a Project with an explicit Owner | `/console#/admin` | `platform_admin` | Supported (G03 API) |
+| Project access: Platform grants, Slurm account links, Provider approvals and the Provider policy | `/console#/admin/projects/<id>` | `platform_admin` | Supported (G03 API) |
 
 These are left out on purpose: renaming, transferring or deleting a Project (use
 the CLI or the API), Organizations, and anything about usage, account binding,
 execution or Runs (G01 and G02b).
 
-### Privileged pages are gated on G03
+### Privileged pages use the G03 API
 
 Creating a Project, the user directory, Platform grants, Slurm account links and
 Provider approvals all go through the privileged management API under `/api/admin`
@@ -49,7 +49,29 @@ another route, a direct database write or a client-side shortcut for these actio
 
 Being a platform admin grants no Project membership and no compute access. A
 Project's Provider approval, its Platform grant and its Slurm account link are
-separate checks, and the Console shows and changes each one separately.
+separate checks, and the Console shows and changes each one separately. Running
+work needs all of them, plus a Project role that may submit.
+
+### Recorded and effective Provider approvals
+
+A Provider approval in the database is a record. Whether it lets submissions
+through depends on where the serving Controller takes approvals from
+(`NEST_PROVIDER_APPROVALS`, see [Onboard a Project](project-onboarding)). The
+admin API reports this as `policy: {source, provider, approvals_effective}`, and
+the Console shows it on every Project access page as *Approval source* and
+*Provider checked*. It labels each record with its effect on this Controller:
+
+| Source | Recorded approval for the Provider checked | Recorded revocation for the Provider checked |
+| --- | --- | --- |
+| `database` | Recorded and effective for new submissions | Recorded and effective: new submissions are refused |
+| `environment` | Recorded only, not effective: the Controller's environment allow-list decides until the cutover | Recorded and effective: new submissions are refused, even for a listed Project |
+| `unknown` (not reported) | Recorded only, not effective | Recorded only |
+
+A record for a Provider other than the one the Controller checks is always
+*recorded only*. When recorded approvals are not effective, the button reads
+**Record approval (not effective here)**, a notice says so, and the Console asks
+for confirmation before it records one. The message after a change comes from the
+policy in the server's answer, never from the click alone.
 
 ## Architecture
 
@@ -135,8 +157,13 @@ The browser tests sign in through the Console's own button. They then manage
 members, invitations and Invite Links as an Admin, join a Project from a second
 account, and check that a Viewer sees no management controls and that the same
 request sent from the page is refused (`403`). They also check that a revoked
-session returns to sign-in and that an expired access token is refreshed. They
-fail on any script error or CSP violation, and on any `POST` without the page's
+session returns to sign-in and that an expired access token is refreshed. As a
+platform admin, they create a Project for a named Owner from the directory, grant
+a Platform, and record and revoke Provider approvals in `database`, `environment`
+and unreported policy modes. They check each label the page shows against the
+admission authority the Controller would use (`DatabaseProviderApprovals` or
+`AllowedProjects`). They also revoke the admin role and then the sessions while
+the page is open. They fail on any script error or CSP violation, and on any `POST` without the page's
 own `Origin`. `NEST_TEST_EVIDENCE_DIR` names a directory for the screenshots they
 take.
 

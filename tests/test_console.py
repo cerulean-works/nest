@@ -7,10 +7,11 @@ whatever a client sends. The browser tests drive the Console in a real Chromium
 (through Playwright) signed in with the fake Google provider in `fake_oidc`.
 
 Platform-admin features (Project creation with an explicit Owner, the user
-directory, Platform grants, Slurm account links and Provider approvals) need the
-privileged management API of G03 (#79). Without it the Console shows none of
-them, which `test_privileged_ui_is_gated_on_the_admin_api` checks; their
-positive acceptance is deferred until that API is merged.
+directory, Platform grants, Slurm account links and Provider approvals) use the
+privileged management API of G03 (#79): `test_privileged_ui_is_gated_on_the_admin_api`
+checks that the Console shows none of them without it, and `ConsoleAdminBrowserTests`
+drives them against it, in each Provider approval mode, checking what the page
+says against the admission authority the Controller would use.
 """
 
 import json
@@ -18,9 +19,10 @@ import os
 import secrets
 import urllib.error
 import urllib.request
+import uuid
 from datetime import UTC, datetime, timedelta
 from importlib.resources import files
-from typing import NoReturn
+from typing import Any, NoReturn
 
 from fake_oidc import CLIENT_ID, CLIENT_SECRET, Account, FakeGoogle
 from test_authz import _Base, browser
@@ -28,8 +30,10 @@ from test_google_auth import Browser, free_port
 
 from nest.auth import INSECURE_SESSION_COOKIE, LOGIN_PATH, GoogleSignIn, start_auth_service
 from nest.auth.console import CONSOLE_CSP
+from nest.authz import Action, AllowedProjects, DatabaseProviderApprovals, Principal
+from nest.authz.admin import ProviderPolicy
 from nest.config import ConfigError, load_controller_config
-from nest.db import SessionStore, hash_token
+from nest.db import PlatformStore, ProviderApprovalStore, SessionStore, hash_token
 
 try:
     from playwright.sync_api import Error as PlaywrightError
@@ -45,6 +49,9 @@ ASSETS = files("nest.auth").joinpath("console_assets")
 
 class _ConsoleBase(_Base):
     """An auth listener with Google sign-in through the fake provider."""
+
+    provider_policy: ProviderPolicy | None = None
+    """The Provider policy the listener reports to the admin API, as the Controller passes it."""
 
     def setUp(self):
         super().setUp()
@@ -63,7 +70,9 @@ class _ConsoleBase(_Base):
         ).google
         assert config is not None
         sign_in = GoogleSignIn(config, self.db, endpoints=self.fake.endpoints, timeout=5)
-        self.http = start_auth_service(config, self.db, sign_in=sign_in)
+        self.http = start_auth_service(
+            config, self.db, sign_in=sign_in, provider_policy=self.provider_policy
+        )
         self.addCleanup(self.http.stop)
         self.sessions = SessionStore(self.db)
 
@@ -382,7 +391,7 @@ class ConsoleHTTPTests(_ConsoleBase):
         self.assertEqual(self.call("GET", "/api/projects", cli)[0], 401)
 
 
-class ConsoleBrowserTests(_ConsoleBase):
+class _BrowserBase(_ConsoleBase):
     """The Console in Chromium. Skipped without Playwright unless required (CI)."""
 
     def unavailable(self, message: str) -> NoReturn:
@@ -425,7 +434,18 @@ class ConsoleBrowserTests(_ConsoleBase):
             "request",
             lambda r: self.posts.append(r.all_headers()) if r.method == "POST" else None,
         )
-        self.page.on("dialog", lambda dialog: dialog.accept())
+        self.dialogs: list[str] = []
+        self.page.on("dialog", self.accept_dialog)
+
+    answer = True
+    """How the next `confirm()` dialogs are answered."""
+
+    def accept_dialog(self, dialog):
+        self.dialogs.append(dialog.message)
+        if self.answer:
+            dialog.accept()
+        else:
+            dialog.dismiss()
 
     def sign_in(self, account: Account | None = None):
         """Signs in from the Console's own button. Returns the new User's ID."""
@@ -450,6 +470,15 @@ class ConsoleBrowserTests(_ConsoleBase):
                 self.assertEqual(headers["origin"], self.base)
                 self.assertEqual(headers.get("sec-fetch-site", "same-origin"), "same-origin")
 
+    def role(self, pid, user_id) -> str | None:
+        row = self.conn.execute(
+            "SELECT role FROM project_memberships WHERE project_id = %s AND user_id = %s",
+            (pid, user_id),
+        ).fetchone()
+        return row[0] if row else None
+
+
+class ConsoleBrowserTests(_BrowserBase):
     def test_owner_manages_members_and_invitations(self):
         me = self.sign_in()
         self.page.get_by_text("You are not a member of any Project yet.").wait_for()
@@ -597,12 +626,229 @@ class ConsoleBrowserTests(_ConsoleBase):
         )
         self.assert_clean()
 
-    def role(self, pid, user_id) -> str | None:
-        row = self.conn.execute(
-            "SELECT role FROM project_memberships WHERE project_id = %s AND user_id = %s",
-            (pid, user_id),
-        ).fetchone()
-        return row[0] if row else None
+
+OPS: dict[str, Any] = {"operator": "console-tests", "reason": "Console admin tests"}
+WHO = Principal(uuid.uuid4(), "browser")
+"""Any caller: the Provider authority decides per Project, not per User."""
+
+
+class _AdminBrowserBase(_BrowserBase):
+    """A platform admin in the Console, against the merged G03 management API."""
+
+    def setUp(self):
+        super().setUp()
+        platforms = PlatformStore(self.db)
+        nano = platforms.create_platform("nano", "Nano", **OPS)
+        platforms.add_login_node(nano.id, "login.nano", transport_modes=["A"], **OPS)
+        self.approvals = ProviderApprovalStore(self.db)
+
+    def admin_signs_in(self):
+        me = self.sign_in()
+        self.assertEqual(self.page.get_by_role("link", name="Administration").count(), 0)
+        self.identities.grant_platform_role(me, **OPS)
+        self.page.reload()
+        self.page.get_by_role("navigation").get_by_role("link", name="Administration").click()
+        self.page.get_by_role("heading", name="User directory").wait_for()
+        return me
+
+    def create_project(self, owner, name: str = "lab") -> uuid.UUID:
+        """Creates a Project from the Administration page, picking `owner` in the directory."""
+        row = self.page.locator("tr", has=self.page.get_by_text(str(owner)))
+        row.get_by_role("button", name="as Owner").click()
+        self.assertEqual(
+            self.page.get_by_label("Initial Owner (user ID)").input_value(), str(owner)
+        )
+        self.page.get_by_label("Project name").fill(name)
+        self.page.get_by_role("button", name="Create Project").click()
+        # The reason is required before anything is sent.
+        self.assertTrue(
+            self.page.get_by_label("Reason", exact=True).evaluate("e => e.matches(':invalid')")
+        )
+        self.page.get_by_label("Reason", exact=True).fill(f"onboard {name}")
+        self.page.get_by_role("button", name="Create Project").click()
+        self.page.get_by_role("heading", name=f"Access: {name}").wait_for()
+        self.page.get_by_text(f"Created {name}.").wait_for()
+        row = self.conn.execute("SELECT id FROM projects WHERE name = %s", (name,)).fetchone()
+        assert row is not None
+        return row[0]
+
+    def reason(self, text: str):
+        self.page.get_by_label("Reason for changes").fill(text)
+
+    def effect(self, provider: str) -> str:
+        row = self.page.locator("tr", has=self.page.locator("code", has_text=provider))
+        return row.locator("td").nth(2).inner_text()
+
+    def audited(self, me, pid) -> list[tuple[str, str | None]]:
+        return self.conn.execute(
+            "SELECT event, note FROM security_audit_events "
+            "WHERE actor_user_id = %s AND project_id = %s AND event LIKE 'provider.approval.%%' "
+            "ORDER BY id",
+            (me, pid),
+        ).fetchall()
+
+
+class ConsoleAdminDatabaseModeTests(_AdminBrowserBase):
+    provider_policy = ProviderPolicy("database", "nano")
+
+    def test_admin_creates_a_project_and_manages_effective_approvals(self):
+        owner = self.user("future owner")
+        me = self.admin_signs_in()
+        pid = self.create_project(owner)
+        self.assertEqual(self.role(pid, owner), "owner")
+        self.assertIsNone(self.role(pid, me))  # An admin who names an Owner joins nothing.
+        authority = DatabaseProviderApprovals(self.db)
+        self.assertFalse(authority.permits(WHO, pid, Action.RUN_SUBMIT, "nano"))
+
+        self.page.get_by_text("Database: approvals and revocations recorded here decide").wait_for()
+        policy = self.page.get_by_label("Provider policy of this Controller")
+        self.assertIn("nano", policy.inner_text())
+        self.assertEqual(self.page.get_by_text("only records an approval").count(), 0)
+        self.assertEqual(self.page.get_by_role("textbox", name="Provider").input_value(), "nano")
+
+        # Every change needs a reason.
+        self.page.get_by_label("Platform (slug or ID)").first.fill("nano")
+        self.page.get_by_role("button", name="Grant Platform").click()
+        self.page.get_by_text("Enter a reason first").wait_for()
+        self.reason("platform for lab")
+        self.page.get_by_role("button", name="Grant Platform").click()
+        self.page.get_by_text("Platform granted.").wait_for()
+        self.page.get_by_role("button", name="Revoke nano", exact=True).wait_for()
+
+        self.reason("approve lab")
+        self.page.get_by_role("button", name="Approve Provider").click()
+        self.page.get_by_text("Approval recorded. It is effective for new submissions").wait_for()
+        self.assertEqual(self.dialogs, [])
+        self.assertIn("recorded and effective", self.effect("nano"))
+        self.assertTrue(authority.permits(WHO, pid, Action.RUN_SUBMIT, "nano"))
+
+        self.reason("offboard lab")
+        self.page.get_by_role("button", name="Revoke nano approval").click()
+        self.page.get_by_text("Revocation recorded. New submissions are refused").wait_for()
+        self.assertIn("Revoked: recorded and effective", self.effect("nano"))
+        self.assertFalse(authority.permits(WHO, pid, Action.RUN_SUBMIT, "nano"))
+
+        # A record for a Provider this Controller does not check decides nothing here.
+        self.reason("other provider")
+        self.page.get_by_role("textbox", name="Provider").fill("other")
+        self.page.get_by_role("button", name="Approve Provider").click()
+        self.page.get_by_text("It does not enable submissions on this Controller").wait_for()
+        self.assertIn("will NOT enable submissions", self.dialogs[-1])
+        self.assertIn("checks Provider nano, not other", self.dialogs[-1])
+        self.assertIn("recorded only, not effective", self.effect("other"))
+        self.assertEqual(
+            self.audited(me, pid),
+            [
+                ("provider.approval.granted", "approve lab"),
+                ("provider.approval.revoked", "offboard lab"),
+                ("provider.approval.granted", "other provider"),
+            ],
+        )
+        self.page.screenshot(
+            path=os.path.join(_evidence(), "console-admin-database.png"), full_page=True
+        )
+        self.assert_clean()
+
+
+class ConsoleAdminEnvironmentModeTests(_AdminBrowserBase):
+    provider_policy = ProviderPolicy("environment", "nano")
+
+    def test_recorded_approvals_are_labelled_not_effective(self):
+        owner = self.user("future owner")
+        self.admin_signs_in()
+        pid = self.create_project(owner)
+        self.page.get_by_text("Environment allow-list: the Controller").wait_for()
+        self.page.get_by_text("only records an approval. It does not enable submissions").wait_for()
+        self.assertEqual(self.page.get_by_role("button", name="Approve Provider").count(), 0)
+        record = self.page.get_by_role("button", name="Record approval (not effective here)")
+
+        # Cancelling the warning records nothing.
+        self.reason("try")
+        self.answer = False
+        record.click()
+        self.page.wait_for_timeout(300)
+        self.assertIn("will NOT enable submissions", self.dialogs[-1])
+        self.assertIn("environment allow-list", self.dialogs[-1])
+        self.assertIsNone(self.approvals.get("nano", pid))
+
+        self.answer = True
+        record.click()
+        self.page.get_by_text(
+            "Approval recorded. It does not enable submissions on this Controller"
+        ).wait_for()
+        self.assertEqual(self.page.get_by_text("effective for new submissions").count(), 0)
+        self.assertIn("recorded only, not effective", self.effect("nano"))
+        # What the Controller would decide: the database approval admits nothing,
+        # only its environment list does.
+        unlisted = AllowedProjects([], revocations=self.approvals)
+        listed = AllowedProjects([str(pid)], revocations=self.approvals)
+        self.assertFalse(unlisted.permits(WHO, pid, Action.RUN_SUBMIT, "nano"))
+        self.assertTrue(listed.permits(WHO, pid, Action.RUN_SUBMIT, "nano"))
+
+        # A recorded revocation does take effect, even for a listed Project.
+        self.reason("offboard")
+        self.page.get_by_role("button", name="Revoke nano approval").click()
+        self.page.get_by_text("Revocation recorded. New submissions are refused").wait_for()
+        self.assertIn("Revoked: recorded and effective", self.effect("nano"))
+        self.assertFalse(listed.permits(WHO, pid, Action.RUN_SUBMIT, "nano"))
+        self.page.screenshot(
+            path=os.path.join(_evidence(), "console-admin-environment.png"), full_page=True
+        )
+        self.assert_clean()
+
+
+class ConsoleAdminRevocationTests(_AdminBrowserBase):
+    """No Provider policy reported (`unknown`), and admin rights that end mid-session."""
+
+    def test_admin_role_and_session_revocation_take_effect(self):
+        owner = self.user("future owner")
+        me = self.admin_signs_in()
+        pid = self.create_project(owner)
+        self.page.get_by_text("Unknown: this server did not report its Provider policy").wait_for()
+        self.page.get_by_role("button", name="Record approval (not effective here)").wait_for()
+
+        # The role is revoked while the page is open: the next change is refused by
+        # the server and the Console drops its Administration pages.
+        self.identities.revoke_platform_role(me, **OPS)
+        self.reason("too late")
+        self.page.get_by_label("Platform (slug or ID)").first.fill("nano")
+        self.page.get_by_role("button", name="Grant Platform").click()
+        self.page.get_by_role("heading", name="Administration not available").wait_for()
+        self.assertEqual(self.page.get_by_role("link", name="Administration").count(), 0)
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT count(*) FROM hpc_platform_project_grants WHERE project_id = %s", (pid,)
+            ).fetchone(),
+            (0,),
+        )
+        # Nor can the page go around the Console.
+        answer = self.page.evaluate(
+            """async () => {
+                const r = await fetch('/api/admin/projects', {
+                    method: 'POST', credentials: 'same-origin',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({name: 'sneaky', reason: 'bypass'})});
+                return [r.status, await r.json()];
+            }"""
+        )
+        self.assertEqual(answer, [403, {"error": "forbidden", "reason": "platform_admin_required"}])
+        # Reloaded, the server's answer still decides: no Administration pages.
+        self.page.reload()
+        self.page.get_by_role("heading", name="Administration not available").wait_for()
+        self.assertEqual(self.page.get_by_role("link", name="Administration").count(), 0)
+
+        # An admin whose sessions are revoked is back at sign-in.
+        self.identities.grant_platform_role(me, **OPS)
+        self.page.reload()
+        self.page.get_by_role("navigation").get_by_role("link", name="Administration").wait_for()
+        self.identities.revoke_user_sessions(me)
+        self.page.get_by_role("navigation").get_by_role("link", name="Administration").click()
+        self.page.get_by_text("Your session has ended. Sign in again.").wait_for()
+        self.assertEqual(
+            self.conn.execute("SELECT count(*) FROM projects WHERE name = 'sneaky'").fetchone(),
+            (0,),
+        )
+        self.assert_clean()
 
 
 def _evidence() -> str:

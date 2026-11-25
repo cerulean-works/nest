@@ -301,7 +301,8 @@
         return await projectView(parts[1], current);
       }
       if (parts[0] === 'invitations' && parts.length === 1) return await invitationsView(current);
-      if (parts[0] === 'admin' && state.admin) {
+      if (parts[0] === 'admin' && !state.admin) return adminUnavailable();
+      if (parts[0] === 'admin') {
         if (parts.length === 1) return await adminView(current);
         if (parts[1] === 'projects' && parts.length === 3 && UUID_RE.test(parts[2])) {
           return await accessView(parts[2], current);
@@ -310,8 +311,23 @@
       show(h('h1', { text: 'Not found' }), h('p', {}, h('a', { href: '#/projects', text: 'Back to Projects' })));
     } catch (error) {
       if (error instanceof ApiError && error.status === 401) return;
-      if (current()) show(h('h1', { text: 'Something went wrong' }), errorBox(error, route));
+      if (!current()) return;
+      if (error instanceof ApiError && error.reason === 'platform_admin_required') {
+        // The server no longer counts the caller as a platform admin.
+        state.admin = false;
+        renderShell();
+        return adminUnavailable();
+      }
+      show(h('h1', { text: 'Something went wrong' }), errorBox(error, route));
     }
+  }
+
+  function adminUnavailable() {
+    show(
+      h('h1', { text: 'Administration not available' }),
+      h('p', { class: 'error', role: 'alert', text: REASONS.platform_admin_required }),
+      h('p', {}, h('a', { href: '#/projects', text: 'Back to your Projects' })),
+    );
   }
 
   // A change: runs it, reports the outcome and re-reads the page, since what the
@@ -936,10 +952,6 @@
       const why = need();
       if (why) change(null, () => api('POST', `/api/admin/projects/${pid}/${path}`, { ...body, reason: why }), done);
     };
-    const approve = (path, body, done) => {
-      const why = need();
-      if (why) change(null, () => api('POST', `/api/admin/provider-approvals/${path}`, { ...body, project_id: pid, reason: why }), done);
-    };
     const textForm = (label, name, submit, button) => {
       const form = h(
         'form',
@@ -950,11 +962,26 @@
       return form;
     };
     const project = access.project;
+    const policy = providerPolicy(access.policy);
+    const decide = (path, body, done) => {
+      const why = need();
+      if (why) change(null, () => api('POST', `/api/admin/provider-approvals/${path}`, { ...body, project_id: pid, reason: why }), done);
+    };
+    const record = (provider) => {
+      if (!provider) return;
+      if (!policy.recordsDecide(provider)) {
+        const ok = window.confirm(
+          `Record an approval for ${provider}? It will NOT enable submissions on this Controller: ${policy.why(provider)}`,
+        );
+        if (!ok) return;
+      }
+      decide('approve', { provider }, (r) => approvedMessage(r, provider));
+    };
     show(
       h('p', {}, h('a', { href: '#/admin', text: '← Administration' })),
       h('h1', { text: `Access: ${project.name}` }),
       h('dl', { class: 'facts' }, h('dt', { text: 'Project ID' }), h('dd', {}, h('code', { text: project.id })), h('dt', { text: 'Owner' }), h('dd', {}, h('code', { text: project.owner_user_id }))),
-      h('p', { class: 'muted', text: 'Provider approval, Platform grant and Slurm account link are separate checks: running work needs all three.' }),
+      h('p', { class: 'muted', text: 'Running work needs every one of these, each granted separately: a Project role that may submit, an effective Provider approval, a Platform grant and a Slurm account link. No single grant authorizes compute.' }),
       field('Reason for changes', reason, 'Required for every change below; recorded in the security audit log.'),
       h(
         'section',
@@ -974,15 +1001,131 @@
           : h('p', { class: 'muted', text: 'No Slurm account linked.' }),
         accountForm((v) => act('accounts/link', { platform: v.platform.trim(), account: v.account.trim(), modes: ['A'], default: v.default === 'on' }, 'Account linked.')),
       ),
-      h(
-        'section',
-        { 'aria-labelledby': 'pv-h' },
-        h('h2', { id: 'pv-h', text: 'Provider approvals' }),
-        access.provider_approvals.length
-          ? h('ul', {}, access.provider_approvals.map((a) => h('li', {}, `${a.provider}: ${a.status} `, a.status === 'approved' ? h('button', { type: 'button', class: 'danger', text: 'Revoke', 'aria-label': `Revoke ${a.provider} approval`, on: { click: () => approve('revoke', { provider: a.provider }, 'Approval revoked.') } }) : null)))
-          : h('p', { class: 'muted', text: 'No Provider approval.' }),
-        textForm('Provider', 'provider', (provider) => approve('approve', { provider }, 'Provider approved.'), 'Approve Provider'),
+      providerSection(access.provider_approvals, policy, record, (provider) =>
+        decide('revoke', { provider }, (r) => revokedMessage(r, provider)),
       ),
+    );
+  }
+
+  // Provider approvals (G03) ----------------------------------------------------------
+  //
+  // An approval record and an effective approval are different things: the
+  // serving Controller reports in `policy` where it takes approvals from. With
+  // `database`, recorded approvals and revocations decide; with `environment`,
+  // its environment allow-list decides what is approved and recorded approvals do
+  // nothing until the cutover, but recorded revocations still refuse new
+  // submissions. A record for another Provider than the one it checks, or an
+  // unknown policy, decides nothing here.
+
+  const SOURCES = {
+    database: 'Database: approvals and revocations recorded here decide admission.',
+    environment: 'Environment allow-list: the Controller’s configured list decides which Projects are approved. Approvals recorded here do nothing until the cutover to database mode; revocations recorded here still refuse new submissions.',
+    unknown: 'Unknown: this server did not report its Provider policy. Treat recorded approvals and revocations as not effective.',
+  };
+
+  function providerPolicy(raw) {
+    const p = raw || {};
+    const source = Object.hasOwn(SOURCES, p.source) ? p.source : 'unknown';
+    const provider = typeof p.provider === 'string' && p.provider ? p.provider : null;
+    const checked = (name) => provider !== null && name === provider;
+    return {
+      source,
+      provider,
+      effective: source === 'database' && p.approvals_effective === true,
+      recordsDecide(name) {
+        return checked(name) && this.effective;
+      },
+      revocationsDecide(name) {
+        return checked(name) && source !== 'unknown';
+      },
+      why(name) {
+        if (source === 'unknown') return 'this server did not report its Provider policy.';
+        if (!checked(name)) return `this Controller checks ${provider ? `Provider ${provider}` : 'no Provider'}, not ${name}.`;
+        return 'this Controller takes approvals from its environment allow-list until the cutover.';
+      },
+    };
+  }
+
+  function approvalState(a, policy) {
+    if (a.status === 'approved') {
+      return policy.recordsDecide(a.provider)
+        ? 'Approved: recorded and effective for new submissions on this Controller.'
+        : `Approved: recorded only, not effective here (${policy.why(a.provider)})`;
+    }
+    if (a.status === 'revoked') {
+      return policy.revocationsDecide(a.provider)
+        ? 'Revoked: recorded and effective; new submissions are refused on this Controller.'
+        : `Revoked: recorded only (${policy.why(a.provider)})`;
+    }
+    return `${title(a.status)}: recorded.`;
+  }
+
+  function approvedMessage(result, provider) {
+    const policy = providerPolicy(result.policy);
+    const recorded = result.changed === false ? 'An approval was already recorded.' : 'Approval recorded.';
+    return policy.recordsDecide(provider)
+      ? `${recorded} It is effective for new submissions on this Controller; running work still needs a Platform grant, a Slurm account and a role that may submit.`
+      : `${recorded} It does not enable submissions on this Controller: ${policy.why(provider)}`;
+  }
+
+  function revokedMessage(result, provider) {
+    const policy = providerPolicy(result.policy);
+    const recorded = result.changed === false ? 'A revocation was already recorded.' : 'Revocation recorded.';
+    return policy.revocationsDecide(provider)
+      ? `${recorded} New submissions are refused on this Controller.`
+      : `${recorded} It does not change admission on this Controller: ${policy.why(provider)}`;
+  }
+
+  function providerSection(approvals, policy, record, revoke) {
+    const input = h('input', { name: 'provider', required: true, autocomplete: 'off', value: policy.provider || '' });
+    const form = h(
+      'form',
+      { class: 'inline', on: { submit: (e) => { e.preventDefault(); record(input.value.trim()); } } },
+      field('Provider', input),
+      h('button', { type: 'submit', text: policy.effective ? 'Approve Provider' : 'Record approval (not effective here)' }),
+    );
+    return h(
+      'section',
+      { 'aria-labelledby': 'pv-h' },
+      h('h2', { id: 'pv-h', text: 'Provider approvals' }),
+      h(
+        'dl',
+        { class: 'facts', 'aria-label': 'Provider policy of this Controller' },
+        h('dt', { text: 'Approval source' }), h('dd', { text: SOURCES[policy.source] }),
+        h('dt', { text: 'Provider checked' }), h('dd', {}, policy.provider ? h('code', { text: policy.provider }) : 'Not reported'),
+      ),
+      policy.effective
+        ? null
+        : h('p', { class: 'notice', text: 'Approving here only records an approval. It does not enable submissions on this Controller.' }),
+      approvals.length
+        ? h(
+            'table',
+            {},
+            h('thead', {}, h('tr', {}, ['Provider', 'Record', 'Effect on this Controller', 'Updated', ''].map((t) => h('th', { scope: 'col', text: t })))),
+            h(
+              'tbody',
+              {},
+              approvals.map((a) =>
+                h(
+                  'tr',
+                  {},
+                  h('td', {}, h('code', { text: a.provider })),
+                  h('td', { text: title(a.status) }),
+                  h('td', { text: approvalState(a, policy) }),
+                  h('td', { text: when(a.updated_at) }),
+                  h(
+                    'td',
+                    {},
+                    a.status === 'approved'
+                      ? h('button', { type: 'button', class: 'danger', text: 'Revoke', 'aria-label': `Revoke ${a.provider} approval`, on: { click: () => revoke(a.provider) } })
+                      : null,
+                  ),
+                ),
+              ),
+            ),
+          )
+        : h('p', { class: 'muted', text: 'No Provider approval recorded.' }),
+      form,
     );
   }
 
