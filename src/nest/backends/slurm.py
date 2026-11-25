@@ -4,6 +4,7 @@ import shlex
 import subprocess
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -388,18 +389,26 @@ class BuildProgress:
     """
     Follows one environment build for [`backends.slurm.SlurmBackend.prepare_environment_bytes`].
 
+    Args:
+        before_submit (`Callable[[], None]`, *optional*): Called after staging and
+            the readiness check, immediately before the build's `sbatch`. An
+            exception it raises propagates with no build job submitted.
+
     Attributes:
         started (`bool`): A build submission began, so a build job may exist.
         job_id (`int | None`): The build's Slurm job ID, once `sbatch` returned it.
         done (`bool`): The build job reached a final state Slurm reported.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, before_submit: Callable[[], None] | None = None) -> None:
+        self.before_submit = before_submit
         self.started = False
         self.job_id: int | None = None
         self.done = False
 
     def submitting(self) -> None:
+        if self.before_submit is not None:
+            self.before_submit()
         self.started = True
 
     def submitted(self, job_id: int) -> None:
@@ -879,6 +888,7 @@ class SlurmBackend:
         partition: str | None = None,
         time: str | None = None,
         bounded: bool = False,
+        before_submit: Callable[[], None] | None = None,
     ) -> tuple[int, str]:
         """
         Stages a serialized call and submits the deployed worker batch script once.
@@ -907,6 +917,9 @@ class SlurmBackend:
                 explicit `--cpus-per-task`, so the job holds exactly what admission
                 reserved. With `gpu` `0` the worker's own GPU default still applies,
                 and is reserved.
+            before_submit (`Callable[[], None]`, *optional*): Called after staging,
+                immediately before `sbatch`. An exception it raises propagates and
+                nothing is submitted.
 
         Returns:
             `tuple[int, str]`: Submitted job ID and remote execution directory.
@@ -945,6 +958,9 @@ class SlurmBackend:
             # script's own `#SBATCH` GPU default applies when `gpu` is `0`.
             str(gpu),
         )
+
+        if before_submit is not None:
+            before_submit()
 
         # Submit Slurm job exactly once; an ambiguous outcome is reported, not retried.
         try:

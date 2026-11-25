@@ -519,7 +519,18 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
     def _run_registry_execution(self, request, context, admission_service, admission, slot):
         backend = admission.backend
         submitted = False
-        build = BuildProgress()
+
+        def still_wanted(step: str):
+            def check() -> None:
+                if not _still_wanted(context):
+                    raise ClientGoneError(
+                        f"The call was cancelled or its deadline passed before {step}; "
+                        "nothing was submitted"
+                    )
+
+            return check
+
+        build = BuildProgress(before_submit=still_wanted("the environment build's sbatch"))
         try:
             environment = None
             if request.HasField("environment"):
@@ -557,6 +568,8 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 partition=admission.partition,
                 time=admission.time,
                 bounded=admission.bounded,
+                # Staging takes time: check again right before the worker's sbatch.
+                before_submit=still_wanted("the worker's sbatch"),
             )
             submitted = True
             logger.info("Worker submitted job_id=%s job_dir=%s", job_id, job_dir)

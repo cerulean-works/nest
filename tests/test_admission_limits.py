@@ -453,6 +453,33 @@ class LifecycleTests(_LimitsBase):
         [held] = self.held()
         self.assertEqual(held["status"], "submitted")
 
+    def test_client_gone_during_payload_staging_never_reaches_sbatch(self):
+        gone = [False]
+        original = SlurmBackend.stage_payload
+
+        def staging_while_the_client_leaves(backend, *args, **kwargs):
+            result = original(backend, *args, **kwargs)
+            gone[0] = True  # cancelled, or its deadline passed, during staging
+            return result
+
+        with (
+            mock.patch("nest.controller._still_wanted", lambda context: not gone[0]),
+            mock.patch.object(
+                SlurmBackend, "stage_payload", autospec=True,
+                side_effect=staging_while_the_client_leaves,
+            ),
+        ):  # fmt: skip
+            error = self.refused(self.execute)
+        self.assertEqual(error.code(), grpc.StatusCode.CANCELLED)
+        self.assertEqual(dict(error.trailing_metadata())["nest-error-kind"], "client_gone")
+        self.assertTrue(gone[0])
+        self.assertNotEqual(self.hpc.calls("ssh"), [])  # staging did run
+        self.assertEqual(self.sbatch_calls(), [])  # the worker never did
+        [attempt] = self.attempts()
+        self.assertEqual((attempt["status"], attempt["error_kind"]), ("failed", "client_gone"))
+        self.assertIsNone(attempt["slurm_job_id"])
+        self.assertEqual(self.held(), [])
+
     def test_client_gone_before_sbatch_releases_and_sends_nothing(self):
         with mock.patch("nest.controller._still_wanted", return_value=False):
             error = self.refused(self.batch)
@@ -914,6 +941,23 @@ class EnvironmentBuildLifecycleTests(_LimitsBase):
         self.assertEqual(self.held(), [])
         [attempt] = self.attempts()
         self.assertEqual(attempt["status"], "failed")
+
+    def test_client_gone_during_build_staging_never_submits_the_build(self):
+        gone = [False]
+
+        def ready_check_while_the_client_leaves(*args, **kwargs):
+            gone[0] = True
+            return False
+
+        self.mocks["environment_ready"].side_effect = ready_check_while_the_client_leaves
+        with mock.patch("nest.controller._still_wanted", lambda context: not gone[0]):
+            error = self.execute_with_environment()
+        self.assertEqual(error.code(), grpc.StatusCode.CANCELLED)
+        self.mocks["build_environment"].assert_not_called()
+        self.assertEqual(self.sbatch_calls(), [])
+        [attempt] = self.attempts()
+        self.assertEqual((attempt["status"], attempt["error_kind"]), ("failed", "client_gone"))
+        self.assertEqual(self.held(), [])
 
     def test_failure_before_any_build_job_releases(self):
         self.mocks["stage_environment_bytes"].side_effect = SSHError("unreachable")
