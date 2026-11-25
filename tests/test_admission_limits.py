@@ -15,6 +15,7 @@ import dataclasses
 import os
 import secrets
 import threading
+import time
 import unittest
 import uuid
 from contextlib import redirect_stderr, redirect_stdout
@@ -63,6 +64,7 @@ from nest.errors import (
     ResultTooLargeError,
     SlurmJobError,
     SSHError,
+    SSHTimeoutError,
     SubmissionUnknownError,
 )
 from nest.proto import execution_pb2
@@ -1051,6 +1053,30 @@ class BoundedResultTests(_LimitsBase):
         with self.assertRaises(RemoteCommandError) as caught:
             backend._ssh_bounded("head -c 20000000 /dev/zero | tr '\\0' e >&2; exit 3", 10)
         self.assertLess(len(str(caught.exception)), 200_000)
+
+    def assert_times_out_and_reaps(self, command):
+        backend = SlurmBackend(
+            dataclasses.replace(self.backend.config, max_result_bytes=self.LIMIT, ssh_timeout=0.5)
+        )
+        pid_file = self.hpc.state / "child.pid"
+        started = time.monotonic()
+        with self.assertRaises(SSHTimeoutError):
+            backend._ssh_bounded(f"echo $$ > {pid_file}; {command}", self.LIMIT)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 3.0)  # 0.5 s timeout; the command sleeps for 30 s
+        pid = int(pid_file.read_text())
+        # The child was killed and reaped: no process, not even a zombie, remains.
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
+    def test_stdout_closed_before_exit_still_times_out(self):
+        self.assert_times_out_and_reaps("exec 1>&-; exec sleep 30")
+
+    def test_both_pipes_closed_before_exit_still_times_out(self):
+        self.assert_times_out_and_reaps("exec 1>&- 2>&-; exec sleep 30")
+
+    def test_stderr_held_open_after_stdout_closes_still_times_out(self):
+        self.assert_times_out_and_reaps("printf partial; exec 1>&-; exec sleep 30")
 
     def test_error_after_partial_output_keeps_its_status(self):
         backend = self.bounded_backend()

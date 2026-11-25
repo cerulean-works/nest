@@ -1,8 +1,9 @@
 import hashlib
+import os
 import re
+import selectors
 import shlex
 import subprocess
-import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -554,6 +555,7 @@ class SlurmBackend:
             [`errors.SSHTimeoutError`], [`errors.SSHError`],
             [`errors.RemoteCommandError`]: As [`backends.slurm.SlurmBackend._ssh`].
         """
+        deadline = time.monotonic() + self.config.ssh_timeout
         process = subprocess.Popen(
             [*self._ssh_argv(), command],
             stdin=subprocess.DEVNULL,
@@ -562,44 +564,52 @@ class SlurmBackend:
             env=child_environ(),
         )
         assert process.stdout is not None and process.stderr is not None
-        stdout, stderr = process.stdout, process.stderr
-        kept_err = bytearray()
-
-        def drain_stderr() -> None:
-            # Keep the head for the message; discard the rest so SSH never blocks.
-            while chunk := stderr.read(65536):
-                if len(kept_err) < self._STDERR_KEEP:
-                    kept_err.extend(chunk[: self._STDERR_KEEP - len(kept_err)])
-
-        errors = threading.Thread(target=drain_stderr, daemon=True)
-        errors.start()
-        expired = threading.Event()
-
-        def expire() -> None:
-            expired.set()
-            process.kill()
-
-        timer = threading.Timer(self.config.ssh_timeout, expire)
-        timer.start()
+        out_fd, err_fd = process.stdout.fileno(), process.stderr.fileno()
         out = bytearray()
-        too_large = False
-        try:
-            while chunk := stdout.read(min(65536, limit + 1 - len(out))):
-                out.extend(chunk)
-                if len(out) > limit:
-                    # Stop reading at once: kill SSH rather than drain the rest.
-                    too_large = True
+        kept_err = bytearray()
+        too_large = timed_out = False
+        # One deadline covers reading both pipes, the process's exit and its reaping.
+        # select() never blocks past it, even if the pipes stay open after EOF on one
+        # of them or after SSH has exited.
+        with selectors.DefaultSelector() as selector:
+            selector.register(out_fd, selectors.EVENT_READ)
+            selector.register(err_fd, selectors.EVENT_READ)
+            try:
+                while selector.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        timed_out = True
+                        break
+                    for key, _ in selector.select(remaining):
+                        fd = key.fd
+                        if fd == out_fd:
+                            chunk = os.read(fd, min(65536, limit + 1 - len(out)))
+                            out.extend(chunk)
+                            if len(out) > limit:
+                                too_large = True
+                        else:
+                            chunk = os.read(fd, 65536)
+                            # Keep the head for the message; discard the rest.
+                            if len(kept_err) < self._STDERR_KEEP:
+                                kept_err.extend(chunk[: self._STDERR_KEEP - len(kept_err)])
+                        if not chunk:
+                            selector.unregister(fd)
+                    if too_large:
+                        break
+                if not (too_large or timed_out):
+                    try:
+                        process.wait(timeout=max(0.0, deadline - time.monotonic()))
+                    except subprocess.TimeoutExpired:
+                        # Output ended, but SSH is still running.
+                        timed_out = True
+            finally:
+                if process.poll() is None:
                     process.kill()
-                    break
-        finally:
-            timer.cancel()
-            if too_large or expired.is_set():
-                process.kill()
-            returncode = process.wait()
-            errors.join(5)
-            stdout.close()
-            stderr.close()
-        timed_out = expired.is_set() and not too_large
+                # SIGKILL cannot be ignored, so the reap is prompt.
+                process.wait()
+                process.stdout.close()
+                process.stderr.close()
+        returncode = process.returncode
         if too_large:
             raise ResultTooLargeError(
                 f"The result is larger than {limit} bytes, the most this Controller returns "
