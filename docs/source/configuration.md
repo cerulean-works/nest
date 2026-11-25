@@ -104,7 +104,7 @@ The CLI and the SDK resolve the sign-in origin the same way
 | Order | Source | CLI (`nest ...`) | SDK (`.remote()`, [`client.session_metadata`]) |
 | --- | --- | --- | --- |
 | 1 | `--url` | yes | not applicable |
-| 2 | `NEST_AUTH_URL` | yes | yes, for any Controller |
+| 2 | `NEST_AUTH_URL` | yes | yes; but `https://auth.nest.cerulean.works` only for a hosted Controller, its MagicDNS name, or an address also set in `NEST_HOSTED_SESSION_ADDRESS` over TLS (otherwise `ConfigError`, before any session is read) |
 | 3 | Hosted default, `https://auth.nest.cerulean.works` | yes | only when `NEST_CONTROLLER_ADDRESS` is exactly `nest.cerulean.works:50051` (`nest.config.HOSTED_CONTROLLER_ADDRESS`) or the hosted gateway `grpc.nest.cerulean.works:443`; not for the MagicDNS name |
 | - | Hosted profile (`NEST_PROFILE=hosted`) | not applicable | always `https://auth.nest.cerulean.works`; another `NEST_AUTH_URL` is an error |
 | - | None | never | no session is sent and no sign-in starts |
@@ -112,6 +112,14 @@ The CLI and the SDK resolve the sign-in origin the same way
 Hosted users who connect by the MagicDNS name therefore set
 `NEST_AUTH_URL=https://auth.nest.cerulean.works` explicitly; without it the SDK
 sends no session and the call fails with `AuthenticationRequiredError`.
+
+The hosted session is a credential for Cerulean-hosted Nest, so naming its issuer
+is not enough to send it elsewhere: with `NEST_AUTH_URL=https://auth.nest.cerulean.works`,
+any other `NEST_CONTROLLER_ADDRESS` (`nest.config.HOSTED_CONTROLLER_ALIASES` lists the
+MagicDNS name) is a configuration error unless `NEST_HOSTED_SESSION_ADDRESS` names
+the same address and `NEST_CONTROLLER_TLS` is on. Use that only for a hosted
+staging gateway you trust with the session; never in plaintext. A leftover
+`NEST_AUTH_URL` therefore cannot hand the hosted session to a custom Controller.
 
 An empty or blank value counts as unset. An invalid `--url` or `NEST_AUTH_URL` is
 an error (exit status 2, or `ConfigError`); it never falls back to the hosted

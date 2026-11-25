@@ -89,7 +89,8 @@ port is a custom Controller and gets nothing.
 - [x] Explicit endpoint overrides, self-hosted deployments and local development
   unchanged; the Tailnet path kept for rollback.
 - [x] Hosted sessions sent only to the hosted Controller; custom endpoints never
-  receive them.
+  receive them, even with `NEST_AUTH_URL` left set to the hosted issuer, unless the
+  address is named again in `NEST_HOSTED_SESSION_ADDRESS` over TLS.
 - [x] Installation, first-call sign-in, Project selection and execution without
   any `NEST_` setting, tested with the default switched on in the test only.
 - [x] The hosted default stays inactive (`HOSTED_PROFILE_DEFAULT = False`) until H09.

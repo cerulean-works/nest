@@ -28,8 +28,12 @@ nest: saved 9b47...0c11 as your Project here; change it with `nest projects use 
 
 A Project is eligible when, at the moment the SDK asks, your role in it allows
 submitting (Owner, Admin or Member; not Viewer), the Controller's Provider approves
-it, and the Controller's HPC Platform is active and granted to it. The Controller
-reads all of this from its database each time; nothing is cached.
+it, the Controller's HPC Platform is active and granted to it, and a submission
+that names no Slurm account would get one: the Project's default account, or the
+Platform's Mode A operator default, linked and active. A Project that admission
+would refuse with `no_account` is not offered. The Controller reads all of this
+from its database each time; nothing is cached, and the answer never names an
+account. `NEST_PROJECT_ID` still selects any Project, and admission decides.
 
 The list is advice. **Every execution is authorized again** by the Controller, from
 scratch, before anything is staged or submitted. If a membership, approval or

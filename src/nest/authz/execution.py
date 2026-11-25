@@ -39,11 +39,13 @@ from uuid import UUID
 from .._logging import get_logger
 from ..audit import AuditLog
 from ..config import ALL_PROJECTS
+from ..db.accounts import SlurmAccountStore
 from ..db.approvals import ProviderApprovalStore
 from ..db.connection import Database
 from ..db.identity import hash_token
 from ..db.sessions import SessionStore
 from ..errors import AUTHORIZATION_METADATA, PROJECT_METADATA
+from .accounts import AccountResolutionError, HPCIdentity, resolve_account
 from .platforms import PlatformCatalog
 from .policy import Action, Decision, Principal, Target, decide
 from .service import AccessDeniedError, Authorizer, ProviderAuthority
@@ -225,6 +227,7 @@ class ExecutionAccess:
         self.audit = audit or AuditLog(database)
         self.authorizer = Authorizer(database, providers, self.audit)
         self.platforms = PlatformCatalog(database, self.audit)
+        self.accounts = SlurmAccountStore(database)
         self.platform_id = platform_id
         self.sessions = SessionStore(database)
         self.provider_id = provider_id
@@ -360,8 +363,12 @@ class ExecutionAccess:
         now (E07), for the SDK's Project selection.
 
         A Project is eligible when the caller's current role allows `run.submit`,
-        the Provider permits it, and the served Platform is active and granted to
-        the Project. Each is read now; nothing is cached, and nothing is recorded
+        the Provider permits it, the served Platform is active and granted to the
+        Project, and the default Mode A submission could charge a Slurm account:
+        [`authz.resolve_account`] with no account named, exactly as registry
+        admission resolves it, so a Project that would be refused `no_account` is
+        not offered. That check reads the Project's account mapping only: no SSH,
+        no audit record, and no account name in the answer. Each is read now; nothing is cached, and nothing is recorded
         per Project, so listing does not fill the audit log with refusals. The
         list is advice only: every submission is authorized again from scratch
         ([`authz.ExecutionAccess.authorize_submit`] and registry admission), so a
@@ -388,10 +395,25 @@ class ExecutionAccess:
             granted, _ = self.platforms.store.project_platforms(principal.user_id, project.id)
             if not any(p.id == self.platform_id for p in granted):
                 continue
+            if not self._default_account_resolves(project.id):
+                continue
             eligible.append(EligibleProject(project.id, project.name, role))
             if len(eligible) >= MAX_ELIGIBLE_PROJECTS:
                 break
         return eligible
+
+    def _default_account_resolves(self, project_id: UUID) -> bool:
+        """Whether a Mode A submission naming no account would get one (E07)."""
+        assert self.platform_id is not None
+        try:
+            resolve_account(
+                self.accounts.mapping(project_id, self.platform_id),
+                mode="A",
+                identity=HPCIdentity.controller(self.platform_id),
+            )
+        except AccountResolutionError:
+            return False
+        return True
 
     def _require_platform(
         self,

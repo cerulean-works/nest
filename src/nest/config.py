@@ -88,6 +88,11 @@ serves plaintext gRPC that only the access-controlled Tailnet encrypts, so the S
 connects to it only when `NEST_CONTROLLER_ADDRESS` names it and
 `NEST_CONTROLLER_TLS=false` says so explicitly."""
 
+HOSTED_CONTROLLER_ALIASES = ("nest-controller.tail8e5ba1.ts.net:50051",)
+"""Other names of [`config.HOSTED_CONTROLLER_ADDRESS`] that hosted users are told to
+use: its Tailnet MagicDNS name. With `NEST_AUTH_URL` set to [`config.HOSTED_AUTH_URL`],
+these receive the hosted session like the hosted addresses themselves."""
+
 HOSTED_GRPC_ADDRESS = "grpc.nest.cerulean.works:443"
 """Public gRPC address of Cerulean-hosted Nest (H08): the Envoy gateway, reached over
 verified TLS with the system's public roots. The SDK uses it only under the hosted
@@ -2870,6 +2875,15 @@ def load_client_config(environ: Mapping[str, str] | None = None) -> ClientConfig
         auth_url, source = resolve_auth_url(
             reader, hosted=address_is_valid and is_hosted_controller(address)
         )
+        if address_is_valid and auth_url == HOSTED_AUTH_URL:
+            _require_hosted_session_binding(reader, address, tls)
+    if reader.get("NEST_HOSTED_SESSION_ADDRESS") is not None and (
+        profile == "hosted" or auth_url != HOSTED_AUTH_URL
+    ):
+        reader.fail(
+            "NEST_HOSTED_SESSION_ADDRESS applies only to a custom NEST_CONTROLLER_ADDRESS "
+            f"with NEST_AUTH_URL={HOSTED_AUTH_URL}; unset it"
+        )
     keepalive = _keepalive(reader, hosted.keepalive if profile == "hosted" else 0.0)
     if reader.problems:
         raise ConfigError(reader.problems)
@@ -2919,6 +2933,42 @@ def _same_address(address: str, expected: str) -> bool:
     host, _, port = address.strip().rpartition(":")
     expected_host, _, expected_port = expected.rpartition(":")
     return host.lower().removesuffix(".") == expected_host and port == expected_port
+
+
+def _require_hosted_session_binding(reader: _Reader, address: str, tls: bool) -> None:
+    """
+    Fails unless the hosted session may go to `address`. The hosted session is a
+    credential for Cerulean-hosted Nest, so an explicit `NEST_AUTH_URL` naming the
+    hosted issuer is not enough: a leftover setting would otherwise hand it to any
+    custom Controller. It goes to a hosted Controller (see
+    [`config.is_hosted_controller`]), one of [`config.HOSTED_CONTROLLER_ALIASES`], or
+    an address the user names again in `NEST_HOSTED_SESSION_ADDRESS`, such as a
+    staging gateway, and then only over TLS. Checked before any credential is read.
+    """
+    if is_hosted_controller(address) or any(
+        _same_address(address, alias) for alias in HOSTED_CONTROLLER_ALIASES
+    ):
+        return
+    bound = reader.get("NEST_HOSTED_SESSION_ADDRESS")
+    if bound is None:
+        reader.fail(
+            f"NEST_AUTH_URL={HOSTED_AUTH_URL} sends the hosted Nest session, which only "
+            f"Cerulean-hosted Controllers may receive, and {address} is not one. Unset "
+            "NEST_AUTH_URL (or set your own Nest's sign-in origin) to call this Controller "
+            "without it, or, if this is a hosted staging gateway you trust with it, set "
+            f"NEST_HOSTED_SESSION_ADDRESS={address}"
+        )
+        return
+    if not _same_address(address, bound.lower().removesuffix(".")):
+        reader.fail(
+            f"NEST_HOSTED_SESSION_ADDRESS is {bound!r}, not NEST_CONTROLLER_ADDRESS "
+            f"{address!r}; the hosted session goes only to the address named in both"
+        )
+    elif not tls:
+        reader.fail(
+            f"The hosted session is never sent in plaintext; set NEST_CONTROLLER_TLS=true "
+            f"for {address}"
+        )
 
 
 def is_hosted_controller(address: str) -> bool:

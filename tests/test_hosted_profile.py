@@ -32,6 +32,7 @@ from nest.config import (
     DEFAULT_CONTROLLER_ADDRESS,
     HOSTED_AUTH_URL,
     HOSTED_CONTROLLER_ADDRESS,
+    HOSTED_CONTROLLER_ALIASES,
     HOSTED_GRPC_ADDRESS,
     HOSTED_PROFILE_DEFAULT,
     PUBLIC_GATEWAY_IDLE_TIMEOUT,
@@ -243,6 +244,127 @@ class HostedTransportTests(HostedCase):
         text = json.dumps(controller.calls)
         self.assertNotIn("authorization", text)
         self.assertNotIn(self.session.access_token, text)
+
+    def refused_before_any_credential(self, env: dict[str, str]) -> ConfigError:
+        """execute_remote with `env` fails on its settings, reading no session."""
+        with (
+            mock.patch.dict("os.environ", env),
+            mock.patch.object(nest_login, "ensure_session") as ensure,
+            self.assertRaises(ConfigError) as caught,
+        ):
+            execute_remote(double, RESOURCES, None, 21)
+        ensure.assert_not_called()
+        return caught.exception
+
+    def test_a_leftover_hosted_issuer_never_sends_the_session_to_a_custom_controller(self):
+        controller = RecordingController(require_session=False)
+        port = serve(self, controller, tls=self.ca.issue("localhost"))
+        ca = self.home / "ca.pem"
+        ca.write_bytes(self.ca.pem)
+        error = self.refused_before_any_credential(
+            {
+                "NEST_CONTROLLER_ADDRESS": f"localhost:{port}",
+                "NEST_CONTROLLER_TLS_CA_FILE": str(ca),
+                "NEST_AUTH_URL": HOSTED_AUTH_URL,
+            }
+        )
+        self.assertIn("NEST_HOSTED_SESSION_ADDRESS", str(error))
+        self.assertEqual(controller.calls, [])
+
+    def test_a_plaintext_custom_controller_never_gets_the_hosted_session(self):
+        controller = RecordingController(require_session=False)
+        port = serve(self, controller)
+        address = f"127.0.0.1:{port}"
+        for label, extra in {
+            "unbound": {},
+            "bound": {"NEST_HOSTED_SESSION_ADDRESS": address},
+        }.items():
+            with self.subTest(label):
+                self.refused_before_any_credential(
+                    {
+                        "NEST_CONTROLLER_ADDRESS": address,
+                        "NEST_CONTROLLER_TLS": "false",
+                        "NEST_AUTH_URL": HOSTED_AUTH_URL,
+                        **extra,
+                    }
+                )
+        self.assertEqual(controller.calls, [])
+
+    def test_an_explicitly_bound_tls_controller_receives_the_hosted_session(self):
+        controller = RecordingController(projects=[(self.project, "alpha")])
+        port = serve(self, controller, tls=self.ca.issue("localhost"))
+        ca = self.home / "ca.pem"
+        ca.write_bytes(self.ca.pem)
+        env = {
+            "NEST_CONTROLLER_ADDRESS": f"localhost:{port}",
+            "NEST_CONTROLLER_TLS_CA_FILE": str(ca),
+            "NEST_AUTH_URL": HOSTED_AUTH_URL,
+        }
+        with self.subTest("another address named"):
+            self.refused_before_any_credential(
+                {**env, "NEST_HOSTED_SESSION_ADDRESS": "grpc.staging.example.org:443"}
+            )
+        with mock.patch.dict(
+            "os.environ", {**env, "NEST_HOSTED_SESSION_ADDRESS": f"LOCALHOST:{port}"}
+        ):
+            self.assertEqual(execute_remote(double, RESOURCES, None, 21), 42)
+        self.assertIn(self.session.access_token, json.dumps(controller.calls))
+
+    def test_hosted_and_self_hosted_endpoints_keep_their_sessions(self):
+        cases = {
+            "Tailnet hosted Controller": (
+                {
+                    "NEST_CONTROLLER_ADDRESS": HOSTED_CONTROLLER_ADDRESS,
+                    "NEST_CONTROLLER_TLS": "false",
+                },
+                HOSTED_AUTH_URL,
+            ),
+            "its MagicDNS name, issuer set": (
+                {
+                    "NEST_CONTROLLER_ADDRESS": HOSTED_CONTROLLER_ALIASES[0],
+                    "NEST_CONTROLLER_TLS": "false",
+                    "NEST_AUTH_URL": HOSTED_AUTH_URL,
+                },
+                HOSTED_AUTH_URL,
+            ),
+            "public gateway by name": (
+                {"NEST_CONTROLLER_ADDRESS": HOSTED_GRPC_ADDRESS, "NEST_CONTROLLER_TLS": "true"},
+                HOSTED_AUTH_URL,
+            ),
+            "self-hosted Nest": (
+                {
+                    "NEST_CONTROLLER_ADDRESS": "nest.example.com:50051",
+                    "NEST_CONTROLLER_TLS": "true",
+                    "NEST_AUTH_URL": CUSTOM_AUTH_URL,
+                },
+                CUSTOM_AUTH_URL,
+            ),
+            "custom Controller, no issuer": (
+                {
+                    "NEST_CONTROLLER_ADDRESS": "nest.example.com:50051",
+                    "NEST_CONTROLLER_TLS": "true",
+                },
+                None,
+            ),
+        }
+        for label, (env, auth_url) in cases.items():
+            with self.subTest(label):
+                self.assertEqual(load_client_config(env).auth_url, auth_url)
+
+    def test_the_binding_setting_is_refused_where_it_does_not_apply(self):
+        for label, env in {
+            "no hosted issuer": {
+                "NEST_CONTROLLER_ADDRESS": "nest.example.com:50051",
+                "NEST_CONTROLLER_TLS": "true",
+                "NEST_HOSTED_SESSION_ADDRESS": "nest.example.com:50051",
+            },
+            "hosted profile": {
+                "NEST_PROFILE": "hosted",
+                "NEST_HOSTED_SESSION_ADDRESS": HOSTED_GRPC_ADDRESS,
+            },
+        }.items():
+            with self.subTest(label), self.assertRaises(ConfigError):
+                load_client_config(env)
 
     def test_another_nest_session_goes_only_to_its_controller(self):
         custom = session_for(CUSTOM_AUTH_URL)

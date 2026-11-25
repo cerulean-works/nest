@@ -148,7 +148,9 @@ uv run python scripts/verify-public-grpc.py grpc.staging.<domain>:443 \
 Each check prints one JSON line and the script exits 1 if any fails. Then, with the
 SDK pointed at the staging name (`NEST_CONTROLLER_ADDRESS=grpc.staging.<domain>:443`,
 `NEST_CONTROLLER_TLS=true`, `NEST_CONTROLLER_TLS_CA_FILE` for the staging roots,
-`NEST_AUTH_URL=https://auth.nest.cerulean.works`), add `--signed-in` and, only in
+`NEST_AUTH_URL=https://auth.nest.cerulean.works`, and
+`NEST_HOSTED_SESSION_ADDRESS=grpc.staging.<domain>:443` to entrust the staging
+gateway with the hosted session), add `--signed-in` and, only in
 the approved pilot, `--execute`, which submits one real Slurm job. Both first run
 the `sdk_target` check: the SDK must name the same address over TLS with the same
 roots as `--ca-file` (or system roots). If it names another Controller, such as

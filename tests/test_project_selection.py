@@ -367,6 +367,46 @@ class EligibilityTests(_Base):
             [e for e in self.audit.events(event="run.submit") if e.outcome == "denied"]
         )
 
+    def test_a_project_without_a_default_account_is_not_eligible(self):
+        # Granted and approved, but no Slurm account a default submission could
+        # charge: admission would refuse it no_account, so it is not offered.
+        self.projects.add_member(browser(self.outsider), self.other, self.member, "member")
+        self.accounts.unlink_project(self.other, self.platform_id, "proj", **OPS)
+        self.assertEqual(self.eligible(), [(self.project, "member")])
+
+        # So the one usable Project is chosen without asking, not reported ambiguous.
+        self.assertEqual(self.run_remote(), 42)
+        # A saved choice of the accountless Project is forgotten and the usable one runs.
+        PreferenceStore(self.preferences).set(self.key(), str(self.other))
+        with redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(self.run_remote(), 42)
+        self.assertIn("no longer available", err.getvalue())
+        self.assertIsNone(PreferenceStore(self.preferences).get(self.key()))
+        self.assertEqual(
+            [r["project_id"] for r in self.sql("SELECT project_id FROM executions")],
+            [self.project, self.project],
+        )
+
+        # NEST_PROJECT_ID still wins, and admission still refuses it authoritatively.
+        sent = len(self.sbatch_calls())
+        with self.assertRaises(Exception) as caught:
+            self.run_remote(NEST_PROJECT_ID=str(self.other))
+        self.assertIn("account", str(caught.exception).lower())
+        self.assertEqual(len(self.sbatch_calls()), sent)
+
+        # Listing an accountless Project records nothing (the refused run above did).
+        resolutions = len(self.audit.events(event="slurm_account.resolve"))
+        self.assertEqual(self.eligible(), [(self.project, "member")])
+        self.assertEqual(len(self.audit.events(event="slurm_account.resolve")), resolutions)
+
+        # Once a default account is linked, it is eligible again.
+        self.accounts.link_project(
+            self.other, self.platform_id, "proj", modes=["A"], default=True, **OPS
+        )
+        self.assertEqual(
+            sorted(self.eligible()), sorted([(self.project, "member"), (self.other, "member")])
+        )
+
     def test_listing_needs_an_accepted_session_and_a_project_scope(self):
         with self.assertRaises(grpc.RpcError) as caught:
             self.list_stub.ListEligibleProjects(
