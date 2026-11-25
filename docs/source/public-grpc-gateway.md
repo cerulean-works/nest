@@ -149,7 +149,12 @@ Each check prints one JSON line and the script exits 1 if any fails. Then, with 
 SDK pointed at the staging name (`NEST_CONTROLLER_ADDRESS=grpc.staging.<domain>:443`,
 `NEST_CONTROLLER_TLS=true`, `NEST_CONTROLLER_TLS_CA_FILE` for the staging roots,
 `NEST_AUTH_URL=https://auth.nest.cerulean.works`), add `--signed-in` and, only in
-the approved pilot, `--execute`, which submits one real Slurm job. Finally:
+the approved pilot, `--execute`, which submits one real Slurm job. Both first run
+the `sdk_target` check: the SDK must name the same address over TLS with the same
+roots as `--ca-file` (or system roots). If it names another Controller, such as
+your Tailnet one, the run fails before any session is read or any job is
+submitted; the script never redirects a session to the address you give it.
+Finally:
 
 ```bash
 docker compose logs grpc-gateway | grep -cF "<a staging session token>"   # must print 0

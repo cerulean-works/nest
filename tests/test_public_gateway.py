@@ -419,6 +419,115 @@ class EdgeProxy:
         self.listener.close()
 
 
+VERIFIER = ROOT / "scripts" / "verify-public-grpc.py"
+
+
+def _load_verifier():
+    spec = importlib.util.spec_from_file_location("verify_public_grpc", VERIFIER)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@unittest.skipUnless(VERIFIER.is_file(), "requires the repository's scripts/")
+class VerifierTargetTests(unittest.TestCase):
+    """The pilot verifier's signed-in and execution checks use the gateway it verifies."""
+
+    GATEWAY = "grpc.staging.example.org:443"
+
+    def setUp(self):
+        self.script = _load_verifier()
+        for name in (
+            "check_tls",
+            "check_wrong_name",
+            "check_http1",
+            "check_unauthenticated",
+            "check_non_nest_path",
+        ):
+            self.enterContext(mock.patch.object(self.script, name, return_value={}))
+        self.session = self.enterContext(
+            mock.patch("nest.client._session", return_value=types.SimpleNamespace(access_token="t"))
+        )
+        self.sdk_channel = self.enterContext(mock.patch("nest.client._channel"))
+        self.listed = self.enterContext(
+            mock.patch("nest.project_selection.list_eligible", return_value=["p"])
+        )
+        self.remote = self.enterContext(mock.patch("nest.remote"))
+        self.remote.return_value = lambda f: types.SimpleNamespace(remote=f)
+        ca = Path(self.enterContext(tempfile.TemporaryDirectory())) / "ca.pem"
+        ca.write_bytes(CertificateAuthority().pem)
+        self.ca_file = str(ca)
+
+    def run_verifier(self, *configs: nest_config.ClientConfig, ca_file: str | None = None):
+        loader = self.enterContext(
+            mock.patch("nest.config.load_client_config", side_effect=list(configs))
+        )
+        out = StringIO()
+        argv = [self.GATEWAY, "--signed-in", "--execute"]
+        if ca_file:
+            argv += ["--ca-file", ca_file]
+        with redirect_stdout(out):
+            code = self.script.main(argv)
+        lines = [json.loads(line) for line in out.getvalue().splitlines()]
+        return code, {line["check"]: line for line in lines[:-1]}, lines[-1], loader
+
+    def assert_nothing_authenticated(self):
+        self.session.assert_not_called()
+        self.listed.assert_not_called()
+        self.remote.assert_not_called()
+
+    def test_another_controller_fails_before_any_session_or_job(self):
+        sdk = nest_config.ClientConfig(address="private-tailnet.example:50051", tls=True)
+        code, checks, summary, _ = self.run_verifier(sdk)
+        self.assertEqual(code, 1)
+        self.assertEqual(summary["summary"], "fail")
+        self.assertFalse(checks["sdk_target"]["passed"])
+        self.assertIn("private-tailnet.example:50051", checks["sdk_target"]["error"])
+        for name in ("signed_in_projects", "remote_execution"):
+            self.assertFalse(checks[name]["passed"])
+            self.assertIn("not run", checks[name]["error"])
+        self.assert_nothing_authenticated()
+
+    def test_plaintext_or_other_roots_fail_before_any_session_or_job(self):
+        cases = {
+            "plaintext": (nest_config.ClientConfig(address=self.GATEWAY, tls=False), None),
+            "staging CA here, system roots in the SDK": (
+                nest_config.ClientConfig(address=self.GATEWAY, tls=True),
+                self.ca_file,
+            ),
+            "system roots here, a CA in the SDK": (
+                nest_config.ClientConfig(address=self.GATEWAY, tls=True, tls_ca_file=self.ca_file),
+                None,
+            ),
+        }
+        for label, (sdk, ca_file) in cases.items():
+            with self.subTest(label):
+                code, checks, _, _ = self.run_verifier(sdk, ca_file=ca_file)
+                self.assertEqual(code, 1)
+                self.assertFalse(checks["sdk_target"]["passed"])
+                self.assert_nothing_authenticated()
+
+    def test_settings_changed_before_execution_submit_nothing(self):
+        good = nest_config.ClientConfig(address=self.GATEWAY, tls=True)
+        moved = nest_config.ClientConfig(address="private-tailnet.example:50051", tls=True)
+        code, checks, _, _ = self.run_verifier(good, moved)
+        self.assertEqual(code, 1)
+        self.assertTrue(checks["signed_in_projects"]["passed"])
+        self.assertFalse(checks["remote_execution"]["passed"])
+        self.remote.assert_not_called()
+
+    def test_the_verified_gateway_is_used_for_every_check(self):
+        same = nest_config.ClientConfig(
+            address="GRPC.staging.example.org.:443", tls=True, tls_ca_file=self.ca_file
+        )
+        code, checks, summary, _ = self.run_verifier(same, same, ca_file=self.ca_file)
+        self.assertEqual((code, summary["summary"]), (0, "pass"), checks)
+        self.assertEqual(checks["signed_in_projects"]["controller"], same.address)
+        self.session.assert_called_once_with(same, interactive=False)
+        self.sdk_channel.assert_called_once_with(same)
+
+
 def _edge_bind_address() -> str:
     """127.0.0.2 where the loopback network allows it (Linux), so a direct
     connection from 127.0.0.1 is not the edge proxy; else 127.0.0.1."""
@@ -689,12 +798,7 @@ class EnvoyGatewayTests(_Base):
                 pass
 
     def test_operator_verification_script_passes_through_the_gateway(self):
-        spec = importlib.util.spec_from_file_location(
-            "verify_public_grpc", ROOT / "scripts" / "verify-public-grpc.py"
-        )
-        assert spec is not None and spec.loader is not None
-        script = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(script)
+        script = _load_verifier()
         closed = _free_port()
         out = StringIO()
         environment = {

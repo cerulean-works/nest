@@ -25,6 +25,13 @@ SDK's settings decide which session: `NEST_PROFILE=hosted`, or `NEST_AUTH_URL`).
 `--execute` also runs one trivial remote function through the SDK, which submits
 one real Slurm job: use it only in the approved pilot. Neither prints a token.
 
+Both first run `sdk_target`: the SDK's settings must name the gateway being
+verified, over TLS, trusting the same roots (`--ca-file`, or system roots). If
+they name another Controller, plaintext or other roots, the check fails and no
+session is read and no job is submitted. The script never redirects a session to
+the address given here; point the SDK at it instead (`NEST_PROFILE=hosted`, or
+`NEST_CONTROLLER_ADDRESS` with `NEST_CONTROLLER_TLS_CA_FILE`).
+
 Exits 1 if any check fails.
 """
 
@@ -147,13 +154,55 @@ def check_origin(origin: str, timeout: float) -> dict:
     raise RuntimeError(f"{origin} accepts TCP connections from this network")
 
 
-def check_signed_in(timeout: float) -> dict:
-    from nest.client import _channel as sdk_channel
-    from nest.client import _session
+def _read(path: str) -> bytes:
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
+def _same_address(a: str, b: str) -> bool:
+    (host_a, port_a), (host_b, port_b) = _split(a), _split(b)
+    return host_a.lower().rstrip(".") == host_b.lower().rstrip(".") and port_a == port_b
+
+
+def require_sdk_target(config, address: str, ca_file: str | None) -> None:
+    """
+    Raises unless the SDK settings `config` connect to `address` over TLS with the
+    same trust roots as the unauthenticated checks, so the signed-in and execution
+    checks verify the same gateway and a session never goes anywhere else.
+    """
+    if not config.tls:
+        raise RuntimeError(
+            f"the SDK connects to {config.address} in plaintext; refusing to send a session"
+        )
+    if not _same_address(config.address, address):
+        raise RuntimeError(
+            f"the SDK is configured for {config.address}, not {address}: point it at the "
+            "gateway being verified (NEST_PROFILE=hosted, or NEST_CONTROLLER_ADDRESS); "
+            "no session was read and nothing was submitted"
+        )
+    sdk_roots = _read(config.tls_ca_file) if config.tls_ca_file else config.tls_root_certificates
+    expected = _read(ca_file) if ca_file else None
+    if sdk_roots != expected:
+        raise RuntimeError(
+            "the SDK trusts different TLS roots than this run ("
+            + ("--ca-file" if ca_file else "system roots")
+            + "); set NEST_CONTROLLER_TLS_CA_FILE to match"
+        )
+
+
+def check_sdk_target(address: str, ca_file: str | None):
     from nest.config import load_client_config
-    from nest.project_selection import list_eligible
 
     config = load_client_config()
+    require_sdk_target(config, address, ca_file)
+    return config
+
+
+def check_signed_in(config, timeout: float) -> dict:
+    from nest.client import _channel as sdk_channel
+    from nest.client import _session
+    from nest.project_selection import list_eligible
+
     session = _session(config, interactive=False)
     if session is None:
         raise RuntimeError("not signed in to the Nest these settings name; run nest login")
@@ -162,8 +211,13 @@ def check_signed_in(timeout: float) -> dict:
     return {"controller": config.address, "eligible_projects": len(projects or [])}
 
 
-def check_execute() -> dict:
+def check_execute(address: str, ca_file: str | None) -> dict:
     from nest import remote
+    from nest.config import load_client_config
+
+    # The SDK reads its settings again when it executes: confirm they still name
+    # the verified gateway immediately before submitting anything.
+    require_sdk_target(load_client_config(), address, ca_file)
 
     @remote(cpu=1)
     def hello() -> str:
@@ -207,10 +261,30 @@ def main(argv: list[str] | None = None) -> int:
         checks.append(
             (f"origin_unreachable_{origin}", lambda o=origin: check_origin(o, args.timeout))
         )
+    verified: dict = {}
+
+    def sdk_target() -> dict:
+        verified["config"] = check_sdk_target(args.address, args.ca_file)
+        return {"controller": verified["config"].address}
+
+    def needs_target(check):
+        def run() -> dict:
+            if "config" not in verified:
+                raise RuntimeError("not run: the SDK does not target the verified gateway")
+            return check(verified["config"])
+
+        return run
+
+    if args.signed_in or args.execute:
+        checks.append(("sdk_target", sdk_target))
     if args.signed_in:
-        checks.append(("signed_in_projects", lambda: check_signed_in(args.timeout)))
+        checks.append(
+            ("signed_in_projects", needs_target(lambda c: check_signed_in(c, args.timeout)))
+        )
     if args.execute:
-        checks.append(("remote_execution", check_execute))
+        checks.append(
+            ("remote_execution", needs_target(lambda c: check_execute(args.address, args.ca_file)))
+        )
 
     failed = 0
     for name, check in checks:
