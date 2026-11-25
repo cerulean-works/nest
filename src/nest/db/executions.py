@@ -29,6 +29,14 @@ Platform is active and granted to the execution's Project and the node is still
 approved for the transport mode, checked in the same transaction. The account it
 charges comes from the Platform-scoped Slurm Account Registry (D08), as chosen by
 [`authz.AccountResolver`], and must still be linked to the Project for that mode.
+
+Admission limits (F02a): with a [`db.Reservation`] and
+[`config.AdmissionLimits`], [`db.ExecutionRegistry.begin_attempt`] also checks that
+the submitter's session and membership still allow it, takes the `nest.admission`
+advisory lock, counts the reservations held by live attempts, and records the new
+attempt's reservation, all in the transaction that records the attempt. A
+reservation is held while its attempt is live and released only by the attempt
+reaching a final state (see migration 0018).
 """
 
 from __future__ import annotations
@@ -45,8 +53,10 @@ from psycopg.types.json import Jsonb
 
 from .._logging import get_logger
 from ..backends.slurm import new_execution_id
+from ..config import AdmissionLimits
 from ._transaction import as_uuid, transaction
 from .connection import Database
+from .identity import lock_session_family
 from .platforms import DEFAULT_SSH_PORT, EndpointNotApprovedError, LoginEndpoint
 
 logger = get_logger("nest.db.executions")
@@ -135,6 +145,271 @@ class AccountNotPermittedError(ExecutionRegistryError):
 
 class ProviderNotApprovedError(ExecutionRegistryError):
     """The Provider no longer accepts Runs from the execution's Project (G03)."""
+
+
+class SubmitterNotAuthorizedError(ExecutionRegistryError):
+    """
+    The submitter's session was revoked or expired, the User was disabled, or their
+    membership no longer allows `run.submit`, since the call was authorized.
+    """
+
+
+class AdmissionLimitError(ExecutionRegistryError):
+    """
+    Admitting the attempt would exceed an admission limit (F02a). Nothing was recorded.
+
+    Attributes:
+        reason (`str`): Machine-readable limit, such as `active_per_user` or
+            `gpu_per_project`.
+        limit (`int`): The configured bound.
+        current (`int`): What is already held (or, for a per-request limit, what was
+            asked for).
+        requested (`int`): What this attempt would add.
+    """
+
+    def __init__(self, reason: str, limit: int, current: int, requested: int, message: str):
+        self.reason = reason
+        self.limit = limit
+        self.current = current
+        self.requested = requested
+        super().__init__(message)
+
+
+@dataclass(frozen=True)
+class Reservation:
+    """
+    What an attempt reserves while it is live.
+
+    Attributes:
+        cpu, gpu (`int`): CPUs per task and GPUs per node the job is allocated (one
+            node, one task), including the batch script's defaults.
+        walltime_seconds (`int | None`): The `--time` it is submitted with.
+        bounded (`bool`): Whether the job's allocation is pinned to `cpu` and `gpu`.
+            `False` for a `SubmitJob` script, whose own directives Nest cannot
+            bound: the counts are then only what was requested.
+    """
+
+    cpu: int = 0
+    gpu: int = 0
+    walltime_seconds: int | None = None
+    bounded: bool = True
+
+
+@dataclass(frozen=True)
+class Submitter:
+    """
+    Who is submitting, rechecked when the attempt is recorded.
+
+    Attributes:
+        user_id (`UUID`): The Nest User; must own the execution.
+        session_id (`UUID | None`): Their session, when the call carried one.
+    """
+
+    user_id: UUID
+    session_id: UUID | None = None
+
+
+_SUBMIT_ROLES = ["owner", "admin", "member"]
+"""Project roles whose members may `run.submit`, as [`authz.policy`] decides."""
+
+
+def check_request_limits(limits: AdmissionLimits, reservation: Reservation) -> None:
+    """
+    Checks the per-request bounds of `limits` that need no database.
+
+    Raises:
+        [`db.AdmissionLimitError`]: If one is exceeded, or the walltime is
+            unknown, which cannot be bounded.
+    """
+    if reservation.cpu > limits.cpu_per_request:
+        raise AdmissionLimitError(
+            "cpu_per_request",
+            limits.cpu_per_request,
+            reservation.cpu,
+            reservation.cpu,
+            f"At most {limits.cpu_per_request} CPUs may be requested per submission",
+        )
+    if reservation.gpu > limits.gpu_per_request:
+        raise AdmissionLimitError(
+            "gpu_per_request",
+            limits.gpu_per_request,
+            reservation.gpu,
+            reservation.gpu,
+            f"At most {limits.gpu_per_request} GPUs may be requested per submission",
+        )
+    if reservation.walltime_seconds is None:
+        raise AdmissionLimitError(
+            "walltime_unbounded",
+            limits.walltime_seconds,
+            0,
+            0,
+            "The submission has no bounded Slurm time limit; request one such as 01:00:00",
+        )
+    if reservation.walltime_seconds > limits.walltime_seconds:
+        raise AdmissionLimitError(
+            "walltime",
+            limits.walltime_seconds,
+            reservation.walltime_seconds,
+            reservation.walltime_seconds,
+            f"The time limit may be at most {limits.walltime_seconds} seconds per submission",
+        )
+
+
+def _check_submitter(cursor: Any, submitter: Submitter, project_id: UUID) -> None:
+    """
+    Re-checks the session, User and membership, holding the locks every
+    revocation conflicts with until the attempt commits.
+
+    The locks follow the order session rotation and revocation use (see
+    `db.identity.lock_session_family`): the session family's advisory lock, then the User
+    row (`FOR SHARE`), then the family's session rows (`FOR SHARE`), then the
+    membership. So a revocation (`revoke_session` takes the family lock and
+    updates the family's rows; `revoke_user_sessions` and a disable lock the User
+    row `FOR UPDATE`; a removal or role change updates the membership) that
+    commits first is seen here and refuses the attempt, and one that starts later
+    waits until this attempt and its reservation are committed.
+    """
+    if submitter.session_id is not None:
+        family = cursor.execute(
+            "SELECT family_id FROM user_sessions WHERE id = %s AND user_id = %s",
+            (submitter.session_id, submitter.user_id),
+        ).fetchone()
+        if family is None:
+            raise SubmitterNotAuthorizedError("Your Nest session was revoked or has expired")
+        lock_session_family(cursor, family["family_id"])
+    user = cursor.execute(
+        "SELECT status FROM users WHERE id = %s FOR SHARE", (submitter.user_id,)
+    ).fetchone()
+    if user is None or user["status"] != "active":
+        raise SubmitterNotAuthorizedError("Your Nest account is disabled")
+    if submitter.session_id is not None:
+        # New statements after the locks: under READ COMMITTED they see every
+        # revocation that committed while this transaction waited. A session
+        # rotated by a refresh is still the same sign-in while its family has a
+        # live session; a revocation (sign-out, an admin) revokes the whole family.
+        sessions = cursor.execute(
+            "SELECT id, revoked_at, revoked_reason, expires_at > now() AS live "
+            "FROM user_sessions WHERE family_id = %s FOR SHARE",
+            (family["family_id"],),
+        ).fetchall()
+        own = next((row for row in sessions if row["id"] == submitter.session_id), None)
+        family_live = any(row["revoked_at"] is None and row["live"] for row in sessions)
+        if (
+            own is None
+            or not own["live"]
+            or not family_live
+            or (own["revoked_at"] is not None and own["revoked_reason"] != "rotated")
+        ):
+            raise SubmitterNotAuthorizedError("Your Nest session was revoked or has expired")
+    member = cursor.execute(
+        "SELECT 1 FROM project_memberships m "
+        "JOIN projects p ON p.id = m.project_id AND p.deleted_at IS NULL "
+        "WHERE m.project_id = %s AND m.user_id = %s AND m.role = ANY(%s) FOR SHARE OF m",
+        (project_id, submitter.user_id, _SUBMIT_ROLES),
+    ).fetchone()
+    if member is None:
+        raise SubmitterNotAuthorizedError(
+            "Your membership in the Project no longer allows submitting Runs"
+        )
+
+
+_ADMISSION_LOCK = "SELECT pg_advisory_xact_lock(hashtextextended('nest.admission', 0))"
+
+
+def _reserve(
+    cursor: Any,
+    attempt_id: int,
+    execution: Mapping[str, Any],
+    platform_id: UUID,
+    reservation: Reservation,
+    limits: AdmissionLimits,
+) -> None:
+    """
+    Counts held reservations under the admission lock and records this attempt's,
+    or raises [`db.AdmissionLimitError`] (rolling the attempt back).
+    """
+    check_request_limits(limits, reservation)
+    cursor.execute(_ADMISSION_LOCK)
+    held = cursor.execute(
+        "SELECT count(*) FILTER (WHERE r.owner_user_id = %(user)s) AS user_active, "
+        "count(*) FILTER (WHERE r.project_id = %(project)s) AS project_active, "
+        "count(*) FILTER (WHERE r.platform_id = %(platform)s) AS platform_active, "
+        "COALESCE(sum(r.cpu) FILTER (WHERE r.project_id = %(project)s), 0) AS project_cpu, "
+        "COALESCE(sum(r.gpu) FILTER (WHERE r.project_id = %(project)s), 0) AS project_gpu "
+        "FROM execution_reservations r JOIN execution_attempts a ON a.id = r.attempt_id "
+        "WHERE a.status = ANY(%(live)s) AND a.id <> %(attempt)s",
+        {
+            "user": execution["owner_user_id"],
+            "project": execution["project_id"],
+            "platform": platform_id,
+            "live": list(LIVE_ATTEMPT_STATUSES),
+            "attempt": attempt_id,
+        },
+    ).fetchone()
+    recent = cursor.execute(
+        "SELECT count(*) AS n FROM execution_reservations "
+        "WHERE owner_user_id = %s AND created_at > now() - interval '60 seconds'",
+        (execution["owner_user_id"],),
+    ).fetchone()["n"]
+    checks = (
+        ("submissions_per_minute", limits.submissions_per_minute, recent, 1, "new submissions"),
+        ("active_per_user", limits.active_per_user, held["user_active"], 1, "your active Runs"),
+        (
+            "active_per_project",
+            limits.active_per_project,
+            held["project_active"],
+            1,
+            "the Project's active Runs",
+        ),
+        (
+            "active_per_platform",
+            limits.active_per_platform,
+            held["platform_active"],
+            1,
+            "the Platform's active Runs",
+        ),
+        (
+            "cpu_per_project",
+            limits.cpu_per_project,
+            held["project_cpu"],
+            reservation.cpu,
+            "CPUs reserved by the Project",
+        ),
+        (
+            "gpu_per_project",
+            limits.gpu_per_project,
+            held["project_gpu"],
+            reservation.gpu,
+            "GPUs reserved by the Project",
+        ),
+    )
+    for reason, limit, current, requested, what in checks:
+        if requested and current + requested > limit:
+            window = " in the last minute" if reason == "submissions_per_minute" else ""
+            raise AdmissionLimitError(
+                reason,
+                limit,
+                int(current),
+                requested,
+                f"Admission limit reached: {what}{window} would be {int(current) + requested}, "
+                f"above the limit of {limit}. Nothing was submitted; retry once a Run finishes",
+            )
+    cursor.execute(
+        "INSERT INTO execution_reservations (attempt_id, project_id, owner_user_id, "
+        "platform_id, cpu, gpu, walltime_seconds, bounded, limits) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        (
+            attempt_id,
+            execution["project_id"],
+            execution["owner_user_id"],
+            platform_id,
+            reservation.cpu,
+            reservation.gpu,
+            reservation.walltime_seconds,
+            reservation.bounded,
+            _jsonb(limits.summary()),
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -544,6 +819,9 @@ class ExecutionRegistry:
         runtime_digest: str | None = None,
         provider: str | None = None,
         provider_revocations: str | None = None,
+        submitter: Submitter | None = None,
+        reservation: Reservation | None = None,
+        limits: AdmissionLimits | None = None,
     ) -> Attempt:
         """
         Durably records a new `submitting` attempt before anything is submitted.
@@ -583,6 +861,19 @@ class ExecutionRegistry:
         approval, revocation and import takes it exclusively), so a revocation in
         flight is waited for and one that starts later waits for this attempt.
 
+        Args:
+            submitter ([`db.Submitter`], *optional*): Who submits. Their
+                session (unless only rotated) must still be valid, the User active,
+                and their membership still one that may `run.submit` in the
+                execution's Project, share-locked like the grant. They must own the
+                execution.
+            reservation ([`db.Reservation`], *optional*): What the attempt
+                reserves while live. Needs `limits`.
+            limits ([`config.AdmissionLimits`], *optional*): Checked under the
+                exclusive `nest.admission` advisory lock against every reservation
+                held by a live attempt, on every replica; the reservation is
+                recorded with the attempt.
+
         Raises:
             [`db.executions.ExecutionNotFoundError`]: If the execution does not exist.
             [`db.executions.ExecutionClosedError`]: If it succeeded or was cancelled.
@@ -595,19 +886,33 @@ class ExecutionRegistry:
             [`db.executions.ProviderNotApprovedError`]: If `provider` no longer
                 approves the Project, or `provider_revocations` has a revocation
                 recorded for it.
+            [`db.SubmitterNotAuthorizedError`]: If `submitter` may no
+                longer submit.
+            [`db.AdmissionLimitError`]: If `limits` would be exceeded.
             [`db.EndpointNotApprovedError`]: If the login node no longer matches an
                 approved endpoint of the Platform.
             [`db.DatabaseError`]: If the database refuses a row.
         """
         if (principal.binding_id is None) != (principal.binding_version is None):
             raise ValueError("binding_id and binding_version must be given together")
+        if (reservation is None) != (limits is None):
+            raise ValueError("reservation and limits must be given together")
+        if limits is not None and reservation is not None:
+            # Refused before any database work: these need no count.
+            check_request_limits(limits, reservation)
         with transaction(self.database, None, "record an execution attempt") as cursor:
             execution = cursor.execute(
-                "SELECT status, project_id FROM executions WHERE execution_id = %s FOR UPDATE",
+                "SELECT status, project_id, owner_user_id FROM executions "
+                "WHERE execution_id = %s FOR UPDATE",
                 (execution_id,),
             ).fetchone()
             if execution is None:
                 raise ExecutionNotFoundError("The execution does not exist")
+            if submitter is not None and submitter.user_id != execution["owner_user_id"]:
+                raise SubmitterNotAuthorizedError("Only the execution's owner may submit it")
+            if submitter is not None:
+                # Before any other lock, in the order session revocation uses.
+                _check_submitter(cursor, submitter, execution["project_id"])
             if execution["status"] in ("succeeded", "cancelled"):
                 raise ExecutionClosedError(f"The execution already {execution['status']}")
             live = cursor.execute(
@@ -709,6 +1014,8 @@ class ExecutionRegistry:
                         for name, option in options.items()
                     ],
                 )
+            if reservation is not None and limits is not None:
+                _reserve(cursor, row["id"], execution, endpoint.platform_id, reservation, limits)
             cursor.execute(
                 "UPDATE executions SET status = 'active', updated_at = now() "
                 "WHERE execution_id = %s",
@@ -972,6 +1279,34 @@ class ExecutionRegistry:
             (evidence[:_MAX_ERROR_MESSAGE],),
             expected="unknown",
         )
+
+    def held_reservations(self) -> dict[str, Any]:
+        """
+        Totals of the reservations held by live attempts, by scope, for operators
+        and metrics. Controller-internal: it spans every Project.
+        """
+        with transaction(self.database, None, "count admission reservations") as cursor:
+            totals = cursor.execute(
+                "SELECT count(*) AS active, COALESCE(sum(r.cpu), 0) AS cpu, "
+                "COALESCE(sum(r.gpu), 0) AS gpu, "
+                "count(*) FILTER (WHERE a.status = 'unknown') AS unknown "
+                "FROM execution_reservations r JOIN execution_attempts a ON a.id = r.attempt_id "
+                "WHERE a.status = ANY(%s)",
+                (list(LIVE_ATTEMPT_STATUSES),),
+            ).fetchone()
+        assert totals is not None
+        return {key: int(value) for key, value in totals.items()}
+
+    def reservation(self, attempt_id: int) -> dict[str, Any] | None:
+        """The reservation of one attempt, with whether it is held. Controller-internal."""
+        with transaction(self.database, None, "read an admission reservation") as cursor:
+            return cursor.execute(
+                "SELECT r.attempt_id, r.project_id, r.owner_user_id, r.platform_id, r.cpu, "
+                "r.gpu, r.walltime_seconds, r.bounded, r.limits, r.created_at, a.status, "
+                "a.status = ANY(%s) AS held FROM execution_reservations r "
+                "JOIN execution_attempts a ON a.id = r.attempt_id WHERE r.attempt_id = %s",
+                (list(LIVE_ATTEMPT_STATUSES), attempt_id),
+            ).fetchone()
 
     # Reads --------------------------------------------------------------------
 

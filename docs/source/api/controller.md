@@ -2,8 +2,10 @@
 
 The Controller implements the `nest.ExecutionService` gRPC service defined in
 [`execution.proto`](https://github.com/cerulean-works/nest/blob/main/src/nest/proto/execution.proto).
-It starts with four RPC worker threads and a plaintext gRPC listener, or a TLS
-listener when `NEST_TLS_CERT_FILE` and `NEST_TLS_KEY_FILE` are set. See
+It starts with four RPC worker threads (`NEST_GRPC_MAX_WORKERS`) and a plaintext
+gRPC listener, or a TLS listener when `NEST_TLS_CERT_FILE` and `NEST_TLS_KEY_FILE`
+are set, bounded and guarded as described in
+[Public API security and abuse controls](../public-api-security). See
 [Deploy a Slurm Controller](../deploy) for setup and
 [Security and limitations](../security) before granting access.
 
@@ -57,6 +59,15 @@ parsing messages:
 | `ssh_error` | `UNAVAILABLE` |
 | `remote_command_error` | `INTERNAL` for `Execute` and `GetJobStatus`; `FAILED_PRECONDITION` for `SubmitJob` and `CancelJob` |
 | `slurm_job_failed`, `infrastructure_error` | `INTERNAL` |
+| `rate_limited` (with `retry-after` seconds) | `RESOURCE_EXHAUSTED` |
+| `origin_not_allowed` | `PERMISSION_DENIED` |
+| `limit_environment_builds` | `RESOURCE_EXHAUSTED` |
+| `client_gone` | `CANCELLED` |
+| `result_too_large` | `RESOURCE_EXHAUSTED` |
+
+Admission limits ([Admission limits](../admission-limits)) answer
+`RESOURCE_EXHAUSTED` or `FAILED_PRECONDITION` with the limit's reason in the
+status message.
 
 A `DEADLINE_EXCEEDED` status without `nest-error-kind` is the caller's own RPC
 deadline. The Controller never retries `sbatch`. See
@@ -80,6 +91,10 @@ deadline. The Controller never retries `sbatch`. See
 
 [[autodoc]] controller.recovery_threshold
 
+[[autodoc]] controller.settle_threshold
+
+[[autodoc]] controller.build_server
+
 [[autodoc]] controller.record_start
 
 ## Registry-backed admission
@@ -99,3 +114,15 @@ deadline. The Controller never retries `sbatch`. See
 [[autodoc]] admission.DuplicateSubmissionError
 
 [[autodoc]] admission.RecoverySweeper
+
+[[autodoc]] admission.BuildSlot
+
+## Abuse controls
+
+[[autodoc]] rpc_guard.RpcGuard
+
+[[autodoc]] rpc_guard.TokenBuckets
+
+[[autodoc]] rpc_guard.client_address
+
+[[autodoc]] rpc_guard.server_options

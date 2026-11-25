@@ -198,6 +198,16 @@ registry.record_submission(attempt.id, slurm_job_id)
 
 [[autodoc]] db.ExecutionClosedError
 
+### Admission reservations (F02a)
+
+[[autodoc]] db.Reservation
+
+[[autodoc]] db.Submitter
+
+[[autodoc]] db.AdmissionLimitError
+
+[[autodoc]] db.SubmitterNotAuthorizedError
+
 [[autodoc]] db.InvalidTransitionError
 
 [[autodoc]] db.PlatformUnavailableError

@@ -222,6 +222,17 @@ class RpcTimeoutError(NestTimeoutError):
     kind = "rpc_timeout"
 
 
+class ResultTooLargeError(InfrastructureError):
+    """
+    The job completed, but its result is larger than the Controller may return
+    (`NEST_GRPC_MAX_MESSAGE_BYTES`), so it was not downloaded. The result stays in
+    the job's execution directory on the cluster.
+    """
+
+    kind = "result_too_large"
+    status = grpc.StatusCode.RESOURCE_EXHAUSTED
+
+
 class DatabaseUnavailableError(InfrastructureError):
     """
     The Controller's PostgreSQL database could not record the request.
@@ -267,6 +278,7 @@ INFRASTRUCTURE_ERRORS: dict[str, type[InfrastructureError]] = {
         ExecutionTimeoutError,
         RpcTimeoutError,
         DatabaseUnavailableError,
+        ResultTooLargeError,
     )
 }
 """Maps each `kind` to its exception class."""

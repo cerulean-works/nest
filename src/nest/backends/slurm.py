@@ -1,9 +1,12 @@
 import hashlib
+import os
 import re
+import selectors
 import shlex
 import subprocess
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -15,6 +18,7 @@ from ..errors import (
     JobBlockedError,
     QueueTimeoutError,
     RemoteCommandError,
+    ResultTooLargeError,
     SlurmJobError,
     SSHError,
     SSHTimeoutError,
@@ -63,6 +67,17 @@ _SQUEUE_FORMAT = "%T|%r|%P|%q|%a"
 
 _REQ_TRES = re.compile(r"(?:^|\s)ReqTRES=(\S+)")
 """Requested trackable resources in `scontrol show job --oneliner` output."""
+
+WORKER_DEFAULT_GPUS = 1
+"""GPUs per node `scripts/worker.sbatch` requests when the Controller passes none."""
+WORKER_DEFAULT_CPUS = 1
+"""CPUs per task `scripts/worker.sbatch` requests when the Controller passes none."""
+ENVIRONMENT_BUILD_GPUS = 1
+"""GPUs per node `scripts/environment-smoke.sbatch` (the environment build) requests."""
+ENVIRONMENT_BUILD_CPUS = 12
+"""CPUs per task the environment build requests."""
+ENVIRONMENT_BUILD_TIME = "00:10:00"
+"""Time limit of the environment build."""
 
 PENDING_QUEUED = "queued"
 """Pending reason category: normal queue congestion that clears on its own."""
@@ -303,6 +318,10 @@ class SlurmConfig:
         ssh_port (`int`, *optional*): Remote port passed with `-p`.
         identity_file (`str`, *optional*): Private key for Mode B.
         known_hosts_file (`str`, *optional*): Verified host keys for Mode B.
+        max_result_bytes (`int`, *optional*): Largest result
+            [`backends.slurm.SlurmBackend.wait_result`] downloads; a larger one is
+            never read past this bound and raises [`errors.ResultTooLargeError`].
+            Unset downloads any size, as before.
         allowed_hosts (`tuple[str, ...]`, *optional*): Approved login nodes. When
             nonempty, `ssh_host` must be one of them.
     """
@@ -326,8 +345,11 @@ class SlurmConfig:
     identity_file: str | None = None
     known_hosts_file: str | None = None
     allowed_hosts: tuple[str, ...] = ()
+    max_result_bytes: int | None = None
 
     def __post_init__(self):
+        if self.max_result_bytes is not None and self.max_result_bytes < 1:
+            raise ValueError("max_result_bytes must be positive")
         if self.blocked_timeout < 0 or (self.limit_timeout is not None and self.limit_timeout < 0):
             raise ValueError("Pending timeouts cannot be negative")
         if self.ssh_mode not in ("A", "B"):
@@ -363,6 +385,52 @@ def environment_id(pyproject_toml: bytes, uv_lock: bytes) -> str:
         hasher.update(len(content).to_bytes(8, "big"))
         hasher.update(content)
     return hasher.hexdigest()
+
+
+def worker_allocation(gpu: int, cpu: int) -> tuple[int, int]:
+    """
+    The GPUs per node and CPUs per task a worker job holds for a request: the
+    request, or `scripts/worker.sbatch`'s default where it asks for `0`.
+    """
+    return (gpu or WORKER_DEFAULT_GPUS, cpu or WORKER_DEFAULT_CPUS)
+
+
+class BuildProgress:
+    """
+    Follows one environment build for [`backends.slurm.SlurmBackend.prepare_environment_bytes`].
+
+    Args:
+        before_submit (`Callable[[], None]`, *optional*): Called after staging and
+            the readiness check, immediately before the build's `sbatch`. An
+            exception it raises propagates with no build job submitted.
+
+    Attributes:
+        started (`bool`): A build submission began, so a build job may exist.
+        job_id (`int | None`): The build's Slurm job ID, once `sbatch` returned it.
+        done (`bool`): The build job reached a final state Slurm reported.
+    """
+
+    def __init__(self, before_submit: Callable[[], None] | None = None) -> None:
+        self.before_submit = before_submit
+        self.started = False
+        self.job_id: int | None = None
+        self.done = False
+
+    def submitting(self) -> None:
+        if self.before_submit is not None:
+            self.before_submit()
+        self.started = True
+
+    def submitted(self, job_id: int) -> None:
+        self.job_id = job_id
+
+    def finished(self) -> None:
+        self.done = True
+
+    @property
+    def may_be_running(self) -> bool:
+        """Whether a build job may exist that Slurm has not reported finished."""
+        return self.started and not self.done
 
 
 class SlurmBackend:
@@ -473,6 +541,91 @@ class SlurmBackend:
             f"Remote command failed:\n{message}", returncode=result.returncode
         )
 
+    _STDERR_KEEP = 64 * 1024
+    """Bytes of a bounded command's standard error kept for its error message."""
+
+    def _ssh_bounded(self, command: str, limit: int) -> bytes:
+        """
+        Runs an SSH command and returns its standard output, reading at most
+        `limit` bytes of it into memory (and a bounded part of standard error).
+
+        Raises:
+            [`errors.ResultTooLargeError`]: If the output exceeds `limit`; SSH is
+                killed and reaped.
+            [`errors.SSHTimeoutError`], [`errors.SSHError`],
+            [`errors.RemoteCommandError`]: As [`backends.slurm.SlurmBackend._ssh`].
+        """
+        deadline = time.monotonic() + self.config.ssh_timeout
+        process = subprocess.Popen(
+            [*self._ssh_argv(), command],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=child_environ(),
+        )
+        assert process.stdout is not None and process.stderr is not None
+        out_fd, err_fd = process.stdout.fileno(), process.stderr.fileno()
+        out = bytearray()
+        kept_err = bytearray()
+        too_large = timed_out = False
+        # One deadline covers reading both pipes, the process's exit and its reaping.
+        # select() never blocks past it, even if the pipes stay open after EOF on one
+        # of them or after SSH has exited.
+        with selectors.DefaultSelector() as selector:
+            selector.register(out_fd, selectors.EVENT_READ)
+            selector.register(err_fd, selectors.EVENT_READ)
+            try:
+                while selector.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        timed_out = True
+                        break
+                    for key, _ in selector.select(remaining):
+                        fd = key.fd
+                        if fd == out_fd:
+                            chunk = os.read(fd, min(65536, limit + 1 - len(out)))
+                            out.extend(chunk)
+                            if len(out) > limit:
+                                too_large = True
+                        else:
+                            chunk = os.read(fd, 65536)
+                            # Keep the head for the message; discard the rest.
+                            if len(kept_err) < self._STDERR_KEEP:
+                                kept_err.extend(chunk[: self._STDERR_KEEP - len(kept_err)])
+                        if not chunk:
+                            selector.unregister(fd)
+                    if too_large:
+                        break
+                if not (too_large or timed_out):
+                    try:
+                        process.wait(timeout=max(0.0, deadline - time.monotonic()))
+                    except subprocess.TimeoutExpired:
+                        # Output ended, but SSH is still running.
+                        timed_out = True
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                # SIGKILL cannot be ignored, so the reap is prompt.
+                process.wait()
+                process.stdout.close()
+                process.stderr.close()
+        returncode = process.returncode
+        if too_large:
+            raise ResultTooLargeError(
+                f"The result is larger than {limit} bytes, the most this Controller returns "
+                "(NEST_GRPC_MAX_MESSAGE_BYTES); it was not downloaded"
+            )
+        if timed_out:
+            raise SSHTimeoutError(
+                f"SSH command to {self.config.ssh_host} timed out after "
+                f"{self.config.ssh_timeout:g} seconds. The remote operation status is unknown."
+            )
+        if returncode != 0:
+            raise self._command_error(
+                subprocess.CompletedProcess(process.args, returncode, bytes(out), bytes(kept_err))
+            )
+        return bytes(out)
+
     def _ssh(self, command: str, input: bytes | None = None) -> bytes:
         """
         Runs an SSH command and classifies its failures.
@@ -541,6 +694,7 @@ class SlurmBackend:
         time: str | None = None,
         inherit_time: bool = True,
         script_args: tuple[str, ...] = (),
+        single_task: bool = False,
     ) -> int:
         """
         Submits a batch script from a remote working directory exactly once.
@@ -567,6 +721,9 @@ class SlurmBackend:
                 `time` omits the flag, so the script's `#SBATCH --time` applies.
             script_args (`tuple[str, ...]`, *optional*, defaults to `()`): Arguments
                 appended after the script path.
+            single_task (`bool`, *optional*, defaults to `False`): Pass `--nodes=1`
+                and `--ntasks=1`, which override the script's own node and task
+                counts, so the job holds at most one node and one task.
 
         Returns:
             `int`: Job ID parsed from the last line of `sbatch --parsable` output.
@@ -596,6 +753,9 @@ class SlurmBackend:
             f"--account={account or self.config.account}",
             f"--partition={partition or self.config.partition}",
         ]
+
+        if single_task:
+            args.extend(("--nodes=1", "--ntasks=1"))
 
         if gpu > 0:
             args.append(f"--gpus-per-node={gpu}")
@@ -822,6 +982,8 @@ class SlurmBackend:
         account: str | None = None,
         partition: str | None = None,
         time: str | None = None,
+        bounded: bool = False,
+        before_submit: Callable[[], None] | None = None,
     ) -> tuple[int, str]:
         """
         Stages a serialized call and submits the deployed worker batch script once.
@@ -845,6 +1007,14 @@ class SlurmBackend:
                 [`backends.slurm.SlurmBackend.submit`]; unset uses the configured
                 defaults, as before. The registry-backed Controller passes the values
                 it resolved and recorded.
+            bounded (`bool`, *optional*, defaults to `False`): Pin the allocation to
+                [`backends.slurm.worker_allocation`]: one node, one task, and an
+                explicit `--cpus-per-task`, so the job holds exactly what admission
+                reserved. With `gpu` `0` the worker's own GPU default still applies,
+                and is reserved.
+            before_submit (`Callable[[], None]`, *optional*): Called after staging,
+                immediately before `sbatch`. An exception it raises propagates and
+                nothing is submitted.
 
         Returns:
             `tuple[int, str]`: Submitted job ID and remote execution directory.
@@ -884,17 +1054,21 @@ class SlurmBackend:
             str(gpu),
         )
 
+        if before_submit is not None:
+            before_submit()
+
         # Submit Slurm job exactly once; an ambiguous outcome is reported, not retried.
         try:
             job_id = self.submit(
                 workdir=self.config.worker_workdir,
                 script="project/scripts/worker.sbatch",
                 gpu=gpu,
-                cpu=cpu,
+                cpu=(worker_allocation(gpu, cpu)[1] if bounded else cpu),
                 account=account,
                 partition=partition,
                 time=time,
                 script_args=script_args,
+                single_task=bounded,
             )
         except SubmissionUnknownError as exc:
             logger.error(
@@ -1099,6 +1273,7 @@ class SlurmBackend:
             [`errors.QueueTimeoutError`]: If the job is still queued at the deadline.
             [`errors.ExecutionTimeoutError`]: If the job is still running at the
                 deadline or Slurm ended it with `TIMEOUT`.
+            [`errors.ResultTooLargeError`]: If the result exceeds `max_result_bytes`.
             [`errors.InfrastructureError`]: If a remote command fails or the result
                 file is empty. Timeouts never cancel the job.
         """
@@ -1112,8 +1287,14 @@ class SlurmBackend:
         # Download binary result through SSH stdout
         output_path = f"{job_dir}/output.pkl"
         logger.info("Downloading result job_id=%s job_dir=%s", job_id, job_dir)
+        limit = self.config.max_result_bytes
         try:
-            result = self._ssh(f"cat {shlex.quote(output_path)}")
+            if limit is None:
+                result = self._ssh(f"cat {shlex.quote(output_path)}")
+            else:
+                # The remote side sends at most one byte past the bound, and the local
+                # read stops there too, so the result never fills memory.
+                result = self._ssh_bounded(f"head -c {limit + 1} {shlex.quote(output_path)}", limit)
         except InfrastructureError as exc:
             exc.job_id = job_id
             raise
@@ -1256,7 +1437,15 @@ class SlurmBackend:
 
         return env_dir
 
-    def build_environment(self, env_dir: str, gpu: int = 0, *, cpu: int = 0) -> int:
+    def build_environment(
+        self,
+        env_dir: str,
+        gpu: int = 0,
+        *,
+        cpu: int = 0,
+        account: str | None = None,
+        partition: str | None = None,
+    ) -> int:
         """
         Submits the environment build script for a staged environment directory.
 
@@ -1270,6 +1459,10 @@ class SlurmBackend:
                 `0` keeps the script's value.
             cpu (`int`, *optional*, defaults to `0`): CPUs per task passed to
                 [`backends.slurm.SlurmBackend.submit`]; `0` keeps the script's value.
+            account, partition (`str`, *optional*): The Slurm account and partition
+                to charge. The registry-backed Controller passes the ones it
+                authorized for the execution, so the build is never charged to the
+                Platform Profile's default account instead. Unset uses the defaults.
 
         Returns:
             `int`: Environment build job ID. Does not wait for completion.
@@ -1298,6 +1491,8 @@ class SlurmBackend:
             script="project/scripts/environment-smoke.sbatch",
             gpu=gpu,
             cpu=cpu,
+            account=account,
+            partition=partition,
             # The build script sets its own limit; the worker job default is often too short.
             inherit_time=False,
             script_args=(env_id, self.config.worker_workdir),
@@ -1454,6 +1649,9 @@ class SlurmBackend:
         uv_lock: bytes,
         gpu: int = 0,
         cpu: int = 0,
+        progress: BuildProgress | None = None,
+        account: str | None = None,
+        partition: str | None = None,
     ) -> str:
         """
         Stages dependency files and reuses or builds their runtime environment.
@@ -1469,6 +1667,11 @@ class SlurmBackend:
                 build job. `0` keeps the script's value.
             cpu (`int`, *optional*, defaults to `0`): CPUs per task for a required
                 build job; `0` keeps the script's value.
+            account, partition (`str`, *optional*): Passed to
+                [`backends.slurm.SlurmBackend.build_environment`].
+            progress ([`backends.slurm.BuildProgress`], *optional*): Told when a
+                build job may exist and when it has finished, so a caller can tell a
+                build that may still be running from one that is over.
 
         Returns:
             `str`: Remote environment directory after its runtime is ready.
@@ -1490,11 +1693,19 @@ class SlurmBackend:
             return env_dir
 
         logger.info("Runtime cache miss environment_id=%s", Path(env_dir).name)
-        job_id = self.build_environment(env_dir, gpu=gpu, cpu=cpu)
+        if progress is not None:
+            progress.submitting()
+        job_id = self.build_environment(
+            env_dir, gpu=gpu, cpu=cpu, account=account, partition=partition
+        )
+        if progress is not None:
+            progress.submitted(job_id)
         logger.info(
             "Environment build submitted job_id=%s environment_id=%s", job_id, Path(env_dir).name
         )
         self.wait_environment(job_id)
+        if progress is not None:
+            progress.finished()
 
         if not self.environment_ready(env_dir):
             raise InfrastructureError(

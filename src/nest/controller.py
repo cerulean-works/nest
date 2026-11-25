@@ -20,6 +20,7 @@ from ._logging import (
 )
 from .admission import (
     AdmissionRefusedError,
+    BuildSlot,
     DuplicateSubmissionError,
     RecoverySweeper,
     RegistryAdmission,
@@ -38,7 +39,13 @@ from .authz.execution import (
     UnauthenticatedError,
 )
 from .authz.service import AccessDeniedError, ProviderAuthority
-from .backends.slurm import SlurmBackend, SlurmConfig, environment_id, new_execution_id
+from .backends.slurm import (
+    BuildProgress,
+    SlurmBackend,
+    SlurmConfig,
+    environment_id,
+    new_execution_id,
+)
 from .config import (
     ConfigError,
     ControllerConfig,
@@ -68,11 +75,13 @@ from .errors import (
     InfrastructureError,
     QueueTimeoutError,
     RemoteCommandError,
+    SlurmJobError,
     SubmissionUnknownError,
 )
 from .executor import execute
 from .mail import start_email_service
 from .proto import execution_pb2, execution_pb2_grpc
+from .rpc_guard import RpcGuard, current_client, server_options
 
 logger = get_logger("nest.controller")
 
@@ -87,7 +96,9 @@ def _logged_rpc(method):
         level = "debug" if method.__name__ == "GetJobStatus" else "info"
         with request_context(incoming_id), audit_interface("grpc"):
             started = time.monotonic()
-            getattr(logger, level)("RPC started method=%s", method.__name__)
+            getattr(logger, level)(
+                "RPC started method=%s client=%s", method.__name__, current_client()
+            )
             try:
                 response = method(self, request, context)
             except Exception:
@@ -212,6 +223,21 @@ def _abort_denied(context, exc: AccessDeniedError, what: str):
     raise AssertionError("context.abort raises")
 
 
+class ClientGoneError(InfrastructureError):
+    """The client cancelled the call or its deadline passed before a side effect."""
+
+    kind = "client_gone"
+    status = grpc.StatusCode.CANCELLED
+
+
+def _still_wanted(context) -> bool:
+    """Whether the client still waits for this call: not cancelled, deadline not passed."""
+    if not context.is_active():
+        return False
+    remaining = context.time_remaining()
+    return remaining is None or remaining > 0
+
+
 def _single_metadata(context, key: str) -> str | None:
     """The one value of request metadata `key`, or `None`; aborts on several."""
     values = [
@@ -235,6 +261,8 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
         jobs: JobStore | None = None,
         access: ExecutionAccess | None = None,
         admission: RegistryAdmission | None = None,
+        guard: RpcGuard | None = None,
+        local_execution: bool = True,
     ):
         """
         Stores the optional Slurm backend and job store used by the RPC handlers.
@@ -253,6 +281,12 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 Slurm submission through the Execution Registry
                 (`NEST_EXECUTION_REGISTRY=required`); needs `access`. Without it the
                 legacy path records submissions in `jobs` only.
+            guard ([`rpc_guard.RpcGuard`], *optional*): Applies its per-User rate
+                limit to every authenticated call.
+            local_execution (`bool`): Whether an authenticated `Execute` with the
+                local executor may deserialize and run the call in this process
+                (`NEST_CONTROLLER_LOCAL_EXECUTION`). Without authentication it
+                always may, as before.
         """
         if admission is not None and access is None:
             raise ValueError("Registry-backed admission needs session authentication")
@@ -261,6 +295,8 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
         self.jobs = jobs
         self.access = access
         self.admission = admission
+        self.guard = guard
+        self.local_execution = local_execution
 
     def _guarded(self, context, call):
         """Runs an access check, turning a database failure into `UNAVAILABLE`."""
@@ -288,7 +324,7 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
             return None
         access = self.access
         try:
-            return self._guarded(
+            principal = self._guarded(
                 context, lambda: access.authenticate(context.invocation_metadata(), rpc)
             )
         except UnauthenticatedError:
@@ -298,6 +334,9 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 "NEST_AUTH_URL so the SDK can sign in",
             )
             raise AssertionError("context.abort raises") from None
+        if self.guard is not None:
+            self.guard.allow_user(context, principal.user_id)
+        return principal
 
     def _authorize_submit(
         self,
@@ -435,23 +474,96 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
             **self._submission_metadata(context),
         )
         try:
-            admission = self._admit(context, principal, attribution, submission, execution_id)
-        except DuplicateSubmissionError as exc:
-            context.set_trailing_metadata(((EXECUTION_ID_METADATA, exc.execution.execution_id),))
-            context.abort(grpc.StatusCode.ALREADY_EXISTS, str(exc))
+            slot = (
+                admission_service.environment_slot()
+                if request.HasField("environment")
+                else BuildSlot(None)
+            )
+        except AdmissionRefusedError as exc:
+            # Refused before admission: nothing is registered or reserved.
+            context.set_trailing_metadata(((ERROR_KIND_METADATA, exc.reason),))
+            context.abort(exc.code, _status_details(f"{exc} [{exc.reason}]"))
             raise AssertionError("context.abort raises") from None
+        try:
+            try:
+                admission = self._admit(context, principal, attribution, submission, execution_id)
+            except DuplicateSubmissionError as exc:
+                context.set_trailing_metadata(
+                    ((EXECUTION_ID_METADATA, exc.execution.execution_id),)
+                )
+                context.abort(grpc.StatusCode.ALREADY_EXISTS, str(exc))
+                raise AssertionError("context.abort raises") from None
+            with admission_service.waiting(admission):
+                return self._run_registry_execution(
+                    request, context, admission_service, admission, slot
+                )
+        finally:
+            slot.release()
+
+    def _abandon_if_gone(self, context, admission_service, admission, step: str) -> None:
+        """
+        Before a side effect: when the client has gone, settles the attempt as a
+        known failure (releasing its reservation) and aborts; nothing more runs.
+        """
+        if _still_wanted(context):
+            return
+        error = ClientGoneError(
+            f"The call was cancelled or its deadline passed before {step}; nothing was submitted"
+        )
+        logger.warning(
+            "Execution abandoned before %s execution_id=%s", step, admission.execution_id
+        )
+        admission_service.failed(admission, error, submitted=False)
+        _abort_infrastructure(context, error, execution_id=admission.execution_id)
+
+    def _run_registry_execution(self, request, context, admission_service, admission, slot):
         backend = admission.backend
         submitted = False
+
+        def still_wanted(step: str):
+            def check() -> None:
+                if not _still_wanted(context):
+                    raise ClientGoneError(
+                        f"The call was cancelled or its deadline passed before {step}; "
+                        "nothing was submitted"
+                    )
+
+            return check
+
+        build = BuildProgress(before_submit=still_wanted("the environment build's sbatch"))
         try:
             environment = None
             if request.HasField("environment"):
                 env = request.environment
-                logger.info("Preparing Python environment")
-                env_dir = backend.prepare_environment_bytes(
-                    pyproject_toml=env.pyproject_toml, uv_lock=env.uv_lock
+                self._abandon_if_gone(
+                    context, admission_service, admission, "the environment build"
                 )
+                logger.info("Preparing Python environment")
+                try:
+                    env_dir = backend.prepare_environment_bytes(
+                        pyproject_toml=env.pyproject_toml,
+                        uv_lock=env.uv_lock,
+                        progress=build,
+                        # The account and partition authorized and recorded for
+                        # this attempt, never the Profile's defaults.
+                        account=admission.account,
+                        partition=admission.partition,
+                    )
+                except (InfrastructureError, RuntimeError, ValueError) as exc:
+                    if build.may_be_running and not isinstance(exc, SlurmJobError):
+                        # The build job may still hold its allocation: keep the
+                        # reservation (unknown) rather than release it as failed.
+                        logger.exception("Environment build outcome unknown")
+                        admission_service.build_unknown(admission, exc, build.job_id)
+                        if isinstance(exc, InfrastructureError):
+                            _abort_infrastructure(context, exc, execution_id=admission.execution_id)
+                        context.abort(grpc.StatusCode.INTERNAL, _status_details(str(exc)))
+                    raise
                 environment = env_dir.rsplit("/", 1)[-1]
                 logger.info("Environment ready environment_id=%s", environment)
+            # The build slot is only needed for the build itself.
+            slot.release()
+            self._abandon_if_gone(context, admission_service, admission, "staging the payload")
             job_id, job_dir = backend.submit_payload(
                 request.payload,
                 gpu=request.gpu,
@@ -461,6 +573,9 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 account=admission.account,
                 partition=admission.partition,
                 time=admission.time,
+                bounded=admission.bounded,
+                # Staging takes time: check again right before the worker's sbatch.
+                before_submit=still_wanted("the worker's sbatch"),
             )
             submitted = True
             logger.info("Worker submitted job_id=%s job_dir=%s", job_id, job_dir)
@@ -523,6 +638,7 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
             )
             context.set_trailing_metadata(((EXECUTION_ID_METADATA, exc.execution.execution_id),))
             return execution_pb2.SubmitJobResponse(job_id=exc.attempt.slurm_job_id)
+        self._abandon_if_gone(context, admission_service, admission, "sbatch")
         try:
             job_id = admission.backend.submit(
                 workdir=request.workdir,
@@ -661,6 +777,16 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
             request.cpu,
             len(request.payload),
         )
+        if mode != "slurm" and self.access is not None and not self.local_execution:
+            # Deserializing runs the caller's code inside the Controller, next to
+            # its database and SSH credentials: never for a non-loopback listener
+            # unless the operator opted in. Refused before authorization, so no
+            # submission is recorded as allowed.
+            context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "This Controller does not run calls in its own process (NEST_EXECUTOR=local "
+                "on a non-loopback listener); nothing was run",
+            )
         # The Execution ID is fixed, authorized and recorded before any side
         # effect; the backend then uses it for the remote directory and worker.
         execution_id = new_execution_id()
@@ -976,6 +1102,8 @@ def build_backend(config: ControllerConfig) -> SlurmBackend | None:
             blocked_timeout=config.pending_blocked_timeout,
             limit_timeout=config.pending_limit_timeout,
             cancel_blocked=config.cancel_blocked_jobs,
+            # Room for the ExecuteResponse envelope (a tag and a length varint).
+            max_result_bytes=config.rpc.max_message_bytes - 16,
         )
     )
 
@@ -1139,7 +1267,8 @@ def build_admission(
             logger.warning(
                 "NEST_EXECUTION_REGISTRY=legacy: Slurm submissions to %r are recorded only in "
                 "the legacy jobs table and charge the Platform Profile's account, as before "
-                "the Execution Registry; use this only for trusted Mode A deployments",
+                "the Execution Registry; use this only for trusted Mode A deployments. "
+                "Admission limits (NEST_LIMIT_*) are enforced only by the registry",
                 config.platform.id,
             )
         return None
@@ -1170,6 +1299,32 @@ def build_admission(
         provider_revocations=(
             access.provider_id if config.provider_approvals == "environment" else None
         ),
+        limits=config.limits,
+    )
+
+
+def settle_threshold(config: ControllerConfig) -> timedelta:
+    """
+    How long a `submitted` or `running` attempt must be unchanged before the sweeper
+    asks Slurm for its state: longer than an `Execute` waits for its result, so a
+    call still waiting on another replica records the outcome itself.
+    """
+    return timedelta(seconds=config.result_timeout + 2 * config.ssh_timeout + 60)
+
+
+def build_server(config: ControllerConfig, guard: RpcGuard | None = None) -> grpc.Server:
+    """
+    The bounded gRPC server (H07): `max_workers` threads, at most
+    `max_concurrent_rpcs` RPCs running or queued (more are refused with
+    `RESOURCE_EXHAUSTED`), and the message, metadata and PING bounds of
+    [`rpc_guard.server_options`].
+    """
+    rpc = config.rpc
+    return grpc.server(
+        futures.ThreadPoolExecutor(max_workers=rpc.max_workers, thread_name_prefix="nest-rpc"),
+        interceptors=[guard or RpcGuard(rpc)],
+        options=server_options(rpc),
+        maximum_concurrent_rpcs=rpc.max_concurrent_rpcs,
     )
 
 
@@ -1200,6 +1355,13 @@ def record_start(config: ControllerConfig, database: Database | None) -> None:
             "email_enabled": config.email is not None,
             "google_sign_in": config.google is not None,
             "execution_registry": config.execution_registry,
+            "grpc_allowed_peers": len(config.rpc.allowed_peers),
+            "grpc_trusted_proxies": len(config.rpc.trusted_proxies),
+            "grpc_peer_rate": config.rpc.peer_rate,
+            "grpc_user_rate": config.rpc.user_rate,
+            "grpc_max_message_bytes": config.rpc.max_message_bytes,
+            "local_execution": config.rpc.local_execution,
+            "admission_limits": config.limits.summary(),
         },
     )
 
@@ -1224,7 +1386,9 @@ def main():
     starts only with `NEST_EMAIL_ENABLED=true` and never contacts the SMTP server
     at startup (see [`mail.start_email_service`]). Google sign-in is served on
     `NEST_AUTH_HTTP_BIND` only when `NEST_GOOGLE_CLIENT_ID` is set, and never
-    contacts Google at startup (see [`auth.start_auth_service`]). Uses four RPC worker threads with port reuse disabled, and TLS when
+    contacts Google at startup (see [`auth.start_auth_service`]). Serves RPCs on the
+    bounded server of [`controller.build_server`] (`NEST_GRPC_*`, four worker threads
+    by default) with port reuse disabled, and TLS when
     `NEST_TLS_CERT_FILE` and `NEST_TLS_KEY_FILE` are set. Handles SIGTERM and SIGINT
     by allowing active RPCs up to ten seconds to finish.
 
@@ -1258,10 +1422,8 @@ def main():
         raise SystemExit(3) from None
     email = start_email_service(config.email, database)
 
-    server = grpc.server(
-        futures.ThreadPoolExecutor(max_workers=4),
-        options=[("grpc.so_reuseport", 0)],
-    )
+    guard = RpcGuard(config.rpc)
+    server = build_server(config, guard)
 
     slurm_backend = build_backend(config)
     access = build_access(config, database)
@@ -1271,14 +1433,25 @@ def main():
         logger.error("%s", exc)
         raise SystemExit(3) from None
     sweeper = (
-        RecoverySweeper(admission, recovery_threshold(config), interval=300)
+        RecoverySweeper(
+            admission,
+            recovery_threshold(config),
+            interval=300,
+            settle_after=settle_threshold(config),
+        )
         if admission is not None
         else None
     )
 
     execution_pb2_grpc.add_ExecutionServiceServicer_to_server(
         ExecutionService(
-            slurm_backend, executor=config.executor, jobs=jobs, access=access, admission=admission
+            slurm_backend,
+            executor=config.executor,
+            jobs=jobs,
+            access=access,
+            admission=admission,
+            guard=guard,
+            local_execution=config.rpc.local_execution,
         ),
         server,
     )
