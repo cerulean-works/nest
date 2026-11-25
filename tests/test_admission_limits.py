@@ -36,6 +36,7 @@ from nest.admission import (
 from nest.authz import Principal
 from nest.backends.slurm import SlurmBackend, SlurmConfig
 from nest.config import AdmissionLimits, ConfigError, load_controller_config, slurm_time_seconds
+from nest.db import executions as executions_module
 from nest.db import hash_token
 from nest.db.cli import main as nest_db_main
 from nest.db.executions import (
@@ -44,6 +45,7 @@ from nest.db.executions import (
     Reservation,
     check_request_limits,
 )
+from nest.db.identity import lock_session_family
 from nest.proto import execution_pb2
 
 LIMITS = AdmissionLimits(
@@ -509,6 +511,93 @@ class RecheckTests(_LimitsBase):
             self.admit(session_id)
         self.assertEqual(caught.exception.reason, "submitter_not_authorized")
         self.assertEqual(self.held(), [])
+
+    def race_revocation(self, revoke):
+        """
+        Holds an attempt's transaction open just after the submitter recheck, starts
+        `revoke(session_id)`, and checks that it waits until the attempt commits and
+        refuses every later attempt.
+        """
+        _, session_id = self.session(self.member)
+        checked, release = threading.Event(), threading.Event()
+        original = executions_module._check_submitter
+
+        def paused(*args, **kwargs):
+            original(*args, **kwargs)
+            checked.set()  # its locks are held until the attempt commits
+            release.wait(30)
+
+        admitted: list[object] = []
+        with mock.patch.object(executions_module, "_check_submitter", paused):
+            admitter = threading.Thread(target=lambda: admitted.append(self.admit(session_id)))
+            admitter.start()
+            self.assertTrue(checked.wait(30))
+            revoker = threading.Thread(target=revoke, args=(session_id,))
+            revoker.start()
+            revoker.join(1.0)
+            # The revocation waits for the transaction that records the attempt.
+            self.assertTrue(revoker.is_alive())
+            release.set()
+            admitter.join(30)
+            revoker.join(30)
+        self.assertFalse(revoker.is_alive())
+        self.assertEqual(len(admitted), 1)  # fully admitted before the revocation
+        # Later attempts are refused before anything is recorded: by this recheck,
+        # or earlier when Platform selection already sees the disabled membership.
+        before = len(self.attempts())
+        with self.assertRaises(AdmissionRefusedError) as caught:
+            self.admit(session_id)
+        self.assertIn(caught.exception.reason, ("submitter_not_authorized", "none_authorized"))
+        self.assertEqual(len(self.attempts()), before)
+
+    def test_concurrent_session_revocation_waits_for_the_admitted_attempt(self):
+        self.race_revocation(self.identities.revoke_session)
+
+    def test_concurrent_user_revocation_waits_for_the_admitted_attempt(self):
+        self.race_revocation(lambda _: self.identities.revoke_user_sessions(self.member))
+
+    def test_concurrent_disable_waits_for_the_admitted_attempt(self):
+        self.race_revocation(lambda _: self.identities.set_user_status(self.member, "disabled"))
+
+    def test_concurrent_member_removal_waits_for_the_admitted_attempt(self):
+        self.race_revocation(
+            lambda _: self.projects.remove_member(browser(self.owner), self.project, self.member)
+        )
+
+    def test_revocation_committed_first_refuses_the_waiting_attempt(self):
+        """An attempt that waits for an in-flight revocation sees it and is refused."""
+        _, session_id = self.session(self.member)
+        locked, release = threading.Event(), threading.Event()
+        family = self.sql("SELECT family_id FROM user_sessions WHERE id = %s", session_id)[0]
+
+        def revoke_slowly():
+            with self.db.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+                lock_session_family(cursor, family["family_id"])
+                locked.set()
+                release.wait(30)
+                self.identities.revoke_session(session_id, conn=conn)
+
+        revoker = threading.Thread(target=revoke_slowly)
+        revoker.start()
+        self.assertTrue(locked.wait(30))
+        outcome: list[object] = []
+
+        def admit():
+            try:
+                outcome.append(self.admit(session_id))
+            except AdmissionRefusedError as exc:
+                outcome.append(exc.reason)
+
+        admitter = threading.Thread(target=admit)
+        admitter.start()
+        admitter.join(1.0)
+        self.assertTrue(admitter.is_alive())  # waiting for the family lock
+        release.set()
+        revoker.join(30)
+        admitter.join(30)
+        self.assertEqual(outcome, ["submitter_not_authorized"])
+        self.assertEqual(self.attempts(), [])
+        self.assert_nothing_sent()
 
     def test_rotated_session_of_a_live_family_is_legitimate_reuse(self):
         refresh = hash_token(secrets.token_urlsafe())

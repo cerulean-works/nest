@@ -56,6 +56,7 @@ from ..backends.slurm import new_execution_id
 from ..config import AdmissionLimits
 from ._transaction import as_uuid, transaction
 from .connection import Database
+from .identity import lock_session_family
 from .platforms import DEFAULT_SSH_PORT, EndpointNotApprovedError, LoginEndpoint
 
 logger = get_logger("nest.db.executions")
@@ -250,11 +251,54 @@ def check_request_limits(limits: AdmissionLimits, reservation: Reservation) -> N
 
 
 def _check_submitter(cursor: Any, submitter: Submitter, project_id: UUID) -> None:
-    """Re-checks the session, User and membership, share-locking what it read."""
+    """
+    Re-checks the session, User and membership, holding the locks every
+    revocation conflicts with until the attempt commits.
+
+    The locks follow the order session rotation and revocation use (see
+    `db.identity.lock_session_family`): the session family's advisory lock, then the User
+    row (`FOR SHARE`), then the family's session rows (`FOR SHARE`), then the
+    membership. So a revocation (`revoke_session` takes the family lock and
+    updates the family's rows; `revoke_user_sessions` and a disable lock the User
+    row `FOR UPDATE`; a removal or role change updates the membership) that
+    commits first is seen here and refuses the attempt, and one that starts later
+    waits until this attempt and its reservation are committed.
+    """
+    if submitter.session_id is not None:
+        family = cursor.execute(
+            "SELECT family_id FROM user_sessions WHERE id = %s AND user_id = %s",
+            (submitter.session_id, submitter.user_id),
+        ).fetchone()
+        if family is None:
+            raise SubmitterNotAuthorizedError("Your Nest session was revoked or has expired")
+        lock_session_family(cursor, family["family_id"])
+    user = cursor.execute(
+        "SELECT status FROM users WHERE id = %s FOR SHARE", (submitter.user_id,)
+    ).fetchone()
+    if user is None or user["status"] != "active":
+        raise SubmitterNotAuthorizedError("Your Nest account is disabled")
+    if submitter.session_id is not None:
+        # New statements after the locks: under READ COMMITTED they see every
+        # revocation that committed while this transaction waited. A session
+        # rotated by a refresh is still the same sign-in while its family has a
+        # live session; a revocation (sign-out, an admin) revokes the whole family.
+        sessions = cursor.execute(
+            "SELECT id, revoked_at, revoked_reason, expires_at > now() AS live "
+            "FROM user_sessions WHERE family_id = %s FOR SHARE",
+            (family["family_id"],),
+        ).fetchall()
+        own = next((row for row in sessions if row["id"] == submitter.session_id), None)
+        family_live = any(row["revoked_at"] is None and row["live"] for row in sessions)
+        if (
+            own is None
+            or not own["live"]
+            or not family_live
+            or (own["revoked_at"] is not None and own["revoked_reason"] != "rotated")
+        ):
+            raise SubmitterNotAuthorizedError("Your Nest session was revoked or has expired")
     member = cursor.execute(
         "SELECT 1 FROM project_memberships m "
         "JOIN projects p ON p.id = m.project_id AND p.deleted_at IS NULL "
-        "JOIN users u ON u.id = m.user_id AND u.status = 'active' "
         "WHERE m.project_id = %s AND m.user_id = %s AND m.role = ANY(%s) FOR SHARE OF m",
         (project_id, submitter.user_id, _SUBMIT_ROLES),
     ).fetchone()
@@ -262,19 +306,6 @@ def _check_submitter(cursor: Any, submitter: Submitter, project_id: UUID) -> Non
         raise SubmitterNotAuthorizedError(
             "Your membership in the Project no longer allows submitting Runs"
         )
-    if submitter.session_id is None:
-        return
-    # A session rotated by a refresh is still the same sign-in: its family must
-    # have a live session. A revocation (sign-out, an admin) revokes the family.
-    session = cursor.execute(
-        "SELECT 1 FROM user_sessions s WHERE s.id = %s AND s.user_id = %s "
-        "AND s.expires_at > now() AND (s.revoked_at IS NULL OR (s.revoked_reason = 'rotated' "
-        "AND EXISTS (SELECT 1 FROM user_sessions f WHERE f.family_id = s.family_id "
-        "AND f.revoked_at IS NULL AND f.expires_at > now())))",
-        (submitter.session_id, submitter.user_id),
-    ).fetchone()
-    if session is None:
-        raise SubmitterNotAuthorizedError("Your Nest session was revoked or has expired")
 
 
 _ADMISSION_LOCK = "SELECT pg_advisory_xact_lock(hashtextextended('nest.admission', 0))"
@@ -872,6 +903,9 @@ class ExecutionRegistry:
                 raise ExecutionNotFoundError("The execution does not exist")
             if submitter is not None and submitter.user_id != execution["owner_user_id"]:
                 raise SubmitterNotAuthorizedError("Only the execution's owner may submit it")
+            if submitter is not None:
+                # Before any other lock, in the order session revocation uses.
+                _check_submitter(cursor, submitter, execution["project_id"])
             if execution["status"] in ("succeeded", "cancelled"):
                 raise ExecutionClosedError(f"The execution already {execution['status']}")
             live = cursor.execute(
@@ -913,8 +947,6 @@ class ExecutionRegistry:
                 raise ProviderNotApprovedError(
                     f"Provider {provider!r} no longer accepts Runs from this Project"
                 )
-            if submitter is not None:
-                _check_submitter(cursor, submitter, execution["project_id"])
             _check_endpoint(cursor, endpoint, execution["project_id"])
             _check_account(
                 cursor,
