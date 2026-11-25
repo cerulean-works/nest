@@ -104,9 +104,11 @@ its own policy, such as whether the User has a linked Provider Account, never fr
 Project membership, so Project Owners and Platform Admins gain no UNIX or Slurm
 access by their role. Until Provider account policy is configured, the default
 [`authz.DenyAllProviders`] refuses every Run action. The Controller's gRPC
-execution service uses [`authz.AllowedProjects`] instead: its operator lists the
-Projects whose Runs its Provider accepts in `NEST_PROVIDER_ALLOWED_PROJECTS` (see
-[Authenticated execution](security#authenticated-execution)).
+execution service uses the operator's Provider approvals instead: durable ones in
+PostgreSQL ([`authz.DatabaseProviderApprovals`], `NEST_PROVIDER_APPROVALS=database`)
+or the startup-only list in `NEST_PROVIDER_ALLOWED_PROJECTS`
+([`authz.AllowedProjects`]); see
+[Authenticated execution](security#authenticated-execution).
 
 ## Sessions and scopes
 
@@ -151,7 +153,7 @@ under `/api/projects`. Browsers authenticate with the session cookie, and their
 | Route | Body | Does |
 | --- | --- | --- |
 | `GET /api/projects` | | Lists your Projects with your role |
-| `POST /api/projects` | `name`, optional `organization_id` | Creates a Project you own (browser session only; see below) |
+| `POST /api/projects` | `name`, `reason`, optional `owner_user_id`, `organization_id` | Creates a Project with its Owner (`platform_admin` with a browser session only; see below) |
 | `GET /api/projects/<id>` | | Describes a Project |
 | `POST /api/projects/<id>/rename` | `name` | Renames it |
 | `POST /api/projects/<id>/delete` | | Deletes it |
@@ -169,13 +171,13 @@ curl -s -H "Authorization: Bearer $NEST_ACCESS_TOKEN" \
     https://nest.example.com/api/projects
 ```
 
-Nest serves no page that calls `POST /api/projects` yet, and every page and JSON
-response on the Nest origin carries `Content-Security-Policy: default-src 'none'`,
-which also blocks `fetch()` typed into the browser's developer console there. A
-CLI session is refused (`browser_only`). Until a creation page or command exists,
-operators create Projects for Users as described in
+Only an active `platform_admin` may create a Project. Anyone else is refused with
+`403 {"error": "forbidden", "reason": "platform_admin_required"}`, and a CLI
+session with `browser_only`. The Owner is `owner_user_id`, or the administrator
+when it is omitted; the Project and its Owner are created in one transaction, and
+an administrator who names another Owner becomes no member. Nest serves no page
+that calls it yet; see [Use the privileged management API](privileged-api) and
 [Create a Project for a User](project-onboarding#create-a-project-for-a-user).
-Restricting creation to platform administrators is planned, not enforced.
 
 Errors are JSON `{"error": ...}`:
 

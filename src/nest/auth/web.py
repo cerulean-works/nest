@@ -29,6 +29,9 @@ It serves these routes and nothing else:
   server's default for them, and `GET /api/platforms/<id or slug>` describes one
   (see [`authz.PlatformCatalog`]). Platforms the User is not authorized for are
   answered as not found. No host, port or host key is ever returned.
+- `/api/admin` and below serve the privileged management API, for active
+  `platform_admin`s only (see [`authz.AdminService`] and *Privileged management
+  API*).
 - `/api/invitations` and below serve the signed-in User's own invitations, and
   `GET`/`POST /invitations/accept` is the browser page that reviews and accepts an
   invitation link (see *Invite people to a Project*).
@@ -59,6 +62,7 @@ from .._logging import get_logger
 from ..audit import audit_interface
 from ..authz import (
     AccessDeniedError,
+    AdminService,
     InvitationService,
     Organization,
     OrganizationMembership,
@@ -70,8 +74,10 @@ from ..authz import (
     Principal,
     ProjectPlatforms,
     ProjectService,
+    ProviderPolicy,
 )
 from ..config import (
+    ADMIN_API_PATH,
     AUTH_CLI_PREFIX,
     AUTH_SESSION_PATHS,
     CLI_SCOPES,
@@ -85,6 +91,7 @@ from ..config import (
 from ..db import (
     Acceptance,
     AccessGrant,
+    AccountLinkNotFoundError,
     AlreadyInvitedError,
     Database,
     DatabaseError,
@@ -101,15 +108,19 @@ from ..db import (
     OwnerRuleError,
     PendingInvitation,
     PlatformNotFoundError,
+    PlatformNotGrantedError,
     Project,
     ProjectAuditEvent,
     ProjectNotFoundError,
     Session,
     SessionRefreshError,
+    SlurmAccountError,
+    SlurmAccountNotFoundError,
     UserNotActiveError,
     UserNotFoundError,
     hash_token,
 )
+from .admin_api import admin_api
 from .cli import (
     CLI_LOGIN_TTL,
     CLISignIn,
@@ -1157,6 +1168,12 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
         except ProjectNotFoundError, PlatformNotFoundError:
             self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+        except SlurmAccountNotFoundError, AccountLinkNotFoundError:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "account_not_found"})
+        except PlatformNotGrantedError:
+            self._json(HTTPStatus.CONFLICT, {"error": "platform_not_granted"})
+        except SlurmAccountError as exc:
+            self._json(HTTPStatus.CONFLICT, {"error": "account_rule", "message": str(exc)})
         except MemberNotFoundError:
             self._json(HTTPStatus.NOT_FOUND, {"error": "member_not_found"})
         except UserNotFoundError:
@@ -1194,6 +1211,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path == ORGANIZATIONS_API_PATH or path.startswith(ORGANIZATIONS_API_PATH + "/"):
             self._organizations_api(method, path, who, body)
             return
+        if path == ADMIN_API_PATH or path.startswith(ADMIN_API_PATH + "/"):
+            admin_api(self, method, path, who, body)
+            return
         service = self.app.projects
         rest = path[len(PROJECTS_API_PATH) :].strip("/")
         parts = rest.split("/") if rest else []
@@ -1221,13 +1241,15 @@ class _Handler(BaseHTTPRequestHandler):
                 projects = [_project_json(p, r) for p, r in service.list_projects(who)]
                 self._json(HTTPStatus.OK, {"projects": projects})
             else:
-                organization = body.get("organization_id")
-                if organization is not None and not isinstance(organization, str):
-                    raise TypeError("organization_id must be a string")
-                project = service.create_project(
-                    who, _string(body, "name"), organization_id=organization
-                )
-                self._json(HTTPStatus.CREATED, _project_json(project, "owner"))
+                fields = {}
+                for name in ("organization_id", "owner_user_id", "reason"):
+                    value = body.get(name)
+                    if value is not None and not isinstance(value, str):
+                        raise TypeError(f"{name} must be a string")
+                    fields[name] = value or None
+                project = service.create_project(who, _string(body, "name"), **fields)
+                role = "owner" if project.owner_user_id == who.user_id else None
+                self._json(HTTPStatus.CREATED, _project_json(project, role))
             return
         assert pid is not None
         action = parts[-1] if len(parts) > 1 else ""
@@ -1553,6 +1575,7 @@ def _is_api(path: str) -> bool:
             INVITATIONS_API_PATH,
             PLATFORMS_API_PATH,
             ORGANIZATIONS_API_PATH,
+            ADMIN_API_PATH,
         )
     )
 
@@ -1795,6 +1818,12 @@ class AuthHTTPServer(ThreadingHTTPServer):
             Defaults to one on the Projects service and `email`, whose links use
             `NEST_PUBLIC_URL` with email enabled and this listener's origin otherwise.
         email ([`mail.EmailService`], *optional*): Email delivery for invitations.
+        organizations ([`authz.OrganizationService`], *optional*): Organizations API
+            service. Defaults to one on the Projects service's authorizer.
+        admin ([`authz.AdminService`], *optional*): Privileged management API
+            service. Defaults to one on the Projects service.
+        provider_policy ([`authz.ProviderPolicy`], *optional*): The Controller's
+            Provider approval source, reported by the default `admin` service.
     """
 
     daemon_threads = True
@@ -1811,6 +1840,8 @@ class AuthHTTPServer(ThreadingHTTPServer):
         platforms: PlatformCatalog | None = None,
         email: EmailService | None = None,
         organizations: OrganizationService | None = None,
+        admin: AdminService | None = None,
+        provider_policy: ProviderPolicy | None = None,
     ):
         self.sign_in = sign_in
         self.cli = cli or CLISignIn(sign_in.database, sign_in.sessions)
@@ -1830,6 +1861,7 @@ class AuthHTTPServer(ThreadingHTTPServer):
         self.invitations = invitations or InvitationService(
             sign_in.database, self.projects, email, link_base_url=self.origin
         )
+        self.admin = admin or AdminService(sign_in.database, self.projects, policy=provider_policy)
         super().__init__(address, _Handler)
 
 
@@ -1881,6 +1913,7 @@ def start_auth_service(
     cli: CLISignIn | None = None,
     bootstrap_admin_email: str | None = None,
     email: EmailService | None = None,
+    provider_policy: ProviderPolicy | None = None,
 ) -> AuthService:
     """
     Starts the auth listener when Google sign-in is configured.
@@ -1898,6 +1931,8 @@ def start_auth_service(
             passed to the default [`auth.GoogleSignIn`].
         email ([`mail.EmailService`], *optional*): Email delivery for invitations;
             invitations are shared by link only without it.
+        provider_policy ([`authz.ProviderPolicy`], *optional*): The Controller's
+            Provider approval source, reported by the privileged management API.
 
     Raises:
         `OSError`: If `NEST_AUTH_HTTP_BIND` cannot be bound.
@@ -1908,7 +1943,13 @@ def start_auth_service(
     if database is None:
         raise RuntimeError("Google sign-in needs the database")
     sign_in = sign_in or GoogleSignIn(config, database, bootstrap_admin_email=bootstrap_admin_email)
-    server = AuthHTTPServer(sign_in, _split_bind(config.http_bind), cli=cli, email=email)
+    server = AuthHTTPServer(
+        sign_in,
+        _split_bind(config.http_bind),
+        cli=cli,
+        email=email,
+        provider_policy=provider_policy,
+    )
     thread = threading.Thread(target=server.serve_forever, name="nest-auth-http", daemon=True)
     thread.start()
     service = AuthService(server, thread)

@@ -820,11 +820,22 @@ class PlatformStore:
     # Project grants ------------------------------------------------------------
 
     def grant_project(
-        self, ref: UUID | str, project_id: UUID | str, *, operator: str, reason: str
+        self,
+        ref: UUID | str,
+        project_id: UUID | str,
+        *,
+        operator: str | None = None,
+        reason: str | None = None,
+        actor_user_id: UUID | None = None,
+        conn: psycopg.Connection | None = None,
     ) -> bool:
         """
         Lets a Project's members discover and use a Platform. Returns `False` when
         the grant already exists.
+
+        Name the `operator` (with `nest-db`), or an active `platform_admin` as
+        `actor_user_id` (the privileged management API); the database refuses a
+        change that names neither.
 
         Raises:
             [`db.PlatformNotFoundError`]: If there is no such Platform.
@@ -833,7 +844,7 @@ class PlatformStore:
         from .projects import ProjectNotFoundError
 
         pid = as_uuid(project_id, "project_id")
-        with transaction(self.database, None, "grant a Platform") as cursor:
+        with transaction(self.database, conn, "grant a Platform") as cursor:
             platform = self._find(cursor, ref, lock=True)
             if (
                 cursor.execute(
@@ -842,7 +853,9 @@ class PlatformStore:
                 is None
             ):
                 raise ProjectNotFoundError("The Project does not exist or was deleted")
-            with audit_context(cursor, operator=operator, reason=reason):
+            with audit_context(
+                cursor, operator=operator, actor_user_id=actor_user_id, reason=reason
+            ):
                 row = cursor.execute(
                     "INSERT INTO hpc_platform_project_grants (platform_id, project_id) "
                     "VALUES (%s, %s) ON CONFLICT DO NOTHING RETURNING project_id",
@@ -851,13 +864,25 @@ class PlatformStore:
         return row is not None
 
     def revoke_project(
-        self, ref: UUID | str, project_id: UUID | str, *, operator: str, reason: str
+        self,
+        ref: UUID | str,
+        project_id: UUID | str,
+        *,
+        operator: str | None = None,
+        reason: str | None = None,
+        actor_user_id: UUID | None = None,
+        conn: psycopg.Connection | None = None,
     ) -> bool:
-        """Withdraws a Project's grant. Returns `False` when there was none."""
+        """
+        Withdraws a Project's grant. Returns `False` when there was none. Running
+        jobs are not cancelled; new submissions are refused.
+        """
         pid = as_uuid(project_id, "project_id")
-        with transaction(self.database, None, "revoke a Platform grant") as cursor:
+        with transaction(self.database, conn, "revoke a Platform grant") as cursor:
             platform = self._find(cursor, ref, lock=True)
-            with audit_context(cursor, operator=operator, reason=reason):
+            with audit_context(
+                cursor, operator=operator, actor_user_id=actor_user_id, reason=reason
+            ):
                 row = cursor.execute(
                     "DELETE FROM hpc_platform_project_grants "
                     "WHERE platform_id = %s AND project_id = %s RETURNING project_id",

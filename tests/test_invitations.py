@@ -19,6 +19,7 @@ from datetime import UTC, datetime, timedelta
 from functools import partial
 from urllib.parse import urlencode, urlsplit
 
+from admin_fixture import owned_project
 from fake_oidc import CLIENT_ID, CLIENT_SECRET, Account, FakeGoogle
 from test_authz import ROLES, _Base, browser, cli
 from test_email import email_settings, enabled
@@ -378,7 +379,7 @@ class EmailInvitationTests(_InvitationBase):
         _, joined = self.first_sign_in()
         self.assertEqual(joined, [])
         # A deleted Project's invitations are gone for the invitee.
-        project = self.service.create_project(browser(users["owner"]), "doomed")
+        project = owned_project(self.service, users["owner"], "doomed")
         doomed = self.invitations.invite(browser(users["owner"]), project.id, INVITEE, "viewer")
         self.service.delete_project(browser(users["owner"]), project.id)
         self.assertEqual(self.invitations.pending(browser(invitee)), [])

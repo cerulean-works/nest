@@ -29,6 +29,7 @@ from unittest import mock
 
 import cloudpickle
 import grpc
+from admin_fixture import owned_project
 from fake_hpc import FakeHpc
 from postgres_fixture import PostgresTestCase, connect
 from psycopg.rows import dict_row
@@ -105,9 +106,9 @@ class _Base(PostgresTestCase):
         self.owner, self.member, self.outsider = (
             self.identities.create_user(display_name=n).id for n in ("owner", "member", "out")
         )
-        self.project = projects.create_project(browser(self.owner), "alpha").id
+        self.project = owned_project(projects, self.owner, "alpha").id
         projects.add_member(browser(self.owner), self.project, self.member, "member")
-        self.other = projects.create_project(browser(self.outsider), "beta").id
+        self.other = owned_project(projects, self.outsider, "beta").id
 
         self.profile = PlatformProfile(
             id="nano",
@@ -869,7 +870,7 @@ class ControllerProcessTests(PostgresTestCase):
         hpc = FakeHpc(root)
         identities = IdentityStore(db)
         user = identities.create_user(display_name="member").id
-        project = ProjectService(db).create_project(browser(user), "alpha").id
+        project = owned_project(ProjectService(db), user, "alpha").id
         session = identities.create_session(
             user,
             kind="cli",

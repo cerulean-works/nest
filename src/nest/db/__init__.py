@@ -21,6 +21,14 @@ from .accounts import (
     SlurmAccountStore,
     normalize_account_name,
 )
+from .approvals import (
+    APPROVAL_STATUSES,
+    ApprovalImport,
+    ProviderApproval,
+    ProviderApprovalStore,
+    normalize_provider,
+    parse_project_ids,
+)
 from .bootstrap import (
     GOOGLE_ISSUERS,
     AuditEvent,
@@ -52,6 +60,7 @@ from .executions import (
     IdempotencyConflictError,
     InvalidTransitionError,
     PlatformUnavailableError,
+    ProviderNotApprovedError,
     ResolvedOption,
 )
 from .identity import (
@@ -127,6 +136,7 @@ __all__ = [
     "ACCOUNT_KINDS",
     "ACCOUNT_MODES",
     "ACCOUNT_ORIGINS",
+    "APPROVAL_STATUSES",
     "ASSIGNABLE_ROLES",
     "GOOGLE_ISSUERS",
     "PROJECT_ROLES",
@@ -136,6 +146,7 @@ __all__ = [
     "AccountLinkNotFoundError",
     "AccountNotPermittedError",
     "AlreadyInvitedError",
+    "ApprovalImport",
     "Attempt",
     "AttemptInFlightError",
     "AuditEvent",
@@ -203,6 +214,9 @@ __all__ = [
     "ProjectError",
     "ProjectNotFoundError",
     "ProjectStore",
+    "ProviderApproval",
+    "ProviderApprovalStore",
+    "ProviderNotApprovedError",
     "QueuedEmail",
     "ResolvedOption",
     "Rotation",
@@ -227,7 +241,9 @@ __all__ = [
     "normalize_account_name",
     "normalize_email",
     "normalize_invited_email",
+    "normalize_provider",
     "order_login_nodes",
+    "parse_project_ids",
     "schema_status",
     "sync_platforms",
     "sync_providers",

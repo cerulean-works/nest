@@ -26,6 +26,7 @@ from typing import Any
 import cloudpickle
 import grpc
 import psycopg
+from admin_fixture import owned_project
 from postgres_fixture import PostgresTestCase, connect
 
 from nest import _logging
@@ -309,11 +310,11 @@ class ExecutionAccessTests(_DatabaseCase):
         self.owner, self.member, self.viewer, self.outsider = (
             self.user(n) for n in ("owner", "member", "viewer", "outsider")
         )
-        self.project = projects.create_project(browser(self.owner), "alpha").id
+        self.project = owned_project(projects, self.owner, "alpha").id
         projects.add_member(browser(self.owner), self.project, self.member, "member")
         projects.add_member(browser(self.owner), self.project, self.viewer, "viewer")
         # The outsider owns a Project of their own that the Provider has not approved.
-        self.other = projects.create_project(browser(self.outsider), "beta").id
+        self.other = owned_project(projects, self.outsider, "beta").id
         self.projects = projects
         self.sql(
             "INSERT INTO provider_profiles (id, ssh_mode, login_nodes, account, partition, "
@@ -719,7 +720,7 @@ class AuditTriggerTests(_DatabaseCase):
 
     def test_invitation_lifecycle_is_audited_without_addresses_or_tokens(self):
         owner, invitee = self.user("owner"), self.user("invitee")
-        project = ProjectService(self.db).create_project(browser(owner), "p").id
+        project = owned_project(ProjectService(self.db), owner, "p").id
         token = secrets.token_urlsafe(32)
         link_token = secrets.token_urlsafe(32)
         smtp_password = "smtp-password-" + secrets.token_hex(8)

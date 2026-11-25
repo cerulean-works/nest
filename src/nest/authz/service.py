@@ -48,6 +48,36 @@ _ROLE_QUERY = (
 )
 
 
+_PLATFORM_ADMIN_QUERY = (
+    "SELECT 1 FROM platform_role_assignments r "
+    "JOIN users u ON u.id = r.user_id AND u.status = 'active' "
+    "WHERE r.user_id = %s AND r.role = 'platform_admin' FOR SHARE OF r, u"
+)
+
+
+def require_reason(reason: str | None) -> str:
+    """
+    The audit reason a privileged change must give: 1 to 1000 characters after
+    trimming.
+
+    Raises:
+        `ValueError`: If it is missing, blank or too long.
+    """
+    if not isinstance(reason, str) or not 1 <= len(reason.strip()) <= 1000:
+        raise ValueError("reason must be 1 to 1000 characters; it is kept in the audit log")
+    return reason.strip()
+
+
+def is_platform_admin(cursor: psycopg.Cursor[dict[str, Any]], user_id: UUID) -> bool:
+    """
+    Whether the User is an active `platform_admin` now, read in the caller's
+    transaction. The role and the User rows are share-locked until it ends, so a
+    concurrent revocation or disablement waits for the change it authorizes, or
+    wins and refuses it.
+    """
+    return cursor.execute(_PLATFORM_ADMIN_QUERY, (user_id,)).fetchone() is not None
+
+
 HIDDEN_REASONS = frozenset({"not_a_member", "platform_not_authorized"})
 """Refusal reasons answered as not found, so the object's existence is not revealed."""
 
@@ -297,46 +327,84 @@ class ProjectService:
     # Projects ------------------------------------------------------------------
 
     def create_project(
-        self, principal: Principal, name: str, *, organization_id: UUID | str | None = None
+        self,
+        principal: Principal,
+        name: str,
+        *,
+        owner_user_id: UUID | str | None = None,
+        organization_id: UUID | str | None = None,
+        reason: str | None,
     ) -> Project:
         """
-        Creates a Project with the caller as Owner.
+        Creates a Project and its first Owner atomically. Only an active
+        `platform_admin`, through a browser session, may create Projects.
 
-        Filing it under an Organization needs the caller to be a member of it.
+        The Owner defaults to the caller. With another `owner_user_id`, the
+        caller is recorded as creator and becomes no member: creating a Project
+        grants the administrator nothing in it. The Owner must be an active User,
+        and filing the Project under an Organization needs the Owner to be a
+        member of it. The Project starts with no Platform grant, Slurm account or
+        Provider approval.
 
         Raises:
-            [`authz.AccessDeniedError`]: If the session cannot create Projects or
-                the caller is not in the Organization.
+            [`authz.AccessDeniedError`]: `browser_only` for another kind of session,
+                `platform_admin_required` when the caller is not an active
+                `platform_admin`, `not_a_member` when the Owner is not in the
+                Organization.
+            [`db.UserNotFoundError`]: If the Owner is not an active User.
+            `ValueError`: If an argument is invalid, including a missing or blank
+                `reason`, which every privileged change must give for the audit
+                log. It is checked after the caller is authorized, so a refused
+                caller learns nothing more.
         """
+        from ..db.projects import UserNotFoundError
+
         decision = may_create_project(principal)
         if not decision:
             self.authorizer.denied(principal, "project.create", None, decision.reason)
             raise AccessDeniedError("project.create", decision)
         org = as_uuid(organization_id, "organization_id") if organization_id else None
+        owner = as_uuid(owner_user_id, "owner_user_id") if owner_user_id else principal.user_id
+        refused: tuple[Decision, str] | None = None
+        project: Project | None = None
         with (
             self.database.connection() as conn,
             transaction(self.database, conn, "create a Project") as cursor,
         ):
-            if org is not None:
-                member = cursor.execute(
-                    "SELECT 1 FROM organization_memberships "
-                    "WHERE organization_id = %s AND user_id = %s",
-                    (org, principal.user_id),
+            if not is_platform_admin(cursor, principal.user_id):
+                refused = (Decision(False, "platform_admin_required"), "platform_admin_required")
+            else:
+                why = require_reason(reason)
+                active = cursor.execute(
+                    "SELECT 1 FROM users WHERE id = %s AND status = 'active' FOR SHARE",
+                    (owner,),
                 ).fetchone()
-                if member is None:
-                    denied = Decision(False, "not_a_member")
-                    self.authorizer.denied(principal, "project.create", None, "organization")
-                    raise AccessDeniedError("project.create", denied)
-            active = cursor.execute(
-                "SELECT 1 FROM users WHERE id = %s AND status = 'active'",
-                (principal.user_id,),
-            ).fetchone()
-            if active is None:
-                raise AccessDeniedError("project.create", Decision(False, "not_a_member"))
-            with audit_context(cursor, actor_user_id=principal.user_id):
-                return self.store.create_project(
-                    name, created_by_user_id=principal.user_id, organization_id=org, conn=conn
-                )
+                if active is None:
+                    raise UserNotFoundError("The Owner is not an active Nest User")
+                if org is not None and (
+                    cursor.execute(
+                        "SELECT 1 FROM organization_memberships "
+                        "WHERE organization_id = %s AND user_id = %s",
+                        (org, owner),
+                    ).fetchone()
+                    is None
+                ):
+                    refused = (Decision(False, "not_a_member"), "organization")
+                else:
+                    with audit_context(cursor, actor_user_id=principal.user_id, reason=why):
+                        project = self.store.create_project(
+                            name,
+                            created_by_user_id=principal.user_id,
+                            owner_user_id=owner,
+                            organization_id=org,
+                            conn=conn,
+                        )
+        if refused is not None:
+            details: dict[str, object] = {"owner_user_id": str(owner)}
+            self.authorizer.denied(principal, "project.create", None, refused[1], details)
+            raise AccessDeniedError("project.create", refused[0])
+        assert project is not None
+        return project
 
     def list_projects(self, principal: Principal) -> list[tuple[Project, str]]:
         """The caller's Projects with their role in each."""
