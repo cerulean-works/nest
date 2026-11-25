@@ -689,6 +689,21 @@ class _AdminBrowserBase(_BrowserBase):
 
 
 class ConsoleAdminDatabaseModeTests(_AdminBrowserBase):
+    def test_revocation_seen_while_paging_the_directory_drops_administration(self):
+        # More users than one directory page (25), so "Load more users" is offered.
+        for n in range(30):
+            self.user(f"user {n:02}")
+        me = self.admin_signs_in()
+        more = self.page.get_by_role("button", name="Load more users")
+        more.wait_for()
+        self.identities.revoke_platform_role(me, **OPS)
+        more.click()
+        self.page.get_by_role("heading", name="Administration not available").wait_for()
+        self.page.get_by_text("Only platform administrators can do this.").first.wait_for()
+        self.assertEqual(self.page.get_by_role("link", name="Administration").count(), 0)
+        self.assertEqual(self.page.get_by_role("button", name="Create Project").count(), 0)
+        self.assert_clean()
+
     provider_policy = ProviderPolicy("database", "nano")
 
     def test_admin_creates_a_project_and_manages_effective_approvals(self):

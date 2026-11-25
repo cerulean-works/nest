@@ -312,14 +312,19 @@
     } catch (error) {
       if (error instanceof ApiError && error.status === 401) return;
       if (!current()) return;
-      if (error instanceof ApiError && error.reason === 'platform_admin_required') {
-        // The server no longer counts the caller as a platform admin.
-        state.admin = false;
-        renderShell();
-        return adminUnavailable();
-      }
+      if (adminRevoked(error)) return;
       show(h('h1', { text: 'Something went wrong' }), errorBox(error, route));
     }
+  }
+
+  // When the server no longer counts the caller as a platform admin, drops the
+  // Administration pages wherever the refusal arrives. Returns whether it did.
+  function adminRevoked(error) {
+    if (!(error instanceof ApiError && error.reason === 'platform_admin_required')) return false;
+    state.admin = false;
+    renderShell();
+    adminUnavailable();
+    return true;
   }
 
   function adminUnavailable() {
@@ -914,7 +919,9 @@
                     const page = await api('GET', `/api/admin/users?limit=25&after=${encodeURIComponent(after)}`);
                     append(page.users, page.next_after);
                   } catch (error) {
-                    if (!(error instanceof ApiError && error.status === 401)) announce(describe(error), 'bad');
+                    if (error instanceof ApiError && error.status === 401) return;
+                    adminRevoked(error);
+                    announce(describe(error), 'bad');
                   }
                 },
               },
