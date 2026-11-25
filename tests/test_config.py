@@ -126,7 +126,10 @@ class DefaultsTests(unittest.TestCase):
         self.assertEqual(config.rpc_timeout, 900)
         with mock.patch.object(grpc, "insecure_channel") as insecure_channel:
             _channel(config)
-        insecure_channel.assert_called_once_with("127.0.0.1:50051")
+        # Retries off: the channel never sends a call twice.
+        insecure_channel.assert_called_once_with(
+            "127.0.0.1:50051", options=[("grpc.enable_retries", 0)]
+        )
 
 
 class ValidationTests(unittest.TestCase):

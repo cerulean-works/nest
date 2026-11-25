@@ -6,9 +6,11 @@
 # Self-contained because Dokploy rewrites YAML before Compose resolves it.
 #
 # Optional services are selected with COMPOSE_PROFILES:
-#   local-db  a PostgreSQL server for this deployment (password: NEST_DATABASE_PASSWORD)
-#   migrate   run `nest-db upgrade` once before every Controller start
-# See docs/source/dokploy.md.
+#   local-db          a PostgreSQL server for this deployment (password: NEST_DATABASE_PASSWORD)
+#   migrate           run `nest-db upgrade` once before every Controller start
+#   public-grpc       the public gRPC gateway (Envoy) for the bounded trusted pilot (H08)
+#   public-grpc-acme  its certificate, from an ACME CA through Cloudflare DNS-01
+# See docs/source/dokploy.md and docs/source/public-grpc-gateway.md.
 name: nest
 
 services:
@@ -76,6 +78,7 @@ services:
       NEST_LIMIT_SUBMISSIONS_PER_MINUTE: ${NEST_LIMIT_SUBMISSIONS_PER_MINUTE:-}
       NEST_LIMIT_ENVIRONMENT_BUILDS: ${NEST_LIMIT_ENVIRONMENT_BUILDS:-}
       NEST_LIMIT_BATCH_SCRIPTS: ${NEST_LIMIT_BATCH_SCRIPTS:-}
+      NEST_PUBLIC_PILOT: ${NEST_PUBLIC_PILOT:-}
       NEST_DATABASE_URL: ${NEST_DATABASE_URL:-}
       NEST_DATABASE_REQUIRED: ${NEST_DATABASE_REQUIRED:-}
       NEST_DATABASE_PASSWORD: ${NEST_DATABASE_PASSWORD:-}
@@ -142,8 +145,13 @@ services:
       tailnet:
         # Keep Serve's backend name stable if Dokploy renames services.
         aliases: [controller]
-    # gRPC is reached through Tailscale Serve, never through Traefik. For Google
-    # sign-in, add a Dokploy Domain for this service on container port 8080 (HTTPS).
+      # Private network shared only with the public gRPC gateway (profile
+      # public-grpc). It is internal: nothing on it reaches or is reached from outside.
+      grpc-origin:
+        aliases: [controller]
+    # gRPC is reached through Tailscale Serve, or through the public-grpc gateway on
+    # grpc-origin; never through Traefik directly, and no port is published. For
+    # Google sign-in, add a Dokploy Domain for this service on container port 8080 (HTTPS).
     logging:
       driver: json-file
       options:
@@ -297,8 +305,119 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # Public gRPC gateway (H08), enabled with the `public-grpc` profile. Dokploy's
+  # Traefik passes grpc.nest.cerulean.works through to it by SNI (TLS passthrough
+  # with PROXY protocol; deploy/public-grpc/traefik/nest-grpc.yml). Envoy terminates
+  # TLS and forwards only the Nest gRPC service to the Controller over h2c on the
+  # internal grpc-origin network. It publishes no host port. See
+  # docs/source/public-grpc-gateway.md for the Controller settings it requires.
+  grpc-gateway:
+    profiles: [public-grpc]
+    image: ${NEST_ENVOY_IMAGE:-envoyproxy/envoy:v1.36.2}
+    restart: unless-stopped
+    user: "101:101"
+    entrypoint: ["/bin/sh", "/opt/nest-grpc/gateway-entrypoint.sh"]
+    environment:
+      NEST_GRPC_PUBLIC_HOST: ${NEST_GRPC_PUBLIC_HOST:-grpc.nest.cerulean.works}
+      # Required (the entrypoint refuses to start without it): Traefik's address
+      # on the edge network as a CIDR, such as 10.0.1.7/32.
+      NEST_GRPC_EDGE_PROXY: ${NEST_GRPC_EDGE_PROXY:-}
+      NEST_GRPC_UPSTREAM: controller:50051
+      NEST_GRPC_CERT_DIR: /certs
+      NEST_GRPC_RUN_DIR: /tmp/nest-grpc
+    depends_on:
+      controller:
+        condition: service_started
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      # The reviewed configuration from the repository checkout, not an operator file.
+      - type: bind
+        source: ./deploy/public-grpc
+        target: /opt/nest-grpc
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: volume
+        source: grpc-certificates
+        target: /certs
+        read_only: true
+    networks:
+      grpc-origin:
+        # Fixed, so the Controller can trust exactly this address:
+        # NEST_GRPC_TRUSTED_PROXIES=172.31.250.2/32.
+        ipv4_address: ${NEST_GRPC_GATEWAY_ADDRESS:-172.31.250.2}
+      edge:
+        aliases: [nest-grpc-gateway]
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      # Routed by the TCP passthrough file, never by Traefik's HTTP labels.
+      traefik.enable: "false"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # The gateway's certificate, enabled with the `public-grpc-acme` profile: lego
+  # obtains it by DNS-01 with a Cloudflare token limited to the zone's DNS records
+  # and renews it 30 days before expiry. Let's Encrypt staging unless
+  # NEST_GRPC_ACME_SERVER names the production directory.
+  grpc-certificates:
+    profiles: [public-grpc-acme]
+    image: ${NEST_LEGO_IMAGE:-goacme/lego:v4.25.2}
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/opt/nest-grpc/renew-certificate.sh"]
+    environment:
+      NEST_GRPC_PUBLIC_HOST: ${NEST_GRPC_PUBLIC_HOST:-grpc.nest.cerulean.works}
+      NEST_GRPC_ACME_EMAIL: ${NEST_GRPC_ACME_EMAIL:-}
+      NEST_GRPC_ACME_ACCEPT_TOS: ${NEST_GRPC_ACME_ACCEPT_TOS:-}
+      NEST_GRPC_ACME_SERVER: ${NEST_GRPC_ACME_SERVER:-}
+      NEST_GRPC_CERT_DIR: /certs
+      NEST_GRPC_GATEWAY_GID: "101"
+    secrets:
+      - cloudflare_dns_api_token
+    volumes:
+      - type: bind
+        source: ./deploy/public-grpc
+        target: /opt/nest-grpc
+        read_only: true
+        bind:
+          create_host_path: false
+      - grpc-certificates:/certs
+      - grpc-acme-state:/var/lib/lego
+    networks:
+      - acme
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      traefik.enable: "false"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 networks:
   tailnet:
+    driver: bridge
+  # Gateway to Controller only. `internal` gives it no route outside the host.
+  grpc-origin:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: ${NEST_GRPC_ORIGIN_SUBNET:-172.31.250.0/28}
+  # Where Dokploy's Traefik reaches the gateway; used only by the public-grpc profile.
+  edge:
+    external: true
+    name: ${NEST_GRPC_EDGE_NETWORK:-dokploy-network}
+  # Outbound access for the ACME client only.
+  acme:
     driver: bridge
 
 volumes:
@@ -306,9 +425,14 @@ volumes:
   tailscale-state:
   # Survives redeploys and `docker compose down`; only `down --volumes` deletes it.
   postgres-data:
+  # The gateway's installed certificate and the ACME account and issued certificates.
+  grpc-certificates:
+  grpc-acme-state:
 
 secrets:
   tailscale_authkey:
     environment: NEST_TAILSCALE_AUTHKEY
   nest_database_password:
     environment: NEST_DATABASE_PASSWORD
+  cloudflare_dns_api_token:
+    environment: NEST_GRPC_CLOUDFLARE_DNS_API_TOKEN

@@ -11,6 +11,7 @@ cancelled only by someone the Project policy and the Provider allow:
 | `Execute`, `SubmitJob` | `run.submit` | `x-nest-project-id` metadata |
 | `GetJobStatus` | `run.read` | the job's recorded Project |
 | `CancelJob` | `run.cancel` (own Runs only) | the job's recorded Project |
+| `ListEligibleProjects` | `run.submit`, evaluated without recording | each of the caller's Projects |
 
 Every operation that reaches the HPC Platform (a Slurm submission on the
 Controller's legacy path, a status query, a cancellation) also needs the
@@ -44,16 +45,18 @@ from ..db.identity import hash_token
 from ..db.sessions import SessionStore
 from ..errors import AUTHORIZATION_METADATA, PROJECT_METADATA
 from .platforms import PlatformCatalog
-from .policy import Action, Decision, Principal, Target
+from .policy import Action, Decision, Principal, Target, decide
 from .service import AccessDeniedError, Authorizer, ProviderAuthority
 
 logger = get_logger("nest.authz.execution")
 
 __all__ = [
     "AUTHORIZATION_METADATA",
+    "MAX_ELIGIBLE_PROJECTS",
     "PROJECT_METADATA",
     "AllowedProjects",
     "DatabaseProviderApprovals",
+    "EligibleProject",
     "ExecutionAccess",
     "JobAccess",
     "ProjectRequiredError",
@@ -149,6 +152,26 @@ class DatabaseProviderApprovals:
         if action == Action.RUN_CANCEL:
             return self.store.has_record(provider, project_id)
         return self.store.is_approved(provider, project_id)
+
+
+MAX_ELIGIBLE_PROJECTS = 200
+"""Most Projects [`authz.ExecutionAccess.eligible_projects`] returns in one answer."""
+
+
+@dataclass(frozen=True)
+class EligibleProject:
+    """
+    A Project the caller may submit to on this Controller now.
+
+    Attributes:
+        id (`UUID`): The Project.
+        name (`str`): Its display name (not unique).
+        role (`str`): The caller's role in it.
+    """
+
+    id: UUID
+    name: str
+    role: str
 
 
 @dataclass(frozen=True)
@@ -330,6 +353,45 @@ class ExecutionAccess:
             details=details,
             required=True,
         )
+
+    def eligible_projects(self, principal: Principal) -> list[EligibleProject]:
+        """
+        The caller's Projects that this Controller would accept a submission from
+        now (E07), for the SDK's Project selection.
+
+        A Project is eligible when the caller's current role allows `run.submit`,
+        the Provider permits it, and the served Platform is active and granted to
+        the Project. Each is read now; nothing is cached, and nothing is recorded
+        per Project, so listing does not fill the audit log with refusals. The
+        list is advice only: every submission is authorized again from scratch
+        ([`authz.ExecutionAccess.authorize_submit`] and registry admission), so a
+        Project revoked after it was listed is refused and nothing runs.
+
+        Returns:
+            `list[EligibleProject]`: At most [`authz.MAX_ELIGIBLE_PROJECTS`], in the
+                order the Projects were created.
+
+        Raises:
+            [`authz.AccessDeniedError`]: If the session may not read Projects.
+            [`db.DatabaseError`]: If the database cannot answer (fail closed).
+        """
+        eligible: list[EligibleProject] = []
+        if self.platform_id is None:
+            return eligible
+        for project, role in self.platforms.projects.list_projects(principal):
+            if not decide(principal, role, Action.RUN_SUBMIT):
+                continue
+            if not self.authorizer.providers.permits(
+                principal, project.id, Action.RUN_SUBMIT, self.provider_id
+            ):
+                continue
+            granted, _ = self.platforms.store.project_platforms(principal.user_id, project.id)
+            if not any(p.id == self.platform_id for p in granted):
+                continue
+            eligible.append(EligibleProject(project.id, project.name, role))
+            if len(eligible) >= MAX_ELIGIBLE_PROJECTS:
+                break
+        return eligible
 
     def _require_platform(
         self,

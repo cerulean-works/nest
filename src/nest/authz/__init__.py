@@ -22,8 +22,10 @@ from .accounts import (
 )
 from .admin import AdminService, DirectoryUser, Page, ProjectAccess, ProviderPolicy
 from .execution import (
+    MAX_ELIGIBLE_PROJECTS,
     AllowedProjects,
     DatabaseProviderApprovals,
+    EligibleProject,
     ExecutionAccess,
     ProjectRequiredError,
     UnauthenticatedError,
@@ -78,6 +80,7 @@ __all__ = [
     "CLI_ACTION_SCOPES",
     "DEFAULT_INVITATION_TTL",
     "DEFAULT_LINK_MAX_USES",
+    "MAX_ELIGIBLE_PROJECTS",
     "ORGANIZATION_READ_ACTIONS",
     "PLATFORM_SCOPES",
     "PROVIDER_ACTIONS",
@@ -95,6 +98,7 @@ __all__ = [
     "Decision",
     "DenyAllProviders",
     "DirectoryUser",
+    "EligibleProject",
     "ExecutionAccess",
     "HPCIdentity",
     "InvitationService",

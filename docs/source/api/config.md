@@ -56,6 +56,12 @@ except ConfigError as error:
 
 [[autodoc]] config.ClientConfig
 
+[[autodoc]] config.HostedProfile
+
+[[autodoc]] config.is_hosted_gateway
+
+[[autodoc]] config.default_preferences_file
+
 [[autodoc]] config.TLSConfig
 
 ## Secrets

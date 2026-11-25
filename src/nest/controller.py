@@ -1057,6 +1057,44 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
         logger.info("Job cancellation requested job_id=%s", request.job_id)
         return execution_pb2.CancelJobResponse()
 
+    @_logged_rpc
+    def ListEligibleProjects(self, request, context):
+        """
+        Lists the caller's Projects this Controller would accept a submission from
+        now, so the SDK can choose one when `NEST_PROJECT_ID` is unset (E07).
+
+        Read-only and advisory: see [`authz.ExecutionAccess.eligible_projects`].
+        Every `Execute` and `SubmitJob` is authorized again from scratch. Without
+        session authentication the answer is empty with `projects_required` false,
+        since no Project applies.
+
+        Args:
+            request (`execution_pb2.ListEligibleProjectsRequest`): Empty.
+            context (`grpc.ServicerContext`): `UNAUTHENTICATED` without an accepted
+                Nest session, `PERMISSION_DENIED` when its scopes may not read
+                Projects, and `UNAVAILABLE` when the database cannot answer.
+
+        Returns:
+            `execution_pb2.ListEligibleProjectsResponse`: The eligible Projects.
+        """
+        principal = self._authenticate(context, "ListEligibleProjects")
+        if self.access is None or principal is None:
+            return execution_pb2.ListEligibleProjectsResponse(projects_required=False)
+        access = self.access
+        try:
+            projects = self._guarded(context, lambda: access.eligible_projects(principal))
+        except AccessDeniedError as exc:
+            _abort_denied(context, exc, "Project")
+            raise AssertionError("context.abort raises") from None
+        logger.info("Eligible Projects listed count=%s", len(projects))
+        return execution_pb2.ListEligibleProjectsResponse(
+            projects=[
+                execution_pb2.EligibleProject(id=str(p.id), name=p.name, role=p.role)
+                for p in projects
+            ],
+            projects_required=True,
+        )
+
 
 def build_backend(config: ControllerConfig) -> SlurmBackend | None:
     """
@@ -1362,6 +1400,7 @@ def record_start(config: ControllerConfig, database: Database | None) -> None:
             "grpc_max_message_bytes": config.rpc.max_message_bytes,
             "local_execution": config.rpc.local_execution,
             "admission_limits": config.limits.summary(),
+            "public_pilot": config.public_pilot,
         },
     )
 

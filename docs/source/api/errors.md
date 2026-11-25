@@ -32,6 +32,8 @@ what each error means and when it is safe to call again.
 
 [[autodoc]] errors.RemoteAccessDeniedError
 
+[[autodoc]] errors.ProjectSelectionError
+
 ## Timeouts
 
 [[autodoc]] errors.NestTimeoutError

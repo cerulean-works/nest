@@ -78,7 +78,10 @@ environment. Prefer the file form where a secret-file mount is available; see
 | `NEST_RPC_TIMEOUT` | `900` | Seconds allowed for each `Execute` RPC. Must be a positive number. When it expires, the call raises `RpcTimeoutError`. |
 | `NEST_CONTROLLER_TLS` | `false` for loopback, `true` when a CA file is set | Use a TLS channel with server certificate verification. Accepts `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`. |
 | `NEST_CONTROLLER_TLS_CA_FILE` | Unset | Absolute path to PEM roots for the Controller's certificate. With TLS enabled, an unset file uses gRPC's default trust roots. |
-| `NEST_PROJECT_ID` | Unset | ID of the Project your calls run in. Required by a Controller with session authentication (`NEST_CONTROLLER_AUTH=session`); sent as `x-nest-project-id` metadata. |
+| `NEST_PROJECT_ID` | Unset | ID of the Project your calls run in, sent as `x-nest-project-id` metadata. Always wins. When unset, a Controller with session authentication is asked which Projects you may run in, and the SDK uses your saved choice, the only eligible Project, or asks on a terminal; see [Choose the Project your calls run in](project-selection). |
+| `NEST_PROFILE` | Unset (`local` until H09) | `hosted` uses the [hosted connection profile](hosted-connection): verified TLS to `grpc.nest.cerulean.works:443` with the hosted session. It cannot be combined with `NEST_CONTROLLER_ADDRESS`, `NEST_CONTROLLER_TLS`, `NEST_CONTROLLER_TLS_CA_FILE` or another `NEST_AUTH_URL`. `local` keeps the local default. Not a default until the H09 sign-off. |
+| `NEST_CONTROLLER_KEEPALIVE` | `30` with the hosted profile, else `0` | Seconds between HTTP/2 keepalive PINGs during a call, `0` (off) or 20 to 300. The Controller refuses PINGs more often than every 20 seconds, and a Controller older than H07 refuses them more often than every 5 minutes, so leave it off for those. |
+| `NEST_PREFERENCES_FILE` | `$XDG_CONFIG_HOME/nest/preferences.json`, or `~/.config/nest/preferences.json` | Absolute path where saved Project choices are kept, mode `0600`, one per sign-in origin, Controller and Nest User. Holds no secret. |
 
 Set these in the process running your Nest application. They do not configure
 where the Controller listens. Invalid client settings raise `nest.config.ConfigError`
@@ -102,7 +105,8 @@ The CLI and the SDK resolve the sign-in origin the same way
 | --- | --- | --- | --- |
 | 1 | `--url` | yes | not applicable |
 | 2 | `NEST_AUTH_URL` | yes | yes, for any Controller |
-| 3 | Hosted default, `https://auth.nest.cerulean.works` | yes | only when `NEST_CONTROLLER_ADDRESS` is exactly `nest.cerulean.works:50051` (`nest.config.HOSTED_CONTROLLER_ADDRESS`); not for the MagicDNS name |
+| 3 | Hosted default, `https://auth.nest.cerulean.works` | yes | only when `NEST_CONTROLLER_ADDRESS` is exactly `nest.cerulean.works:50051` (`nest.config.HOSTED_CONTROLLER_ADDRESS`) or the hosted gateway `grpc.nest.cerulean.works:443`; not for the MagicDNS name |
+| - | Hosted profile (`NEST_PROFILE=hosted`) | not applicable | always `https://auth.nest.cerulean.works`; another `NEST_AUTH_URL` is an error |
 | - | None | never | no session is sent and no sign-in starts |
 
 Hosted users who connect by the MagicDNS name therefore set
@@ -112,7 +116,8 @@ sends no session and the call fails with `AuthenticationRequiredError`.
 An empty or blank value counts as unset. An invalid `--url` or `NEST_AUTH_URL` is
 an error (exit status 2, or `ConfigError`); it never falls back to the hosted
 default. `nest auth status --json` reports the origin as `auth_url` and where it
-came from as `auth_url_source` (`--url`, `NEST_AUTH_URL` or `hosted default`).
+came from as `auth_url_source` (`--url`, `NEST_AUTH_URL` or `hosted default`; the
+SDK's [`config.ClientConfig`] also reports `hosted profile`).
 
 Sessions are stored per origin, so a session is only ever sent to the origin that
 issued it and to the Controllers that origin applies to. Signing in to, refreshing
@@ -156,8 +161,13 @@ Slurm submission and result retrieval). `nest.cerulean.works:50051`, the address
 built into the SDK as `nest.config.HOSTED_CONTROLLER_ADDRESS`, has not been verified
 end to end in this deployment; do not rely on it for gRPC. Use the MagicDNS name
 rather than a Tailscale IP: a shared node's IP is assigned per Tailnet and is not
-guaranteed to be the same for every recipient. `NEST_PROJECT_ID` stays explicit as
-well: Nest never chooses a Project.
+guaranteed to be the same for every recipient. `NEST_PROJECT_ID` may be left unset
+against a current Controller (see [Choose the Project your calls run in](project-selection));
+set it to pin a Project, as before.
+
+The Tailnet path stays supported for existing users and as the rollback of the
+[hosted connection profile](hosted-connection), which reaches the same Controller
+through its public gateway with verified TLS once H09 approves it.
 
 For a non-loopback address, set `NEST_CONTROLLER_TLS=true` or provide a CA file
 to use TLS. Set `NEST_CONTROLLER_TLS=false` explicitly for a plaintext deployment
@@ -189,6 +199,7 @@ on a trusted private network such as an authorized Tailnet.
 | `NEST_GRPC_MAX_MESSAGE_BYTES`, `NEST_GRPC_MAX_METADATA_BYTES` | `4194304`, `16384` | Largest message (after decompression) and request metadata. Change the message size only with the SDK and gateway. |
 | `NEST_GRPC_RATE_LIMIT_PER_PEER`, `NEST_GRPC_RATE_LIMIT_PER_USER` | `600`, `300` | Calls per minute per client address (before authentication) and per Nest User (after); `0` turns one off. |
 | `NEST_GRPC_ALLOWED_PEERS`, `NEST_GRPC_TRUSTED_PROXIES` | Unset | Networks the Controller accepts connections from (origin bypass protection), and gateways whose `x-forwarded-for` is trusted. See [Public API security](public-api-security). |
+| `NEST_PUBLIC_PILOT` | `false` | `true` marks this Controller as the origin of the public gRPC gateway's bounded trusted pilot (H08). Startup then fails unless session authentication, `NEST_EXECUTOR=slurm`, `NEST_EXECUTION_REGISTRY=required`, `NEST_LIMIT_BATCH_SCRIPTS=refuse`, `NEST_GRPC_ALLOWED_PEERS`, `NEST_GRPC_TRUSTED_PROXIES` inside them, nonzero rate limits, the 4 MiB message limit, no wildcard Provider approval, TLS or explicit private plaintext, and `NEST_ENVIRONMENT_TIMEOUT` plus `NEST_RESULT_TIMEOUT` under 1200 seconds all hold. See [Public gRPC gateway](public-grpc-gateway). |
 | `NEST_LIMIT_*` | See [Admission limits](admission-limits) | Per-User, per-Project and per-Platform admission limits enforced by the Execution Registry: `ACTIVE_PER_USER`, `ACTIVE_PER_PROJECT`, `ACTIVE_PER_PLATFORM`, `CPU_PER_REQUEST`, `GPU_PER_REQUEST`, `CPU_PER_PROJECT`, `GPU_PER_PROJECT`, `WALLTIME`, `SUBMISSIONS_PER_MINUTE`, `ENVIRONMENT_BUILDS`, and `BATCH_SCRIPTS` (`trusted` or `refuse`; set `refuse` for a bounded pilot). |
 | `NEST_PROVIDER_ALLOWED_PROJECTS` | Unset (no Project) | Startup-only Provider approval, used only with `NEST_PROVIDER_APPROVALS=environment` (revocations recorded in the database still refuse new submissions then): Project IDs, comma-separated, whose members' Runs the Controller's Provider accepts, or `*` for every Project. Every job runs as the Controller's HPC account, so this is the operator's approval; no Project role grants it. Read only at start: after a change, recreate the Controller container (in Dokploy, **Deploy** again). Needs `NEST_CONTROLLER_AUTH=session`. It is never imported into the database by itself; see [Move Provider approvals to the database](project-onboarding#move-provider-approvals-to-the-database). |
 | `NEST_PROVIDER_APPROVALS` | `environment` while `NEST_PROVIDER_ALLOWED_PROJECTS` is set, otherwise `database` | Where Provider approvals come from. `database` reads them from PostgreSQL at every submission (`nest-db provider`, or the [privileged management API](privileged-api)), so they change without a redeploy, on every Controller sharing the database; registry admission checks the approval again in the transaction that records the attempt. `environment` keeps `NEST_PROVIDER_ALLOWED_PROJECTS`. `database` together with `NEST_PROVIDER_ALLOWED_PROJECTS` is refused at start. Needs `NEST_CONTROLLER_AUTH=session`. |

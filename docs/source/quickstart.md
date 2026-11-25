@@ -41,7 +41,7 @@ To try Nest on one machine without a cluster, a sign-in or a Project, use the
 | Controller (Tailscale MagicDNS) | `NEST_CONTROLLER_ADDRESS=nest-controller.tail8e5ba1.ts.net:50051` |
 | Transport | `NEST_CONTROLLER_TLS=false`, only because the authorized Tailnet encrypts and access-controls the connection |
 | Sign-in | `NEST_AUTH_URL=https://auth.nest.cerulean.works` |
-| Project | `NEST_PROJECT_ID=<project-id>`, a UUID; Nest never picks one |
+| Project | `NEST_PROJECT_ID=<project-id>`, a UUID, or unset to [choose one](project-selection) |
 
 `nest.cerulean.works:50051` has **not** been verified end to end in this
 deployment; do not use it for gRPC. Examples below use `<project-id>` as a
@@ -200,10 +200,13 @@ Then select the Project for your calls:
 export NEST_PROJECT_ID="<project-id>"
 ```
 
-Nest never picks a Project for you, even when you belong to only one: a call
-without `NEST_PROJECT_ID` is refused with *Name the Project to run in with
-NEST_PROJECT_ID*, and nothing runs. A value that is not a UUID is rejected by the
-SDK before any call (*NEST_PROJECT_ID must be a Project ID (a UUID)*).
+`NEST_PROJECT_ID` always wins. Against a current Controller you may also leave it
+unset: the SDK then uses your saved choice or your only eligible Project, or asks
+on a terminal, and the Controller authorizes the Project on every call (see
+[Choose the Project your calls run in](project-selection)). A Controller from
+before Project selection refuses a call without it with *Name the Project to run
+in with NEST_PROJECT_ID*, and nothing runs. A value that is not a UUID is rejected
+by the SDK before any call (*NEST_PROJECT_ID must be a Project ID (a UUID)*).
 
 ## 5. Ask the operator to approve the Project
 

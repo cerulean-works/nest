@@ -17,6 +17,10 @@ guide:
         title: Run functions on GPUs
       - local: remote-errors
         title: Handle remote errors
+      - local: project-selection
+        title: Choose the Project your calls run in
+      - local: hosted-connection
+        title: Connect to Cerulean-hosted Nest
   - title: Hosting
     sections:
       - local: docker-compose
@@ -67,6 +71,8 @@ guide:
         title: Public gRPC transport feasibility (H06)
       - local: public-api-security
         title: Public API security and abuse controls (H07)
+      - local: public-grpc-gateway
+        title: Run the public gRPC gateway pilot (H08)
   - title: Contributing
     sections:
       - local: developing

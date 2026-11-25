@@ -1,0 +1,30 @@
+# Dokploy Traefik: pass the public gRPC name through to the Nest gateway (H08).
+#
+# Copy to /etc/dokploy/traefik/dynamic/nest-grpc.yml on the Dokploy host (Traefik
+# reloads dynamic files by itself; every other router is unchanged). Deleting the
+# file is the rollback. Traefik does not terminate TLS for this name: Envoy holds the
+# certificate, so Traefik's own timeouts and certificates do not apply to it.
+#
+# Replace grpc.nest.cerulean.works with the staging name for a staging run.
+tcp:
+  routers:
+    nest-grpc:
+      entryPoints:
+        - websecure
+      rule: HostSNI(`grpc.nest.cerulean.works`)
+      service: nest-grpc-gateway
+      tls:
+        passthrough: true
+  services:
+    nest-grpc-gateway:
+      loadBalancer:
+        servers:
+          # The gateway's alias on dokploy-network (compose.dokploy.yaml, profile
+          # public-grpc). Its port is never published on the host.
+          - address: nest-grpc-gateway:8443
+        # Envoy requires PROXY protocol v2 and refuses connections without it, so
+        # the client address survives the TLS passthrough. Confirm this key on the
+        # deployed Traefik version (some v3 releases move it to a TCP
+        # serversTransport); a mismatch fails closed, it never skips the header.
+        proxyProtocol:
+          version: 2

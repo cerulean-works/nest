@@ -62,6 +62,7 @@ CONTROLLER_SETTINGS = {
     "NEST_LIMIT_SUBMISSIONS_PER_MINUTE",
     "NEST_LIMIT_ENVIRONMENT_BUILDS",
     "NEST_LIMIT_BATCH_SCRIPTS",
+    "NEST_PUBLIC_PILOT",
     "NEST_DATABASE_URL",
     "NEST_DATABASE_REQUIRED",
     "NEST_DATABASE_PASSWORD_FILE",
@@ -378,6 +379,51 @@ def check_dokploy(dokploy):
     assert depends["migrate"]["condition"] == "service_completed_successfully"
     assert depends["postgres"]["condition"] == "service_healthy"
     assert not depends["migrate"].get("required", True)
+    check_public_gateway()
+
+
+def check_public_gateway():
+    """The public-grpc profiles (H08): the gateway publishes nothing, reaches the
+    Controller only on an internal network, and only the ACME client gets the
+    Cloudflare token."""
+    public = render(
+        "compose.dokploy.yaml",
+        profiles=("public-grpc", "public-grpc-acme"),
+        NEST_TAILSCALE_AUTHKEY="",
+        NEST_GRPC_CLOUDFLARE_DNS_API_TOKEN="",
+        NEST_GRPC_EDGE_PROXY="10.0.1.7/32",
+    )
+    services = public["services"]
+    assert set(services) == {"controller", "tailscale", "grpc-gateway", "grpc-certificates"}
+    gateway, acme, controller = (
+        services["grpc-gateway"],
+        services["grpc-certificates"],
+        services["controller"],
+    )
+    for name, service in services.items():
+        assert not service.get("ports"), f"{name} must publish no host port"
+    assert public["networks"]["grpc-origin"]["internal"] is True
+    assert set(gateway["networks"]) == {"grpc-origin", "edge"}
+    assert gateway["networks"]["grpc-origin"]["ipv4_address"] == "172.31.250.2"
+    assert gateway["networks"]["edge"]["aliases"] == ["nest-grpc-gateway"]
+    assert public["networks"]["edge"]["external"] is True
+    assert public["networks"]["edge"]["name"] == "dokploy-network"
+    assert "grpc-origin" in controller["networks"] and "edge" not in controller["networks"]
+    assert gateway["read_only"] and gateway["cap_drop"] == ["ALL"]
+    assert gateway["user"] == "101:101"
+    assert not gateway.get("secrets") and not controller.get("secrets")
+    assert [s["source"] for s in acme["secrets"]] == ["cloudflare_dns_api_token"]
+    assert public["secrets"]["cloudflare_dns_api_token"]["environment"] == (
+        "NEST_GRPC_CLOUDFLARE_DNS_API_TOKEN"
+    )
+    config, certificates = gateway["volumes"]
+    assert config["source"] == str(ROOT / "deploy/public-grpc") and config["read_only"]
+    assert certificates["source"] == "grpc-certificates" and certificates["read_only"]
+    assert gateway["environment"]["NEST_GRPC_EDGE_PROXY"] == "10.0.1.7/32"
+    assert gateway["environment"]["NEST_GRPC_UPSTREAM"] == "controller:50051"
+    assert acme["networks"] == {"acme": None} or set(acme["networks"]) == {"acme"}
+    assert "edge" not in acme["networks"] and "grpc-origin" not in acme["networks"]
+    assert gateway["labels"]["traefik.enable"] == "false"
 
 
 if __name__ == "__main__":

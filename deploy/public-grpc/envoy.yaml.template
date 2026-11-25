@@ -1,0 +1,183 @@
+# Nest public gRPC gateway (H08), topology D of the H06 study:
+#
+#   SDK --TLS :443--> Cloudflare DNS only --> Dokploy Traefik (TCP HostSNI, TLS
+#   passthrough, PROXY protocol v2) --> this Envoy (TLS termination) --h2c, private
+#   network--> Controller :50051 (publishes no port)
+#
+# Rendered by gateway-entrypoint.sh, which validates and substitutes the
+# at-sign placeholders; nothing else in this file depends on the deployment. See
+# docs/source/public-grpc-gateway.md for the contract each setting implements.
+#
+# Admission at the gateway, before the Controller sees anything:
+#   - only connections from the edge proxy (RBAC on the TCP peer, before PROXY
+#     protocol is trusted), so no other container can claim a client address;
+#   - only the configured SNI name, TLS 1.2+, ALPN h2;
+#   - a cap on connections, a new-connection rate, a request rate, 16 concurrent
+#     streams per connection, 16 KiB of headers, 10 s to send them;
+#   - only /nest.ExecutionService/* gRPC paths (reflection and health are 404);
+#   - no retries, no upstream PINGs (the Controller's grpcio ping policy), and the
+#     client's grpc-timeout honored up to the idle timeout.
+# Per-address and per-User limits, authentication, Project authorization and
+# registry admission stay in the Controller, which reads the client address from
+# the x-forwarded-for this Envoy appends.
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: @ADMIN_PORT@ }
+
+overload_manager:
+  resource_monitors:
+    - name: envoy.resource_monitors.global_downstream_max_connections
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.resource_monitors.downstream_connections.v3.DownstreamConnectionsConfig
+        max_active_downstream_connections: 1024
+
+static_resources:
+  listeners:
+    - name: public_grpc
+      address:
+        socket_address: { address: 0.0.0.0, port_value: @LISTEN_PORT@ }
+      per_connection_buffer_limit_bytes: 1048576
+      listener_filters:
+        # The edge proxy (Traefik) sends PROXY protocol v2 so the client address
+        # survives TLS passthrough. A connection without the header is refused.
+        - name: envoy.filters.listener.proxy_protocol
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.listener.proxy_protocol.v3.ProxyProtocol
+        - name: envoy.filters.listener.tls_inspector
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
+      # No filter chain matches another SNI name, so such a connection is closed.
+      filter_chains:
+        - filter_chain_match:
+            server_names: ["@PUBLIC_HOST@"]
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                alpn_protocols: ["h2"]
+                tls_params:
+                  tls_minimum_protocol_version: TLSv1_2
+                # Reloaded when renew-certificate.sh moves a new certificate in.
+                tls_certificate_sds_secret_configs:
+                  - name: nest_grpc_certificate
+                    sds_config:
+                      path_config_source:
+                        path: @SDS_PATH@
+                      resource_api_version: V3
+          filters:
+            # Origin protection for the gateway itself: only the edge proxy may
+            # connect. `direct_remote_ip` is the TCP peer, not the PROXY header.
+            - name: envoy.filters.network.rbac
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.rbac.v3.RBAC
+                stat_prefix: edge_only
+                rules:
+                  action: ALLOW
+                  policies:
+                    edge_proxy:
+                      permissions: [{ any: true }]
+                      principals:
+                        - direct_remote_ip: { address_prefix: "@EDGE_ADDRESS@", prefix_len: @EDGE_PREFIX@ }
+            - name: envoy.filters.network.connection_limit
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.connection_limit.v3.ConnectionLimit
+                stat_prefix: connections
+                max_connections: 512
+            - name: envoy.filters.network.local_ratelimit
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.local_ratelimit.v3.LocalRateLimit
+                stat_prefix: new_connections
+                token_bucket: { max_tokens: 100, tokens_per_fill: 20, fill_interval: 1s }
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: public_grpc
+                codec_type: HTTP2
+                # A silent Execute sends nothing until it returns (H06): above the
+                # SDK's 900 s deadline, the Controller's pilot bound (1200 s).
+                stream_idle_timeout: 1200s
+                request_timeout: 0s
+                request_headers_timeout: 10s
+                max_request_headers_kb: 16
+                common_http_protocol_options:
+                  idle_timeout: 3600s
+                  headers_with_underscores_action: REJECT_REQUEST
+                http2_protocol_options:
+                  max_concurrent_streams: 16
+                  connection_keepalive:
+                    interval: 30s
+                    timeout: 10s
+                # The client address is the PROXY protocol source; Envoy appends it
+                # to x-forwarded-for, and the Controller trusts only this hop.
+                use_remote_address: true
+                xff_num_trusted_hops: 0
+                strip_any_host_port: true
+                # Method, status, sizes and duration only: never a header or body.
+                access_log:
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                      log_format:
+                        text_format_source:
+                          inline_string: "[%START_TIME%] %REQ(:PATH)% grpc=%GRPC_STATUS% http=%RESPONSE_CODE% flags=%RESPONSE_FLAGS% rx=%BYTES_RECEIVED% tx=%BYTES_SENT% ms=%DURATION%\n"
+                route_config:
+                  name: nest
+                  virtual_hosts:
+                    - name: nest
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/nest.ExecutionService/", grpc: {} }
+                          route:
+                            cluster: controller
+                            timeout: 0s
+                            max_stream_duration:
+                              grpc_timeout_header_max: 1200s
+                        # Reflection, health checks and anything else are not public.
+                        - match: { prefix: "/" }
+                          direct_response: { status: 404 }
+                http_filters:
+                  # Overall request rate across all clients, answered as gRPC
+                  # RESOURCE_EXHAUSTED. Per-address and per-User limits are the
+                  # Controller's (NEST_GRPC_RATE_LIMIT_*).
+                  - name: envoy.filters.http.local_ratelimit
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
+                      stat_prefix: requests
+                      token_bucket: { max_tokens: 200, tokens_per_fill: 50, fill_interval: 1s }
+                      filter_enabled:
+                        default_value: { numerator: 100, denominator: HUNDRED }
+                      filter_enforced:
+                        default_value: { numerator: 100, denominator: HUNDRED }
+                      rate_limited_as_resource_exhausted: true
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    - name: controller
+      type: STRICT_DNS
+      connect_timeout: 5s
+      # Above the Controller's own bound (NEST_GRPC_MAX_CONCURRENT_RPCS, 32), so
+      # its RESOURCE_EXHAUSTED answer normally wins; never retried.
+      circuit_breakers:
+        thresholds:
+          - max_connections: 64
+            max_pending_requests: 64
+            max_requests: 64
+            max_retries: 0
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          # No upstream PING keepalive: the Controller accepts a PING without data
+          # only every 20 s, and a gateway that PINGs more often kills silent calls
+          # (H06: too_many_pings). The hop is a private Docker network.
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: controller
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: "@UPSTREAM_HOST@", port_value: @UPSTREAM_PORT@ }

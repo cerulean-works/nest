@@ -2,7 +2,7 @@ import sys
 from collections.abc import Callable
 from functools import wraps
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import cloudpickle
 import grpc
@@ -27,14 +27,43 @@ from .errors import (
     RemoteExecutionError,
     RpcTimeoutError,
 )
+from .project_selection import ProjectChoice, forget_refused, is_interactive, select_project
 from .proto import execution_pb2, execution_pb2_grpc
 
+if TYPE_CHECKING:
+    from .login import NestSession
+
 logger = get_logger(__name__)
+
+
+def channel_options(config: ClientConfig) -> list[tuple[str, int]]:
+    """
+    The channel options of a Controller connection.
+
+    Retries are off, so the channel never sends a call twice: an `Execute` reaches
+    the Controller at most once per attempt the SDK makes. With a keepalive (the
+    hosted profile, or `NEST_CONTROLLER_KEEPALIVE`), HTTP/2 PINGs keep NAT and
+    firewall state alive during a silent call, at an interval the Controller and
+    the gateway accept, and never while no call is open.
+    """
+    options = [("grpc.enable_retries", 0)]
+    if config.keepalive > 0:
+        options += [
+            ("grpc.keepalive_time_ms", int(config.keepalive * 1000)),
+            ("grpc.keepalive_timeout_ms", 20_000),
+            ("grpc.keepalive_permit_without_calls", 0),
+            ("grpc.http2.max_pings_without_data", 0),
+        ]
+    return options
 
 
 def _channel(config: ClientConfig) -> grpc.Channel:
     """
     Opens a plaintext or TLS channel to the configured Controller.
+
+    A TLS channel always verifies the certificate chain and that it names the
+    address's host; nothing overrides the expected name, and a failed handshake is
+    an error, never a reason to try plaintext.
 
     Args:
         config ([`config.ClientConfig`]): Validated client configuration.
@@ -42,17 +71,23 @@ def _channel(config: ClientConfig) -> grpc.Channel:
     Returns:
         `grpc.Channel`: The channel; close it after use.
     """
+    options = channel_options(config)
     if not config.tls:
-        return grpc.insecure_channel(config.address)
-    roots = None
+        return grpc.insecure_channel(config.address, options=options)
+    roots = config.tls_root_certificates
     if config.tls_ca_file is not None:
         with open(config.tls_ca_file, "rb") as handle:
             roots = handle.read()
-    return grpc.secure_channel(config.address, grpc.ssl_channel_credentials(roots))
+    return grpc.secure_channel(config.address, grpc.ssl_channel_credentials(roots), options=options)
 
 
 def _controller_error(
-    exc: grpc.RpcError, address: str, timeout: float, *, auth_url: str | None = None
+    exc: grpc.RpcError,
+    address: str,
+    timeout: float,
+    *,
+    auth_url: str | None = None,
+    hosted: bool = False,
 ) -> Exception | None:
     """
     Converts a Controller RPC error into a typed Nest exception when possible.
@@ -63,6 +98,7 @@ def _controller_error(
         timeout (`float`): RPC deadline in seconds, used in messages.
         auth_url (`str`, *optional*): The sign-in origin whose session was used,
             used in messages.
+        hosted (`bool`): Whether `address` is the hosted profile's gateway.
 
     Returns:
         `Exception | None`: The exception to raise, or `None` to re-raise `exc`.
@@ -106,6 +142,14 @@ def _controller_error(
             "allow longer calls."
         )
 
+    if status == grpc.StatusCode.UNAVAILABLE and hosted:
+        return ConnectionError(
+            f"Cannot connect to Cerulean-hosted Nest at {address} over verified TLS.\n\n"
+            "Please check that your network allows outgoing HTTPS (port 443), and try "
+            "again later. Nest never falls back to an unencrypted connection. To use "
+            "another Controller, set NEST_CONTROLLER_ADDRESS (and NEST_CONTROLLER_TLS)."
+        )
+
     if status == grpc.StatusCode.UNAVAILABLE:
         return ConnectionError(
             f"Cannot connect to Nest Controller at {address}.\n\n"
@@ -120,11 +164,11 @@ def _controller_error(
     return None
 
 
-def _access_token(config: ClientConfig, *, interactive: bool) -> str | None:
+def _session(config: ClientConfig, *, interactive: bool) -> NestSession | None:
     """
-    The stored Nest session's access token, refreshed when needed, or `None` when
-    no sign-in origin applies to this Controller (see [`config.ClientConfig`]) or no
-    one is signed in and `interactive` is `False`. Only the session of
+    The stored Nest session of `config.auth_url`, refreshed when needed, or `None`
+    when no sign-in origin applies to this Controller (see [`config.ClientConfig`])
+    or no one is signed in and `interactive` is `False`. Only the session of
     `config.auth_url` is read, so a Controller never receives another Nest's session.
     """
     if config.auth_url is None:
@@ -133,20 +177,29 @@ def _access_token(config: ClientConfig, *, interactive: bool) -> str | None:
     from .login import NotSignedInError, ensure_session
 
     try:
-        session = ensure_session(load_cli_auth_config(url=config.auth_url), interactive=interactive)
+        return ensure_session(load_cli_auth_config(url=config.auth_url), interactive=interactive)
     except NotSignedInError:
         return None
-    return session.access_token
 
 
-def call_metadata(config: ClientConfig, token: str | None) -> tuple[tuple[str, str], ...]:
+def _access_token(config: ClientConfig, *, interactive: bool) -> str | None:
+    """The access token of [`client._session`], or `None`."""
+    session = _session(config, interactive=interactive)
+    return session.access_token if session is not None else None
+
+
+def call_metadata(
+    config: ClientConfig, token: str | None, project_id: str | None = None
+) -> tuple[tuple[str, str], ...]:
     """
-    Request metadata for a Controller call: the request ID, the Project from
-    `NEST_PROJECT_ID`, and the Nest session's bearer token when there is one.
+    Request metadata for a Controller call: the request ID, the Project
+    (`project_id`, else `NEST_PROJECT_ID`), and the Nest session's bearer token
+    when there is one.
     """
     metadata = [("x-nest-request-id", current_request_id())]
-    if config.project_id is not None:
-        metadata.append((PROJECT_METADATA, config.project_id))
+    project = project_id or config.project_id
+    if project is not None:
+        metadata.append((PROJECT_METADATA, project))
     if token is not None:
         metadata.append((AUTHORIZATION_METADATA, f"Bearer {token}"))
     return tuple(metadata)
@@ -157,16 +210,48 @@ def session_metadata(
 ) -> tuple[tuple[str, str], ...]:
     """
     Metadata for a direct gRPC call to the Controller, such as `SubmitJob`: the
-    request ID, `NEST_PROJECT_ID`, and, when a sign-in origin applies (`NEST_AUTH_URL`,
+    request ID, the Project, and, when a sign-in origin applies (`NEST_AUTH_URL`,
     or the hosted origin for the hosted Controller), the Nest session's bearer token,
     signing in first when `interactive` and no session is stored.
 
+    The Project is `NEST_PROJECT_ID`, else the one
+    [`project_selection.select_project`] chooses (asking on a terminal only when
+    `interactive`).
+
     Args:
         config ([`config.ClientConfig`], *optional*): Defaults to the environment.
-        interactive (`bool`): Sign in through the browser when needed.
+        interactive (`bool`): Sign in through the browser, and choose among several
+            Projects, when needed.
+
+    Raises:
+        [`errors.ProjectSelectionError`]: If no Project can be chosen.
     """
     config = config or load_client_config()
-    return call_metadata(config, _access_token(config, interactive=interactive))
+    session = _session(config, interactive=interactive)
+    token = session.access_token if session is not None else None
+    choice = None
+    if config.project_id is None and session is not None:
+        with _channel(config) as channel:
+            try:
+                choice = select_project(
+                    config,
+                    channel,
+                    token,
+                    session.user_id,
+                    interactive=interactive and is_interactive(),
+                )
+            except grpc.RpcError as exc:
+                error = _controller_error(
+                    exc,
+                    config.address,
+                    config.rpc_timeout,
+                    auth_url=config.auth_url,
+                    hosted=config.profile == "hosted",
+                )
+                if error is None:
+                    raise
+                raise error from exc
+    return call_metadata(config, token, choice.project_id if choice else None)
 
 
 def _logged_execution(method):
@@ -185,21 +270,26 @@ def execute_remote(
     """
     Serializes a function call and executes it through the controller.
 
-    Reads its settings with [`config.load_client_config`]. `NEST_CONTROLLER_ADDRESS`
-    overrides [`config.DEFAULT_CONTROLLER_ADDRESS`]. The call has a 900-second
-    deadline unless `NEST_RPC_TIMEOUT` sets another positive number of seconds.
-    Non-loopback addresses require an explicit `NEST_CONTROLLER_TLS` setting or
-    `NEST_CONTROLLER_TLS_CA_FILE`.
+    Reads its settings with [`config.load_client_config`]: the hosted connection
+    profile (`NEST_PROFILE=hosted`, verified TLS to [`config.HOSTED_GRPC_ADDRESS`]),
+    or `NEST_CONTROLLER_ADDRESS`, else [`config.DEFAULT_CONTROLLER_ADDRESS`]. The call
+    has a 900-second deadline unless `NEST_RPC_TIMEOUT` sets another positive number
+    of seconds. Non-loopback custom addresses require an explicit
+    `NEST_CONTROLLER_TLS` setting or `NEST_CONTROLLER_TLS_CA_FILE`. A TLS failure is
+    an error; the SDK never retries in plaintext, and the channel never retries.
 
-    With `NEST_AUTH_URL` set, or when `NEST_CONTROLLER_ADDRESS` names the hosted
-    Controller ([`config.HOSTED_CONTROLLER_ADDRESS`], whose sign-in is
-    [`config.HOSTED_AUTH_URL`]), the stored Nest session of that origin (see
-    [`login.ensure_session`]) is sent as a bearer token, and `NEST_PROJECT_ID` names
-    the Project the call runs in. Any other Controller receives no session. When the Controller requires a session and none is stored, an interactive
-    terminal signs in through the browser and the call is sent once more; nothing
-    ran the first time.
-    Otherwise the call is never retried. Only send trusted functions and accept results from
-    trusted hosts: deserializing Python objects can execute code.
+    With the hosted profile, with `NEST_AUTH_URL` set, or when
+    `NEST_CONTROLLER_ADDRESS` names a hosted Controller (see
+    [`config.is_hosted_controller`]), the stored Nest session of that origin (see
+    [`login.ensure_session`]) is sent as a bearer token. Any other Controller
+    receives no session. The call runs in `NEST_PROJECT_ID`, or, when it is unset,
+    in the Project [`project_selection.select_project`] chooses for this account
+    and Controller; the Controller authorizes it on every call. When the
+    Controller requires a session and none is stored, an interactive terminal
+    signs in through the browser and the call is sent once more; nothing ran the
+    first time. Otherwise the call is never retried. Only send trusted functions
+    and accept results from trusted hosts: deserializing Python objects can
+    execute code.
 
     Args:
         func (`Callable`): Function to serialize with cloudpickle.
@@ -219,7 +309,9 @@ def execute_remote(
         [`errors.AuthenticationRequiredError`]: If the Controller requires a Nest
             session and none was accepted.
         [`errors.RemoteAccessDeniedError`]: If the Controller's Project policy or
-            Provider refused the call.
+            Provider refused the call. A refused saved Project choice is forgotten.
+        [`errors.ProjectSelectionError`]: If `NEST_PROJECT_ID` is unset and no
+            Project can be chosen.
         [`login.AuthError`]: If signing in fails.
         [`errors.RpcTimeoutError`]: If the RPC deadline expires.
         [`errors.InfrastructureError`]: If the Controller reports a classified SSH or
@@ -253,44 +345,74 @@ def execute_remote(
     address, timeout = config.address, config.rpc_timeout
 
     logger.info(
-        "Calling controller address=%s tls=%s gpu=%s cpu=%s payload_bytes=%s",
+        "Calling controller address=%s profile=%s tls=%s gpu=%s cpu=%s payload_bytes=%s",
         address,
+        config.profile,
         config.tls,
         resources.gpu,
         resources.cpu,
         len(payload),
     )
 
+    session = _session(config, interactive=False)
+    choice: ProjectChoice | None = None
+
+    def attempt(stub, session) -> execution_pb2.ExecuteResponse:
+        nonlocal choice
+        token = session.access_token if session is not None else None
+        user_id = session.user_id if session is not None else None
+        # The Project is chosen before every call; the Controller authorizes it anew.
+        choice = select_project(config, channel, token, user_id)
+        project = choice.project_id if choice is not None else None
+        if choice is not None and choice.source != "NEST_PROJECT_ID":
+            logger.info("Running in Project project_id=%s source=%s", project, choice.source)
+        return stub.Execute(
+            request, timeout=timeout, metadata=call_metadata(config, token, project)
+        )
+
     # Connect to Controller
-    token = _access_token(config, interactive=False)
     try:
         with _channel(config) as channel:
             stub = execution_pb2_grpc.ExecutionServiceStub(channel)
             try:
-                response = stub.Execute(
-                    request, timeout=timeout, metadata=call_metadata(config, token)
-                )
+                response = attempt(stub, session)
             except grpc.RpcError as exc:
                 # Refused before anything ran, so one retry after signing in is safe.
                 if not (
                     cast(grpc.Call, exc).code() == grpc.StatusCode.UNAUTHENTICATED
-                    and token is None
+                    and session is None
                     and config.auth_url is not None
                     and sys.stdin.isatty()
                 ):
                     raise
-                token = _access_token(config, interactive=True)
-                response = stub.Execute(
-                    request, timeout=timeout, metadata=call_metadata(config, token)
-                )
+                session = _session(config, interactive=True)
+                response = attempt(stub, session)
 
     except grpc.RpcError as exc:
         # Errors raised by stub calls are also `grpc.Call`s, which carry the status.
         status = cast(grpc.Call, exc).code()
         logger.error("Controller RPC failed address=%s status=%s", address, status.name)
-        error = _controller_error(exc, address, timeout, auth_url=config.auth_url)
+        error = _controller_error(
+            exc, address, timeout, auth_url=config.auth_url, hosted=config.profile == "hosted"
+        )
         if error is None:
             raise
+        if (
+            isinstance(error, RemoteAccessDeniedError)
+            and choice is not None
+            and choice.source != "NEST_PROJECT_ID"
+        ):
+            forgotten = forget_refused(
+                config, session.user_id if session is not None else None, choice
+            )
+            error = RemoteAccessDeniedError(
+                f"{error} The Project was {choice.project_id} ({choice.source})"
+                + (
+                    "; that saved choice was forgotten, so the next call chooses again."
+                    if forgotten
+                    else "."
+                )
+            )
         raise error from exc
 
     logger.debug("Result received result_bytes=%s", len(response.result))

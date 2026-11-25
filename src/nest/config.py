@@ -88,8 +88,66 @@ serves plaintext gRPC that only the access-controlled Tailnet encrypts, so the S
 connects to it only when `NEST_CONTROLLER_ADDRESS` names it and
 `NEST_CONTROLLER_TLS=false` says so explicitly."""
 
-AUTH_URL_SOURCES = ("--url", "NEST_AUTH_URL", "hosted default")
-"""Where [`config.resolve_auth_url`] found the sign-in origin, highest precedence first."""
+HOSTED_GRPC_ADDRESS = "grpc.nest.cerulean.works:443"
+"""Public gRPC address of Cerulean-hosted Nest (H08): the Envoy gateway, reached over
+verified TLS with the system's public roots. The SDK uses it only under the hosted
+connection profile (see [`config.HostedProfile`]); it is not a default until
+[`config.HOSTED_PROFILE_DEFAULT`] is switched on after the H09 production sign-off."""
+
+HOSTED_PROFILE_DEFAULT = False
+"""Whether the hosted connection profile applies when nothing names a Controller.
+
+`False` until H09 (production rollout and security sign-off) approves the public
+endpoint: until then the SDK's default stays the local Controller
+([`config.DEFAULT_CONTROLLER_ADDRESS`]) and the hosted profile applies only with
+`NEST_PROFILE=hosted`. Switching it on is the one change that activates the hosted
+default; rolling it back is switching it off."""
+
+CONNECTION_PROFILES = ("hosted", "local")
+"""`NEST_PROFILE` values: `hosted` (Cerulean-hosted Nest over its public gateway) or
+`local` (the local Controller, or the one `NEST_CONTROLLER_ADDRESS` names)."""
+
+DEFAULT_HOSTED_KEEPALIVE = 30.0
+"""Seconds between HTTP/2 keepalive PINGs on a hosted connection, within a call
+(H06 contract: 30 to 60 seconds; the Controller accepts one every 20 seconds)."""
+
+MIN_KEEPALIVE = 20.0
+MAX_KEEPALIVE = 300.0
+
+
+@dataclass(frozen=True)
+class HostedProfile:
+    """
+    The first-party hosted connection profile (E08). Fixed in code: no environment
+    variable changes where it connects, which roots it trusts, or which sign-in
+    origin's session it sends, so a hosted session can only reach the hosted
+    Controller over verified TLS.
+
+    Attributes:
+        address (`str`): The public gateway, [`config.HOSTED_GRPC_ADDRESS`].
+        auth_url (`str`): The only sign-in origin whose session it sends,
+            [`config.HOSTED_AUTH_URL`].
+        keepalive (`float`): Default keepalive PING interval, in seconds.
+        root_certificates (`bytes | None`): PEM roots; `None` uses the system's
+            public roots. Only tests replace it, never configuration.
+    """
+
+    address: str = HOSTED_GRPC_ADDRESS
+    auth_url: str = HOSTED_AUTH_URL
+    keepalive: float = DEFAULT_HOSTED_KEEPALIVE
+    root_certificates: bytes | None = field(default=None, repr=False)
+
+
+HOSTED_PROFILE = HostedProfile()
+"""The hosted connection profile [`config.load_client_config`] applies."""
+
+AUTH_URL_SOURCES = ("--url", "NEST_AUTH_URL", "hosted default", "hosted profile")
+"""Where [`config.resolve_auth_url`] found the sign-in origin, highest precedence first;
+`hosted profile` is the SDK's hosted connection profile."""
+
+CLIENT_PROFILE_SOURCES = ("hosted", "local", "custom")
+"""[`config.ClientConfig.profile`]: the hosted profile, the default local
+Controller, or a Controller named by `NEST_CONTROLLER_ADDRESS`."""
 
 DEFAULT_RPC_TIMEOUT = 900.0
 DEFAULT_SSH_TIMEOUT = 60.0
@@ -785,6 +843,10 @@ DEFAULT_LIMIT_WALLTIME = "1-00:00:00"
 DEFAULT_LIMIT_SUBMISSIONS_PER_MINUTE = 30
 DEFAULT_LIMIT_ENVIRONMENT_BUILDS = 2
 BATCH_SCRIPT_MODES = ("trusted", "refuse")
+
+PUBLIC_GATEWAY_IDLE_TIMEOUT = 1200.0
+"""Seconds the public gateway (`deploy/public-grpc/envoy.yaml`, `stream_idle_timeout`)
+lets a call send nothing. A pilot `Execute` must answer before it (H06)."""
 """`NEST_LIMIT_BATCH_SCRIPTS`: how admission treats `SubmitJob` scripts, whose own
 `#SBATCH` directives Nest cannot bound."""
 MAX_LIMIT = 1_000_000
@@ -1003,6 +1065,10 @@ class ControllerConfig:
         rpc ([`config.RpcPolicy`]): gRPC listener bounds and abuse controls (H07).
         limits ([`config.AdmissionLimits`]): Admission limits the Execution
             Registry enforces (F02a); unused on the legacy path.
+        public_pilot (`bool`): `NEST_PUBLIC_PILOT`: this Controller is the origin of
+            the public gRPC gateway's bounded trusted pilot (H08). Loading the
+            configuration then fails unless every pilot requirement holds (see
+            [`config.PUBLIC_PILOT_REQUIREMENTS`]).
 
     `providers`, `default_provider`, and `provider` are deprecated read-only aliases
     of `platforms`, `default_platform`, and `platform`.
@@ -1034,6 +1100,7 @@ class ControllerConfig:
     execution_registry: str = "legacy"
     rpc: RpcPolicy = field(default_factory=RpcPolicy)
     limits: AdmissionLimits = field(default_factory=AdmissionLimits)
+    public_pilot: bool = False
     warnings: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -1104,6 +1171,7 @@ class ControllerConfig:
             "execution_registry": self.execution_registry,
             "rpc": self.rpc.summary(),
             "limits": self.limits.summary(),
+            "public_pilot": self.public_pilot,
         }
 
 
@@ -1125,6 +1193,16 @@ class ClientConfig:
             session and never starts a sign-in.
         auth_url_source (`str | None`): Where `auth_url` came from, one of
             [`config.AUTH_URL_SOURCES`].
+        profile (`str`): One of [`config.CLIENT_PROFILE_SOURCES`].
+        keepalive (`float`): Seconds between HTTP/2 keepalive PINGs during a call;
+            `0` sends none. `NEST_CONTROLLER_KEEPALIVE`, else
+            [`config.DEFAULT_HOSTED_KEEPALIVE`] for the hosted profile and `0`
+            otherwise.
+        tls_root_certificates (`bytes | None`): PEM roots of the hosted profile
+            (see [`config.HostedProfile`]); `None` everywhere else.
+        preferences_file (`str | None`): `NEST_PREFERENCES_FILE`, where the SDK
+            keeps each account's chosen Project (no secrets), by default
+            `$XDG_CONFIG_HOME/nest/preferences.json`.
     """
 
     address: str = DEFAULT_CONTROLLER_ADDRESS
@@ -1134,6 +1212,10 @@ class ClientConfig:
     project_id: str | None = None
     auth_url: str | None = None
     auth_url_source: str | None = None
+    profile: str = "local"
+    keepalive: float = 0.0
+    tls_root_certificates: bytes | None = field(default=None, repr=False)
+    preferences_file: str | None = None
 
 
 class _Reader:
@@ -2094,6 +2176,22 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
     )
     rpc = _rpc_policy(reader, bind, auth, executor)
     limits = _admission_limits(reader)
+    public_pilot = reader.boolean("NEST_PUBLIC_PILOT")
+    if public_pilot and not reader.problems:
+        _check_public_pilot(
+            reader,
+            auth=auth,
+            executor=executor,
+            execution_registry=execution_registry,
+            limits=limits,
+            rpc=rpc,
+            allowed_projects=allowed_projects,
+            provider_approvals=provider_approvals,
+            tls=tls,
+            allow_plaintext=allow_plaintext,
+            environment_timeout=float(timeouts["environment_timeout"] or 0),
+            result_timeout=float(timeouts["result_timeout"] or 0),
+        )
     _reserved(reader)
 
     if reader.problems:
@@ -2119,6 +2217,7 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
         execution_registry=execution_registry,
         rpc=rpc,
         limits=limits,
+        public_pilot=public_pilot,
         **timeouts,
     )
 
@@ -2496,6 +2595,103 @@ def _rpc_policy(reader: _Reader, bind: str, auth: str, executor: str) -> RpcPoli
     )
 
 
+PUBLIC_PILOT_REQUIREMENTS = (
+    "NEST_CONTROLLER_AUTH=session",
+    "NEST_EXECUTOR=slurm",
+    "NEST_EXECUTION_REGISTRY=required",
+    "NEST_LIMIT_BATCH_SCRIPTS=refuse",
+    "NEST_GRPC_ALLOWED_PEERS set to the gateway's private network (no default route)",
+    "NEST_GRPC_TRUSTED_PROXIES set, inside NEST_GRPC_ALLOWED_PEERS",
+    "NEST_GRPC_RATE_LIMIT_PER_PEER and NEST_GRPC_RATE_LIMIT_PER_USER above 0",
+    "NEST_GRPC_MAX_MESSAGE_BYTES at most the gateway's 4 MiB",
+    "no wildcard NEST_PROVIDER_ALLOWED_PROJECTS",
+    "TLS, or NEST_CONTROLLER_ALLOW_PLAINTEXT=true for the gateway's private network",
+    "NEST_ENVIRONMENT_TIMEOUT plus NEST_RESULT_TIMEOUT under the gateway idle timeout",
+)
+"""What `NEST_PUBLIC_PILOT=true` requires (H08); each unmet one is a configuration error."""
+
+
+def _network_inside(network: Network, networks: tuple[Network, ...]) -> bool:
+    """Whether `network` lies within one of `networks` of the same IP version."""
+    for outer in networks:
+        if isinstance(network, IPv4Network) and isinstance(outer, IPv4Network):
+            if network.subnet_of(outer):
+                return True
+        elif (
+            isinstance(network, IPv6Network)
+            and isinstance(outer, IPv6Network)
+            and network.subnet_of(outer)
+        ):
+            return True
+    return False
+
+
+def _check_public_pilot(
+    reader: _Reader,
+    *,
+    auth: str,
+    executor: str,
+    execution_registry: str,
+    limits: AdmissionLimits,
+    rpc: RpcPolicy,
+    allowed_projects: frozenset[str],
+    provider_approvals: str,
+    tls: TLSConfig | None,
+    allow_plaintext: bool,
+    environment_timeout: float,
+    result_timeout: float,
+) -> None:
+    """
+    Fails closed unless the Controller is fit to be the public gateway's origin for
+    the bounded trusted pilot (H08): every call is authenticated and admitted
+    through the Execution Registry under its limits, batch scripts are refused,
+    only the gateway's network may connect and its `x-forwarded-for` alone is
+    trusted, rate limits are on, no Project is approved by wildcard, and a blocking
+    `Execute` ends before the gateway's idle timeout cuts it.
+    """
+    prefix = "NEST_PUBLIC_PILOT=true requires"
+    if auth != "session":
+        reader.fail(f"{prefix} NEST_CONTROLLER_AUTH=session")
+    if executor != "slurm":
+        reader.fail(f"{prefix} NEST_EXECUTOR=slurm")
+    if execution_registry != "required":
+        reader.fail(f"{prefix} NEST_EXECUTION_REGISTRY=required (registry-backed admission)")
+    if limits.batch_scripts != "refuse":
+        reader.fail(f"{prefix} NEST_LIMIT_BATCH_SCRIPTS=refuse")
+    if not rpc.allowed_peers:
+        reader.fail(f"{prefix} NEST_GRPC_ALLOWED_PEERS (the gateway's private network)")
+    elif any(network.prefixlen == 0 for network in rpc.allowed_peers):
+        reader.fail(f"{prefix} NEST_GRPC_ALLOWED_PEERS without a default route such as 0.0.0.0/0")
+    if not rpc.trusted_proxies:
+        reader.fail(f"{prefix} NEST_GRPC_TRUSTED_PROXIES (the gateway's address)")
+    elif not all(_network_inside(proxy, rpc.allowed_peers) for proxy in rpc.trusted_proxies):
+        reader.fail(
+            f"{prefix} every NEST_GRPC_TRUSTED_PROXIES network inside NEST_GRPC_ALLOWED_PEERS"
+        )
+    if rpc.peer_rate <= 0 or rpc.user_rate <= 0:
+        reader.fail(
+            f"{prefix} NEST_GRPC_RATE_LIMIT_PER_PEER and NEST_GRPC_RATE_LIMIT_PER_USER above 0"
+        )
+    if rpc.max_message_bytes > DEFAULT_GRPC_MAX_MESSAGE_BYTES:
+        reader.fail(
+            f"{prefix} NEST_GRPC_MAX_MESSAGE_BYTES at most {DEFAULT_GRPC_MAX_MESSAGE_BYTES}, "
+            "the gateway's message limit"
+        )
+    if provider_approvals == "environment" and ALL_PROJECTS in allowed_projects:
+        reader.fail(f"{prefix} explicit NEST_PROVIDER_ALLOWED_PROJECTS, not '*'")
+    if tls is None and not allow_plaintext:
+        reader.fail(
+            f"{prefix} TLS, or NEST_CONTROLLER_ALLOW_PLAINTEXT=true on the gateway's private network"
+        )
+    longest = environment_timeout + result_timeout
+    if longest >= PUBLIC_GATEWAY_IDLE_TIMEOUT:
+        reader.fail(
+            f"{prefix} NEST_ENVIRONMENT_TIMEOUT plus NEST_RESULT_TIMEOUT below "
+            f"{PUBLIC_GATEWAY_IDLE_TIMEOUT:g} seconds, the gateway's idle timeout "
+            f"(now {longest:g})"
+        )
+
+
 def _admission_limits(reader: _Reader) -> AdmissionLimits:
     """Reads the `NEST_LIMIT_*` admission limits (F02a); every one is a positive bound."""
     walltime_raw = reader.get("NEST_LIMIT_WALLTIME") or DEFAULT_LIMIT_WALLTIME
@@ -2553,6 +2749,20 @@ def load_client_config(environ: Mapping[str, str] | None = None) -> ClientConfig
     """
     Reads and validates the SDK client settings.
 
+    The Controller is chosen in this order:
+
+    1. `NEST_PROFILE=hosted`: the hosted connection profile ([`config.HOSTED_PROFILE`]),
+       verified TLS to [`config.HOSTED_GRPC_ADDRESS`] with the hosted session. It
+       cannot be combined with `NEST_CONTROLLER_ADDRESS`, `NEST_CONTROLLER_TLS`,
+       `NEST_CONTROLLER_TLS_CA_FILE` or another `NEST_AUTH_URL`.
+    2. `NEST_CONTROLLER_ADDRESS`: a custom (self-hosted or local) Controller, as
+       before. A non-loopback address needs an explicit `NEST_CONTROLLER_TLS` or
+       CA file. Naming the hosted gateway's address applies the hosted profile's
+       rules: TLS with public roots only, and only the hosted session.
+    3. Otherwise the hosted profile when [`config.HOSTED_PROFILE_DEFAULT`] is on
+       (after H09) and `NEST_PROFILE` is not `local`, else
+       [`config.DEFAULT_CONTROLLER_ADDRESS`].
+
     Args:
         environ (`Mapping[str, str]`, *optional*): Environment. Defaults to `os.environ`.
 
@@ -2563,23 +2773,24 @@ def load_client_config(environ: Mapping[str, str] | None = None) -> ClientConfig
         [`config.ConfigError`]: Listing every invalid setting.
     """
     reader = _Reader(environ)
-    address = reader.address("NEST_CONTROLLER_ADDRESS", DEFAULT_CONTROLLER_ADDRESS)
-    address_is_valid = not reader.problems
-    timeout = reader.seconds("NEST_RPC_TIMEOUT", DEFAULT_RPC_TIMEOUT)
-    ca_file = reader.readable_file("NEST_CONTROLLER_TLS_CA_FILE")
-    tls = reader.boolean("NEST_CONTROLLER_TLS", default=ca_file is not None)
-    if (
-        address_is_valid
-        and ca_file is None
-        and reader.get("NEST_CONTROLLER_TLS") is None
-        and not _is_loopback_address(address)
-    ):
-        reader.fail(
-            "Non-loopback NEST_CONTROLLER_ADDRESS requires an explicit NEST_CONTROLLER_TLS "
-            "setting (true or false) or NEST_CONTROLLER_TLS_CA_FILE"
+    profile_choice = reader.get("NEST_PROFILE")
+    if profile_choice is not None:
+        profile_choice = profile_choice.lower()
+        if profile_choice not in CONNECTION_PROFILES:
+            reader.fail(f"NEST_PROFILE must be one of {', '.join(CONNECTION_PROFILES)}")
+            profile_choice = None
+    endpoint_settings = [
+        name
+        for name in (
+            "NEST_CONTROLLER_ADDRESS",
+            "NEST_CONTROLLER_TLS",
+            "NEST_CONTROLLER_TLS_CA_FILE",
         )
-    if ca_file and not tls:
-        reader.fail("NEST_CONTROLLER_TLS_CA_FILE is set but NEST_CONTROLLER_TLS is false")
+        if reader.get(name) is not None
+    ]
+    hosted = HOSTED_PROFILE
+    address_is_valid = True
+    timeout = reader.seconds("NEST_RPC_TIMEOUT", DEFAULT_RPC_TIMEOUT)
     project_id = reader.get("NEST_PROJECT_ID")
     if project_id is not None:
         try:
@@ -2587,9 +2798,79 @@ def load_client_config(environ: Mapping[str, str] | None = None) -> ClientConfig
         except ValueError:
             reader.fail("NEST_PROJECT_ID must be a Project ID (a UUID)")
             project_id = None
-    auth_url, source = resolve_auth_url(
-        reader, hosted=address_is_valid and is_hosted_controller(address)
+    preferences = reader.get("NEST_PREFERENCES_FILE") or default_preferences_file(reader.environ)
+    if not os.path.isabs(preferences):
+        reader.fail(f"NEST_PREFERENCES_FILE must be an absolute path, got {preferences!r}")
+
+    use_hosted = profile_choice == "hosted" or (
+        HOSTED_PROFILE_DEFAULT and profile_choice is None and not endpoint_settings
     )
+    if use_hosted:
+        if profile_choice == "hosted" and endpoint_settings:
+            reader.fail(
+                "NEST_PROFILE=hosted fixes the Controller and its TLS settings; unset "
+                f"{', '.join(endpoint_settings)}, or unset NEST_PROFILE to use a custom "
+                "Controller"
+            )
+        address, tls, ca_file, roots = hosted.address, True, None, hosted.root_certificates
+        profile = "hosted"
+    else:
+        before = len(reader.problems)
+        address = reader.address("NEST_CONTROLLER_ADDRESS", DEFAULT_CONTROLLER_ADDRESS)
+        address_is_valid = len(reader.problems) == before
+        ca_file = reader.readable_file("NEST_CONTROLLER_TLS_CA_FILE")
+        tls = reader.boolean("NEST_CONTROLLER_TLS", default=ca_file is not None)
+        roots = None
+        if (
+            address_is_valid
+            and ca_file is None
+            and reader.get("NEST_CONTROLLER_TLS") is None
+            and not _is_loopback_address(address)
+        ):
+            reader.fail(
+                "Non-loopback NEST_CONTROLLER_ADDRESS requires an explicit NEST_CONTROLLER_TLS "
+                "setting (true or false) or NEST_CONTROLLER_TLS_CA_FILE"
+            )
+        if ca_file and not tls:
+            reader.fail("NEST_CONTROLLER_TLS_CA_FILE is set but NEST_CONTROLLER_TLS is false")
+        profile = "custom" if reader.get("NEST_CONTROLLER_ADDRESS") is not None else "local"
+        if address_is_valid and is_hosted_gateway(address):
+            # The hosted gateway by name: the hosted profile's transport rules hold.
+            if not tls:
+                reader.fail(
+                    f"{hosted.address} serves only verified TLS: set NEST_CONTROLLER_TLS=true "
+                    "(Nest never sends a session to it in plaintext)"
+                )
+            if ca_file is not None:
+                reader.fail(
+                    f"{hosted.address} is verified with the system's public roots; unset "
+                    "NEST_CONTROLLER_TLS_CA_FILE"
+                )
+            address, roots, profile = hosted.address, hosted.root_certificates, "hosted"
+
+    if profile == "hosted":
+        explicit = reader.get("NEST_AUTH_URL")
+        if explicit:
+            try:
+                if normalize_auth_url(explicit) != hosted.auth_url:
+                    reader.fail(
+                        f"The hosted Controller accepts only sessions from {hosted.auth_url}; "
+                        "unset NEST_AUTH_URL, or name your own Controller with "
+                        "NEST_CONTROLLER_ADDRESS"
+                    )
+            except ValueError as exc:
+                reader.fail(f"NEST_AUTH_URL {exc}; got {explicit!r}")
+        auth_url, source = hosted.auth_url, "hosted profile"
+        if timeout > PUBLIC_GATEWAY_IDLE_TIMEOUT:
+            reader.fail(
+                f"NEST_RPC_TIMEOUT must be at most {PUBLIC_GATEWAY_IDLE_TIMEOUT:g} seconds with "
+                "the hosted Controller, whose gateway ends a call that is silent for longer"
+            )
+    else:
+        auth_url, source = resolve_auth_url(
+            reader, hosted=address_is_valid and is_hosted_controller(address)
+        )
+    keepalive = _keepalive(reader, hosted.keepalive if profile == "hosted" else 0.0)
     if reader.problems:
         raise ConfigError(reader.problems)
     return ClientConfig(
@@ -2600,14 +2881,51 @@ def load_client_config(environ: Mapping[str, str] | None = None) -> ClientConfig
         project_id=project_id,
         auth_url=auth_url,
         auth_url_source=source,
+        profile=profile,
+        keepalive=keepalive,
+        tls_root_certificates=roots,
+        preferences_file=preferences,
     )
 
 
-def is_hosted_controller(address: str) -> bool:
-    """Whether `address` (`host:port`) names [`config.HOSTED_CONTROLLER_ADDRESS`]."""
+def _keepalive(reader: _Reader, default: float) -> float:
+    """Reads `NEST_CONTROLLER_KEEPALIVE`: `0`, or 20 to 300 seconds."""
+    raw = reader.get("NEST_CONTROLLER_KEEPALIVE")
+    if raw is None:
+        return default
+    value = reader.seconds("NEST_CONTROLLER_KEEPALIVE", default, allow_zero=True)
+    if value and not MIN_KEEPALIVE <= value <= MAX_KEEPALIVE:
+        reader.fail(
+            f"NEST_CONTROLLER_KEEPALIVE must be 0 (off) or {MIN_KEEPALIVE:g} to "
+            f"{MAX_KEEPALIVE:g} seconds: the Controller refuses PINGs more often than every "
+            "20 seconds"
+        )
+        return default
+    return value
+
+
+def default_preferences_file(environ: Mapping[str, str] | None = None) -> str:
+    """Returns `$XDG_CONFIG_HOME/nest/preferences.json`, or under `~/.config`."""
+    return os.path.join(os.path.dirname(default_credentials_file(environ)), "preferences.json")
+
+
+def is_hosted_gateway(address: str) -> bool:
+    """Whether `address` (`host:port`) names the hosted public gateway of
+    [`config.HOSTED_PROFILE`]."""
+    return _same_address(address, HOSTED_PROFILE.address)
+
+
+def _same_address(address: str, expected: str) -> bool:
     host, _, port = address.strip().rpartition(":")
-    hosted_host, _, hosted_port = HOSTED_CONTROLLER_ADDRESS.rpartition(":")
-    return host.lower().removesuffix(".") == hosted_host and port == hosted_port
+    expected_host, _, expected_port = expected.rpartition(":")
+    return host.lower().removesuffix(".") == expected_host and port == expected_port
+
+
+def is_hosted_controller(address: str) -> bool:
+    """Whether `address` (`host:port`) names a Cerulean-hosted Controller: the
+    Tailnet [`config.HOSTED_CONTROLLER_ADDRESS`] or the public gateway of
+    [`config.HOSTED_PROFILE`]. Only those receive the hosted session."""
+    return _same_address(address, HOSTED_CONTROLLER_ADDRESS) or is_hosted_gateway(address)
 
 
 def resolve_auth_url(

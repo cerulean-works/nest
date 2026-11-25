@@ -15,6 +15,9 @@ service ExecutionService {
 
     // Requests cancellation of a Slurm job without waiting for it to stop.
     rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
+
+    // Lists the caller's Projects this Controller would accept an execution from now.
+    rpc ListEligibleProjects(ListEligibleProjectsRequest) returns (ListEligibleProjectsResponse);
 }
 
 message ExecuteRequest {
@@ -64,3 +67,16 @@ message CancelJobRequest {
 }
 
 message CancelJobResponse {}
+message ListEligibleProjectsRequest {}
+
+message EligibleProject {
+    string id = 1;
+    string name = 2;
+    string role = 3;
+}
+
+message ListEligibleProjectsResponse {
+    repeated EligibleProject projects = 1;
+    // False when the Controller does not authenticate callers, so no Project applies.
+    bool projects_required = 2;
+}

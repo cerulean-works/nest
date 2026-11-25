@@ -71,6 +71,19 @@ jobs:
             echo "NEST_TEST_TLS_CA_FILE=$certs/ca.crt"
             echo "NEST_TEST_TLS_OTHER_CA_FILE=$certs/other-ca.crt"
           } >> "$GITHUB_ENV"
+      # The public gRPC gateway tests (tests/test_public_gateway.py) run the real
+      # Envoy of compose.dokploy.yaml in front of the Controller; the binary is
+      # copied out of the same pinned image, which is never started.
+      - name: Extract Envoy for the public gateway tests
+        run: |
+          docker create --name envoy-binary envoyproxy/envoy:v1.36.2
+          docker cp envoy-binary:/usr/local/bin/envoy "$RUNNER_TEMP/envoy"
+          docker rm envoy-binary
+          "$RUNNER_TEMP/envoy" --version
+          {
+            echo "NEST_TEST_ENVOY=$RUNNER_TEMP/envoy"
+            echo "NEST_TEST_ENVOY_REQUIRED=1"
+          } >> "$GITHUB_ENV"
       - name: Install Chromium for the real-browser tests
         run: uv run --frozen playwright install --with-deps chromium
       # Eight pytest-xdist workers: the suite mostly waits on subprocesses, servers and

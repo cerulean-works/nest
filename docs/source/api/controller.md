@@ -17,6 +17,7 @@ are set, bounded and guarded as described in
 | `GetJobStatus` | `job_id` (int64) | `state` (string) |
 | `SubmitJob` | `workdir`, `script`, `account`, `partition`, `time` (strings), `gpu` and `cpu` (int32), `script_args` (repeated string) | `job_id` (int64) |
 | `CancelJob` | `job_id` (int64) | Empty response |
+| `ListEligibleProjects` | Empty | `projects` (repeated `id`, `name`, `role`), `projects_required` (bool) |
 
 `environment` contains `pyproject_toml` and `uv_lock` bytes. When supplied, both
 must be nonempty. `gpu` and `cpu` must not be negative; `0` omits the Slurm flag.
@@ -25,12 +26,19 @@ verbatim as one argument, so an element is never an `sbatch` option. Slurm job
 operations require a configured backend, even when `Execute` uses local mode.
 Cancellation requests do not wait for a job to stop.
 
+`ListEligibleProjects` answers which of the caller's Projects this Controller would
+accept a submission from now (role, Provider approval and the served Platform's
+grant), for the SDK's [Project selection](../project-selection). It only reads,
+records no per-Project refusal, and is advice: every submission is authorized
+again. Without session authentication it answers `projects_required: false`.
+
 ## Request metadata
 
 | Key | Value |
 | --- | --- |
 | `authorization` | `Bearer <access token>` of a Nest CLI session. Required with `NEST_CONTROLLER_AUTH=session`. |
-| `x-nest-project-id` | The Project a submission (`Execute`, `SubmitJob`) runs in. Required with session authentication. |
+| `x-nest-project-id` | The Project a submission (`Execute`, `SubmitJob`) runs in. Required with session authentication. The SDK sends `NEST_PROJECT_ID`, or the Project it [selected](../project-selection). |
+| `x-forwarded-for` | Read only from a peer in `NEST_GRPC_TRUSTED_PROXIES` (the public gateway), for rate limits, logs and the `client_address` of audit records. |
 | `x-nest-request-id` | Optional 32-character hex correlation ID, used in logs and audit records. |
 | `x-nest-platform` | Optional HPC Platform slug or ID for a registry-backed submission. It must be eligible for the Project; it is refused, never replaced. |
 | `x-nest-idempotency-key` | Optional key (1 to 200 printable ASCII characters) that makes a registry-backed submission idempotent for its owner and Project. |

@@ -31,16 +31,14 @@ from __future__ import annotations
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Generator, Iterable
-from contextlib import contextmanager
-from contextvars import ContextVar
+from collections.abc import Callable, Iterable
 from ipaddress import IPv4Address, IPv6Address, ip_address
 from typing import Any
 
 import grpc
 from google.protobuf.message import DecodeError
 
-from ._logging import get_logger
+from ._logging import client_context, current_client, get_logger
 from .config import Network, RpcPolicy
 from .errors import ERROR_KIND_METADATA
 
@@ -63,14 +61,7 @@ ORIGIN_KIND = "origin_not_allowed"
 MAX_TRACKED_KEYS = 10_000
 """Most rate-limit buckets kept at once; the least recently used is dropped first."""
 
-_client: ContextVar[str] = ContextVar("nest_rpc_client", default="-")
-
 Address = IPv4Address | IPv6Address
-
-
-def current_client() -> str:
-    """The client address of the RPC being served, for logs and audit; `-` outside one."""
-    return _client.get()
 
 
 def server_options(policy: RpcPolicy) -> list[tuple[str, Any]]:
@@ -267,7 +258,7 @@ class RpcGuard(grpc.ServerInterceptor):
             except DecodeError, ValueError:
                 context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Malformed request message")
                 raise AssertionError("context.abort raises") from None
-            with _client_context(client):
+            with client_context(client):
                 return behavior(request, context)
 
         return grpc.unary_unary_rpc_method_handler(
@@ -275,12 +266,3 @@ class RpcGuard(grpc.ServerInterceptor):
             request_deserializer=None,
             response_serializer=handler.response_serializer,
         )
-
-
-@contextmanager
-def _client_context(client: str) -> Generator[None]:
-    token = _client.set(client)
-    try:
-        yield
-    finally:
-        _client.reset(token)
