@@ -23,6 +23,12 @@ For the current team deployment, restrict network access using Tailscale Grants 
 
 Do not expose the Controller directly to the public Internet.
 
+[Public API security and abuse controls](public-api-security) describes the
+Controller-side bounds, rate limits and origin checks (H07), and
+[Admission limits](admission-limits) the per-User, per-Project and per-Platform
+quotas (F02a). They limit abuse by authenticated, trusted callers; they do not make
+it safe to run untrusted code.
+
 The [shared Tailscale deployment](tailscale-shared) exposes only TCP 50051 to
 accepted, policy-authorized recipients. All callers still submit work as the
 Controller's single HPC SSH user. Node Sharing and Grants restrict network

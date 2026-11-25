@@ -32,6 +32,12 @@ except ConfigError as error:
 
 [[autodoc]] config.ControllerConfig
 
+[[autodoc]] config.RpcPolicy
+
+[[autodoc]] config.AdmissionLimits
+
+[[autodoc]] config.slurm_time_seconds
+
 [[autodoc]] config.PlatformProfile
 
 [[autodoc]] config.LoginNode

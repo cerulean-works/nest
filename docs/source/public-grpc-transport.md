@@ -376,6 +376,9 @@ public address.
 
 This is a proposal for review and is not implemented here. H07 owns the public
 gateway, F02a the access policy, H08 the audit fields and E08 the SDK default.
+The Controller side of the keepalive, message-size, origin and header-trust
+points is implemented by H07; see
+[Public API security and abuse controls](public-api-security).
 
 - **Address:** `grpc.<domain>:443`, using TLS 1.2+ (1.3 preferred) and ALPN `h2`
   only. Certificates come from a public WebPKI CA. Clients verify with system

@@ -53,6 +53,8 @@ guide:
         title: Map Slurm accounts to Projects
       - local: execution-registry
         title: Admit submissions through the Execution Registry
+      - local: admission-limits
+        title: Admission limits for the trusted pilot (F02a)
       - local: platform-admin
         title: Bootstrap and recover platform administration
       - local: privileged-api
@@ -63,6 +65,8 @@ guide:
         title: Deployment validation and roadmap
       - local: public-grpc-transport
         title: Public gRPC transport feasibility (H06)
+      - local: public-api-security
+        title: Public API security and abuse controls (H07)
   - title: Contributing
     sections:
       - local: developing
