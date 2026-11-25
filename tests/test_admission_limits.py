@@ -11,6 +11,7 @@ oversubscribe a limit; and a reservation is released only by its attempt reachin
 a final state, never by a timeout, a lost RPC, a restart or an unknown outcome.
 """
 
+import dataclasses
 import os
 import secrets
 import threading
@@ -27,7 +28,7 @@ import cloudpickle
 import grpc
 import psycopg
 from fake_hpc import FakeHpc
-from test_registry_admission import _Base, browser
+from test_registry_admission import OPS, _Base, browser
 
 from nest.admission import (
     AdmissionRefusedError,
@@ -56,7 +57,14 @@ from nest.db.executions import (
     check_request_limits,
 )
 from nest.db.identity import lock_session_family
-from nest.errors import ExecutionTimeoutError, SlurmJobError, SSHError, SubmissionUnknownError
+from nest.errors import (
+    ExecutionTimeoutError,
+    RemoteCommandError,
+    ResultTooLargeError,
+    SlurmJobError,
+    SSHError,
+    SubmissionUnknownError,
+)
 from nest.proto import execution_pb2
 
 LIMITS = AdmissionLimits(
@@ -964,6 +972,112 @@ class EnvironmentBuildLifecycleTests(_LimitsBase):
         self.execute_with_environment()
         self.assertEqual(self.held(), [])
         self.mocks["build_environment"].assert_not_called()
+
+
+class BoundedResultTests(_LimitsBase):
+    """The worker's result is never read into the Controller past the RPC bound."""
+
+    LIMIT = 4096
+
+    def bounded_backend(self) -> SlurmBackend:
+        return SlurmBackend(dataclasses.replace(self.backend.config, max_result_bytes=self.LIMIT))
+
+    def serve_bounded(self):
+        backend = self.bounded_backend()
+        admission = RegistryAdmission(
+            self.db, backend, self.profile, self.platform_id, audit=self.audit, limits=LIMITS
+        )
+        self.stub = self.serve(admission, backend)
+
+    def test_oversized_slurm_result_is_refused_unread_and_settled(self):
+        self.serve_bounded()
+        error = self.refused(lambda: self.execute(lambda: b"x" * 200_000))
+        self.assertEqual(error.code(), grpc.StatusCode.RESOURCE_EXHAUSTED)
+        self.assertEqual(dict(error.trailing_metadata())["nest-error-kind"], "result_too_large")
+        # The download asked the login node for at most one byte past the bound.
+        commands = [c["argv"][-1] for c in self.hpc.calls("ssh")]
+        downloads = [c for c in commands if "output.pkl" in c]
+        self.assertTrue(downloads)
+        self.assertTrue(all(f"head -c {self.LIMIT + 1} " in c for c in downloads), downloads)
+        # The job completed, so the attempt is settled and its reservation released.
+        [attempt] = self.attempts()
+        self.assertEqual((attempt["status"], attempt["error_kind"]), ("failed", "result_too_large"))
+        self.assertEqual(self.held(), [])
+        # The result stays on the cluster.
+        [execution] = self.sql("SELECT execution_id FROM executions")
+        output = self.hpc.base / "jobs" / execution["execution_id"] / "output.pkl"
+        self.assertGreater(output.stat().st_size, self.LIMIT)
+
+    def test_result_within_the_bound_is_returned(self):
+        self.serve_bounded()
+        self.assertEqual(self.execute(lambda: b"y" * 1000), b"y" * 1000)
+
+    def test_an_endless_stream_is_cut_at_the_bound(self):
+        backend = self.bounded_backend()
+        with self.assertRaises(ResultTooLargeError):
+            backend._ssh_bounded("yes", self.LIMIT)  # never ends on its own
+
+    def test_error_output_is_bounded_too(self):
+        backend = self.bounded_backend()
+        with self.assertRaises(RemoteCommandError) as caught:
+            backend._ssh_bounded("head -c 20000000 /dev/zero | tr '\\0' e >&2; exit 3", 10)
+        self.assertLess(len(str(caught.exception)), 200_000)
+
+    def test_error_after_partial_output_keeps_its_status(self):
+        backend = self.bounded_backend()
+        with self.assertRaises(RemoteCommandError):
+            backend._ssh_bounded("printf abc; exit 4", self.LIMIT)
+        self.assertEqual(backend._ssh_bounded("printf abc", self.LIMIT), b"abc")
+
+
+class BuildAccountTests(_LimitsBase):
+    """An environment build is charged to the account authorized for the attempt."""
+
+    def setUp(self):
+        super().setUp()
+        env_dir = f"{self.hpc.base}/environments/{ENV_ID}"
+        for name, value in (("stage_environment_bytes", env_dir), ("environment_ready", False)):
+            patcher = mock.patch.object(SlurmBackend, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        # The build job is recorded failed without running, so no real build runs.
+        self.hpc.hold_jobs("FAILED")
+
+    def execute_with_environment(self, **extra):
+        return self.refused(
+            lambda: self.stub.Execute(
+                execution_pb2.ExecuteRequest(
+                    payload=b"x",
+                    environment=execution_pb2.EnvironmentFiles(
+                        pyproject_toml=b"[project]\nname='x'\n", uv_lock=b"version = 1\n"
+                    ),
+                ),
+                timeout=60,
+                metadata=self.metadata(**extra),
+            )
+        )
+
+    def test_cold_cache_build_is_charged_to_the_projects_account(self):
+        # The Profile's default account (legacy-acct) is not linked to the Project;
+        # its default account is `proj`.
+        self.execute_with_environment()
+        [build] = self.sbatch_calls()
+        self.assertEqual(Path(build["script"]).name, "environment-smoke.sbatch")
+        self.assertIn("--account=proj", build["flags"])
+        self.assertIn("--partition=dev", build["flags"])
+        self.assertNotIn("--account=legacy-acct", build["flags"])
+        [attempt] = self.attempts()
+        self.assertEqual(attempt["slurm_account"], "proj")
+
+    def test_unlinked_account_refuses_before_any_build(self):
+        self.accounts.unlink_project(self.project, self.platform_id, "proj", **OPS)
+        self.accounts.unlink_project(self.project, self.platform_id, "spare", **OPS)
+        error = self.execute_with_environment()
+        self.assertIn(
+            error.code(), (grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.FAILED_PRECONDITION)
+        )
+        self.assert_nothing_sent()
+        self.assertEqual(self.attempts(), [])
 
 
 class LimitConfigTests(unittest.TestCase):

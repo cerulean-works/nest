@@ -99,7 +99,12 @@ from .db.platforms import (
     Platform,
     PlatformNotFoundError,
 )
-from .errors import InfrastructureError, SlurmJobError, SubmissionUnknownError
+from .errors import (
+    InfrastructureError,
+    ResultTooLargeError,
+    SlurmJobError,
+    SubmissionUnknownError,
+)
 
 logger = get_logger("nest.admission")
 
@@ -908,15 +913,16 @@ class RegistryAdmission:
 
         Before the worker's `sbatch` (`submitted=False`) every error is a known
         failure, except [`errors.SubmissionUnknownError`], which leaves the attempt
-        `unknown`. Afterwards only a Slurm job failure settles the attempt; a timeout
-        or a lost status query leaves it `submitted`, since the job may still run.
+        `unknown`. Afterwards only a Slurm job failure, or a result too large to
+        return from a job that completed, settles the attempt; a timeout or a lost
+        status query leaves it `submitted`, since the job may still run.
         """
         kind = exc.kind if isinstance(exc, InfrastructureError) else "internal"
         job_id = exc.job_id if isinstance(exc, InfrastructureError) else None
         message = str(exc)
         if isinstance(exc, SubmissionUnknownError) and not submitted:
             status = "unknown"
-        elif not submitted or isinstance(exc, SlurmJobError):
+        elif not submitted or isinstance(exc, (SlurmJobError, ResultTooLargeError)):
             status = "failed"
         else:
             logger.warning(

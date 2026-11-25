@@ -63,6 +63,7 @@ parsing messages:
 | `origin_not_allowed` | `PERMISSION_DENIED` |
 | `limit_environment_builds` | `RESOURCE_EXHAUSTED` |
 | `client_gone` | `CANCELLED` |
+| `result_too_large` | `RESOURCE_EXHAUSTED` |
 
 Admission limits ([Admission limits](../admission-limits)) answer
 `RESOURCE_EXHAUSTED` or `FAILED_PRECONDITION` with the limit's reason in the

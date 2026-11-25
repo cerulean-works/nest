@@ -541,7 +541,13 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 logger.info("Preparing Python environment")
                 try:
                     env_dir = backend.prepare_environment_bytes(
-                        pyproject_toml=env.pyproject_toml, uv_lock=env.uv_lock, progress=build
+                        pyproject_toml=env.pyproject_toml,
+                        uv_lock=env.uv_lock,
+                        progress=build,
+                        # The account and partition authorized and recorded for
+                        # this attempt, never the Profile's defaults.
+                        account=admission.account,
+                        partition=admission.partition,
                     )
                 except (InfrastructureError, RuntimeError, ValueError) as exc:
                     if build.may_be_running and not isinstance(exc, SlurmJobError):
@@ -1096,6 +1102,8 @@ def build_backend(config: ControllerConfig) -> SlurmBackend | None:
             blocked_timeout=config.pending_blocked_timeout,
             limit_timeout=config.pending_limit_timeout,
             cancel_blocked=config.cancel_blocked_jobs,
+            # Room for the ExecuteResponse envelope (a tag and a length varint).
+            max_result_bytes=config.rpc.max_message_bytes - 16,
         )
     )
 

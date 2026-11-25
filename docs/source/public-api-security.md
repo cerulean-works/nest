@@ -72,6 +72,7 @@ the network-level controls: the Controller still publishes no port, and the
 | Bound | Default | Why |
 | --- | --- | --- |
 | Message size, both directions, after decompression | 4 MiB | gRPC's default, which the SDK also uses; a 5 KiB gzip request that inflates past the limit is refused unread. Raise it only with the SDK and the gateway together (H06 contract). |
+| Worker result downloaded from the cluster | the message size, less 16 bytes of envelope | The login node is asked for at most one byte past the bound (`head -c`), the Controller reads no further, kills SSH, and answers `RESOURCE_EXHAUSTED` with `nest-error-kind: result_too_large`. The job completed, so its attempt is settled `failed` (`result_too_large`) and its reservation released; the result stays in the execution directory. Standard error of that download is kept to 64 KiB. |
 | Request metadata | 16 KiB | A session token, Project and request ID are well under 1 KiB. |
 | RPC worker threads | 4 | Unchanged from before H07. |
 | RPCs running or queued | 32 | Excess calls are refused at once instead of queueing without limit; memory is bounded by this times the message size. |

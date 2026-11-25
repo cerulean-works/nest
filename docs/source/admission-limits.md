@@ -53,6 +53,7 @@ Limits count what Slurm is asked to allocate, not only the counts in the RPC.
   before the worker, within the same attempt. Since admission cannot know in
   advance whether the cache is warm, it reserves the larger of the two
   allocations: at least 1 GPU, 12 CPUs and 10 minutes.
+- **Account.** The environment build is charged to the same Slurm account and partition that admission authorized and recorded for the attempt, never to the Platform Profile's default account.
 - **`SubmitJob`.** See [Batch scripts](#batch-scripts).
 
 The per-request bounds (`*_PER_REQUEST`, `WALLTIME`) apply to these effective
@@ -118,6 +119,7 @@ however many times that state is observed:
 | --- | --- | --- |
 | Job completed, failed, timed out in Slurm, or was cancelled, as Slurm reports | `succeeded`, `failed`, `cancelled` | released |
 | Refused by Slurm, or SSH failed before `sbatch` | `failed` | released |
+| Job completed, but its result exceeds the RPC message bound | `failed` (`result_too_large`) | released |
 | Environment build failed in Slurm, or nothing was built (staging or readiness check failed before a build job) | `failed` | released |
 | Environment build timed out, its status could not be read, or its `sbatch` outcome is unknown | `unknown` (`environment_build_unknown`) | **held** until reconciled: the build job may still run |
 | Client cancelled or its deadline passed before a side effect | `failed` (`client_gone`) | released |
