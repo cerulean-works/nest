@@ -258,7 +258,9 @@ def test_slurm_forwards_context_without_payload_in_logs(backend, monkeypatch, ca
     captured = {}
     monkeypatch.setenv("NEST_LOG_LEVEL", "DEBUG")
     monkeypatch.setattr(
-        backend, "stage_payload", lambda payload, execution_id=None: "/nest/jobs/" + "e" * 32
+        backend,
+        "stage_payload",
+        lambda payload, execution_id=None, attempt=None: "/nest/jobs/" + "e" * 32,
     )
 
     def submit(**kwargs):
@@ -268,7 +270,8 @@ def test_slurm_forwards_context_without_payload_in_logs(backend, monkeypatch, ca
     monkeypatch.setattr(backend, "submit", submit)
     with request_context("f" * 32):
         assert backend.submit_payload(b"private-payload", environment_id="a" * 64)[0] == 789
-    assert captured["script_args"] == ("e" * 32, "a" * 64, "/nest", "f" * 32, "DEBUG", "1")
+    # The seventh argument, the attempt number, is empty: the shared execution directory.
+    assert captured["script_args"] == ("e" * 32, "a" * 64, "/nest", "f" * 32, "DEBUG", "1", "")
     assert "job_id=789" in caplog.text
     assert "private-payload" not in caplog.text
 

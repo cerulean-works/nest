@@ -339,6 +339,12 @@ the durable Execution Registry (the default with `NEST_CONTROLLER_AUTH=session`)
 `legacy` keeps the trusted Mode A path that records only the `jobs` table (the only
 choice without session authentication)."""
 
+LEGACY_WORKER_POLICIES = ("refuse", "allow")
+"""`NEST_LEGACY_WORKERS` values: `refuse` (the default) refuses an `Execute` whose
+Platform's worker script predates the outcome record (worker protocol 1), before
+anything is submitted; `allow` admits it during a rollout, and its completion is
+recorded as an unverified success (see [`admission.completion`])."""
+
 EXECUTION_AUTHORITIES = ("controller_owned", "user_owned")
 """`NEST_EXECUTION_AUTHORITIES` values, the deployment layer of execution authority
 (D01): `controller_owned` (Mode A, Controller SSH, trusted deployments only) and
@@ -1176,6 +1182,9 @@ class ControllerConfig:
             records only the `jobs` table). `required` is the default with session
             authentication, and the only choice for a Mode B Platform under it;
             `legacy` is the only choice without session authentication.
+        legacy_workers (`str`): `NEST_LEGACY_WORKERS`: `refuse` (the default) or
+            `allow` a registry-backed `Execute` on a worker script that predates the
+            outcome record. See [`config.LEGACY_WORKER_POLICIES`].
         rpc ([`config.RpcPolicy`]): gRPC listener bounds and abuse controls (H07).
         limits ([`config.AdmissionLimits`]): Admission limits the Execution
             Registry enforces (F02a); unused on the legacy path.
@@ -1216,6 +1225,7 @@ class ControllerConfig:
     allowed_projects: frozenset[str] = frozenset()
     provider_approvals: str = "environment"
     execution_registry: str = "legacy"
+    legacy_workers: str = "refuse"
     rpc: RpcPolicy = field(default_factory=RpcPolicy)
     limits: AdmissionLimits = field(default_factory=AdmissionLimits)
     execution_authorities: tuple[str, ...] = ("controller_owned",)
@@ -1289,6 +1299,7 @@ class ControllerConfig:
             "allowed_projects": sorted(self.allowed_projects),
             "provider_approvals": self.provider_approvals,
             "execution_registry": self.execution_registry,
+            "legacy_workers": self.legacy_workers,
             "execution_authorities": list(self.execution_authorities),
             "rpc": self.rpc.summary(),
             "limits": self.limits.summary(),
@@ -2378,6 +2389,7 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
         reader, auth, platforms.get(default_platform) if default_platform else None
     )
     execution_authorities = _execution_authorities(reader, execution_registry)
+    legacy_workers = reader.choice("NEST_LEGACY_WORKERS", LEGACY_WORKER_POLICIES, "refuse")
     rpc = _rpc_policy(reader, bind, auth, executor)
     limits = _admission_limits(reader)
     public_pilot = reader.boolean("NEST_PUBLIC_PILOT")
@@ -2420,6 +2432,7 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
         allowed_projects=allowed_projects,
         provider_approvals=provider_approvals,
         execution_registry=execution_registry,
+        legacy_workers=legacy_workers,
         rpc=rpc,
         limits=limits,
         execution_authorities=execution_authorities,

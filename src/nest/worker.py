@@ -7,6 +7,7 @@ from pathlib import Path
 
 import cloudpickle
 
+from . import outcome
 from ._logging import configure_logging, get_logger, operation, request_context
 from .gpu import GpuUnavailableError, check_gpu_access
 
@@ -21,7 +22,9 @@ def main():
     `user_python` executable. With a user interpreter, copies cloudpickle beside
     the input and runs `user_runner.py` in isolated mode. Otherwise, executes the
     call in this process. Writes the return value or a remote error record to the
-    output file with cloudpickle.
+    output file with cloudpickle, then the plain-JSON outcome sidecar
+    (`outcome.json`, see [`outcome`]) saying whether the call returned or raised,
+    so the Controller can tell without unpickling the result.
 
     When the worker script passes a GPU request (`NEST_GPU_REQUESTED`), first runs
     [`gpu.check_gpu_access`]; if the GPUs Slurm assigned are unusable, writes a
@@ -30,7 +33,8 @@ def main():
     Raises:
         `ValueError`: If the command line does not contain two or three arguments.
         `subprocess.CalledProcessError`: If the user interpreter exits unsuccessfully.
-        `RuntimeError`: If the user process does not produce a nonempty result file.
+        `RuntimeError`: If the user process does not produce a nonempty result file
+            and its outcome sidecar.
         `OSError`: If bootstrap files or the result file cannot be written.
     """
     if len(sys.argv) not in (3, 4):
@@ -40,6 +44,8 @@ def main():
     output_path = Path(sys.argv[2])
     user_python = sys.argv[3] if len(sys.argv) == 4 else None
     logger.info("Worker input job_dir=%s user_environment=%s", input_path.parent, bool(user_python))
+    # A retry runs in the same directory: never report an earlier attempt's outcome.
+    outcome.clear(output_path.parent)
 
     # A GPU request must see exactly its allocation before user code runs.
     try:
@@ -72,6 +78,10 @@ def main():
             Path(__file__).with_name("_logging.py"),
             bootstrap_dir / "nest_logging.py",
         )
+        shutil.copyfile(
+            Path(__file__).with_name("outcome.py"),
+            bootstrap_dir / "nest_outcome.py",
+        )
         runner_path = Path(__file__).with_name("user_runner.py")
         logger.info(
             "User interpreter starting python=%s job_dir=%s", user_python, input_path.parent
@@ -97,6 +107,8 @@ def main():
 
         if not output_path.is_file() or output_path.stat().st_size == 0:
             raise RuntimeError("User process did not produce a result")
+        if not (output_path.parent / outcome.OUTCOME_FILE).is_file():
+            raise RuntimeError("User process did not report whether the call returned or raised")
 
         logger.info("User interpreter completed job_dir=%s", input_path.parent)
         return
@@ -111,25 +123,32 @@ def main():
         result = func(*args, **kwargs)
 
         # Serializing return value
-        with output_path.open("wb") as f:
+        with outcome.publish(output_path) as f:
             cloudpickle.dump(result, f)
 
     except Exception as exc:
         logger.exception("User function failed job_dir=%s", input_path.parent)
         _write_error(output_path, exc)
+        return
+
+    outcome.write(output_path.parent, outcome.RETURNED)
 
 
 def _write_error(output_path: Path, exc: BaseException) -> None:
-    """Writes the remote error record for `exc`, with its traceback, as the result."""
+    """
+    Writes the remote error record for `exc`, with its traceback, as the result,
+    then the `raised` outcome sidecar.
+    """
     error = {
         "__nest_remote_error_v1__": True,
-        "type": (f"{type(exc).__module__}.{type(exc).__qualname__}"),
+        "type": outcome.error_type_of(exc),
         "message": str(exc),
         "traceback": "".join(traceback.format_exception(exc)),
     }
 
-    with output_path.open("wb") as f:
+    with outcome.publish(output_path) as f:
         cloudpickle.dump(error, f)
+    outcome.write(output_path.parent, outcome.RAISED, error["type"])
 
 
 if __name__ == "__main__":

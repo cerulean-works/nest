@@ -251,6 +251,32 @@ class DatabaseUnavailableError(InfrastructureError):
     status = grpc.StatusCode.UNAVAILABLE
 
 
+class WorkerProtocolError(InfrastructureError):
+    """
+    The deployed worker script predates the outcome record (worker protocol 1), and
+    this Controller refuses legacy workers (`NEST_LEGACY_WORKERS=refuse`, the
+    default). Raised before anything is staged or submitted: update the Platform's
+    Nest checkout, or have the operator allow legacy workers during a rollout.
+    """
+
+    kind = "worker_protocol_unsupported"
+    status = grpc.StatusCode.FAILED_PRECONDITION
+
+
+class SharedArtifactsRetryError(InfrastructureError):
+    """
+    A retry under the same idempotency key would run on a legacy worker (protocol
+    1) in the execution directory an earlier attempt already used, where it could
+    overwrite that attempt's result while it is still being read. Raised before
+    anything is staged or submitted: retry with a new idempotency key, or once the
+    Platform's worker declares protocol 2 (its attempts each get their own
+    directory).
+    """
+
+    kind = "retry_needs_isolated_worker"
+    status = grpc.StatusCode.FAILED_PRECONDITION
+
+
 class SessionUnavailableError(InfrastructureError):
     """
     The Slurm operation needs a user-owned SSH session that is not available now.
@@ -327,6 +353,8 @@ INFRASTRUCTURE_ERRORS: dict[str, type[InfrastructureError]] = {
         NestTimeoutError,
         SSHTimeoutError,
         SubmissionUnknownError,
+        WorkerProtocolError,
+        SharedArtifactsRetryError,
         QueueTimeoutError,
         JobBlockedError,
         ExecutionTimeoutError,

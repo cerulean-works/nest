@@ -990,7 +990,7 @@ class SchemaTests(_Base):
             session.id, token_hash=hash_token(access), ttl_seconds=600
         )
         with connect(url) as conn:
-            applied = upgrade(conn)
+            applied = upgrade(conn, migrations=[m for m in migrations if m.version <= 20])
         self.assertEqual([m.label for m in applied], ["0020_service_principals"])
         grant = SessionStore(db).authenticate(hash_token(access), kind="cli")
         assert grant is not None

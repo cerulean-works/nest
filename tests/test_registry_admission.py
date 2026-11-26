@@ -11,6 +11,7 @@ as seen from another connection, before `sbatch` runs; and whenever admission or
 the database fails, `sbatch` never runs at all.
 """
 
+import json
 import os
 import secrets
 import shutil
@@ -29,6 +30,7 @@ from unittest import mock
 
 import cloudpickle
 import grpc
+import psycopg
 from admin_fixture import owned_project
 from fake_hpc import FakeHpc
 from postgres_fixture import PostgresTestCase, connect
@@ -56,6 +58,7 @@ from nest.db import (
     Database,
     DatabaseError,
     ExecutionRegistry,
+    ExecutionRegistryError,
     HPCPrincipal,
     IdentityStore,
     JobStore,
@@ -285,28 +288,6 @@ class _Base(PostgresTestCase):
 
 
 class SubmissionPathTests(_Base):
-    def test_application_error_settles_as_a_completed_attempt_with_its_traceback(self):
-        # Current contract: the function's exception is its result. The worker writes
-        # the remote error record and exits 0, so Slurm reports COMPLETED and the
-        # registry records the attempt and execution as succeeded; the client raises
-        # RemoteExecutionError from the record. Distinguishing application failure in
-        # the registry is a separate follow-up (issue #73).
-        def train():
-            raise RuntimeError("CUDA error: device-side assert triggered")
-
-        record = self.execute(train)
-        self.assertIs(record["__nest_remote_error_v1__"], True)
-        self.assertEqual(record["type"], "builtins.RuntimeError")
-        self.assertEqual(record["message"], "CUDA error: device-side assert triggered")
-        self.assertIn("in train", record["traceback"])
-        [worker] = self.sbatch_calls()
-        self.assertEqual(self.hpc.job_state(worker["job_id"]), "COMPLETED")
-        [attempt] = self.attempts()
-        self.assertEqual((attempt["status"], attempt["slurm_state"]), ("succeeded", "COMPLETED"))
-        self.assertIsNone(attempt["error_kind"])
-        [execution] = self.sql("SELECT status FROM executions")
-        self.assertEqual(execution["status"], "succeeded")
-
     def test_execute_commits_its_attempt_before_sbatch(self):
         seen = self.spy_on_sbatch()
         self.assertEqual(self.execute(), 42)
@@ -325,9 +306,11 @@ class SubmissionPathTests(_Base):
             (attempt.status, attempt.slurm_job_id, attempt.slurm_state),
             ("succeeded", worker["job_id"], "COMPLETED"),
         )
+        # Its own artifact directory, by the worker protocol pinned before sbatch.
+        self.assertEqual(attempt.worker_protocol, 2)
         self.assertEqual(
             attempt.output_ref,
-            f"{self.hpc.base}/jobs/{committed['execution_id']}/output.pkl",
+            f"{self.hpc.base}/jobs/{committed['execution_id']}/attempts/1/output.pkl",
         )
         self.assertEqual(
             (attempt.endpoint.host, attempt.endpoint.mode, attempt.endpoint.platform_id),
@@ -392,6 +375,626 @@ class SubmissionPathTests(_Base):
         [after] = self.attempts()
         for column in ("slurm_account", "slurm_account_origin", "login_node_host", "unix_user"):
             self.assertEqual(after[column], before[column])
+
+
+class ApplicationOutcomeTests(_Base):
+    """
+    A function that raises completes in Slurm (`COMPLETED`), but its attempt is
+    `failed` with `remote_application_error`, decided from the worker's plain-JSON
+    outcome record in the attempt's own artifact directory, never by unpickling the
+    result (issue #73).
+    """
+
+    @property
+    def train(self):
+        """A function cloudpickle sends by value, since it is defined here."""
+
+        def train():
+            raise RuntimeError("CUDA error: device-side assert triggered")
+
+        return train
+
+    def flaky(self):
+        """Raises until `self.flag` exists, then returns "ok"; the same payload each time."""
+        flag = str(self.hpc.base.parent / "second-try")
+
+        def flaky():
+            if not os.path.exists(flag):
+                raise RuntimeError("first try fails")
+            return "ok"
+
+        return flaky
+
+    @property
+    def flag(self) -> Path:
+        return self.hpc.base.parent / "second-try"
+
+    def attempt_dir(self, execution_id: str, attempt: int = 1) -> Path:
+        return self.hpc.base / "jobs" / execution_id / "attempts" / str(attempt)
+
+    def outcome_file(self, execution_id: str, attempt: int = 1) -> Path:
+        return self.attempt_dir(execution_id, attempt) / "outcome.json"
+
+    def assert_application_failure(self, attempt, error_type="builtins.RuntimeError"):
+        self.assertEqual(
+            (attempt["status"], attempt["slurm_state"], attempt["error_kind"]),
+            ("failed", "COMPLETED", "remote_application_error"),
+        )
+        self.assertIn(error_type, attempt["error_message"])
+        # The exception message and traceback are the caller's, not the registry's.
+        self.assertNotIn("device-side", attempt["error_message"])
+        self.assertIsNotNone(attempt["finished_at"])
+
+    def record_nothing_on_completion(self):
+        """The Execute RPC records nothing itself, as when a status query wins the race."""
+        patcher = mock.patch.object(RegistryAdmission, "completed", autospec=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def status(self, job_id):
+        return self.stub.GetJobStatus(
+            execution_pb2.JobStatusRequest(job_id=job_id), timeout=30, metadata=self.metadata()
+        ).state
+
+    def deploy_legacy_worker(self):
+        """A worker script from before the outcome record: it declares no protocol."""
+        script = self.hpc.base / "project" / "scripts" / "worker.sbatch"
+        lines = script.read_text().splitlines(keepends=True)
+        script.write_text("".join(line for line in lines if "nest-worker-protocol" not in line))
+
+    # The contract --------------------------------------------------------------
+
+    def test_application_error_fails_the_attempt_and_delivers_the_traceback(self):
+        record = self.execute(self.train)
+        # Delivered to the client unchanged.
+        self.assertIs(record["__nest_remote_error_v1__"], True)
+        self.assertEqual(record["type"], "builtins.RuntimeError")
+        self.assertEqual(record["message"], "CUDA error: device-side assert triggered")
+        self.assertIn("in train", record["traceback"])
+        [worker] = self.sbatch_calls()
+        self.assertEqual(self.hpc.job_state(worker["job_id"]), "COMPLETED")
+        [attempt] = self.attempts()
+        self.assert_application_failure(attempt)
+        self.assertEqual(
+            (attempt["slurm_job_id"], attempt["worker_protocol"]), (worker["job_id"], 2)
+        )
+        # Its own artifact directory, passed to the worker as the attempt number.
+        self.assertEqual(worker["args"][6], "1")
+        directory = self.attempt_dir(attempt["execution_id"])
+        self.assertEqual(attempt["output_ref"], f"{directory}/output.pkl")
+        # The record the Controller read is plain JSON with only the type.
+        self.assertEqual(
+            json.loads(self.outcome_file(attempt["execution_id"]).read_text()),
+            {"nest_outcome": 1, "status": "raised", "error_type": "builtins.RuntimeError"},
+        )
+        [execution] = self.sql("SELECT status, finished_at FROM executions")
+        self.assertEqual((execution["status"], execution["finished_at"]), ("failed", None))
+        # A later status query or sweep does not overwrite the application outcome.
+        self.assertEqual(self.status(worker["job_id"]), "COMPLETED")
+        self.admission.settle(timedelta(0))
+        self.assertEqual(self.attempts(), [attempt])
+
+    def test_returning_function_succeeds(self):
+        self.assertEqual(self.execute(), 42)
+        [attempt] = self.attempts()
+        self.assertEqual(
+            (attempt["status"], attempt["slurm_state"], attempt["error_kind"]),
+            ("succeeded", "COMPLETED", None),
+        )
+        self.assertEqual(
+            json.loads(self.outcome_file(attempt["execution_id"]).read_text()),
+            {"nest_outcome": 1, "status": "returned"},
+        )
+        # Published atomically: no partial file is left beside the result.
+        names = {p.name for p in self.attempt_dir(attempt["execution_id"]).iterdir()}
+        self.assertEqual(names - {".nest-bootstrap"}, {"input.pkl", "outcome.json", "output.pkl"})
+
+    def test_application_failure_may_be_retried_under_the_same_key(self):
+        first = self.execute(self.flaky(), x_nest_idempotency_key="train-1")
+        self.assertEqual(first["message"], "first try fails")
+        self.flag.touch()
+        self.assertEqual(self.execute(self.flaky(), x_nest_idempotency_key="train-1"), "ok")
+        failed, retried = self.attempts()
+        self.assert_application_failure(failed)
+        self.assertEqual(retried["execution_id"], failed["execution_id"])
+        self.assertEqual(
+            (retried["attempt_number"], retried["status"], retried["error_kind"]),
+            (2, "succeeded", None),
+        )
+        # Each attempt keeps its own artifacts and reference.
+        execution_id = failed["execution_id"]
+        self.assertEqual(failed["output_ref"], f"{self.attempt_dir(execution_id, 1)}/output.pkl")
+        self.assertEqual(retried["output_ref"], f"{self.attempt_dir(execution_id, 2)}/output.pkl")
+        self.assertEqual(
+            json.loads(self.outcome_file(execution_id, 1).read_text())["status"], "raised"
+        )
+        self.assertEqual(
+            json.loads(self.outcome_file(execution_id, 2).read_text())["status"], "returned"
+        )
+        [execution] = self.sql("SELECT status FROM executions")
+        self.assertEqual(execution["status"], "succeeded")
+        self.assertEqual(len(self.sbatch_calls()), 2)
+
+    # Retry isolation -----------------------------------------------------------
+
+    def run_retry_while_first_rpc_is_paused(
+        self, pause_in: str, *, refused_ok: bool = False, before_retry=None
+    ):
+        """
+        Pauses attempt A's Execute in `pause_in` (`wait_result`, before its download,
+        or `read_outcome`, after it), settles A through GetJobStatus as another
+        replica would, runs retry B with the same key to completion, then resumes A.
+        """
+        paused, resume = threading.Event(), threading.Event()
+        original = getattr(SlurmBackend, pause_in)
+        calls = []
+
+        def pause(backend, *args, **kwargs):
+            calls.append(args)
+            if len(calls) == 1:
+                paused.set()
+                resume.wait(30)
+            return original(backend, *args, **kwargs)
+
+        results: dict[str, Any] = {}
+
+        def first():
+            results["a"] = self.execute(self.flaky(), x_nest_idempotency_key="race")
+
+        with mock.patch.object(SlurmBackend, pause_in, autospec=True, side_effect=pause):
+            thread = threading.Thread(target=first)
+            thread.start()
+            self.assertTrue(paused.wait(30))
+            [a] = self.attempts()
+            self.assertEqual(self.status(a["slurm_job_id"]), "COMPLETED")
+            [a] = self.attempts()
+            self.assert_application_failure(a)
+            self.flag.touch()
+            if before_retry is not None:
+                before_retry()
+            retry_error = None
+            try:
+                results["b"] = self.execute(self.flaky(), x_nest_idempotency_key="race")
+            except grpc.RpcError as exc:
+                if not refused_ok:
+                    raise
+                retry_error = cast(grpc.Call, exc)
+            finally:
+                resume.set()
+                thread.join(60)
+        return results, retry_error
+
+    def assert_isolated(self, results):
+        # A's client gets A's traceback, never B's result; B gets its own.
+        self.assertEqual(results["a"]["message"], "first try fails")
+        self.assertEqual(results["b"], "ok")
+        a, b = self.attempts()
+        self.assert_application_failure(a)
+        self.assertEqual(
+            (b["attempt_number"], b["status"], b["error_kind"]), (2, "succeeded", None)
+        )
+        self.assertNotEqual(a["output_ref"], b["output_ref"])
+        execution_id = a["execution_id"]
+        self.assertEqual(
+            json.loads(self.outcome_file(execution_id, 1).read_text())["status"], "raised"
+        )
+        self.assertEqual(
+            cloudpickle.loads((self.attempt_dir(execution_id, 1) / "output.pkl").read_bytes())[
+                "message"
+            ],
+            "first try fails",
+        )
+        self.assertEqual(
+            cloudpickle.loads((self.attempt_dir(execution_id, 2) / "output.pkl").read_bytes()), "ok"
+        )
+
+    def test_retry_never_touches_an_attempt_paused_before_its_download(self):
+        self.assert_isolated(self.run_retry_while_first_rpc_is_paused("wait_result")[0])
+
+    def test_retry_never_touches_an_attempt_paused_before_its_outcome_read(self):
+        self.assert_isolated(self.run_retry_while_first_rpc_is_paused("read_outcome")[0])
+
+    # Missing, late and unreadable records ----------------------------------------
+
+    def remove_outcome_after_the_job(self):
+        """The job completes, but its outcome record is not visible to the login node."""
+        original = SlurmBackend.wait_result
+        hidden: list[Path] = []
+
+        def hide(backend, job_id, job_dir, *args, **kwargs):
+            result = original(backend, job_id, job_dir, *args, **kwargs)
+            record = Path(job_dir) / "outcome.json"
+            hidden.append(record.with_name("outcome.hidden"))
+            record.rename(hidden[-1])
+            return result
+
+        patcher = mock.patch.object(SlurmBackend, "wait_result", autospec=True, side_effect=hide)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return hidden
+
+    def test_missing_outcome_record_is_never_a_success(self):
+        self.remove_outcome_after_the_job()
+        # The caller still gets the result.
+        self.assertEqual(self.execute(), 42)
+        [attempt] = self.attempts()
+        # Live (so it keeps any reservation), marked pending.
+        self.assertEqual(
+            (attempt["status"], attempt["slurm_state"], attempt["error_kind"]),
+            ("submitted", "COMPLETED", "remote_outcome_pending"),
+        )
+        # A status query never fails or succeeds it; a sweep waits a full threshold.
+        self.assertEqual(self.status(attempt["slurm_job_id"]), "COMPLETED")
+        self.admission.settle(timedelta(hours=1))
+        self.assertEqual(self.attempts()[0]["status"], "submitted")
+        self.admission.settle(timedelta(0))
+        [attempt] = self.attempts()
+        self.assertEqual(
+            (attempt["status"], attempt["slurm_state"], attempt["error_kind"]),
+            ("failed", "COMPLETED", "remote_outcome_missing"),
+        )
+
+    def test_a_late_outcome_record_settles_the_attempt(self):
+        records = self.remove_outcome_after_the_job()
+        self.execute(self.train)
+        [attempt] = self.attempts()
+        self.assertEqual(attempt["error_kind"], "remote_outcome_pending")
+        # The shared filesystem catches up before the sweep decides.
+        records[-1].rename(records[-1].with_name("outcome.json"))
+        self.admission.settle(timedelta(0))
+        [attempt] = self.attempts()
+        self.assert_application_failure(attempt)
+
+    def test_unreadable_outcome_leaves_the_attempt_live_for_settling(self):
+        self.hpc.drop_ssh("nest-outcome")
+        record = self.execute(self.train)
+        self.assertEqual(record["message"], "CUDA error: device-side assert triggered")
+        [attempt] = self.attempts()
+        # Never recorded as succeeded; the reservation is kept until it is known.
+        self.assertEqual((attempt["status"], attempt["error_kind"]), ("submitted", None))
+        # The sweep cannot read it either: still live.
+        self.admission.settle(timedelta(0))
+        self.assertEqual(self.attempts()[0]["status"], "submitted")
+        (self.hpc.state / "ssh-fault.json").unlink()
+        self.admission.settle(timedelta(0))
+        [attempt] = self.attempts()
+        self.assert_application_failure(attempt)
+
+    def test_an_outcome_path_that_is_not_a_regular_file_fails_the_attempt(self):
+        self.record_nothing_on_completion()
+        self.execute()
+        [attempt] = self.attempts()
+        record = self.outcome_file(attempt["execution_id"])
+        record.unlink()
+        record.mkdir()
+        self.admission.settle(timedelta(0))
+        [attempt] = self.attempts()
+        self.assertEqual(
+            (attempt["status"], attempt["slurm_state"], attempt["error_kind"]),
+            ("failed", "COMPLETED", "remote_outcome_unreadable"),
+        )
+
+    def test_status_query_settles_a_completed_application_failure_as_failed(self):
+        self.record_nothing_on_completion()
+        self.execute(self.train)
+        [attempt] = self.attempts()
+        self.assertEqual(attempt["status"], "submitted")
+        self.assertEqual(self.status(attempt["slurm_job_id"]), "COMPLETED")
+        [attempt] = self.attempts()
+        self.assert_application_failure(attempt)
+
+    def test_invalid_outcome_record_fails_the_attempt(self):
+        self.record_nothing_on_completion()
+        self.execute()
+        [attempt] = self.attempts()
+        self.outcome_file(attempt["execution_id"]).write_bytes(
+            b'{"nest_outcome": "sk-live-SECRET-SENTINEL", "status": "returned"}'
+        )
+        self.admission.settle(timedelta(0))
+        [attempt] = self.attempts()
+        self.assertEqual(
+            (attempt["status"], attempt["slurm_state"], attempt["error_kind"]),
+            ("failed", "COMPLETED", "remote_outcome_invalid"),
+        )
+        self.assertNotIn("SECRET-SENTINEL", attempt["error_message"])
+
+    # Legacy workers ------------------------------------------------------------
+
+    def test_legacy_worker_is_refused_before_anything_is_staged(self):
+        self.deploy_legacy_worker()
+        error = self.refused(self.execute)
+        self.assertEqual(error.code(), grpc.StatusCode.FAILED_PRECONDITION)
+        self.assertEqual(
+            dict(error.trailing_metadata())["nest-error-kind"], "worker_protocol_unsupported"
+        )
+        self.assertIn("NEST_LEGACY_WORKERS=allow", error.details())
+        self.assertEqual(self.sbatch_calls(), [])
+        self.assertFalse(any("input.pkl" in " ".join(c["argv"]) for c in self.hpc.calls("ssh")))
+        [attempt] = self.attempts()
+        self.assertEqual(
+            (attempt["status"], attempt["error_kind"], attempt["worker_protocol"]),
+            ("failed", "worker_protocol_unsupported", None),
+        )
+
+    def test_allowed_legacy_worker_is_an_unverified_success_in_the_shared_directory(self):
+        admission = RegistryAdmission(
+            self.db,
+            self.backend,
+            self.profile,
+            self.platform_id,
+            audit=self.audit,
+            legacy_workers="allow",
+        )
+        self.admission = admission
+        self.stub = self.serve(admission)
+        self.deploy_legacy_worker()
+        self.record_nothing_on_completion()
+        self.execute()
+        [worker] = self.sbatch_calls()
+        self.assertEqual(worker["args"][6], "")  # no attempt directory
+        [attempt] = self.attempts()
+        self.assertEqual(attempt["worker_protocol"], 1)
+        shared = self.hpc.base / "jobs" / attempt["execution_id"]
+        # A worker that predates the record writes none.
+        (shared / "outcome.json").unlink()
+        admission.settle(timedelta(0))
+        [attempt] = self.attempts()
+        self.assertEqual(
+            (attempt["status"], attempt["error_kind"], attempt["worker_protocol"]),
+            ("succeeded", None, 1),
+        )
+        self.assertEqual(attempt["output_ref"], f"{shared}/output.pkl")
+
+    def allow_legacy_workers(self) -> RegistryAdmission:
+        admission = RegistryAdmission(
+            self.db,
+            self.backend,
+            self.profile,
+            self.platform_id,
+            audit=self.audit,
+            legacy_workers="allow",
+        )
+        self.admission = admission
+        self.stub = self.serve(admission)
+        return admission
+
+    def deploy_current_worker(self):
+        shutil.copyfile(
+            Path(__file__).resolve().parent.parent / "scripts" / "worker.sbatch",
+            self.hpc.base / "project" / "scripts" / "worker.sbatch",
+        )
+
+    def test_legacy_retry_in_the_shared_directory_needs_a_new_key(self):
+        # A mixed rollout: a legacy script runs the current worker, which still
+        # writes an outcome record in the shared directory.
+        self.allow_legacy_workers()
+        self.deploy_legacy_worker()
+        first = self.execute(self.flaky(), x_nest_idempotency_key="legacy")
+        self.assertEqual(first["message"], "first try fails")
+        self.flag.touch()
+        error = self.refused(lambda: self.execute(self.flaky(), x_nest_idempotency_key="legacy"))
+        self.assertEqual(error.code(), grpc.StatusCode.FAILED_PRECONDITION)
+        self.assertEqual(
+            dict(error.trailing_metadata())["nest-error-kind"], "retry_needs_isolated_worker"
+        )
+        self.assertEqual(len(self.sbatch_calls()), 1)
+        failed, refused = self.attempts()
+        self.assert_application_failure(failed)
+        self.assertEqual(failed["worker_protocol"], 1)
+        self.assertEqual(
+            (refused["status"], refused["error_kind"], refused["worker_protocol"]),
+            ("failed", "retry_needs_isolated_worker", None),
+        )
+        # The first attempt's result in the shared directory is untouched.
+        shared = self.hpc.base / "jobs" / failed["execution_id"]
+        self.assertEqual(
+            cloudpickle.loads((shared / "output.pkl").read_bytes())["message"], "first try fails"
+        )
+        # A new key is a new execution, in its own directory.
+        self.assertEqual(self.execute(self.flaky(), x_nest_idempotency_key="legacy-2"), "ok")
+
+    def test_a_retry_after_an_unpinned_attempt_needs_an_isolated_worker(self):
+        # An attempt recorded before migration 0021 has no worker_protocol: it
+        # used the shared directory.
+        self.allow_legacy_workers()
+        self.deploy_legacy_worker()
+        self.execute(self.flaky(), x_nest_idempotency_key="old")
+        self.sql(
+            "ALTER TABLE execution_attempts DISABLE TRIGGER execution_attempts_worker_protocol"
+        )
+        self.sql("UPDATE execution_attempts SET worker_protocol = NULL")
+        self.sql("ALTER TABLE execution_attempts ENABLE TRIGGER execution_attempts_worker_protocol")
+        error = self.refused(lambda: self.execute(self.flaky(), x_nest_idempotency_key="old"))
+        self.assertEqual(
+            dict(error.trailing_metadata())["nest-error-kind"], "retry_needs_isolated_worker"
+        )
+        # An updated worker isolates the retry, so it may run.
+        self.deploy_current_worker()
+        self.flag.touch()
+        self.assertEqual(self.execute(self.flaky(), x_nest_idempotency_key="old"), "ok")
+
+    def test_legacy_attempt_paused_before_its_download_keeps_its_own_result(self):
+        self.legacy_attempt_paused_keeps_its_own_result("wait_result")
+
+    def test_legacy_attempt_paused_before_its_outcome_read_keeps_its_own_result(self):
+        self.legacy_attempt_paused_keeps_its_own_result("read_outcome")
+
+    def legacy_attempt_paused_keeps_its_own_result(self, pause_in):
+        self.allow_legacy_workers()
+        self.deploy_legacy_worker()
+        results, retry_error = self.run_retry_while_first_rpc_is_paused(pause_in, refused_ok=True)
+        # The legacy retry was refused before staging; A's client got A's traceback.
+        self.assertEqual(results["a"]["message"], "first try fails")
+        assert retry_error is not None
+        self.assertEqual(
+            dict(retry_error.trailing_metadata())["nest-error-kind"], "retry_needs_isolated_worker"
+        )
+        self.assertEqual(len(self.sbatch_calls()), 1)
+
+    def test_cross_version_retry_during_a_paused_download_is_isolated(self):
+        self.cross_version_retry_never_touches_the_legacy_attempt("wait_result")
+
+    def test_cross_version_retry_during_a_paused_outcome_read_is_isolated(self):
+        self.cross_version_retry_never_touches_the_legacy_attempt("read_outcome")
+
+    def cross_version_retry_never_touches_the_legacy_attempt(self, pause_in):
+        # A ran on a legacy script in the shared directory; the Platform is
+        # updated, and B runs isolated in attempts/2 while A is still being read.
+        self.allow_legacy_workers()
+        self.deploy_legacy_worker()
+        results, _ = self.run_retry_while_first_rpc_is_paused(
+            pause_in, before_retry=self.deploy_current_worker
+        )
+        self.assertEqual(results["a"]["message"], "first try fails")
+        self.assertEqual(results["b"], "ok")
+        a, b = self.attempts()
+        self.assertEqual((a["worker_protocol"], b["worker_protocol"]), (1, 2))
+        self.assert_application_failure(a)
+        self.assertEqual((b["status"], b["error_kind"]), ("succeeded", None))
+        shared = self.hpc.base / "jobs" / a["execution_id"]
+        self.assertEqual(a["output_ref"], f"{shared}/output.pkl")
+        self.assertEqual(b["output_ref"], f"{self.attempt_dir(a['execution_id'], 2)}/output.pkl")
+        self.assertEqual(
+            cloudpickle.loads((shared / "output.pkl").read_bytes())["message"], "first try fails"
+        )
+
+    def hidden_completed_attempt(self):
+        """A completed attempt nobody has settled, whose record is not visible yet."""
+        self.record_nothing_on_completion()
+        records = self.remove_outcome_after_the_job()
+        self.execute(self.train)
+        [attempt] = self.attempts()
+        self.assertEqual((attempt["status"], attempt["error_kind"]), ("submitted", None))
+        self.sql("UPDATE execution_attempts SET updated_at = now() - interval '2 hours'")
+        return attempt, records[-1]
+
+    def observe_during_the_sweeps_status_query(self, concurrent):
+        """Runs `concurrent` once, inside the sweep's Slurm status request."""
+        original = SlurmBackend.status
+        ran = []
+
+        def status(backend, job_id):
+            if not ran:
+                ran.append(True)
+                concurrent()
+            return original(backend, job_id)
+
+        return mock.patch.object(SlurmBackend, "status", autospec=True, side_effect=status)
+
+    def assert_still_pending(self):
+        [attempt] = self.attempts()
+        self.assertEqual(
+            (attempt["status"], attempt["slurm_state"], attempt["error_kind"]),
+            ("submitted", "COMPLETED", "remote_outcome_pending"),
+        )
+
+    def test_a_concurrent_status_query_restarts_the_missing_outcome_wait(self):
+        attempt, hidden = self.hidden_completed_attempt()
+        other = RegistryAdmission(
+            self.open_database(), self.backend, self.profile, self.platform_id
+        )
+        record = {"attempt_id": attempt["id"], "status": "submitted"}
+        with self.observe_during_the_sweeps_status_query(
+            lambda: other.observe(record, "COMPLETED")
+        ):
+            # Selected as idle for 2 hours, but marked pending during its query.
+            self.admission.settle(timedelta(hours=1))
+        self.assert_still_pending()
+        self.admission.settle(timedelta(hours=1))
+        self.assert_still_pending()
+        # The record appears within the wait: settled normally, never failed.
+        hidden.rename(hidden.with_name("outcome.json"))
+        self.admission.settle(timedelta(0))
+        self.assert_application_failure(self.attempts()[0])
+
+    def test_two_replicas_sweeping_wait_the_full_grace(self):
+        attempt, _ = self.hidden_completed_attempt()
+        replica = RegistryAdmission(
+            self.open_database(), self.backend, self.profile, self.platform_id
+        )
+        with self.observe_during_the_sweeps_status_query(
+            lambda: replica.settle(timedelta(hours=1))
+        ):
+            self.admission.settle(timedelta(hours=1))
+        self.assert_still_pending()
+        # After the full wait, either replica fails it.
+        self.sql("UPDATE execution_attempts SET updated_at = now() - interval '2 hours'")
+        replica.settle(timedelta(hours=1))
+        [attempt] = self.attempts()
+        self.assertEqual(
+            (attempt["status"], attempt["error_kind"]), ("failed", "remote_outcome_missing")
+        )
+
+    def test_failing_a_missing_outcome_is_a_locked_compare_and_set(self):
+        attempt, _ = self.hidden_completed_attempt()
+        # Not pending: refused.
+        with self.assertRaises(ExecutionRegistryError):
+            self.registry.finish_attempt(
+                attempt["id"],
+                "failed",
+                error_kind="remote_outcome_missing",
+                pending_for=timedelta(0),
+            )
+        self.assertTrue(self.registry.note_outcome_pending(attempt["id"], "pending"))
+        # Pending, but not for the whole wait: refused.
+        with self.assertRaises(ExecutionRegistryError):
+            self.registry.finish_attempt(
+                attempt["id"],
+                "failed",
+                error_kind="remote_outcome_missing",
+                pending_for=timedelta(hours=1),
+            )
+        self.assert_still_pending()
+
+    def test_worker_protocol_is_pinned_once_before_submission(self):
+        self.record_nothing_on_completion()
+        self.execute()
+        [attempt] = self.attempts()
+        with self.assertRaises(ExecutionRegistryError):
+            self.registry.record_worker_protocol(attempt["id"], 1)
+        with self.assertRaises(psycopg.errors.CheckViolation):
+            self.sql(
+                "UPDATE execution_attempts SET worker_protocol = 1 WHERE id = %s", attempt["id"]
+            )
+        self.assertEqual(self.attempts()[0]["worker_protocol"], 2)
+
+    # Other kinds and paths -------------------------------------------------------
+
+    def test_batch_jobs_complete_without_reading_an_outcome(self):
+        response = self.submit()
+        self.assertEqual(self.status(response.job_id), "COMPLETED")
+        [attempt] = self.attempts()
+        self.assertEqual((attempt["status"], attempt["error_kind"]), ("succeeded", None))
+        self.assertFalse(
+            any("nest-outcome" in " ".join(call["argv"]) for call in self.hpc.calls("ssh"))
+        )
+
+    def test_legacy_jobs_record_an_application_failure(self):
+        stub = self.serve(None)
+        response = stub.Execute(
+            execution_pb2.ExecuteRequest(payload=cloudpickle.dumps((self.train, (), {}))),
+            timeout=60,
+            metadata=self.metadata(),
+        )
+        record = cloudpickle.loads(response.result)
+        self.assertEqual(record["type"], "builtins.RuntimeError")
+        [job] = self.sql("SELECT status, error_kind, error_message FROM jobs")
+        self.assertEqual((job["status"], job["error_kind"]), ("failed", "remote_application_error"))
+        self.assertNotIn("device-side", job["error_message"])
+
+    def test_legacy_jobs_mark_an_unreadable_outcome_unknown(self):
+        self.hpc.drop_ssh("nest-outcome")
+        stub = self.serve(None)
+        response = stub.Execute(
+            execution_pb2.ExecuteRequest(payload=cloudpickle.dumps((self.train, (), {}))),
+            timeout=60,
+            metadata=self.metadata(),
+        )
+        self.assertEqual(cloudpickle.loads(response.result)["type"], "builtins.RuntimeError")
+        [job] = self.sql("SELECT status, error_kind FROM jobs")
+        self.assertEqual(
+            (job["status"], job["error_kind"]), ("unknown", "remote_outcome_unreadable")
+        )
 
 
 class DatabaseFailureTests(_Base):
@@ -553,7 +1156,7 @@ class UnknownOutcomeTests(_Base):
         )
 
     def test_lost_worker_acknowledgement_in_execute_is_unknown(self):
-        self.hpc.hang_ssh("worker.sbatch", after=True)
+        self.hpc.hang_ssh("sbatch --parsable", after=True)
         error = self.refused(self.execute)
         self.assertEqual(error.code(), grpc.StatusCode.UNKNOWN)
         [attempt] = self.attempts()

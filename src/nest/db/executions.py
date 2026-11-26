@@ -111,7 +111,9 @@ _ATTEMPT_COLUMNS = (
     "(to_jsonb(a) ->> 'platform_authority_policy_version')::integer "
     "AS platform_authority_policy_version, "
     "(to_jsonb(a) ->> 'project_authority_policy_version')::integer "
-    "AS project_authority_policy_version"
+    "AS project_authority_policy_version, "
+    # Added by 0021, read the same way.
+    "(to_jsonb(a) ->> 'worker_protocol')::integer AS worker_protocol"
 )
 _ATTEMPT_FROM = "execution_attempts a JOIN hpc_platforms p ON p.id = a.platform_id"
 # Restricts an attempt query to one Project; its parameter comes first.
@@ -571,6 +573,7 @@ class Attempt:
     nodes: tuple[str, ...] = ()
     options: dict[str, ResolvedOption] = field(default_factory=dict)
     authority: AuthorityPin | None = None
+    worker_protocol: int | None = None
     """The execution authority and policy versions it was admitted under; `None`
     for an attempt recorded before migration 0019, which is not reinterpreted."""
 
@@ -654,6 +657,7 @@ def _attempt(
             if row.get("execution_authority") is not None
             else None
         ),
+        worker_protocol=row.get("worker_protocol"),
     )
 
 
@@ -1172,6 +1176,47 @@ class ExecutionRegistry:
             slurm_job_id=slurm_job_id,
         )
 
+    def record_worker_protocol(self, attempt_id: int, protocol: int) -> None:
+        """
+        Pins the worker protocol the attempt's job will run with, before `sbatch`.
+
+        Raises:
+            [`db.executions.InvalidTransitionError`]: If the attempt is no longer
+                `submitting`, or its protocol is already recorded.
+        """
+        with transaction(self.database, None, "record an attempt's worker protocol") as cursor:
+            row = cursor.execute(
+                "UPDATE execution_attempts SET worker_protocol = %s, updated_at = now() "
+                "WHERE id = %s AND status = 'submitting' AND worker_protocol IS NULL "
+                "RETURNING id",
+                (protocol, attempt_id),
+            ).fetchone()
+        if row is None:
+            raise InvalidTransitionError(
+                "The worker protocol is recorded once, while the attempt is submitting"
+            )
+
+    def note_outcome_pending(self, attempt_id: int, message: str) -> bool:
+        """
+        Marks a live attempt whose job completed but whose outcome record is not
+        readable yet (`error_kind` `remote_outcome_pending`, `slurm_state`
+        `COMPLETED`), and restarts its idle time, so the settle sweep waits a full
+        threshold before deciding. The attempt stays live and keeps its reservation.
+
+        Returns:
+            `bool`: Whether it was marked now; `False` if it already was, or is no
+                longer `submitted` or `running`.
+        """
+        with transaction(self.database, None, "mark an outcome pending") as cursor:
+            row = cursor.execute(
+                "UPDATE execution_attempts SET updated_at = now(), slurm_state = 'COMPLETED', "
+                "error_kind = 'remote_outcome_pending', error_message = %s "
+                "WHERE id = %s AND status IN ('submitted', 'running') "
+                "AND error_kind IS DISTINCT FROM 'remote_outcome_pending' RETURNING id",
+                (message[:_MAX_ERROR_MESSAGE], attempt_id),
+            ).fetchone()
+        return row is not None
+
     def record_running(
         self, attempt_id: int, nodes: Iterable[str] = (), *, slurm_state: str = "RUNNING"
     ) -> Attempt:
@@ -1191,9 +1236,15 @@ class ExecutionRegistry:
         usage_ref: str | None = None,
         error_kind: str | None = None,
         error_message: str | None = None,
+        pending_for: timedelta | None = None,
     ) -> Attempt:
         """
         Moves an attempt to `succeeded`, `failed`, `cancelled` or `unknown`.
+
+        With `pending_for`, the move happens only if the attempt is still marked
+        `remote_outcome_pending` and has stayed unchanged for at least that long,
+        checked under the row lock that makes the move, so an earlier snapshot or a
+        concurrent observation can never shorten the wait.
 
         A final status also updates the execution: `succeeded` and `cancelled` close
         it, and `failed` leaves it open for a retry.
@@ -1205,7 +1256,8 @@ class ExecutionRegistry:
         Raises:
             [`db.executions.ExecutionNotFoundError`]: If the attempt does not exist.
             [`db.executions.InvalidTransitionError`]: If the attempt is already final,
-                or would be `succeeded` without a Slurm job ID.
+                would be `succeeded` without a Slurm job ID, or (with `pending_for`)
+                is not pending, or not for long enough yet.
         """
         if status not in (*FINAL_ATTEMPT_STATUSES, "unknown"):
             raise ValueError(f"Unknown final attempt status {status!r}")
@@ -1230,6 +1282,7 @@ class ExecutionRegistry:
                 status in FINAL_ATTEMPT_STATUSES,
             ),
             slurm_job_id=slurm_job_id,
+            pending_for=pending_for,
         )
 
     def _transition(
@@ -1242,15 +1295,24 @@ class ExecutionRegistry:
         nodes: Iterable[str] = (),
         slurm_job_id: int | None = None,
         expected: str | None = None,
+        pending_for: timedelta | None = None,
     ) -> Attempt:
         with transaction(self.database, None, f"mark an execution attempt {status}") as cursor:
             current = cursor.execute(
-                "SELECT e.execution_id, a.status, a.slurm_job_id FROM execution_attempts a "
+                "SELECT e.execution_id, a.status, a.slurm_job_id, a.error_kind, "
+                "a.updated_at <= now() - %s::interval AS aged "
+                "FROM execution_attempts a "
                 "JOIN executions e USING (execution_id) WHERE a.id = %s FOR UPDATE",
-                (attempt_id,),
+                (pending_for or timedelta(0), attempt_id),
             ).fetchone()
             if current is None:
                 raise ExecutionNotFoundError("The execution attempt does not exist")
+            if pending_for is not None and not (
+                current["error_kind"] == "remote_outcome_pending" and current["aged"]
+            ):
+                raise InvalidTransitionError(
+                    "The attempt's outcome has not been pending for the full wait yet"
+                )
             if expected is not None and current["status"] != expected:
                 raise InvalidTransitionError(
                     f"The attempt is {current['status']}, no longer {expected}"
@@ -1469,6 +1531,17 @@ class ExecutionRegistry:
                 "SELECT project_id FROM executions WHERE execution_id = %s", (execution_id,)
             ).fetchone()
         return row["project_id"] if row else None
+
+    def kind_of(self, execution_id: str) -> str | None:
+        """
+        An execution's kind (`execution` or `batch`), or `None`. Controller-internal,
+        for settling an attempt by its Slurm state; never returned to a User.
+        """
+        with transaction(self.database, None, "read an execution kind") as cursor:
+            row = cursor.execute(
+                "SELECT kind FROM executions WHERE execution_id = %s", (execution_id,)
+            ).fetchone()
+        return row["kind"] if row else None
 
     def get_attempt(self, attempt_id: int) -> Attempt | None:
         """
