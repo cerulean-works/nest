@@ -29,6 +29,8 @@ guide:
         title: Share a Controller over Tailscale
       - local: dokploy
         title: Deploy on Dokploy from environment variables
+      - local: deployment-recovery
+        title: Preflight and recover a Dokploy deployment
       - local: deploy
         title: Deploy a Slurm Controller
       - local: runtime-image
@@ -73,6 +75,8 @@ guide:
         title: Public API security and abuse controls (H07)
       - local: public-grpc-gateway
         title: Run the public gRPC gateway pilot (H08)
+      - local: hosted-rollout
+        title: Hosted gRPC rollout runbook and evidence (H09)
   - title: Contributing
     sections:
       - local: developing

@@ -9,6 +9,7 @@ and the `nest-db platform` and `nest platforms` commands.
 """
 
 import json
+import logging
 import os
 import secrets
 import subprocess
@@ -562,11 +563,21 @@ class EnvironmentSyncTests(_Base):
         }
         with self.assertRaises(PlatformSlugConflictError):
             open_database(load_controller_config(environ))
-        with (
-            mock.patch.dict(os.environ, environ, clear=True),
-            self.assertRaises(SystemExit) as caught,
-        ):
-            main()
+        # main() configures Nest's console logging; undo it so the handler, bound to
+        # this test's captured stderr, does not outlive the test.
+        nest_logger = logging.getLogger("nest")
+        saved = nest_logger.handlers[:], nest_logger.level, nest_logger.propagate
+        try:
+            with (
+                mock.patch.dict(os.environ, environ, clear=True),
+                self.assertRaises(SystemExit) as caught,
+            ):
+                main()
+        finally:
+            for handler in nest_logger.handlers:
+                if handler not in saved[0]:
+                    handler.close()
+            nest_logger.handlers, nest_logger.level, nest_logger.propagate = saved
         self.assertEqual(caught.exception.code, 3)
 
     def test_controller_mirrors_and_records_jobs_on_the_env_platform(self):

@@ -159,7 +159,10 @@ services:
         max-file: "3"
 
   # One-shot schema upgrade, enabled with the `migrate` profile. It receives only the
-  # database settings. With no pending migration it changes nothing.
+  # database settings. With no pending migration it changes nothing. If a deploy
+  # waits forever on a never-started migrate container (an interrupted recreate),
+  # see `scripts/nest-deploy-doctor.py migrate-status` and
+  # docs/source/deployment-recovery.md; never skip this step.
   migrate:
     profiles: [migrate]
     image: ${NEST_CONTROLLER_IMAGE:-nest-controller:local}
@@ -345,8 +348,9 @@ services:
         read_only: true
     networks:
       grpc-origin:
-        # Fixed, so the Controller can trust exactly this address:
-        # NEST_GRPC_TRUSTED_PROXIES=172.31.250.2/32.
+        # Fixed, so the Controller can trust exactly this address
+        # (NEST_GRPC_TRUSTED_PROXIES=<this address>/32). It must be a host of
+        # NEST_GRPC_ORIGIN_SUBNET other than the first, which the bridge uses.
         ipv4_address: ${NEST_GRPC_GATEWAY_ADDRESS:-172.31.250.2}
       edge:
         aliases: [nest-grpc-gateway]
@@ -406,6 +410,11 @@ networks:
   tailnet:
     driver: bridge
   # Gateway to Controller only. `internal` gives it no route outside the host.
+  # Created on every deploy, because the Controller always joins it. The default
+  # subnet lies in Docker's own address pools and can overlap another network,
+  # which fails the deploy at network creation: check it first with
+  # `python3 scripts/nest-deploy-doctor.py preflight` and set NEST_GRPC_ORIGIN_SUBNET
+  # and NEST_GRPC_GATEWAY_ADDRESS (docs/source/deployment-recovery.md).
   grpc-origin:
     driver: bridge
     internal: true

@@ -5,7 +5,8 @@
 # file is the rollback. Traefik does not terminate TLS for this name: Envoy holds the
 # certificate, so Traefik's own timeouts and certificates do not apply to it.
 #
-# Replace grpc.nest.cerulean.works with the staging name for a staging run.
+# Replace grpc.nest.cerulean.works with the staging name for a staging run, or
+# render it with deploy/public-grpc/traefik/render.sh. For Traefik v2.x to v3.4.
 tcp:
   routers:
     nest-grpc:
@@ -23,8 +24,9 @@ tcp:
           # public-grpc). Its port is never published on the host.
           - address: nest-grpc-gateway:8443
         # Envoy requires PROXY protocol v2 and refuses connections without it, so
-        # the client address survives the TLS passthrough. Confirm this key on the
-        # deployed Traefik version (some v3 releases move it to a TCP
-        # serversTransport); a mismatch fails closed, it never skips the header.
+        # the client address survives the TLS passthrough. Verified with Traefik
+        # v2.11, v3.2, v3.3, v3.4.5, v3.5.3 and v3.6.2 (tests/check_traefik_passthrough.sh).
+        # v3.5 and later log this key as deprecated: use
+        # nest-grpc.servers-transport.yml there. A mismatch fails closed.
         proxyProtocol:
           version: 2
