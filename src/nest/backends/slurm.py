@@ -1,28 +1,33 @@
 import hashlib
-import os
 import re
-import selectors
 import shlex
-import subprocess
 import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import ClassVar
 
 from .._logging import current_request_id, get_logger, operation
-from ..config import DEFAULT_PARTITION, child_environ, load_log_level
+from ..config import DEFAULT_PARTITION, load_log_level
 from ..errors import (
     ExecutionTimeoutError,
     InfrastructureError,
     JobBlockedError,
     QueueTimeoutError,
     RemoteCommandError,
-    ResultTooLargeError,
+    SessionUnavailableError,
     SlurmJobError,
     SSHError,
     SSHTimeoutError,
     SubmissionUnknownError,
+)
+from .transport import (
+    ControllerSSHTransport,
+    ExecutionAuthority,
+    Operation,
+    SlurmTransport,
+    TransportCapabilities,
 )
 
 logger = get_logger(__name__)
@@ -245,6 +250,34 @@ class SlurmJobInfo:
         return " ".join(f"{key}={value}" for key, value in fields.items() if value is not None)
 
 
+@dataclass(frozen=True)
+class SlurmAccounting:
+    """
+    One job's allocation record from `sacct`, as Slurm reported it.
+
+    Fields Slurm left empty are `None`; they are never filled in or assumed zero.
+
+    Attributes:
+        job_id (`int`): Slurm job ID.
+        state (`str`): Slurm state, such as `COMPLETED` or `FAILED`.
+        exit_code (`str`, *optional*): `<exit status>:<signal>`.
+        elapsed (`str`, *optional*): Elapsed time, such as `00:01:02`.
+        account (`str`, *optional*): Slurm account charged.
+        user (`str`, *optional*): HPC UNIX user that ran the job.
+        node_list (`str`, *optional*): Allocated nodes.
+        alloc_tres (`str`, *optional*): Allocated trackable resources.
+    """
+
+    job_id: int
+    state: str
+    exit_code: str | None = None
+    elapsed: str | None = None
+    account: str | None = None
+    user: str | None = None
+    node_list: str | None = None
+    alloc_tres: str | None = None
+
+
 def _pending_detail(info: SlurmJobInfo) -> str:
     """Returns a message fragment naming a pending job's reason, context, and fix."""
     if info.state != "PENDING" or not info.reason:
@@ -434,23 +467,54 @@ class BuildProgress:
 
 
 class SlurmBackend:
-    """Stages files and manages Slurm jobs through noninteractive SSH commands."""
+    """
+    The shared Slurm execution core: stages files and manages Slurm jobs.
 
-    def __init__(self, config: SlurmConfig):
+    Every remote command runs through a [`backends.transport.SlurmTransport`],
+    which owns the connection. The default is the Controller's own noninteractive
+    SSH ([`backends.transport.ControllerSSHTransport`], trusted Mode A), exactly as
+    before. Operations a transport cannot perform without the user's live session
+    raise [`errors.SessionUnavailableError`] before any command runs.
+    """
+
+    def __init__(self, config: SlurmConfig, transport: SlurmTransport | None = None):
         """
         Stores the backend configuration without connecting to the cluster.
 
         Args:
-            config ([`backends.slurm.SlurmConfig`]): SSH host, Slurm defaults, and paths.
+            config ([`backends.slurm.SlurmConfig`]): Slurm defaults, paths and, for
+                the default transport, SSH settings.
+            transport ([`backends.transport.SlurmTransport`], *optional*): Runs the
+                remote commands. Defaults to the Controller's SSH from `config`.
+
+        Raises:
+            `ValueError`: If a user-owned transport is paired with a configuration
+                carrying Controller SSH credentials, which it must never reach.
         """
+        if transport is None:
+            transport = ControllerSSHTransport(config)
+        elif transport.capabilities.execution_authority != ExecutionAuthority.CONTROLLER_OWNED and (
+            config.ssh_mode != "A" or config.identity_file or config.known_hosts_file
+        ):
+            raise ValueError(
+                "A user-owned transport cannot use Controller SSH credentials; "
+                "give it a configuration without ssh_mode B, identity_file or "
+                "known_hosts_file"
+            )
         self.config = config
+        self.transport = transport
+
+    @property
+    def capabilities(self) -> TransportCapabilities:
+        """What the transport can do: authority, interaction and offline limits."""
+        return self.transport.capabilities
 
     def for_endpoint(self, host: str, port: int | None) -> SlurmBackend:
         """
         The same backend connected to another approved login node.
 
-        Only the host and port change: the SSH mode, credentials, host-key file and
-        every Slurm default stay the operator's.
+        Only the host and port change: the transport's identity, credentials,
+        host-key file and every Slurm default stay the same.
 
         Raises:
             `ValueError`: If `host` is not one of `allowed_hosts` (or the configured
@@ -461,221 +525,82 @@ class SlurmBackend:
             raise ValueError(f"SSH host {host!r} is not an approved login node")
         if (host, port) == (self.config.ssh_host, self.config.ssh_port):
             return self
-        return SlurmBackend(replace(self.config, ssh_host=host, ssh_port=port))
+        return SlurmBackend(
+            replace(self.config, ssh_host=host, ssh_port=port),
+            self.transport.for_endpoint(host, port),
+        )
 
-    def _ssh_process(
-        self, command: str, input: bytes | None = None
-    ) -> subprocess.CompletedProcess[bytes]:
+    def _require_session(self, operation: Operation, job_id: int | None = None) -> None:
         """
-        Runs one noninteractive SSH command without classifying its outcome.
-
-        Args:
-            command (`str`): Shell command to execute on the configured host.
-            input (`bytes`, *optional*): Data written to the command's standard input.
-
-        Returns:
-            `subprocess.CompletedProcess[bytes]`: The finished SSH process.
+        Refuses an operation the transport cannot perform now, before any command.
 
         Raises:
-            `subprocess.TimeoutExpired`: If SSH exceeds `ssh_timeout`. The process is
-                killed, but the remote command may still have run.
+            [`errors.SessionUnavailableError`]: If the user's session is not active
+                and the transport cannot perform `operation` offline.
         """
-        return subprocess.run(
-            [*self._ssh_argv(), command],
-            check=False,
-            # Never hand the Controller's credentials to ssh, where a SendEnv setting
-            # could forward them to the Login Node.
-            env=child_environ(),
-            input=input,
-            capture_output=True,
-            timeout=self.config.ssh_timeout,
+        transport = self.transport
+        capabilities = transport.capabilities
+        if capabilities.allows_offline(operation) or transport.session_active():
+            return
+        how = (
+            "Reconnect from an interactive terminal to answer the HPC password and MFA "
+            "prompts, then try again."
+            if capabilities.interactive_required
+            else "Reconnect the session, then try again."
         )
-
-    def _ssh_argv(self) -> list[str]:
-        """
-        Builds the SSH command line, without the remote command, for the SSH mode.
-
-        Returns:
-            `list[str]`: Mode A: `ssh -o BatchMode=yes [-p port] [-l user] host`.
-                Mode B adds `-F none`, strict host-key checking against
-                `known_hosts_file`, and only `identity_file` as a key, so no SSH
-                configuration file, agent, or proxy setting can change the connection.
-        """
-        config = self.config
-        argv = ["ssh"]
-        if config.ssh_mode == "B":
-            known_hosts = str(config.known_hosts_file)
-            argv += ["-F", "none"]
-            argv += ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes"]
-            argv += ["-o", f"UserKnownHostsFile={known_hosts}"]
-            argv += ["-o", f"GlobalKnownHostsFile={known_hosts}"]
-            argv += ["-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none"]
-            argv += ["-o", "ForwardAgent=no", "-o", "ClearAllForwardings=yes"]
-            argv += ["-i", str(config.identity_file), "-p", str(config.ssh_port or 22)]
-        else:
-            argv += ["-o", "BatchMode=yes"]
-            if config.ssh_port is not None:
-                argv += ["-p", str(config.ssh_port)]
-        if config.ssh_user:
-            argv += ["-l", config.ssh_user]
-        argv.append(config.ssh_host)
-        return argv
-
-    def _command_error(self, result: subprocess.CompletedProcess[bytes]) -> InfrastructureError:
-        """
-        Classifies an unsuccessful SSH process.
-
-        Args:
-            result (`subprocess.CompletedProcess[bytes]`): SSH process with a nonzero
-                exit status.
-
-        Returns:
-            [`errors.InfrastructureError`]: [`errors.SSHError`] for exit status 255,
-                which SSH reserves for its own failures, otherwise
-                [`errors.RemoteCommandError`].
-        """
-        message = (result.stderr or result.stdout or b"").decode(errors="replace").strip()
-        if result.returncode == 255:
-            return SSHError(f"SSH to {self.config.ssh_host} failed:\n{message}")
-        return RemoteCommandError(
-            f"Remote command failed:\n{message}", returncode=result.returncode
+        raise SessionUnavailableError(
+            f"Slurm {operation} needs an active {capabilities.execution_authority} SSH "
+            f"session to {transport.target}, and none is available. {how} Nest does not "
+            "use the Controller's SSH instead.",
+            job_id=job_id,
+            interactive_required=capabilities.interactive_required,
+            operation=str(operation),
         )
-
-    _STDERR_KEEP = 64 * 1024
-    """Bytes of a bounded command's standard error kept for its error message."""
 
     def _ssh_bounded(self, command: str, limit: int) -> bytes:
         """
-        Runs an SSH command and returns its standard output, reading at most
-        `limit` bytes of it into memory (and a bounded part of standard error).
+        Runs a command and returns its standard output, reading at most `limit`
+        bytes of it into memory.
 
         Raises:
-            [`errors.ResultTooLargeError`]: If the output exceeds `limit`; SSH is
-                killed and reaped.
+            [`errors.ResultTooLargeError`]: If the output exceeds `limit`.
             [`errors.SSHTimeoutError`], [`errors.SSHError`],
             [`errors.RemoteCommandError`]: As [`backends.slurm.SlurmBackend._ssh`].
         """
-        deadline = time.monotonic() + self.config.ssh_timeout
-        process = subprocess.Popen(
-            [*self._ssh_argv(), command],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=child_environ(),
-        )
-        assert process.stdout is not None and process.stderr is not None
-        out_fd, err_fd = process.stdout.fileno(), process.stderr.fileno()
-        out = bytearray()
-        kept_err = bytearray()
-        too_large = timed_out = False
-        # One deadline covers reading both pipes, the process's exit and its reaping.
-        # select() never blocks past it, even if the pipes stay open after EOF on one
-        # of them or after SSH has exited.
-        with selectors.DefaultSelector() as selector:
-            selector.register(out_fd, selectors.EVENT_READ)
-            selector.register(err_fd, selectors.EVENT_READ)
-            try:
-                while selector.get_map():
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        timed_out = True
-                        break
-                    for key, _ in selector.select(remaining):
-                        fd = key.fd
-                        if fd == out_fd:
-                            chunk = os.read(fd, min(65536, limit + 1 - len(out)))
-                            out.extend(chunk)
-                            if len(out) > limit:
-                                too_large = True
-                        else:
-                            chunk = os.read(fd, 65536)
-                            # Keep the head for the message; discard the rest.
-                            if len(kept_err) < self._STDERR_KEEP:
-                                kept_err.extend(chunk[: self._STDERR_KEEP - len(kept_err)])
-                        if not chunk:
-                            selector.unregister(fd)
-                    if too_large:
-                        break
-                if not (too_large or timed_out):
-                    try:
-                        process.wait(timeout=max(0.0, deadline - time.monotonic()))
-                    except subprocess.TimeoutExpired:
-                        # Output ended, but SSH is still running.
-                        timed_out = True
-            finally:
-                if process.poll() is None:
-                    process.kill()
-                # SIGKILL cannot be ignored, so the reap is prompt.
-                process.wait()
-                process.stdout.close()
-                process.stderr.close()
-        returncode = process.returncode
-        if too_large:
-            raise ResultTooLargeError(
-                f"The result is larger than {limit} bytes, the most this Controller returns "
-                "(NEST_GRPC_MAX_MESSAGE_BYTES); it was not downloaded"
-            )
-        if timed_out:
-            raise SSHTimeoutError(
-                f"SSH command to {self.config.ssh_host} timed out after "
-                f"{self.config.ssh_timeout:g} seconds. The remote operation status is unknown."
-            )
-        if returncode != 0:
-            raise self._command_error(
-                subprocess.CompletedProcess(process.args, returncode, bytes(out), bytes(kept_err))
-            )
-        return bytes(out)
+        return self.transport.run_bounded(command, limit)
 
     def _ssh(self, command: str, input: bytes | None = None) -> bytes:
         """
-        Runs an SSH command and classifies its failures.
+        Runs a remote command through the transport and classifies its failures.
 
         Args:
-            command (`str`): Shell command to execute on the configured host.
+            command (`str`): Shell command to execute on the login node.
             input (`bytes`, *optional*): Data written to the command's standard input.
 
         Returns:
             `bytes`: Raw standard output.
 
         Raises:
-            [`errors.SSHTimeoutError`]: If SSH exceeds `ssh_timeout`. The remote
-                operation's status is unknown.
+            [`errors.SSHTimeoutError`]: If the command exceeds the transport's
+                timeout. The remote operation's status is unknown.
             [`errors.SSHError`]: If SSH itself fails (exit status 255).
             [`errors.RemoteCommandError`]: If the remote command exits unsuccessfully.
         """
-        started = time.monotonic()
-        logger.debug("SSH command started host=%s", self.config.ssh_host)
-        try:
-            result = self._ssh_process(command, input)
-        except subprocess.TimeoutExpired as exc:
-            raise SSHTimeoutError(
-                f"SSH command to {self.config.ssh_host} timed out after "
-                f"{self.config.ssh_timeout:g} seconds. The remote operation status is unknown."
-            ) from exc
-
-        if result.returncode != 0:
-            raise self._command_error(result)
-
-        logger.debug(
-            "SSH command completed host=%s elapsed_ms=%.1f",
-            self.config.ssh_host,
-            (time.monotonic() - started) * 1000,
-        )
-        return result.stdout
+        return self.transport.check(command, input)
 
     def _run_remote(self, command: str) -> str:
         """
-        Runs a text command over SSH with batch mode enabled.
+        Runs a text command through the transport.
 
         Args:
-            command (`str`): Shell command to execute on the configured host.
+            command (`str`): Shell command to execute on the login node.
 
         Returns:
             `str`: Standard output with leading and trailing whitespace removed.
 
         Raises:
-            [`errors.SSHTimeoutError`]: If SSH exceeds `ssh_timeout` (60 seconds by
-                default). The remote operation's status remains unknown.
+            [`errors.SSHTimeoutError`]: If the command exceeds the transport's
+                timeout (60 seconds by default). Its status remains unknown.
             [`errors.SSHError`]: If SSH cannot reach or authenticate to the host.
             [`errors.RemoteCommandError`]: If the remote command exits unsuccessfully.
         """
@@ -778,17 +703,18 @@ class SlurmBackend:
             "it. Check the queue (for example `squeue --me`) before submitting again."
         )
 
+        self._require_session(Operation.SUBMIT)
         try:
-            result = self._ssh_process(command)
-        except subprocess.TimeoutExpired as exc:
+            result = self.transport.run(command)
+        except SSHTimeoutError as exc:
             raise SubmissionUnknownError(
-                f"sbatch over SSH timed out after {self.config.ssh_timeout:g} seconds. {unknown}"
+                f"sbatch over SSH timed out after {self.transport.timeout:g} seconds. {unknown}"
             ) from exc
 
         stdout = result.stdout.decode(errors="replace")
 
         if result.returncode != 0:
-            error = self._command_error(result)
+            error = self.transport.error(result)
             if isinstance(error, SSHError) and _SUBMIT_MARKER in stdout:
                 raise SubmissionUnknownError(f"SSH disconnected during sbatch: {error}. {unknown}")
             raise error
@@ -849,6 +775,7 @@ class SlurmBackend:
             [`errors.SSHTimeoutError`]: If an SSH command exceeds `ssh_timeout`.
         """
         job_id = int(job_id)
+        self._require_session(Operation.STATUS, job_id)
 
         # Check active jobs
         try:
@@ -914,8 +841,112 @@ class SlurmBackend:
             [`errors.SSHTimeoutError`]: If the SSH command exceeds `ssh_timeout`.
         """
         job_id = int(job_id)
+        self._require_session(Operation.CANCEL, job_id)
         logger.info("Cancelling Slurm job job_id=%s", job_id)
         self._run_remote(f"scancel {job_id}")
+
+    _LOG_PREFIXES: ClassVar[dict[str, str]] = {"worker": "worker", "environment": "env"}
+    """`#SBATCH --output` prefixes of the deployed worker and environment build scripts."""
+
+    _LOG_MARKER = b"nest-log\n"
+    """Printed before a log's contents, so a missing log differs from an empty one."""
+
+    DEFAULT_LOG_BYTES = 64 * 1024
+    """Bytes [`backends.slurm.SlurmBackend.read_log`] returns from a log's end by default."""
+
+    @operation(logger, "Slurm read_log")
+    def read_log(
+        self, job_id: int, *, job: str = "worker", limit: int = DEFAULT_LOG_BYTES
+    ) -> bytes | None:
+        """
+        Reads the end of a job's Slurm output file. Read-only.
+
+        Args:
+            job_id (`int`): Slurm job ID.
+            job (`str`, *optional*, defaults to `"worker"`): `"worker"` for a worker
+                job, `"environment"` for an environment build.
+            limit (`int`, *optional*): Most bytes returned, from the end of the log.
+
+        Returns:
+            `bytes | None`: The last `limit` bytes, or `None` when the log does not
+                exist (yet, or any more).
+
+        Raises:
+            `ValueError`: If `job` or `limit` is invalid or `worker_workdir` is missing.
+            [`errors.SessionUnavailableError`]: If the transport cannot read now.
+            [`errors.InfrastructureError`]: If the remote read fails.
+        """
+        prefix = self._LOG_PREFIXES.get(job)
+        if prefix is None:
+            raise ValueError(f"Unknown job kind {job!r}")
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        if not self.config.worker_workdir:
+            raise ValueError("worker_workdir is not configured")
+        job_id = int(job_id)
+        self._require_session(Operation.LOGS, job_id)
+        path = shlex.quote(f"{self.config.worker_workdir.rstrip('/')}/{prefix}-{job_id}.out")
+        marker = self._LOG_MARKER
+        command = f"test -f {path} || exit 0; printf {shlex.quote(marker.decode())}; tail -c {limit} {path}"
+        try:
+            output = self._ssh_bounded(command, limit + len(marker))
+        except InfrastructureError as exc:
+            exc.job_id = job_id
+            raise
+        if not output.startswith(marker):
+            return None
+        return output[len(marker) :]
+
+    _ACCOUNTING_FIELDS: ClassVar[tuple[str, ...]] = (
+        "JobID",
+        "State",
+        "ExitCode",
+        "Elapsed",
+        "Account",
+        "User",
+        "NodeList",
+        "AllocTRES",
+    )
+
+    @operation(logger, "Slurm accounting")
+    def accounting(self, job_id: int) -> SlurmAccounting | None:
+        """
+        Reads a job's allocation record from Slurm accounting (`sacct`). Read-only.
+
+        Reports what Slurm recorded and nothing more: it does not decide whether
+        the user's function succeeded, and a missing record is `None`, never zero
+        usage.
+
+        Args:
+            job_id (`int`): Slurm job ID.
+
+        Returns:
+            [`backends.slurm.SlurmAccounting`] or `None`: The record, or `None`
+                when accounting does not know the job.
+
+        Raises:
+            [`errors.SessionUnavailableError`]: If the transport cannot read now.
+            [`errors.InfrastructureError`]: If the remote query fails.
+        """
+        job_id = int(job_id)
+        self._require_session(Operation.ACCOUNTING, job_id)
+        output = self._run_remote(
+            f"sacct -X -n -P --jobs={job_id} --format={','.join(self._ACCOUNTING_FIELDS)}"
+        )
+        line = output.splitlines()[0] if output else ""
+        if not line.strip():
+            return None
+        fields = [*line.split("|"), *[""] * len(self._ACCOUNTING_FIELDS)]
+        return SlurmAccounting(
+            job_id=job_id,
+            state=fields[1].strip() or "UNKNOWN",
+            exit_code=_field(fields[2]),
+            elapsed=_field(fields[3]),
+            account=_field(fields[4]),
+            user=_field(fields[5]),
+            node_list=_field(fields[6]),
+            alloc_tres=_field(fields[7]),
+        )
 
     def execution_dir(self, execution_id: str) -> str:
         """
@@ -959,10 +990,11 @@ class SlurmBackend:
             [`errors.SSHTimeoutError`]: If the upload exceeds `ssh_timeout`.
         """
         job_dir = self.execution_dir(execution_id or new_execution_id())
+        self._require_session(Operation.SUBMIT)
         input_path = f"{job_dir}/input.pkl"
         logger.info(
             "Staging payload host=%s job_dir=%s payload_bytes=%s",
-            self.config.ssh_host,
+            self.transport.target,
             job_dir,
             len(payload),
         )
@@ -1277,6 +1309,7 @@ class SlurmBackend:
             [`errors.InfrastructureError`]: If a remote command fails or the result
                 file is empty. Timeouts never cancel the job.
         """
+        self._require_session(Operation.RESULT, job_id)
         self._wait_job(
             job_id,
             "Slurm job",
@@ -1363,6 +1396,8 @@ class SlurmBackend:
 
         if not pyproject_toml or not uv_lock:
             raise ValueError("Environment files cannot be empty")
+
+        self._require_session(Operation.PREPARE)
 
         names = ("pyproject.toml", "uv.lock")
         files = {
@@ -1544,6 +1579,7 @@ class SlurmBackend:
         if not self.config.worker_workdir:
             raise ValueError("worker_workdir is not configured")
 
+        self._require_session(Operation.PREPARE)
         image = f"{self.config.worker_workdir.rstrip('/')}/images/uv-python314.sif"
 
         quoted = shlex.quote(image)

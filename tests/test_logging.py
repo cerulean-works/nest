@@ -223,7 +223,7 @@ def test_slurm_polls_log_only_state_transitions(backend, monkeypatch, caplog, wa
     monkeypatch.setattr(backend, "job_info", lambda job_id: SlurmJobInfo(job_id, next(states)))
     monkeypatch.setattr("nest.backends.slurm.time.sleep", lambda _: None)
     monkeypatch.setattr(
-        "nest.backends.slurm.subprocess.run",
+        "nest.backends.transport.subprocess.run",
         lambda *a, **k: SimpleNamespace(returncode=0, stdout=b"private-result"),
     )
     with request_context("d" * 32):
@@ -306,7 +306,7 @@ def test_environment_cache_logging_omits_dependency_contents(
         uploads.append(kwargs["input"])
         return SimpleNamespace(returncode=0, stdout=b"")
 
-    monkeypatch.setattr("nest.backends.slurm.subprocess.run", upload)
+    monkeypatch.setattr("nest.backends.transport.subprocess.run", upload)
     monkeypatch.setattr(backend, "environment_ready", lambda _: True)
     monkeypatch.setattr(
         backend,
