@@ -152,7 +152,7 @@ came from that address. Do not use a third-party "what is my IP" service.
 
 ### Steps
 
-**1. Rehearse against the local fixture** (synthetic; needs Python 3.12 or later and
+**1. Rehearse against the local fixture** (synthetic; needs Python 3.14, as in the Controller image, and
 nothing else, so `uv run python` in this repository works too):
 
 ```bash

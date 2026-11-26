@@ -24,4 +24,4 @@ python3 egress_probe.py --host 127.0.0.1 --port 2222 --allowed-port 2222 --fixtu
 kill %1
 ```
 
-The scripts need Python 3.12 or later (the Controller image has 3.14). Fixture tests: `uv run pytest tests/test_ssh_egress_poc.py`.
+The scripts need Python 3.14, as in the Controller image (they use 3.14-only syntax). Fixture tests: `uv run pytest tests/test_ssh_egress_poc.py`.
