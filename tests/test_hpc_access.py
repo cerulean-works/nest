@@ -20,6 +20,7 @@ from io import StringIO
 from typing import Any, ClassVar
 from unittest import mock
 
+import cloudpickle
 import grpc
 import psycopg
 from postgres_fixture import PostgresTestCase, connect
@@ -53,6 +54,7 @@ from nest.db import (
 )
 from nest.db.cli import main as nest_db
 from nest.db.platforms import endpoint_for
+from nest.proto import execution_pb2
 
 OPS: dict[str, Any] = {"operator": "ops-test", "reason": "hpc access tests"}
 PIN = "SHA256:abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"
@@ -711,6 +713,31 @@ class AdmissionTests(_AdmissionBase):
         self.assertEqual(attempt["execution_authority"], "controller_owned")
         self.assertIsNone(attempt["hpc_binding_id"])
         self.assertEqual(attempt["unix_user"], "nestop")
+
+    def test_default_submissions_are_refused_once_every_layer_permits_user_owned(self):
+        # No shipped client sends x-nest-execution-authority. With both authorities
+        # permitted on all three layers, such a submission resolves to user_owned and
+        # is refused even with a verified binding: never controller_owned.
+        self.enable_user_owned(BOTH)
+        attest(self.access_store, self.member, self.platform_id, "member01")
+        stub = self.deployment(BOTH)
+        error = self.refused(lambda: self.submit(stub))
+        self.assertEqual(error.code(), grpc.StatusCode.FAILED_PRECONDITION)
+        self.assertIn("user_owned_transport_unavailable", error.details())
+        error = self.refused(
+            lambda: stub.Execute(
+                execution_pb2.ExecuteRequest(payload=cloudpickle.dumps((lambda: 1, (), {}))),
+                timeout=60,
+                metadata=self.metadata(),
+            )
+        )
+        self.assertIn("user_owned_transport_unavailable", error.details())
+        self.assert_nothing_sent()
+        self.assertEqual(self.attempts(), [])
+        # The same Project still runs Mode A on a deployment that does not permit it.
+        self.submit()
+        [attempt] = self.attempts()
+        self.assertEqual(attempt["execution_authority"], "controller_owned")
 
     def test_a_user_owned_only_project_cannot_choose_controller_owned(self):
         self.enable_user_owned(["user_owned"])

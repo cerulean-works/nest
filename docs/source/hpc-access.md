@@ -46,16 +46,17 @@ Project Owner or a `platform_admin`.
 
 ### How a submission is decided
 
-The SDK or CLI may ask for an authority with the request metadata
-`x-nest-execution-authority: controller_owned | user_owned`. It is only a request:
+A submission may ask for an authority with the gRPC request metadata
+`x-nest-execution-authority: controller_owned | user_owned`. **No Nest client
+sends it yet**: the SDK and `nest` CLI send no authority, so their submissions
+always take the unrequested path below. The header is only a request:
 
 - An authority that is asked for must be permitted; otherwise the submission is
   refused with `authority_not_permitted` (`PERMISSION_DENIED`), and **no other
   authority is tried**.
 - When none is asked for, `user_owned` is chosen whenever it is permitted, and
   `controller_owned` otherwise. A Project that may run under its Users' own
-  identities never silently runs under the Controller's. A client that wants the
-  Controller's identity while both are permitted asks for `controller_owned`.
+  identities never silently runs under the Controller's.
 - No permitted authority at all: `no_authority_permitted`.
 - `user_owned` needs a human Nest User (browser or CLI session) with a
   **verified** binding on the Platform: otherwise `hpc_binding_missing`,
@@ -133,10 +134,22 @@ Rules, enforced by the database:
 Every claim, verification, replacement and revocation is recorded in the security
 audit log (`hpc_binding.*`), with the operator and reason.
 
+> **Warning: enabling `user_owned` stops a Project's submissions today.** Once
+> the deployment, the Platform and a Project all permit `user_owned`, every
+> submission from that Project that asks for no authority (every SDK and CLI
+> submission) resolves to `user_owned` and is refused (`hpc_binding_missing`,
+> `hpc_binding_unverified` or `user_owned_transport_unavailable`), even if
+> `controller_owned` is permitted too. It never runs as the Controller, and no
+> shipped client can opt back into `controller_owned`. Until the user-owned
+> transport ships, enable `user_owned` only to stage and test policies and
+> bindings, on a Project that should not run Mode A jobs.
+
 ## Operate with `nest-db`
 
 ```bash
-# Let the Platform and one Project use user_owned (in addition to controller_owned).
+# Permit user_owned on the Platform and one Project. See the warning above: with
+# NEST_EXECUTION_AUTHORITIES also permitting it, that Project's SDK and CLI
+# submissions are refused until the user-owned transport ships.
 nest-db hpc-access set-platform-policy nano4 --authorities controller_owned,user_owned \
     --operator alice --reason "NCHC approved user-owned SSH, ticket 42"
 nest-db hpc-access set-project-policy nano4 --project-id PROJECT_ID \

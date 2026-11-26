@@ -1341,7 +1341,10 @@ def build_admission(
             "NEST_EXECUTION_AUTHORITIES permits user_owned, but this Controller has no "
             "user-owned SSH session transport: such submissions are authorized against "
             "the Platform and Project policies and verified HPC bindings, then refused; "
-            "they never fall back to the Controller's credentials"
+            "they never fall back to the Controller's credentials. In every Project whose "
+            "Platform and Project policies also permit user_owned, submissions that ask "
+            "for no authority (every SDK and CLI submission) resolve to user_owned and are "
+            "refused too, even where controller_owned is permitted"
         )
     return RegistryAdmission(
         database,
