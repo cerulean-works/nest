@@ -707,7 +707,9 @@ class LocalOpenSSHTransport(_OpenSSHTransport):
             port=port or 22,
             timeout=self.timeout,
             login_timeout=self.login_timeout,
-            control_dir=self._control_dir,
+            # A directory this transport created is removed by its close(), so a
+            # derived transport gets its own; a caller's directory is shared.
+            control_dir=None if self._owns_control_dir else self._control_dir,
             control_persist=self.control_persist,
             has_terminal=self._has_terminal,
         )

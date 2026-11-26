@@ -537,6 +537,26 @@ class LocalSessionLifecycleTests(unittest.TestCase):
             transport.close()
         self.assertTrue(os.path.isdir(directory))
 
+    def test_a_derived_transport_survives_the_parent_closing(self):
+        parent = self.local()
+        parent_dir = parent.control_dir  # created and owned by the parent
+        child = parent.for_endpoint("login2.example.edu", 22)
+        self.addCleanup(child.close)
+        self.assertNotEqual(child.control_dir, parent_dir)
+        with mock.patch(
+            "nest.backends.transport.subprocess.run",
+            return_value=mock.Mock(returncode=0, stdout=b"", stderr=b""),
+        ):
+            parent.close()
+        self.assertFalse(os.path.exists(parent_dir))
+        self.assertTrue(os.path.isdir(child.control_dir))
+
+    def test_a_callers_control_dir_is_shared_by_derived_transports(self):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, True)
+        parent = self.local(control_dir=directory)
+        self.assertEqual(parent.for_endpoint("login2.example.edu", 22).control_dir, directory)
+
     def test_close_without_any_command_runs_nothing(self):
         with mock.patch("nest.backends.transport.subprocess.run") as run:
             self.local().close()
