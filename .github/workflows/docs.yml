@@ -1,16 +1,24 @@
 name: Docs
 
+# Pull requests run the build only: it holds no secrets and uploads a short-lived
+# `docs-build` artifact, so an autodoc or MDX failure (#107) fails the pull request
+# instead of main. Publishing runs only for pushes to main or a tag and for a manual
+# dispatch: on a pull request the production publish would overwrite `main`.
 on:
   push:
     branches: [main]
     tags: ["v*"]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions: {}
 
+# A new commit on a pull request cancels that pull request's superseded build;
+# main and tag runs are never cancelled.
 concurrency:
-  group: docs-${{ github.ref }}
-  cancel-in-progress: false
+  group: docs-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
@@ -23,6 +31,7 @@ jobs:
 
   publish:
     needs: build
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     uses: cerulean-works/doc-builder/.github/workflows/publish_docs.yml@main
     permissions:
       actions: read
