@@ -122,8 +122,13 @@ Rules, enforced by the database:
 
 - At most one current (`claimed` or `verified`) binding per User and Platform.
 - A UNIX account is verified for at most one Nest User per Platform: a shared UNIX
-  account does not isolate its Users. The same name on another Platform is another
-  account.
+  account does not isolate its Users. This holds by name and, when the attestation
+  states it, by numeric UID, since file and process permissions follow the UID: two
+  names with the same UID cannot be verified for two Users. The same name or UID on
+  another Platform is another account.
+- A binding attested without a UID is checked only by name. That the name is a
+  distinct UNIX principal then rests on the operator's independent attestation,
+  not on a numeric check; record `--unix-uid` whenever the attestation states it.
 - Only an operator can verify a binding, or change or revoke a verified one. A
   User can only record and withdraw their own claim.
 - A recorded verification is never edited. Replacing a binding creates the next
@@ -179,6 +184,21 @@ each change is the next version.
 | Slurm account | `slurm_accounts` (see [Map Slurm accounts to Projects](slurm-accounts)) | A UNIX identity |
 | Controller identity | The Platform Profile's `SSH_USER` | Any User's binding; it is never used for `user_owned` |
 | Service principal | B09 | A human User; it has no user-owned binding |
+
+## Off the Execution Registry
+
+The legacy path (`NEST_EXECUTION_REGISTRY=legacy`) and the local executor run every
+call as the Controller, and only `controller_owned` exists there:
+
+- A call that asks for `user_owned` is refused with `authority_not_permitted`
+  (`PERMISSION_DENIED`), and any other value but `controller_owned` with
+  `invalid_authority` (`INVALID_ARGUMENT`), before anything is recorded, staged or
+  sent over SSH. It is never served as the Controller instead.
+- With session authentication, a legacy Slurm job is also refused when the stored
+  Platform or Project policy does not permit `controller_owned`, so switching a
+  Controller to the legacy path never bypasses a restrictive policy.
+- A call that asks for no authority, or for `controller_owned`, under policies that
+  permit it, runs as before.
 
 ## Rollback
 

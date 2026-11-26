@@ -15,6 +15,7 @@ import os
 import secrets
 import unittest
 import uuid
+from concurrent import futures
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from typing import Any, ClassVar
@@ -30,7 +31,7 @@ from nest.admission import RegistryAdmission
 from nest.audit import AuditLog
 from nest.authz import AuthorityRefusedError, AuthorityResolver, Principal
 from nest.config import ConfigError, load_controller_config, load_database_config
-from nest.controller import build_admission
+from nest.controller import ExecutionService, build_admission
 from nest.db import (
     EXECUTION_AUTHORITIES,
     AuthorityNotPermittedError,
@@ -54,7 +55,7 @@ from nest.db import (
 )
 from nest.db.cli import main as nest_db
 from nest.db.platforms import endpoint_for
-from nest.proto import execution_pb2
+from nest.proto import execution_pb2, execution_pb2_grpc
 
 OPS: dict[str, Any] = {"operator": "ops-test", "reason": "hpc access tests"}
 PIN = "SHA256:abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"
@@ -321,6 +322,33 @@ class BindingTests(_Database):
         self.assertEqual(on_f1.platform_id, self.f1.id)
         # A claim is no evidence, so it cannot block the real owner.
         self.access.claim(self.bob, self.nano4.id, "shared01")
+
+    def test_a_known_uid_is_verified_for_at_most_one_user_per_platform(self):
+        attest(self.access, self.alice, self.nano4.id, "alice01", unix_uid=40123)
+        # Another name for the same UID is the same POSIX principal.
+        with self.assertRaises(BindingConflictError):
+            attest(self.access, self.bob, self.nano4.id, "alias01", unix_uid=40123)
+        self.assertIsNone(self.access.current_binding(self.bob, self.nano4.id))
+        # The same UID on another Platform is another account.
+        attest(self.access, self.bob, self.f1.id, "bob01", unix_uid=40123)
+        # Bindings without an attested UID are checked by name only.
+        attest(self.access, self.bob, self.nano4.id, "bob01")
+        carol = IdentityStore(self.db).create_user(display_name="carol").id
+        attest(self.access, carol, self.nano4.id, "carol01")
+        # The owner may replace their own binding and keep the UID.
+        mine = attest(self.access, self.alice, self.nano4.id, "alice02", unix_uid=40123)
+        self.assertEqual((mine.version, mine.unix_uid), (2, 40123))
+        # A claim verified in place is checked too.
+        self.access.revoke(
+            self.access.current_binding(carol, self.nano4.id).id, reason="x", operator="o"
+        )  # type: ignore[union-attr]
+        self.access.claim(carol, self.nano4.id, "carol02")
+        with self.assertRaises(BindingConflictError):
+            attest(self.access, carol, self.nano4.id, "carol02", unix_uid=40123)
+        # Once revoked, the UID can be verified for its next owner.
+        self.access.revoke(mine.id, reason="account_reassigned", operator="ops")
+        moved = attest(self.access, carol, self.nano4.id, "carol02", unix_uid=40123)
+        self.assertEqual(moved.status, "verified")
 
     def test_revocation_and_withdrawal(self):
         claim = self.access.claim(self.alice, self.nano4.id, "alice01")
@@ -799,6 +827,104 @@ class AdmissionTests(_AdmissionBase):
         # The same key with a different request (here: no authority asked for).
         error = self.refused(lambda: self.submit(x_nest_idempotency_key="k"))
         self.assertIn("idempotency_conflict", error.details())
+
+
+class LegacyPathTests(_AdmissionBase):
+    """The legacy Slurm path and the local executor run only as the Controller."""
+
+    def setUp(self):
+        super().setUp()
+        self.access_store = HPCAccessStore(self.db)
+        self.legacy = self.serve(None)
+
+    def legacy_execute(self, **extra):
+        return self.legacy.Execute(
+            execution_pb2.ExecuteRequest(payload=cloudpickle.dumps((lambda: 7, (), {}))),
+            timeout=60,
+            metadata=self.metadata(**extra),
+        )
+
+    def jobs_rows(self):
+        return self.sql("SELECT execution_id FROM jobs")
+
+    def test_ordinary_legacy_calls_are_unchanged(self):
+        self.submit(self.legacy)
+        self.submit(self.legacy, x_nest_execution_authority="controller_owned")
+        self.assertEqual(cloudpickle.loads(self.legacy_execute().result), 7)
+        self.assertEqual(len(self.sbatch_calls()), 3)
+        self.assertEqual(self.attempts(), [])
+
+    def test_a_user_owned_request_is_refused_before_anything_runs(self):
+        for call in (
+            lambda **kw: self.submit(self.legacy, **kw),
+            lambda **kw: self.legacy_execute(**kw),
+        ):
+            error = self.refused(lambda call=call: call(x_nest_execution_authority="user_owned"))
+            self.assertEqual(error.code(), grpc.StatusCode.PERMISSION_DENIED)
+            self.assertIn("authority_not_permitted", error.details())
+            error = self.refused(lambda call=call: call(x_nest_execution_authority="root"))
+            self.assertEqual(error.code(), grpc.StatusCode.INVALID_ARGUMENT)
+        duplicate = self.metadata() + [
+            ("x-nest-execution-authority", "controller_owned"),
+            ("x-nest-execution-authority", "user_owned"),
+        ]
+        error = self.refused(
+            lambda: self.legacy.SubmitJob(
+                execution_pb2.SubmitJobRequest(workdir=self.batch_dir(), script="hello.sbatch"),
+                timeout=60,
+                metadata=duplicate,
+            )
+        )
+        self.assertEqual(error.code(), grpc.StatusCode.INVALID_ARGUMENT)
+        self.assert_nothing_sent()
+        self.assertEqual(self.jobs_rows(), [])
+        denied = [
+            e
+            for e in self.audit.events(event="execution.authority", limit=20)
+            if e.outcome == "denied"
+        ]
+        self.assertEqual(len(denied), 4)
+
+    def test_restrictive_stored_policies_are_not_bypassed(self):
+        for authorities in ([], ["user_owned"]):
+            with self.subTest(authorities=authorities):
+                self.access_store.set_project_policy(
+                    self.project, self.platform_id, authorities, **OPS
+                )
+                for call in (lambda: self.submit(self.legacy), self.legacy_execute):
+                    error = self.refused(call)
+                    self.assertEqual(error.code(), grpc.StatusCode.PERMISSION_DENIED)
+                    self.assertIn("authority_not_permitted", error.details())
+        # The Platform layer applies too.
+        self.access_store.set_project_policy(self.project, self.platform_id, BOTH, **OPS)
+        self.access_store.set_platform_policy(self.platform_id, ["user_owned"], **OPS)
+        error = self.refused(lambda: self.submit(self.legacy))
+        self.assertIn("authority_not_permitted", error.details())
+        self.assert_nothing_sent()
+        self.assertEqual(self.jobs_rows(), [])
+        # Restoring controller_owned restores the legacy path.
+        self.access_store.set_platform_policy(self.platform_id, BOTH, **OPS)
+        self.submit(self.legacy)
+        self.assertEqual(len(self.sbatch_calls()), 1)
+
+    def test_the_local_executor_refuses_user_owned_too(self):
+        service = ExecutionService(None, executor="local")
+        server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
+        execution_pb2_grpc.add_ExecutionServiceServicer_to_server(service, server)
+        port = server.add_insecure_port("127.0.0.1:0")
+        server.start()
+        self.addCleanup(server.stop, None)
+        channel = grpc.insecure_channel(f"127.0.0.1:{port}")
+        self.addCleanup(channel.close)
+        stub = execution_pb2_grpc.ExecutionServiceStub(channel)
+        request = execution_pb2.ExecuteRequest(payload=cloudpickle.dumps((lambda: 5, (), {})))
+        with self.assertRaises(grpc.RpcError) as caught:
+            stub.Execute(
+                request, timeout=30, metadata=[("x-nest-execution-authority", "user_owned")]
+            )
+        self.assertEqual(caught.exception.code(), grpc.StatusCode.PERMISSION_DENIED)  # type: ignore[attr-defined]
+        response = stub.Execute(request, timeout=30)
+        self.assertEqual(cloudpickle.loads(response.result), 5)
 
 
 class CommandLineTests(_Database):

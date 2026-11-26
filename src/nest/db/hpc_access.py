@@ -394,8 +394,8 @@ class HPCAccessStore:
         attestation never edits history and attempts keep the version they ran as.
 
         Raises:
-            [`db.BindingConflictError`]: If the UNIX account is verified for another
-                User on the Platform.
+            [`db.BindingConflictError`]: If the UNIX account, by name or by
+                `unix_uid`, is verified for another User on the Platform.
             [`db.PlatformNotFoundError`]: If there is no such Platform.
             `ValueError`: For invalid input.
         """
@@ -429,7 +429,8 @@ class HPCAccessStore:
         except DatabaseError as exc:
             if _conflict(exc):
                 raise BindingConflictError(
-                    "That UNIX account is already verified for another User on this Platform"
+                    "That UNIX account (its name or UID) is already verified for another User "
+                    "on this Platform"
                 ) from None
             raise
         assert row is not None

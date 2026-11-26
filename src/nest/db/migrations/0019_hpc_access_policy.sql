@@ -237,6 +237,11 @@ CREATE UNIQUE INDEX hpc_account_bindings_one_current ON hpc_account_bindings (us
 -- UNIX account would not isolate its Users from each other.
 CREATE UNIQUE INDEX hpc_account_bindings_one_owner ON hpc_account_bindings (platform_id, unix_user)
     WHERE status = 'verified';
+-- File and process permissions follow the numeric UID, not the name: a known UID
+-- is verified for at most one Nest User per Platform too, whatever it is called.
+-- A binding without an attested UID relies on the operator's attestation alone.
+CREATE UNIQUE INDEX hpc_account_bindings_one_owner_uid ON hpc_account_bindings (platform_id, unix_uid)
+    WHERE status = 'verified' AND unix_uid IS NOT NULL;
 CREATE INDEX hpc_account_bindings_platform ON hpc_account_bindings (platform_id, status);
 
 CREATE FUNCTION nest_hpc_binding_insert() RETURNS trigger

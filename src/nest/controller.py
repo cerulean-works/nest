@@ -29,7 +29,7 @@ from .admission import (
 )
 from .audit import AuditLog, audit_interface
 from .auth.web import start_auth_service
-from .authz import Action, Principal
+from .authz import Action, AuthorityRefusedError, Principal
 from .authz.admin import ProviderPolicy
 from .authz.execution import (
     AllowedProjects,
@@ -377,6 +377,67 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 context, exc, "Platform" if exc.reason == "platform_not_authorized" else "Project"
             )
         return {"project_id": project_id, "submitted_by_user_id": principal.user_id}
+
+    def _refuse_unsupported_authority(self, context, principal: Principal | None, rpc: str):
+        """
+        Off the Execution Registry (the legacy Slurm path and the local executor),
+        every call runs as the Controller. A request for any other execution
+        authority is refused before anything runs or is staged, never served as
+        the Controller: `user_owned` with `PERMISSION_DENIED`, an unknown value with
+        `INVALID_ARGUMENT`. A call that asks for none, or for `controller_owned`,
+        is served as before.
+        """
+        requested = _single_metadata(context, EXECUTION_AUTHORITY_METADATA)
+        if requested is None or requested == "controller_owned":
+            return
+        reason = "authority_not_permitted" if requested == "user_owned" else "invalid_authority"
+        logger.warning(
+            "Execution authority refused off the registry rpc=%s requested=%s",
+            rpc,
+            requested[:40],
+        )
+        if self.access is not None:
+            self.access.audit.record(
+                "execution.authority",
+                "denied",
+                actor_user_id=principal.user_id if principal else None,
+                session_id=principal.session_id if principal else None,
+                resource_type="execution",
+                reason=reason,
+                details={"path": "legacy", "rpc": rpc, "requested": requested[:40]},
+            )
+        context.set_trailing_metadata(((ERROR_KIND_METADATA, reason),))
+        if reason == "invalid_authority":
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"{EXECUTION_AUTHORITY_METADATA} must be controller_owned or user_owned [{reason}]",
+            )
+        context.abort(
+            grpc.StatusCode.PERMISSION_DENIED,
+            "This Controller runs jobs only as its own HPC identity "
+            "(NEST_EXECUTION_REGISTRY=legacy or the local executor), so user_owned cannot be "
+            f"served; nothing was run, and the Controller's identity is never used instead [{reason}]",
+        )
+
+    def _require_legacy_authority(self, context, principal, attribution, execution_id) -> None:
+        """
+        On the legacy Slurm path, refuses a job whose stored Platform or Project
+        authority policy does not permit `controller_owned`, before any record,
+        staging or SSH command.
+        """
+        access = self.access
+        if access is None or principal is None or "project_id" not in attribution:
+            return
+        try:
+            self._guarded(
+                context,
+                lambda: access.require_legacy_authority(
+                    principal, attribution["project_id"], execution_id=execution_id
+                ),
+            )
+        except AuthorityRefusedError as exc:
+            context.set_trailing_metadata(((ERROR_KIND_METADATA, exc.reason),))
+            context.abort(grpc.StatusCode.PERMISSION_DENIED, f"{exc} [{exc.reason}]")
 
     def _job_record(self, job_id: int) -> dict | None:
         """
@@ -798,6 +859,9 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 "This Controller does not run calls in its own process (NEST_EXECUTOR=local "
                 "on a non-loopback listener); nothing was run",
             )
+        registry = mode == "slurm" and self.admission is not None
+        if not registry:
+            self._refuse_unsupported_authority(context, principal, "Execute")
         # The Execution ID is fixed, authorized and recorded before any side
         # effect; the backend then uses it for the remote directory and worker.
         execution_id = new_execution_id()
@@ -822,6 +886,7 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
 
         if mode == "slurm":
             backend = self._require_slurm_backend(context)
+            self._require_legacy_authority(context, principal, attribution, execution_id)
             job_dir = None
             if self.jobs is not None:
                 try:
@@ -970,6 +1035,8 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 "Script arguments cannot contain NUL bytes",
             )
 
+        if self.admission is None:
+            self._refuse_unsupported_authority(context, principal, "SubmitJob")
         execution_id = new_execution_id()
         attribution = self._authorize_submit(
             context,
@@ -987,6 +1054,7 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
             return self._submit_job_registry(
                 request, context, backend, principal, execution_id, attribution
             )
+        self._require_legacy_authority(context, principal, attribution, execution_id)
         record = self._begin_record(
             context,
             "batch",
