@@ -31,7 +31,8 @@ Dokploy host :443 ── Traefik TCP router HostSNI(grpc.nest.cerulean.works), T
   │                  PROXY protocol v2 (every other name: the unchanged HTTPS routers)
   ▼  dokploy-network
 Envoy grpc-gateway :8443 (TLS termination; no published port)
-  │  h2c on grpc-origin, an `internal` network with a fixed subnet (172.31.250.0/28)
+  │  h2c on grpc-origin, an `internal` network with a fixed subnet
+  │  (NEST_GRPC_ORIGIN_SUBNET; check it with nest-deploy-doctor.py preflight)
   ▼
 Controller :50051 (NEST_PUBLIC_PILOT=true; publishes no port)
   └── still on the Tailnet through Tailscale Serve: existing users and rollback
@@ -53,9 +54,14 @@ Controller :50051 (NEST_PUBLIC_PILOT=true; publishes no port)
 | `deploy/public-grpc/envoy.yaml.template` | The gateway's Envoy configuration, with placeholders only for deployment values |
 | `deploy/public-grpc/gateway-entrypoint.sh` | Validates those values (refusing a missing, wide or default-route edge address and malformed names), renders the configuration and runs Envoy. `--render DIR` only renders, for review and `envoy --mode validate` |
 | `deploy/public-grpc/renew-certificate.sh` | Obtains and renews the certificate with lego (DNS-01 through Cloudflare) and installs it by rename |
-| `deploy/public-grpc/traefik/nest-grpc.yml` | The Traefik TCP passthrough router, for `/etc/dokploy/traefik/dynamic/` |
+| `deploy/public-grpc/traefik/nest-grpc.yml` | The Traefik TCP passthrough router for Traefik v2.x to v3.4 (`proxyProtocol` on the load balancer), for `/etc/dokploy/traefik/dynamic/` |
+| `deploy/public-grpc/traefik/nest-grpc.servers-transport.yml` | The same router for Traefik v3.5 and later (`proxyProtocol` on a TCP `serversTransport`) |
+| `deploy/public-grpc/traefik/render.sh` | Prints the right one of the two for a name and a Traefik version |
+| `deploy/public-grpc/staging.env.example` | Every staging setting, with placeholders, for the Dokploy Environment panel |
+| `scripts/nest-deploy-doctor.py` | `preflight`: checks the origin subnet against Docker networks and host routes and checks the gateway settings against the running Traefik and Tailnet bridge (see [Preflight and recover a Dokploy deployment](deployment-recovery)) |
 | `compose.dokploy.yaml` profiles `public-grpc` and `public-grpc-acme` | The `grpc-gateway` (Envoy `v1.36.2`) and `grpc-certificates` (lego) services, the internal `grpc-origin` network, and the external edge network |
 | `scripts/verify-public-grpc.py` | The live validation checks below |
+| `tests/check_traefik_passthrough.sh` | Runs a Traefik image with the rendered route and checks that it delivers a PROXY v2 header on SNI passthrough |
 
 ## Deploy to staging
 
@@ -68,21 +74,28 @@ performs them.
 1. **Upgrade the Controller** to this release (`nest-db upgrade`, then redeploy).
    This release needs no schema change.
 
-2. **Controller settings** (Dokploy Environment panel). The Tailnet path stays,
-   so add its network to the allowed peers:
+2. **Controller settings** (Dokploy Environment panel). Start from
+   `deploy/public-grpc/staging.env.example`, which lists every value below with
+   placeholders. The Tailnet path stays, so add its network to the allowed peers:
 
    ```bash
+   NEST_GRPC_ORIGIN_SUBNET=<free private /28>            # e.g. 10.253.250.0/28; see preflight below
+   NEST_GRPC_GATEWAY_ADDRESS=<its second host>           # e.g. 10.253.250.2
    NEST_PUBLIC_PILOT=true
    NEST_EXECUTOR=slurm
    NEST_CONTROLLER_AUTH=session
    NEST_EXECUTION_REGISTRY=required
    NEST_LIMIT_BATCH_SCRIPTS=refuse
    NEST_CONTROLLER_ALLOW_PLAINTEXT=true                  # h2c on grpc-origin and the Tailnet bridge only
-   NEST_GRPC_ALLOWED_PEERS=172.31.250.0/28,<tailnet bridge subnet>
-   NEST_GRPC_TRUSTED_PROXIES=172.31.250.2/32             # the gateway's fixed address
+   NEST_GRPC_ALLOWED_PEERS=<NEST_GRPC_ORIGIN_SUBNET>,<tailnet bridge subnet>
+   NEST_GRPC_TRUSTED_PROXIES=<NEST_GRPC_GATEWAY_ADDRESS>/32   # exactly the gateway
    NEST_ENVIRONMENT_TIMEOUT=540                          # with NEST_RESULT_TIMEOUT=600: under 1200 s
    NEST_PROVIDER_APPROVALS=database                      # or an explicit list, never '*'
    ```
+
+   The defaults (`172.31.250.0/28`, gateway `172.31.250.2`) fall inside Docker's
+   own address pools and collided on the hosted host. Choose the subnet with
+   `preflight` (step 5).
 
    Find the Tailnet bridge subnet with
    `docker network inspect <project>_tailnet --format '{{(index .IPAM.Config 0).Subnet}}'`.
@@ -121,16 +134,44 @@ performs them.
    day and renews 30 days before expiry; Envoy reloads the moved-in pair without a
    restart. Alert when `verify-public-grpc.py` reports `days_left` under 14.
 
-5. **Start the gateway**: `COMPOSE_PROFILES=public-grpc,public-grpc-acme` (plus any
-   profile already in use), and redeploy. Check `docker compose logs grpc-gateway`
-   for `rendered for grpc.staging.<domain>`.
+5. **Preflight, then start the gateway**: set
+   `COMPOSE_PROFILES=public-grpc,public-grpc-acme` (plus any profile already in
+   use), then on the Dokploy host:
 
-6. **Route it.** Copy `deploy/public-grpc/traefik/nest-grpc.yml` to
-   `/etc/dokploy/traefik/dynamic/nest-grpc.yml` with the staging name in its rule.
-   Traefik reloads it by itself; no other router changes. Confirm the
-   `proxyProtocol` key against the deployed Traefik version: some v3 releases move
-   it to a TCP `serversTransport`. A mismatch fails closed: Envoy refuses
-   connections without a PROXY header.
+   ```bash
+   python3 scripts/nest-deploy-doctor.py preflight --project <appName> --env-file .env
+   ```
+
+   Every line must be `PASS` (or `SKIP` with the reason checked by hand). It fails
+   closed on an overlapping subnet or route, a trusted proxy other than the
+   gateway's /32, allowed peers missing the gateway or the actual Tailnet bridge,
+   and an edge address that is not the running Traefik's. Then redeploy. Check
+   `docker compose logs grpc-gateway` for `rendered for grpc.staging.<domain>`, and
+   `python3 scripts/nest-deploy-doctor.py migrate-status --project <appName>`. If
+   the deploy hangs on `migrate`, see
+   [Recover a stuck migrate](deployment-recovery#recover-a-stuck-migrate).
+
+6. **Route it.** Render the route for the staging name and the installed
+   Traefik, then install it:
+
+   ```bash
+   version=$(docker exec dokploy-traefik traefik version | awk '/^Version/{print $2}')
+   sh deploy/public-grpc/traefik/render.sh grpc.staging.<domain> "v$version" \
+     > /etc/dokploy/traefik/dynamic/nest-grpc.yml
+   ```
+
+   Traefik reloads the file by itself; no other router changes. Do not use a
+   Dokploy HTTP Domain for this name: it would terminate TLS in Traefik and bypass
+   the gateway's controls. The PROXY v2 setting depends on the Traefik version,
+   checked against real images by `tests/check_traefik_passthrough.sh`:
+
+   | Traefik | `nest-grpc.yml` (load balancer `proxyProtocol`) | `nest-grpc.servers-transport.yml` |
+   | --- | --- | --- |
+   | v2.11, v3.2, v3.3, v3.4.5 | Works | Refused (`field not found, node: proxyProtocol`), routes nothing |
+   | v3.5.3, v3.6.2 | Works, logged as deprecated | Works (chosen by `render.sh`) |
+
+   Either mismatch fails closed. Envoy refuses connections without a PROXY header,
+   and a refused file routes nothing.
 
 7. **DNS.** Create the staging record as **DNS only** (grey cloud), pointing at the
    Dokploy host. Do not proxy it and do not change any production record.
@@ -187,11 +228,21 @@ The compose check covers no published ports, the internal origin network, the
 gateway's fixed address, and that only the ACME client gets the Cloudflare
 token. The Controller tests cover every `NEST_PUBLIC_PILOT` requirement.
 
+**Synthetic evidence for this release** (Docker, no Nest credential, no public
+name). `tests/check_traefik_passthrough.sh` ran real Traefik v2.11.64, v3.2.5,
+v3.3.7, v3.4.5, v3.5.3 and v3.6.2 images with the route `render.sh` chose for
+each. All six routed by SNI with TLS passthrough and sent a PROXY v2 header. The
+wrong file for a version routes nothing. `nest-deploy-doctor.py preflight` was
+run against real Docker networks, including a squatting network that overlaps the
+origin subnet. This is not live acceptance.
+
 **Pending live acceptance (not claimed as passed).** These need the staging host,
-a real name, a public CA and an outside network:
+a real name, a public CA and an outside network. The
+[rollout runbook](hosted-rollout) lists the commands and expected results for
+each, and the evidence each one needs:
 
 - [ ] Staging record (DNS only) and the Traefik passthrough on the deployed Traefik
-  version, including its `proxyProtocol` key.
+  version (record `traefik version` and the rendered file).
 - [ ] ACME staging issuance, then renewal and reload without a restart.
 - [ ] `verify-public-grpc.py` passes from a residential network and from a cloud
   VM, including `origin_unreachable_*` for the Controller and gateway ports.
@@ -229,7 +280,9 @@ Tailnet `NEST_CONTROLLER_ADDRESS`).
 3. **DNS:** delete the staging record; revoke the Cloudflare token.
 4. **Controller:** unset `NEST_PUBLIC_PILOT` (or leave it: the settings it
    requires are safe for the Tailnet path), and remove the grpc-origin subnet from
-   `NEST_GRPC_ALLOWED_PEERS`. No data changes.
+   `NEST_GRPC_ALLOWED_PEERS`. No data changes. Keep `NEST_GRPC_ORIGIN_SUBNET` and
+   `NEST_GRPC_GATEWAY_ADDRESS`: the Controller still joins `grpc-origin`, and
+   changing the subnet recreates the network.
 
 ## Acceptance checklist (H08)
 
