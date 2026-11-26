@@ -22,6 +22,12 @@ the prompts) raises [`errors.SessionUnavailableError`]. Nothing ever falls back
 to Controller-owned SSH.
 """
 
+# `SlurmConfig` is imported only for type checking (`backends.slurm` imports this
+# module), so the annotations that name it must stay unevaluated at runtime.
+# Without this, `inspect.signature(ControllerSSHTransport)` raises `NameError` on
+# Python 3.14, which breaks the Docs build (#107).
+from __future__ import annotations
+
 import os
 import selectors
 import shutil
