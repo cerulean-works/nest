@@ -5,6 +5,7 @@ with throwaway keys; nothing contacts GitHub and no HPC job runs. PostgreSQL tes
 run against the server named by `NEST_TEST_DATABASE_URL` (see `postgres_fixture`).
 """
 
+import dataclasses
 import io
 import json
 import secrets
@@ -450,8 +451,8 @@ class ExchangeTests(_Base):
         waiting on a lock, so the test knows the exchange is blocked there."""
         for _ in range(400):
             [(waiting,)] = self.sql(
-                "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
-                "AND query LIKE %s",
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+                "AND pid <> pg_backend_pid() AND wait_event_type = 'Lock' AND query LIKE %s",
                 query_prefix + "%",
             )
             if waiting:
@@ -463,52 +464,73 @@ class ExchangeTests(_Base):
     def sleep_past(deadline: datetime) -> None:
         time.sleep(max(0.0, (deadline - datetime.now(UTC)).total_seconds()) + 0.5)
 
-    def test_a_token_whose_deadline_passes_during_a_lock_wait_is_refused(self):
-        # A token whose exp was 50 seconds ago: inside the verifier's 60 s skew, so
-        # it verifies, with its acceptance deadline (exp + 60 s) 10 seconds away.
-        now = int(time.time())
-        token = self.issuer.mint(exp=now - 50, iat=now - 300, nbf=now - 300)
-        deadline = datetime.fromtimestamp(now - 50 + 60, UTC)
-        verified = threading.Event()
-        verify = self.exchanger.verifier.verify
+    def lock_wait_expiry(self, *, verification_delay: float) -> None:
+        """
+        Exchanges a token whose acceptance deadline passes while the exchange waits
+        for the principal's row lock, in a fixed order that no timing can change:
 
-        def verify_and_signal(raw):
-            claims = verify(raw)  # raises, and the test fails, if refused here
+        1. the verifier accepts the token (after `verification_delay`, to show a
+           slow verification changes nothing), and only then is the token given an
+           acceptance deadline 3 seconds ahead;
+        2. the exchange is observed blocked on the principal's row lock;
+        3. the deadline passes, and only then is the lock released.
+        """
+        token = self.issuer.mint()
+        verifier = self.exchanger.verifier
+        verify = verifier.verify
+        verified = threading.Event()
+        deadline: dict[str, datetime] = {}
+
+        def verify_then_set_deadline(raw):
+            time.sleep(verification_delay)
+            claims = verify(raw)  # a refusal here fails the test
+            # The exchange accepts the token until exp + 60 s.
+            deadline["at"] = datetime.now(UTC) + timedelta(seconds=3)
             verified.set()
-            return claims
+            return dataclasses.replace(claims, expires_at=deadline["at"] - timedelta(seconds=60))
 
         release = self.hold_principal_lock()
-        with unittest.mock.patch.object(self.exchanger.verifier, "verify", verify_and_signal):
+        with unittest.mock.patch.object(verifier, "verify", verify_then_set_deadline):
             thread, outcome = self.in_background(
                 lambda: self.exchanger.exchange(token, str(self.principal.id))
             )
-            # 1. The token passed verification, before its deadline.
-            self.assertTrue(verified.wait(10), "the token was not verified")
-            self.assertLess(datetime.now(UTC), deadline)
-            # 2. The exchange is blocked on the principal's row lock.
-            self.wait_until_blocked("SELECT id, name, description, status")
-            # 3. Only once the deadline has passed is the lock released.
-            self.sleep_past(deadline)
-            release.set()
-            thread.join(30)
+            try:
+                self.assertTrue(verified.wait(verification_delay + 10), "not verified")
+                self.wait_until_blocked("SELECT id, name, description, status")
+                self.assertLess(datetime.now(UTC), deadline["at"], "blocked too late")
+                self.sleep_past(deadline["at"])
+            finally:
+                release.set()
+                thread.join(30)
         error = outcome.get("error")
         self.assertIsInstance(error, WorkloadExchangeError, outcome)
         assert isinstance(error, WorkloadExchangeError)
         self.assertEqual(error.reason, "invalid_token")
         self.assertEqual(self.sql("SELECT count(*) FROM workload_token_uses"), [(0,)])
         self.assertEqual(self.sql("SELECT count(*) FROM service_sessions"), [(0,)])
-        # Refused by the post-lock check, not the verifier: the refusal is audited.
+        # Refused by the post-lock check, not the verifier: only it audits `expired`.
         [denied] = [e for e in self.events("workload.exchange") if e.reason == "expired"]
         self.assertEqual(denied.outcome, "denied")
+
+    def test_a_token_whose_deadline_passes_during_a_lock_wait_is_refused(self):
+        self.lock_wait_expiry(verification_delay=0)
+
+    def test_a_slow_verification_still_reaches_the_lock_wait_expiry(self):
+        """Six seconds of verification, longer than any margin the old test had,
+        still ends in the post-lock refusal: the deadline is set only once the
+        token has been verified."""
+        self.lock_wait_expiry(verification_delay=6)
 
     def test_issuance_uses_the_clock_after_the_lock_wait(self):
         release = self.hold_principal_lock()
         started = datetime.now(UTC)
         thread, outcome = self.in_background(self.exchange)
-        self.wait_until_blocked("SELECT id, name, description, status")
-        time.sleep(2.0)
-        release.set()
-        thread.join(30)
+        try:
+            self.wait_until_blocked("SELECT id, name, description, status")
+            time.sleep(2.0)
+        finally:
+            release.set()
+            thread.join(30)
         self.assertNotIn("error", outcome)
         session = outcome["result"].session
         # Created when it was issued, not when its transaction began, and its
@@ -581,12 +603,14 @@ class ExchangeTests(_Base):
         # The exchange got past every pre-insert check before its deadline and is
         # now blocked on the unique index; only after the deadline does the writer
         # roll back.
-        self.wait_until_blocked("INSERT INTO workload_token_uses")
-        self.assertLess(datetime.now(UTC), deadline)
-        self.sleep_past(deadline)
-        release.set()
-        writer_thread.join(30)
-        thread.join(30)
+        try:
+            self.wait_until_blocked("INSERT INTO workload_token_uses")
+            self.assertLess(datetime.now(UTC), deadline, "blocked too late")
+            self.sleep_past(deadline)
+        finally:
+            release.set()
+            writer_thread.join(30)
+            thread.join(30)
         self.assertEqual(outcome.get("result"), "expired", outcome)
         self.assertEqual(self.sql("SELECT count(*) FROM workload_token_uses"), [(0,)])
         self.assertEqual(self.sql("SELECT count(*) FROM service_sessions"), [(0,)])
