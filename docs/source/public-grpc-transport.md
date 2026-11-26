@@ -14,6 +14,8 @@ to connect, not who is allowed to submit. Every call still needs a Nest session
 and a Project grant. H07, F02a, H08 and H09 remain separate tickets.
 
 The reproducible PoC is in [`poc/public-grpc/`](https://github.com/cerulean-works/nest/tree/main/poc/public-grpc).
+The pilot deployment that implements this topology is
+[Run the public gRPC gateway pilot (H08)](public-grpc-gateway).
 
 ## Summary
 
@@ -351,7 +353,7 @@ The following are unsupported until C03/C04 lands:
 | Origin bypass | A Controller port opened to the public would skip the gateway | The Controller is only on an `internal: true` network with no published port, and the probe's `origin_unreachable` check must pass from outside. Keep `NEST_CONTROLLER_ALLOW_PLAINTEXT` only for the Tailnet and internal-network paths | H07 |
 | Certificate renewal (Envoy) | An expired certificate means a total outage | Let's Encrypt is moving to 64-day (2027-02-10) and 45-day (2028-02-16) certificates. Renew at about two-thirds of the lifetime or by ARI, alert at 14 days left (`tls_certificate_sni_alpn_h2` reports `days_left`), and use DNS-01 so that port 80 is not needed | H07 |
 | Cloudflare Access does not cover gRPC | It cannot be used as a second factor in mode A | Nest sessions are the only access control. Do not plan on Access | — |
-| `x-forwarded-for` and client IP | The audit log records the gateway's address | Envoy `use_remote_address: true` sets XFF. Recording XFF in the audit log is a separate change | H08 |
+| `x-forwarded-for` and client IP | The audit log records the gateway's address | Envoy `use_remote_address: true` sets XFF, from Traefik's PROXY protocol header. Since H08 the Controller records it as `client_address` ([gateway pilot](public-grpc-gateway)) | H08 |
 
 ## Rollback
 

@@ -56,7 +56,8 @@ it is limited by. With no trusted proxy configured, `x-forwarded-for` is ignored
 
 For topology D, set Envoy's address on the private network as the only trusted
 proxy, and keep `use_remote_address: true` in `envoy.yaml` so Envoy sets the
-header itself. Recording the address in the audit log is H08.
+header itself. Since H08 every audit record of a gRPC call carries this address as
+`client_address`; see [Run the public gRPC gateway pilot](public-grpc-gateway).
 
 ## Origin bypass protection
 

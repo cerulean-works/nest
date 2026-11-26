@@ -14,8 +14,9 @@ applies to its Controller (the hosted Controller, or any Controller with
 an interactive terminal; in a batch job or without a terminal it raises
 `AuthenticationRequiredError` instead, so sign in with `nest login` first.
 
-To use a session for remote calls, also set `NEST_PROJECT_ID`; see
-[Run your first remote function](quickstart).
+Remote calls run in `NEST_PROJECT_ID` when it is set; otherwise the SDK chooses
+among the Projects you may run in, and `nest projects list|current|use|forget`
+manages that choice (see [Choose the Project your calls run in](project-selection)).
 
 A Nest session identifies you to Nest only. It is **not** an NCHC SSH password,
 one-time code (MFA) or key, Nest never sends it to an HPC login node, and the

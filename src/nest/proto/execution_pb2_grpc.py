@@ -55,6 +55,11 @@ class ExecutionServiceStub:
                 request_serializer=nest_dot_proto_dot_execution__pb2.CancelJobRequest.SerializeToString,
                 response_deserializer=nest_dot_proto_dot_execution__pb2.CancelJobResponse.FromString,
                 _registered_method=True)
+        self.ListEligibleProjects = channel.unary_unary(
+                '/nest.ExecutionService/ListEligibleProjects',
+                request_serializer=nest_dot_proto_dot_execution__pb2.ListEligibleProjectsRequest.SerializeToString,
+                response_deserializer=nest_dot_proto_dot_execution__pb2.ListEligibleProjectsResponse.FromString,
+                _registered_method=True)
 
 
 class ExecutionServiceServicer:
@@ -89,6 +94,13 @@ class ExecutionServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ListEligibleProjects(self, request, context):
+        """Lists the caller's Projects this Controller would accept an execution from now.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_ExecutionServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -111,6 +123,11 @@ def add_ExecutionServiceServicer_to_server(servicer, server):
                     servicer.CancelJob,
                     request_deserializer=nest_dot_proto_dot_execution__pb2.CancelJobRequest.FromString,
                     response_serializer=nest_dot_proto_dot_execution__pb2.CancelJobResponse.SerializeToString,
+            ),
+            'ListEligibleProjects': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListEligibleProjects,
+                    request_deserializer=nest_dot_proto_dot_execution__pb2.ListEligibleProjectsRequest.FromString,
+                    response_serializer=nest_dot_proto_dot_execution__pb2.ListEligibleProjectsResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -222,6 +239,33 @@ class ExecutionService:
             '/nest.ExecutionService/CancelJob',
             nest_dot_proto_dot_execution__pb2.CancelJobRequest.SerializeToString,
             nest_dot_proto_dot_execution__pb2.CancelJobResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListEligibleProjects(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/nest.ExecutionService/ListEligibleProjects',
+            nest_dot_proto_dot_execution__pb2.ListEligibleProjectsRequest.SerializeToString,
+            nest_dot_proto_dot_execution__pb2.ListEligibleProjectsResponse.FromString,
             options,
             channel_credentials,
             insecure,

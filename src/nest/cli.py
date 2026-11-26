@@ -9,6 +9,10 @@ Usage:
     nest platforms list [--url URL] [--project-id UUID] [--json]
     nest platforms show SLUG [--url URL] [--project-id UUID] [--json]
     nest platforms default --project-id UUID [--url URL] [--json]
+    nest projects list [--json]              # Projects you may run in on this Controller
+    nest projects current [--json]           # the Project the SDK would use, and why
+    nest projects use UUID                   # save the Project the SDK uses here
+    nest projects forget                     # forget the saved Project
 
 Every command talks to the Nest named by `--url`, else `NEST_AUTH_URL`, else the
 Cerulean-hosted Nest at `https://auth.nest.cerulean.works`.
@@ -22,9 +26,14 @@ or password as an argument.
 `nest platforms default` shows which of a Project's eligible Platforms a job that
 names none runs on, and why; a Project Owner or Admin chooses it in a browser.
 
+`nest projects` asks the Controller the SDK is configured for (the same
+`NEST_PROFILE`, `NEST_CONTROLLER_ADDRESS` and `NEST_AUTH_URL` settings) which Nest
+Projects you may run in, and keeps the SDK's saved choice for that Controller and
+account in `NEST_PREFERENCES_FILE`. `NEST_PROJECT_ID` always overrides it.
+
 Exit status: 0 on success, 1 when not signed in or the sign-in was denied or
-expired or the Platform is not available, 2 for invalid configuration or arguments,
-3 when Nest is unreachable.
+expired, the Platform or Project is not available, or no Project can be chosen,
+2 for invalid configuration or arguments, 3 when Nest is unreachable.
 """
 
 from __future__ import annotations
@@ -35,7 +44,14 @@ import os
 import sys
 from uuid import UUID
 
-from .config import HOSTED_AUTH_URL, ConfigError, is_hosted_controller, load_cli_auth_config
+from .config import (
+    HOSTED_AUTH_URL,
+    ConfigError,
+    is_hosted_controller,
+    load_cli_auth_config,
+    load_client_config,
+)
+from .errors import ProjectSelectionError
 from .login import (
     AuthError,
     CredentialsFileError,
@@ -107,6 +123,21 @@ def _parser() -> argparse.ArgumentParser:
         "--project-id", type=UUID, metavar="UUID", required=True, help="the Project"
     )
     default_platform.add_argument("--json", action="store_true", help="print JSON")
+    projects = commands.add_parser(
+        "projects", help="choose the Nest Project the SDK runs in on this Controller"
+    )
+    project_actions = projects.add_subparsers(dest="action", required=True)
+    as_json = argparse.ArgumentParser(add_help=False)
+    as_json.add_argument("--json", action="store_true", help="print JSON")
+    project_actions.add_parser(
+        "list", parents=[as_json], help="list the Projects you may run in here"
+    )
+    project_actions.add_parser(
+        "current", parents=[as_json], help="show the Project the SDK would run in, and why"
+    )
+    use = project_actions.add_parser("use", help="save the Project the SDK runs in here")
+    use.add_argument("project_id", type=UUID, metavar="UUID", help="an eligible Project's ID")
+    project_actions.add_parser("forget", help="forget the saved Project")
     return parser
 
 
@@ -216,9 +247,115 @@ def _warn_custom_controller(config) -> None:
         )
 
 
+def _projects(args) -> int:
+    """`nest projects`: Project selection against the SDK's configured Controller."""
+    import grpc
+
+    from . import project_selection as selection
+    from .client import _channel, _controller_error
+
+    client = load_client_config()
+    if client.auth_url is None:
+        print(
+            f"nest: the SDK sends no Nest session to {client.address}, so no Project "
+            "applies there. Set NEST_AUTH_URL to its sign-in address, or use "
+            "NEST_PROFILE=hosted.",
+            file=sys.stderr,
+        )
+        return 2
+    from .login import ensure_session
+
+    store = selection.store_for(client)
+    session = ensure_session(load_cli_auth_config(url=client.auth_url))
+    key = selection.preference_key(client, session.user_id)
+    if args.action == "forget":
+        removed = store is not None and key is not None and store.remove(key)
+        print("Forgot the saved Project." if removed else "No Project was saved here.")
+        return 0
+    try:
+        with _channel(client) as channel:
+            if args.action == "current":
+                choice = selection.select_project(
+                    client, channel, session.access_token, session.user_id, interactive=False
+                )
+                if choice is None:
+                    print("This Controller needs no Project.")
+                    return 0
+                if args.json:
+                    print(json.dumps({"project_id": choice.project_id, "source": choice.source}))
+                else:
+                    print(f"{choice.project_id} ({choice.source})")
+                return 0
+            eligible = selection.list_eligible(channel, session.access_token)
+    except ProjectSelectionError as exc:
+        print(f"nest: {exc}", file=sys.stderr)
+        return 1
+    except grpc.RpcError as exc:
+        error = _controller_error(
+            exc,
+            client.address,
+            selection.LIST_TIMEOUT,
+            auth_url=client.auth_url,
+            hosted=client.profile == "hosted",
+        )
+        print(f"nest: {error or exc}", file=sys.stderr)
+        return 3 if isinstance(error, ConnectionError) else 1
+    if eligible is None:
+        print("This Controller needs no Project.")
+        return 0
+    saved = store.get(key) if store is not None and key is not None else None
+    if args.action == "use":
+        wanted = str(args.project_id)
+        if not any(p.id == wanted for p in eligible):
+            print(
+                f"nest: Project {wanted} is not one you may run in on {client.address}; "
+                "see `nest projects list`.",
+                file=sys.stderr,
+            )
+            return 1
+        if store is None or key is None:
+            return 2
+        store.set(key, wanted)
+        print(f"The SDK now runs in {wanted} on {client.address} (unless NEST_PROJECT_ID is set).")
+        return 0
+    if args.json:
+        payload = {
+            "controller": client.address,
+            "saved_project_id": saved,
+            "projects": [{"id": p.id, "name": p.name, "role": p.role} for p in eligible],
+        }
+        print(json.dumps(payload, indent=2))
+    elif not eligible:
+        print(
+            "You have no Project that may run on this Controller; ask a Project Owner or "
+            "Admin to invite you.",
+            file=sys.stderr,
+        )
+    else:
+        for project in eligible:
+            marker = "*" if project.id == saved else " "
+            print(f"{marker} {selection.describe(project)}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Runs `nest`. Returns the exit status."""
     args = _parser().parse_args(argv)
+    if args.command == "projects":
+        try:
+            return _projects(args)
+        except ConfigError as exc:
+            print(f"nest: {exc}", file=sys.stderr)
+            return 2
+        except NestUnavailableError as exc:
+            print(f"nest: {exc}", file=sys.stderr)
+            return 3
+        except AuthError as exc:
+            print(f"nest: {exc}", file=sys.stderr)
+            return 1
+        except KeyboardInterrupt:
+            print("\nnest: cancelled", file=sys.stderr)
+            return 130
     try:
         config = load_cli_auth_config(url=args.url)
     except ConfigError as exc:

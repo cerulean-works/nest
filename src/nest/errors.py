@@ -263,6 +263,25 @@ class RemoteAccessDeniedError(PermissionError):
     """
 
 
+class ProjectSelectionError(RuntimeError):
+    """
+    `NEST_PROJECT_ID` is unset and the SDK could not choose a Project. Nothing was run.
+
+    Attributes:
+        reason (`str`): `none_eligible` (no Project of yours may run on this
+            Controller), `ambiguous` (several may, and there is no terminal to ask
+            which), or `unsupported` (the Controller cannot list Projects; only
+            `nest projects` reports it, while the SDK then sends no Project as
+            before).
+        project_ids (`tuple[str, ...]`): The eligible Projects, for `ambiguous`.
+    """
+
+    def __init__(self, message: str, reason: str, project_ids: tuple[str, ...] = ()):
+        super().__init__(message)
+        self.reason = reason
+        self.project_ids = project_ids
+
+
 INFRASTRUCTURE_ERRORS: dict[str, type[InfrastructureError]] = {
     cls.kind: cls
     for cls in (

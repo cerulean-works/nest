@@ -184,6 +184,8 @@ admin.project_access(principal, project.id)  # grants, account links, approvals
 
 [[autodoc]] authz.ExecutionAccess
 
+[[autodoc]] authz.EligibleProject
+
 [[autodoc]] authz.UnauthenticatedError
 
 [[autodoc]] authz.ProjectRequiredError

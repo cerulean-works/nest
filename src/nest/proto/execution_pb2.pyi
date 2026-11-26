@@ -79,3 +79,25 @@ class CancelJobRequest(_message.Message):
 class CancelJobResponse(_message.Message):
     __slots__ = ()
     def __init__(self) -> None: ...
+
+class ListEligibleProjectsRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class EligibleProject(_message.Message):
+    __slots__ = ("id", "name", "role")
+    ID_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    ROLE_FIELD_NUMBER: _ClassVar[int]
+    id: str
+    name: str
+    role: str
+    def __init__(self, id: _Optional[str] = ..., name: _Optional[str] = ..., role: _Optional[str] = ...) -> None: ...
+
+class ListEligibleProjectsResponse(_message.Message):
+    __slots__ = ("projects", "projects_required")
+    PROJECTS_FIELD_NUMBER: _ClassVar[int]
+    PROJECTS_REQUIRED_FIELD_NUMBER: _ClassVar[int]
+    projects: _containers.RepeatedCompositeFieldContainer[EligibleProject]
+    projects_required: bool
+    def __init__(self, projects: _Optional[_Iterable[_Union[EligibleProject, _Mapping]]] = ..., projects_required: _Optional[bool] = ...) -> None: ...

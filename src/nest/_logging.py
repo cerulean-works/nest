@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 
 _request_id = ContextVar("nest_request_id", default="-")
+_client_address = ContextVar("nest_client_address", default="-")
 
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
@@ -68,6 +69,21 @@ def request_context(value=None):
 
 def current_request_id():
     return _request_id.get()
+
+
+def current_client():
+    """The client address of the RPC being served, for logs and audit; `-` outside one."""
+    return _client_address.get()
+
+
+@contextmanager
+def client_context(value):
+    """Sets the client address of the RPC being served (see `rpc_guard.client_address`)."""
+    token = _client_address.set(value)
+    try:
+        yield value
+    finally:
+        _client_address.reset(token)
 
 
 def configure_logging():

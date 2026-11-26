@@ -22,3 +22,28 @@ stub.SubmitJob(request, timeout=30, metadata=session_metadata())
 [[autodoc]] client.session_metadata
 
 [[autodoc]] client.call_metadata
+
+[[autodoc]] client.channel_options
+
+## Project selection
+
+When `NEST_PROJECT_ID` is unset, each call chooses its Project as described in
+[Choose the Project your calls run in](../project-selection).
+
+[[autodoc]] project_selection.select_project
+
+[[autodoc]] project_selection.list_eligible
+
+[[autodoc]] project_selection.forget_refused
+
+[[autodoc]] project_selection.ProjectChoice
+
+[[autodoc]] project_selection.EligibleProject
+
+[[autodoc]] project_selection.PreferenceStore
+
+[[autodoc]] project_selection.PreferenceKey
+
+[[autodoc]] project_selection.preference_key
+
+[[autodoc]] project_selection.is_interactive

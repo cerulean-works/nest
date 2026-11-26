@@ -36,7 +36,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from . import _logging
-from ._logging import current_request_id, get_logger
+from ._logging import current_client, current_request_id, get_logger
 from .db.connection import Database, DatabaseError
 from .errors import DatabaseUnavailableError
 
@@ -235,6 +235,9 @@ class AuditLog:
             reason (`str`, *optional*): Machine-readable reason, such as the
                 policy's; anything else is dropped.
             details (`Mapping`, *optional*): Passed through [`audit.redact_details`].
+                An event recorded while a gRPC call is served also gets
+                `client_address`: the TCP peer, or the client a trusted gateway
+                named in `x-forwarded-for` (see [`rpc_guard.client_address`]).
             interface (`str`, *optional*): Defaults to the one set by
                 [`audit.audit_interface`], or `controller`.
             required (`bool`): Raise unless the row is written and sealed into
@@ -256,6 +259,9 @@ class AuditLog:
         interface = interface or _interface.get() or "controller"
         if interface not in INTERFACES:
             raise ValueError(f"Unknown audit interface {interface!r}")
+        client = current_client()
+        if interface == "grpc" and client != "-" and "client_address" not in (details or {}):
+            details = {"client_address": client, **(details or {})}
         row = {
             "event": event,
             "outcome": outcome,
