@@ -18,6 +18,10 @@ import json
 import os
 import re
 import secrets
+import shlex
+import subprocess
+import sys
+import tempfile
 import unittest
 import urllib.error
 import urllib.request
@@ -32,6 +36,7 @@ from fake_oidc import CLIENT_ID, CLIENT_SECRET, Account, FakeGoogle
 from test_authz import _Base, browser
 from test_google_auth import Browser, free_port
 
+from nest import project_selection
 from nest.auth import INSECURE_SESSION_COOKIE, LOGIN_PATH, GoogleSignIn, start_auth_service
 from nest.auth.console import CONSOLE_CSP, PAGE_CSP, connection_profiles
 from nest.authz import (
@@ -1352,6 +1357,163 @@ class ConnectBrowserTests(_EligibilityBrowserBase):
             ],
         )
         self.page.locator("#connect-needs-controller").wait_for()
+        self.assert_clean()
+
+    # Runnable commands (G02c, #95): offered only for a Project the server says can run
+    # here, and bound to it, so a copied command never runs in another Project.
+
+    SETUP_ONLY: ClassVar[list[str]] = ["Install Nest", "Connection settings and sign-in"]
+    RUNNABLE: ClassVar[list[str]] = [
+        *SETUP_ONLY,
+        "Select the Project",
+        "Example main.py",
+        "Run the example",
+    ]
+
+    def offered(self) -> list[str | None]:
+        """The names of the copyable command blocks the Connect page shows now."""
+        return [c.get_attribute("data-command") for c in self.page.locator("[data-command]").all()]
+
+    def command(self, name: str) -> str:
+        return self.page.locator(f'[data-command="{name}"] pre').inner_text()
+
+    def open_connect(self):
+        self.page.goto(f"{self.base}/console#/connect")
+        self.page.reload()
+        self.page.get_by_role("heading", name="Connect to a Project").wait_for()
+
+    def choose(self, pid):
+        self.page.get_by_label("Project", exact=True).select_option(str(pid))
+
+    def assert_runnable_for(self, pid):
+        self.page.get_by_text("can run on this Controller.").wait_for()
+        self.assertEqual(self.offered(), self.RUNNABLE)
+        self.assertEqual(self.page.locator("#connect-not-runnable").count(), 0)
+        self.assertEqual(
+            self.command("Select the Project").splitlines(),
+            [f"uv run nest projects use {pid}", "uv run nest projects current"],
+        )
+        self.assertEqual(
+            self.command("Run the example"), f"NEST_PROJECT_ID={pid} uv run python main.py"
+        )
+
+    def assert_not_runnable(self, why: str):
+        self.page.locator("#connect-not-runnable").get_by_text(why).wait_for()
+        self.assertEqual(self.offered(), self.SETUP_ONLY)
+        text = "\n".join(self.page.locator("#connect-steps pre").all_inner_texts())
+        self.assertNotIn("NEST_PROJECT_ID", text)
+        self.assertNotIn("python main.py", text)
+        self.assertNotIn("projects use", text)
+
+    def test_an_ineligible_project_offers_no_selection_or_run_commands(self):
+        me = self.sign_in()
+        owner = self.user("pi")
+        a = owned_project(self.service, owner, "alpha")
+        b = owned_project(self.service, owner, "beta")
+        for p in (a, b):
+            self.service.add_member(browser(owner), p.id, me, "member")
+        self.make_ready(a.id)  # B is never approved
+        self.open_connect()
+        self.assert_runnable_for(a.id)
+        self.choose(b.id)
+        self.page.get_by_text("beta cannot run on this Controller yet.").wait_for()
+        self.assert_not_runnable("Selecting and running commands appear here once")
+        # The Console keeps the Project the user chose; it never switches to A by itself.
+        self.assertEqual(
+            self.page.get_by_label("Current Project", exact=True).input_value(), str(b.id)
+        )
+        self.choose(a.id)
+        self.assert_runnable_for(a.id)
+        self.assert_clean()
+
+    def test_revoked_eligibility_removes_runnable_commands(self):
+        me = self.sign_in()
+        owner = self.user("pi")
+        project = owned_project(self.service, owner, "lab")
+        self.service.add_member(browser(owner), project.id, me, "member")
+        self.make_ready(project.id)
+        self.open_connect()
+        self.assert_runnable_for(project.id)
+        self.platforms.revoke_project(self.nano.id, project.id, **OPS)
+        self.open_connect()
+        self.assert_not_runnable("Selecting and running commands appear here once")
+        self.assert_clean()
+
+    def test_unknown_eligibility_offers_no_runnable_commands(self):
+        server = self.http.server
+        assert server is not None
+        server.eligibility = None  # the Controller cannot evaluate eligibility
+        me = self.sign_in()
+        owner = self.user("pi")
+        project = owned_project(self.service, owner, "lab")
+        self.service.add_member(browser(owner), project.id, me, "member")
+        self.open_connect()
+        self.assert_not_runnable("could not confirm that lab can run")
+        self.assert_clean()
+
+    def test_without_a_project_no_runnable_commands_are_offered(self):
+        self.sign_in()
+        self.open_connect()
+        self.page.get_by_text("You are not in any Project yet").first.wait_for()
+        self.assert_not_runnable("Join a Project")
+        self.assert_clean()
+
+    def test_run_command_is_bound_to_the_chosen_project_despite_overrides(self):
+        me = self.sign_in()
+        owner = self.user("pi")
+        first = owned_project(self.service, owner, "alpha")
+        second = owned_project(self.service, owner, "beta")
+        for p in (first, second):
+            self.service.add_member(browser(owner), p.id, me, "member")
+            self.make_ready(p.id)
+        self.open_connect()
+        self.choose(second.id)
+        self.page.get_by_text("beta can run on this Controller.").wait_for()
+        self.assert_runnable_for(second.id)
+        self.page.get_by_text("Saves this Project for this Controller").wait_for()
+        block = self.page.locator('[data-command="Run the example"]')
+        block.get_by_role("button").click()
+        block.get_by_role("button", name="Copy: Run the example").filter(
+            has_text="Copied"
+        ).wait_for()
+        run = self.page.evaluate("navigator.clipboard.readText()")
+        self.assertEqual(run, f"NEST_PROJECT_ID={second.id} uv run python main.py")
+        settings = self.command("Connection settings and sign-in").splitlines()
+        exports = [line for line in settings if line.startswith("export ")]
+
+        # In a real POSIX shell, with the other Project both saved for this account and
+        # exported as NEST_PROJECT_ID, the copied command still runs in the chosen one.
+        with tempfile.TemporaryDirectory() as home:
+            prefs = os.path.join(home, "prefs.json")
+            env = {k: v for k, v in os.environ.items() if not k.startswith("NEST_")}
+            env["NEST_PREFERENCES_FILE"] = prefs
+            exported = (shlex.split(e.removeprefix("export "))[0].split("=", 1) for e in exports)
+            saved = load_client_config({**env, **dict(exported)})
+            key = project_selection.preference_key(saved, me)
+            assert key is not None
+            project_selection.PreferenceStore(prefs).set(key, str(first.id))
+            probe = (
+                "from nest.config import load_client_config\n"
+                "from nest import project_selection as s\n"
+                f"c = s.select_project(load_client_config(), None, 'token', {str(me)!r},"
+                " interactive=False)\n"
+                "print(c.project_id, c.source)\n"
+            )
+            program = f"{shlex.quote(sys.executable)} -c {shlex.quote(probe)}"
+            script = "\n".join(
+                [
+                    *exports,
+                    f"export NEST_PROJECT_ID={first.id}",
+                    run.removesuffix("uv run python main.py") + program,
+                ]
+            )
+            self.assertTrue(run.endswith(" uv run python main.py"))
+            done = subprocess.run(
+                ["sh", "-c", script], env=env, capture_output=True, text=True, check=True
+            )
+            # Nothing global was changed: the saved choice is still the other Project.
+            self.assertEqual(project_selection.PreferenceStore(prefs).get(key), str(first.id))
+        self.assertEqual(done.stdout.split(), [str(second.id), "NEST_PROJECT_ID"])
         self.assert_clean()
 
     def test_projects_list_searches_filters_and_pages(self):

@@ -42,10 +42,12 @@ from ..config import ALL_PROJECTS
 from ..db.accounts import SlurmAccountStore
 from ..db.approvals import ProviderApprovalStore
 from ..db.connection import Database
+from ..db.hpc_access import HPCAccessStore
 from ..db.identity import hash_token
 from ..db.sessions import SessionStore
 from ..errors import AUTHORIZATION_METADATA, PROJECT_METADATA
 from .accounts import AccountResolutionError, HPCIdentity, resolve_account
+from .hpc_access import AuthorityRefusedError
 from .platforms import PlatformCatalog
 from .policy import Action, Decision, Principal, Target, decide
 from .service import AccessDeniedError, Authorizer, ProviderAuthority
@@ -262,10 +264,55 @@ class ExecutionAccess:
         self.authorizer = Authorizer(database, providers, self.audit)
         self.platforms = PlatformCatalog(database, self.audit)
         self.accounts = SlurmAccountStore(database)
+        self.authority = HPCAccessStore(database)
         self.platform_id = platform_id
         self.sessions = SessionStore(database)
         self.provider_id = provider_id
         self._log_only = AuditLog(None)
+
+    def require_legacy_authority(
+        self, principal: Principal, project_id: UUID, *, execution_id: str
+    ) -> None:
+        """
+        Checks that the stored execution authority policies (D01) of `project_id`
+        on the served Platform still permit `controller_owned`, the only authority
+        the legacy path (`NEST_EXECUTION_REGISTRY=legacy`) runs a Slurm job under.
+        A Platform or Project policy that denies it is never bypassed by switching
+        a Controller to the legacy path.
+
+        Raises:
+            [`authz.AuthorityRefusedError`]: `authority_not_permitted`, with the
+                refusal recorded in the security audit log.
+        """
+        if self.platform_id is None:
+            return
+        policy = self.authority.effective_policy(project_id, self.platform_id)
+        if "controller_owned" in policy.authorities:
+            return
+        self.audit.record(
+            "execution.authority",
+            "denied",
+            actor_user_id=principal.user_id,
+            session_id=principal.session_id,
+            project_id=project_id,
+            resource_type="execution",
+            resource_id=execution_id,
+            reason="authority_not_permitted",
+            details={
+                "path": "legacy",
+                "authority": "controller_owned",
+                "platform_id": str(self.platform_id),
+                "platform_authority_policy_version": policy.platform_version,
+                "project_authority_policy_version": policy.project_version,
+            },
+        )
+        raise AuthorityRefusedError(
+            "authority_not_permitted",
+            "The execution authority policy of this Project on the Platform does not permit "
+            "controller_owned, the only authority the legacy path runs jobs under; nothing "
+            "was submitted",
+            "controller_owned",
+        )
 
     def authenticate(self, metadata: Iterable[tuple[str, str | bytes]], rpc: str) -> Principal:
         """

@@ -9,7 +9,8 @@ and [`authz.InvitationService`] to email invitations and Invite Links.
 eligibility, default Platform selection, login-node selection and every
 Platform-bound operation (`authorize_platform_action`),
 [`authz.OrganizationService`] Organization changes, and [`authz.AccountResolver`]
-chooses the Slurm account a job charges.
+chooses the Slurm account a job charges. [`authz.AuthorityResolver`] decides whose
+HPC identity a job may run as (execution authority and verified HPC bindings).
 See *Share Projects and manage roles* and *Security and limitations*.
 """
 
@@ -31,6 +32,12 @@ from .execution import (
     ProjectEligibility,
     ProjectRequiredError,
     UnauthenticatedError,
+)
+from .hpc_access import (
+    HUMAN_SESSION_KINDS,
+    AuthorityDecision,
+    AuthorityRefusedError,
+    AuthorityResolver,
 )
 from .invitations import (
     DEFAULT_INVITATION_TTL,
@@ -83,6 +90,7 @@ __all__ = [
     "DEFAULT_INVITATION_TTL",
     "DEFAULT_LINK_MAX_USES",
     "ELIGIBILITY_REASONS",
+    "HUMAN_SESSION_KINDS",
     "MAX_ELIGIBLE_PROJECTS",
     "ORGANIZATION_READ_ACTIONS",
     "PLATFORM_SCOPES",
@@ -96,6 +104,9 @@ __all__ = [
     "Action",
     "AdminService",
     "AllowedProjects",
+    "AuthorityDecision",
+    "AuthorityRefusedError",
+    "AuthorityResolver",
     "Authorizer",
     "DatabaseProviderApprovals",
     "Decision",

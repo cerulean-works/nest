@@ -320,6 +320,7 @@ CONTROLLER_AUTH_SETTINGS = (
     "NEST_PROVIDER_ALLOWED_PROJECTS",
     "NEST_PROVIDER_APPROVALS",
     "NEST_EXECUTION_REGISTRY",
+    "NEST_EXECUTION_AUTHORITIES",
 )
 """gRPC authentication, transport and Provider approval settings, read by
 [`config.load_controller_config`]."""
@@ -337,6 +338,13 @@ EXECUTION_REGISTRY_MODES = ("required", "legacy")
 the durable Execution Registry (the default with `NEST_CONTROLLER_AUTH=session`);
 `legacy` keeps the trusted Mode A path that records only the `jobs` table (the only
 choice without session authentication)."""
+
+EXECUTION_AUTHORITIES = ("controller_owned", "user_owned")
+"""`NEST_EXECUTION_AUTHORITIES` values, the deployment layer of execution authority
+(D01): `controller_owned` (Mode A, Controller SSH, trusted deployments only) and
+`user_owned` (Mode B, the User's own HPC account). The default permits only
+`controller_owned`. The Platform and Project policies in the database must permit an
+authority too (see [`authz.AuthorityResolver`])."""
 
 ALL_PROJECTS = "*"
 """`NEST_PROVIDER_ALLOWED_PROJECTS` value that approves every Project."""
@@ -1131,6 +1139,9 @@ class ControllerConfig:
         rpc ([`config.RpcPolicy`]): gRPC listener bounds and abuse controls (H07).
         limits ([`config.AdmissionLimits`]): Admission limits the Execution
             Registry enforces (F02a); unused on the legacy path.
+        execution_authorities (`tuple[str, ...]`): `NEST_EXECUTION_AUTHORITIES`: the
+            execution authorities this deployment permits (D01), in canonical order.
+            Only `controller_owned` by default, and on the legacy path.
         public_pilot (`bool`): `NEST_PUBLIC_PILOT`: this Controller is the origin of
             the public gRPC gateway's bounded trusted pilot (H08). Loading the
             configuration then fails unless every pilot requirement holds (see
@@ -1166,6 +1177,7 @@ class ControllerConfig:
     execution_registry: str = "legacy"
     rpc: RpcPolicy = field(default_factory=RpcPolicy)
     limits: AdmissionLimits = field(default_factory=AdmissionLimits)
+    execution_authorities: tuple[str, ...] = ("controller_owned",)
     public_pilot: bool = False
     warnings: tuple[str, ...] = ()
 
@@ -1235,6 +1247,7 @@ class ControllerConfig:
             "allowed_projects": sorted(self.allowed_projects),
             "provider_approvals": self.provider_approvals,
             "execution_registry": self.execution_registry,
+            "execution_authorities": list(self.execution_authorities),
             "rpc": self.rpc.summary(),
             "limits": self.limits.summary(),
             "public_pilot": self.public_pilot,
@@ -2321,6 +2334,7 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
     execution_registry = _execution_registry(
         reader, auth, platforms.get(default_platform) if default_platform else None
     )
+    execution_authorities = _execution_authorities(reader, execution_registry)
     rpc = _rpc_policy(reader, bind, auth, executor)
     limits = _admission_limits(reader)
     public_pilot = reader.boolean("NEST_PUBLIC_PILOT")
@@ -2364,6 +2378,7 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
         execution_registry=execution_registry,
         rpc=rpc,
         limits=limits,
+        execution_authorities=execution_authorities,
         public_pilot=public_pilot,
         **timeouts,
     )
@@ -2674,6 +2689,33 @@ def _execution_registry(reader: _Reader, auth: str, platform: PlatformProfile | 
             "which every execution attempt records as its HPC identity"
         )
     return mode
+
+
+def _execution_authorities(reader: _Reader, execution_registry: str) -> tuple[str, ...]:
+    """
+    Reads `NEST_EXECUTION_AUTHORITIES`, a comma-separated list of execution
+    authorities this deployment permits. Only the Execution Registry resolves
+    authority, so the legacy path accepts only the default, `controller_owned`.
+    """
+    raw = reader.get("NEST_EXECUTION_AUTHORITIES")
+    if raw is None:
+        return ("controller_owned",)
+    items = [item.strip().lower() for item in raw.split(",") if item.strip()]
+    unknown = [item for item in items if item not in EXECUTION_AUTHORITIES]
+    if not items or unknown or len(set(items)) != len(items):
+        reader.fail(
+            "NEST_EXECUTION_AUTHORITIES must list controller_owned and/or user_owned once "
+            f"each, got {raw[:80]!r}"
+        )
+        return ("controller_owned",)
+    authorities = tuple(a for a in EXECUTION_AUTHORITIES if a in items)
+    if execution_registry != "required" and authorities != ("controller_owned",):
+        reader.fail(
+            "NEST_EXECUTION_AUTHORITIES other than controller_owned needs "
+            "NEST_EXECUTION_REGISTRY=required: only the Execution Registry resolves "
+            "execution authority, and the legacy path runs every job as the Controller"
+        )
+    return authorities
 
 
 def _networks(reader: _Reader, name: str) -> tuple[Network, ...]:

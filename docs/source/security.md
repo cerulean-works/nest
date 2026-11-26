@@ -124,6 +124,19 @@ reference to check, never as authority.
   actor, session, Project, reason (such as `platform_not_authorized`) and Platform
   ID, never an endpoint credential. See [Review the security audit log](audit-log).
 
+**Execution authority and HPC bindings (D01, D02).** Whose HPC identity a
+registry-backed submission runs as is decided on the server from the deployment
+(`NEST_EXECUTION_AUTHORITIES`), Platform and Project policies, before any login
+node is selected. A client can only ask for an authority; one the policies do not
+permit is refused, and `user_owned` (Mode B) never falls back to the Controller's
+Mode A credentials. `user_owned` needs the caller's own HPC account binding
+verified by an operator-recorded, independent attestation: a typed username or a
+successful relay is no evidence. Each attempt pins its authority, policy versions
+and binding version. No password, OTP, SSH key or session is stored. This is a
+policy and audit control, not HPC isolation: per-user UNIX, workspace and job
+isolation (D05, D06) remain release gates for untrusted users. See
+[Authorize execution authority and HPC account bindings](hpc-access).
+
 Future interfaces, such as the Relay, a Web UI or Mode B interactive SSH, must use
 the same checks: resolve and authorize the Platform with
 [`authz.PlatformCatalog`] after the Project check, bind it to the authenticated

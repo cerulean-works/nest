@@ -20,6 +20,11 @@ For each submission the Controller, on the server side and in this order:
    [Register HPC Platforms and login nodes](platforms)). An ineligible or disabled
    Platform is refused, never replaced, and a Platform this Controller does not
    serve is refused (`platform_not_served`) instead of running elsewhere;
+   then resolves the execution authority (`controller_owned` or `user_owned`)
+   from the deployment, Platform and Project policies and, for `user_owned`, the
+   caller's verified HPC binding. An authority the policies do not permit is
+   refused, never replaced, and `user_owned` never falls back to the Controller's
+   credentials (see [Authorize execution authority and HPC account bindings](hpc-access));
 3. chooses an approved login node of that Platform for its transport mode;
 4. takes the HPC identity from its own configuration: in Mode A, the operator's
    UNIX user (`SSH_USER` of the Platform Profile). Nothing the client sends can
@@ -31,7 +36,8 @@ For each submission the Controller, on the server side and in this order:
 6. registers the execution and records its `submitting` attempt, committing both:
    the requested options, every resolved option with its origin (`request` or the
    default's layer: `project`, `platform`, `server` or `catalog`), the Platform,
-   the login-node snapshot, the mode, the UNIX user, the account and its origin,
+   the login-node snapshot, the mode, the execution authority and the policy
+   versions it was admitted under, the UNIX user, the account and its origin,
    and the digests of the serialized call and of the environment files.
 
 Only then does it stage files and run `sbatch`, with the recorded account,
