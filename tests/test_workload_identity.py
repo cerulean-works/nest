@@ -258,7 +258,7 @@ class ExchangeTests(_Base):
 
     def test_only_exact_repository_ref_workflow_and_environment_match(self):
         other_repo = "example-org/other"
-        cases = {
+        cases: dict[str, dict[str, Any]] = {
             "cross-repository": {
                 "repository": other_repo,
                 "repository_id": "100000002",
@@ -283,6 +283,14 @@ class ExchangeTests(_Base):
             "workflow of another repository": {"workflow_ref": f"{other_repo}/{WORKFLOW}@{REF}"},
             "prefix of the workflow": {"workflow_ref": f"{REPOSITORY}/{WORKFLOW}.bak/x.yml@{REF}"},
             "unexpected environment": {"environment": "production"},
+            # Fork-triggerable events run in the base repository's context, on its
+            # default branch, with exactly the trusted ref and workflow_ref.
+            "pull_request_target": {"event_name": "pull_request_target"},
+            "workflow_run": {"event_name": "workflow_run"},
+            "issue_comment": {"event_name": "issue_comment"},
+            "pull_request on a branch ref": {"event_name": "pull_request"},
+            "event not listed": {"event_name": "workflow_dispatch"},
+            "no event": {"event_name": DROP},
         }
         for name, overrides in cases.items():
             with self.subTest(name):
@@ -313,6 +321,81 @@ class ExchangeTests(_Base):
         self.assertTrue(denied)
         self.assertTrue(all(e.outcome == "denied" for e in denied))
         self.assertIn("ref", {c for e in denied for c in str(e.details.get("checks")).split(",")})
+
+    def test_only_listed_events_that_a_fork_cannot_trigger_are_trusted(self):
+        manual = self.store.create_principal("nest-manual", **OPS)
+        self.store.add_trust_policy(
+            manual.id,
+            audience=AUDIENCE,
+            repository=REPOSITORY,
+            repository_id=REPOSITORY_ID,
+            repository_owner_id=OWNER_ID,
+            refs=[REF],
+            workflows=[WORKFLOW],
+            event_names=["workflow_dispatch", "schedule"],
+            **OPS,
+        )
+        self.exchange(principal=manual.id, event_name="workflow_dispatch")
+        self.exchange(principal=manual.id, event_name="schedule")
+        self.assertEqual(self.refused(principal=manual.id), "not_trusted")  # push
+        policy: dict[str, Any] = dict(
+            audience=AUDIENCE,
+            repository=REPOSITORY,
+            repository_id=REPOSITORY_ID,
+            repository_owner_id=OWNER_ID,
+            refs=[REF],
+            workflows=[WORKFLOW],
+            **OPS,
+        )
+        for event in ("pull_request_target", "workflow_run", "issue_comment", "pull_request"):
+            with self.subTest(event), self.assertRaises(ValueError):
+                self.store.add_trust_policy(manual.id, event_names=[event], **policy)
+        with self.assertRaises(ValueError):
+            self.store.add_trust_policy(manual.id, event_names=[], **policy)
+        # The schema refuses them too.
+        with (
+            self.assertRaises(psycopg.errors.CheckViolation),
+            connect(self.url) as conn,
+        ):
+            conn.execute("SELECT set_config('nest.audit_operator', 'x', false)")
+            conn.execute(
+                "INSERT INTO workload_trust_policies (service_principal_id, issuer, audience, "
+                "repository, repository_id, repository_owner_id, refs, workflows, event_names) "
+                "VALUES (%s, 'https://token.actions.githubusercontent.com', 'a', 'o/r', '1', "
+                "'2', ARRAY['refs/heads/main'], ARRAY['.github/workflows/a.yml'], "
+                "ARRAY['pull_request_target'])",
+                (manual.id,),
+            )
+
+    def test_token_uses_outlive_the_verifiers_clock_skew(self):
+        claims = self.issuer.claims()
+        issued = self.exchange(self.issuer.mint(jti=claims["jti"], exp=claims["exp"]))
+        [(expires,)] = self.sql(
+            "SELECT token_expires_at FROM workload_token_uses WHERE jti = %s", claims["jti"]
+        )
+        # Kept until exp plus the verifier's 60 seconds of skew, then 60 more.
+        self.assertEqual(int(expires.timestamp()), claims["exp"] + 60)
+        self.assertIsNotNone(issued)
+        with self.assertRaises(psycopg.errors.IntegrityConstraintViolation):
+            self.sql("DELETE FROM workload_token_uses WHERE jti = %s", claims["jti"])
+        # Boundary: a use whose token stopped being accepted 30 seconds ago, an hour
+        # after it was used, is still kept; one from 2 minutes ago may be pruned.
+        for jti, ago in (("inside-margin", 30), ("past-margin", 120)):
+            self.sql(
+                "INSERT INTO workload_token_uses (issuer, jti, service_principal_id, "
+                "trust_policy_id, token_expires_at, used_at) VALUES "
+                "('https://token.actions.githubusercontent.com', %s, %s, %s, "
+                "now() - make_interval(secs => %s), now() - interval '2 hours')",
+                jti,
+                self.principal.id,
+                self.policy.id,
+                ago,
+            )
+        self.assertEqual(self.store.prune_token_uses(), 1)
+        remaining = {row[0] for row in self.sql("SELECT jti FROM workload_token_uses")}
+        self.assertEqual(remaining, {claims["jti"], "inside-margin"})
+        with self.assertRaises(psycopg.errors.IntegrityConstraintViolation):
+            self.sql("DELETE FROM workload_token_uses WHERE jti = 'inside-margin'")
 
     def test_a_token_is_exchanged_once(self):
         token = self.issuer.mint()
@@ -504,6 +587,7 @@ class SchemaTests(_Base):
             "wildcard workflow": {"workflows": [".github/workflows/*.yml"]},
             "other path": {"workflows": ["ci.yml"]},
             "wildcard environment": {"environments": ["prod*"]},
+            "fork-triggerable event": {"event_names": ["pull_request_target"]},
             "repository pattern": {"repository": "example-org/*"},
             "repository name as id": {"repository_id": "pipeline"},
         }
@@ -692,6 +776,7 @@ class GrpcTests(_Base):
             provider_id="nano",
             platform_id=self.platform_id,
             audit=self.audit,
+            workload=True,
         )
         jobs = JobStore(self.db, "nano", platform_id=self.platform_id)
         service = ExecutionService(self.slurm, executor="local", jobs=jobs, access=access)
@@ -769,6 +854,38 @@ class GrpcTests(_Base):
                 caught.exception.code(),  # ty: ignore[missing-attribute]
                 grpc.StatusCode.UNAUTHENTICATED,
             )
+
+    def test_with_the_exchange_off_service_tokens_are_unauthenticated(self):
+        token = self.exchange().token
+        before = len(self.audit.events(limit=1000))
+        access = ExecutionAccess(
+            self.db,
+            AllowedProjects([str(self.project)]),
+            provider_id="nano",
+            platform_id=self.platform_id,
+            audit=self.audit,
+        )
+        service = ExecutionService(self.slurm, executor="local", access=access)
+        server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
+        execution_pb2_grpc.add_ExecutionServiceServicer_to_server(service, server)
+        port = server.add_insecure_port("127.0.0.1:0")
+        server.start()
+        self.addCleanup(server.stop, None)
+        channel = grpc.insecure_channel(f"127.0.0.1:{port}")
+        self.addCleanup(channel.close)
+        stub = execution_pb2_grpc.ExecutionServiceStub(channel)
+        with self.assertRaises(grpc.RpcError) as caught:
+            stub.ListEligibleProjects(
+                execution_pb2.ListEligibleProjectsRequest(),
+                timeout=10,
+                metadata=[("authorization", f"Bearer {token}")],
+            )
+        self.assertEqual(
+            caught.exception.code(),  # ty: ignore[missing-attribute]
+            grpc.StatusCode.UNAUTHENTICATED,
+        )
+        # Like any unauthenticated call, it writes nothing to the database.
+        self.assertEqual(len(self.audit.events(limit=1000)), before)
 
     def test_a_member_still_runs_mode_a(self):
         """Human CLI sessions and Mode A are unchanged by B09."""

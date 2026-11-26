@@ -1300,6 +1300,7 @@ def build_access(config: ControllerConfig, database: Database | None) -> Executi
         providers,
         provider_id=provider_id,
         platform_id=platform_id,
+        workload=config.workload is not None,
     )
 
 

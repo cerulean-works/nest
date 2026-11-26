@@ -12,9 +12,10 @@ such a token only when:
    skew), it lives at most an hour, and it carries a `jti`;
 3. it matches one active trust policy of the named service principal exactly:
    `repository`, `repository_id`, `repository_owner_id`, `ref`, the workflow file
-   (from `workflow_ref`, which must name the same repository and ref) and
-   `environment` (see [`db.TrustPolicy`]). Nothing is a pattern, and pull request
-   refs are never trusted;
+   (from `workflow_ref`, which must name the same repository and ref),
+   `environment` and `event_name` (see [`db.TrustPolicy`]). Nothing is a pattern,
+   pull request refs are never trusted, and neither is any event a fork's pull
+   request can trigger (`pull_request_target`, `workflow_run`, `issue_comment`);
 4. its `jti` was never exchanged before, and the principal is within its exchange
    and active-session quotas, checked in the transaction that issues the session.
 
@@ -33,7 +34,7 @@ import hmac
 import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -135,6 +136,7 @@ class WorkloadClaims:
         repository, repository_id, repository_owner_id, ref, workflow_ref (`str`):
             GitHub's claims, as strings.
         environment (`str | None`): The deployment environment, if any.
+        event_name (`str | None`): The event that triggered the run.
         provenance (`dict`): Non-secret claims kept with the service session.
     """
 
@@ -149,6 +151,7 @@ class WorkloadClaims:
     ref: str
     workflow_ref: str
     environment: str | None
+    event_name: str | None
     provenance: Mapping[str, object]
 
 
@@ -294,6 +297,7 @@ class WorkloadTokenVerifier:
             ref=str(values["ref"]),
             workflow_ref=str(values["workflow_ref"]),
             environment=env,
+            event_name=_text(claims.get("event_name"), 64),
             provenance=provenance,
         )
 
@@ -309,7 +313,7 @@ def match_policy(claims: WorkloadClaims, policy: TrustPolicy) -> str | None:
     Returns:
         `str | None`: The first mismatching check: `inactive`, `issuer`,
             `audience`, `repository`, `repository_id`, `repository_owner_id`,
-            `ref`, `workflow` or `environment`.
+            `ref`, `workflow`, `environment` or `event`.
     """
     if not policy.active:
         return "inactive"
@@ -338,6 +342,11 @@ def match_policy(claims: WorkloadClaims, policy: TrustPolicy) -> str | None:
             return "environment"
     elif claims.environment not in policy.environments:
         return "environment"
+    # Checked last but never optional: a fork's pull request can trigger
+    # pull_request_target, workflow_run or issue_comment runs on the default branch,
+    # with the same ref and workflow_ref as a trusted push.
+    if claims.event_name is None or claims.event_name not in policy.event_names:
+        return "event"
     return None
 
 
@@ -425,7 +434,9 @@ class WorkloadExchange:
                 policy.id,
                 issuer=claims.issuer,
                 jti=claims.jti,
-                token_expires_at=claims.expires_at,
+                # The verifier accepts the token until exp plus the clock skew, so
+                # its use is kept at least that long (see workload_token_uses).
+                token_expires_at=claims.expires_at + timedelta(seconds=CLOCK_SKEW),
                 token_hash=hash_token(secret),
                 ttl_seconds=self.config.token_ttl,
                 provenance={**claims.provenance, "subject": claims.subject[:255]},

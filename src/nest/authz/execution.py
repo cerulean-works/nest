@@ -278,6 +278,9 @@ class ExecutionAccess:
             Controller submits to (see [`controller.environment_platform_id`]).
             Without one, every Platform-bound operation is refused.
         audit ([`audit.AuditLog`], *optional*): Defaults to one on `database`.
+        workload (`bool`): Whether CI workload identity is enabled
+            (`NEST_WORKLOAD_OIDC_AUDIENCE`). Without it, every service token is
+            refused as unauthenticated, as though it never existed.
     """
 
     def __init__(
@@ -288,6 +291,7 @@ class ExecutionAccess:
         provider_id: str | None = None,
         platform_id: UUID | None = None,
         audit: AuditLog | None = None,
+        workload: bool = False,
     ):
         self.audit = audit or AuditLog(database)
         self.authorizer = Authorizer(database, providers, self.audit)
@@ -295,7 +299,7 @@ class ExecutionAccess:
         self.accounts = SlurmAccountStore(database)
         self.platform_id = platform_id
         self.sessions = SessionStore(database)
-        self.services = ServiceAccess(database, self.audit)
+        self.services = ServiceAccess(database, self.audit) if workload else None
         self.provider_id = provider_id
         self._log_only = AuditLog(None)
 
@@ -325,7 +329,7 @@ class ExecutionAccess:
             if scheme.lower() != "bearer" or not token or len(token) > 512:
                 reason = "malformed_token"
         if reason is None and is_service_token(token):
-            caller = self.services.authenticate(token)
+            caller = self.services.authenticate(token) if self.services else None
             if caller is not None:
                 raise ServicePrincipalCall(caller)
             reason = "invalid_token"
@@ -350,6 +354,7 @@ class ExecutionAccess:
         Raises:
             [`authz.ServiceDeniedError`]: Always, with `noninteractive_auth_unavailable`.
         """
+        assert self.services is not None, "only an authenticated service caller is refused"
         try:
             project_id: UUID | None = self.project_of(metadata)
         except ProjectRequiredError:

@@ -8,7 +8,7 @@
     nest-db service-principal trust  PRINCIPAL --audience AUD --repository OWNER/NAME
                               --repository-id N --repository-owner-id N
                               --ref REF [--ref REF ...] --workflow PATH [--workflow PATH ...]
-                              [--environment NAME ...]
+                              [--environment NAME ...] [--event EVENT ...]
     nest-db service-principal grant  PRINCIPAL --project-id UUID --capabilities CAP,CAP
                               [--platform PLATFORM]
     nest-db service-principal revoke PRINCIPAL
@@ -82,6 +82,13 @@ def add_parser(commands, change: argparse.ArgumentParser) -> None:
         default=[],
         help="a deployment environment; without one, only jobs without an environment match",
     )
+    trust.add_argument(
+        "--event",
+        action="append",
+        choices=("push", "workflow_dispatch", "schedule", "release"),
+        help="a triggering event to trust (default: push); events a fork can trigger, "
+        "such as pull_request_target, are never accepted",
+    )
     grant = actions.add_parser("grant", parents=[change], help="grant capabilities on a Project")
     grant.add_argument("principal", metavar="PRINCIPAL")
     grant.add_argument("--project-id", required=True, metavar="UUID")
@@ -119,7 +126,8 @@ def _print_policy(policy: TrustPolicy) -> None:
         f"repository_id={policy.repository_id} owner_id={policy.repository_owner_id} "
         f"audience={json.dumps(policy.audience)} refs={','.join(policy.refs)} "
         f"workflows={','.join(policy.workflows)} "
-        f"environments={','.join(policy.environments) or '(none)'}"
+        f"environments={','.join(policy.environments) or '(none)'} "
+        f"events={','.join(policy.event_names)}"
     )
 
 
@@ -178,6 +186,7 @@ def run(database: Database, args: argparse.Namespace) -> int:
                     refs=args.ref,
                     workflows=args.workflow,
                     environments=args.environment,
+                    event_names=args.event or ["push"],
                     **audit,
                 )
             )

@@ -13,7 +13,8 @@
 -- workload identity token, such as a GitHub Actions OIDC token, at the auth
 -- listener. The token is accepted only if it matches one of the principal's trust
 -- policies exactly (issuer, audience, repository and its numeric IDs, ref,
--- workflow, environment) and its `jti` was never exchanged before. The exchange
+-- workflow, environment, triggering event) and its `jti` was never exchanged
+-- before. The exchange
 -- issues a service session: an opaque bearer token, stored only as its SHA-256
 -- digest, that expires within an hour and cannot be refreshed. Service sessions
 -- are a separate table from user_sessions and session_access_tokens, so a service
@@ -94,6 +95,14 @@ CREATE TABLE workload_trust_policies (
     environments          text[] NOT NULL DEFAULT '{}'
                           CHECK (cardinality(environments) <= 20
                                  AND nest_all_match(environments, '^[^*?\s]{1,255}$')),
+    -- Events that may trigger a trusted run. Only events a fork cannot cause are
+    -- allowed: pull_request_target, workflow_run, issue_comment and the other
+    -- events a fork's pull request can trigger in the base repository's context,
+    -- on its default branch ref, can never be trusted.
+    event_names           text[] NOT NULL DEFAULT ARRAY['push']
+                          CHECK (cardinality(event_names) BETWEEN 1 AND 4
+                                 AND event_names <@ ARRAY['push', 'workflow_dispatch',
+                                                          'schedule', 'release']::text[]),
     status                text NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'revoked')),
     created_at            timestamptz NOT NULL DEFAULT now(),
     revoked_at            timestamptz,
@@ -129,8 +138,10 @@ CREATE UNIQUE INDEX service_principal_grants_active
 CREATE INDEX service_principal_grants_project ON service_principal_grants (project_id);
 
 -- Every workload token ever exchanged, by issuer and jti, so a replayed token is
--- refused. Rows may be pruned once the token has expired and the hour counted by
--- the exchange quota has passed.
+-- refused. token_expires_at is when the exchange stops accepting the token: its
+-- `exp` plus the verifier's clock skew. Rows may be pruned only after that, with
+-- another 60 seconds of margin, and once the hour counted by the exchange quota
+-- has passed.
 CREATE TABLE workload_token_uses (
     issuer                text NOT NULL,
     jti                   text NOT NULL CHECK (jti ~ '^[\x21-\x7e]{1,255}$'),
@@ -178,7 +189,8 @@ CREATE TRIGGER service_principals_immutable BEFORE UPDATE ON service_principals
 CREATE TRIGGER workload_trust_policies_immutable BEFORE UPDATE ON workload_trust_policies
     FOR EACH ROW EXECUTE FUNCTION nest_forbid_column_change(
         'id', 'service_principal_id', 'issuer', 'audience', 'repository', 'repository_id',
-        'repository_owner_id', 'refs', 'workflows', 'environments', 'created_at');
+        'repository_owner_id', 'refs', 'workflows', 'environments', 'event_names',
+        'created_at');
 CREATE TRIGGER service_principal_grants_immutable BEFORE UPDATE ON service_principal_grants
     FOR EACH ROW EXECUTE FUNCTION nest_forbid_column_change(
         'id', 'service_principal_id', 'project_id', 'platform_id', 'capabilities', 'created_at');
@@ -222,7 +234,8 @@ CREATE TRIGGER workload_token_uses_no_truncate BEFORE TRUNCATE ON workload_token
 CREATE FUNCTION nest_prune_workload_token_use() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
-    IF OLD.token_expires_at > now() OR OLD.used_at > now() - interval '1 hour' THEN
+    IF OLD.token_expires_at + interval '60 seconds' > now()
+       OR OLD.used_at > now() - interval '1 hour' THEN
         RAISE EXCEPTION 'a workload token use is kept until the token has expired'
             USING ERRCODE = 'integrity_constraint_violation',
                   CONSTRAINT = 'workload_token_uses_replay_window';

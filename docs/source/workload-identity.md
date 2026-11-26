@@ -36,16 +36,24 @@ when every check below passes. Any failure is refused and nothing is issued.
 | Issuer | Exactly `https://token.actions.githubusercontent.com`. |
 | Audience | Exactly `NEST_WORKLOAD_OIDC_AUDIENCE`, a single audience. The trust policy must name the same value. |
 | Time | `exp`, `iat` and `nbf` are present and hold, with 60 seconds of clock skew. The token lives at most an hour. |
-| Replay | The token's `jti` has never been exchanged before, for any principal. Concurrent exchanges of one token issue at most one session. |
-| Trust policy | One active policy of the named principal matches exactly: `repository`, `repository_id`, `repository_owner_id`, `ref`, the workflow file in `workflow_ref` (which must name the same repository and ref), and `environment`. |
+| Replay | The token's `jti` has never been exchanged before, for any principal. Concurrent exchanges of one token issue at most one session. A used `jti` is kept at least until the token's `exp` plus the 60 seconds of skew, and 60 seconds more, so pruning can never make it acceptable again. |
+| Trust policy | One active policy of the named principal matches exactly: `repository`, `repository_id`, `repository_owner_id`, `ref`, the workflow file in `workflow_ref` (which must name the same repository and ref), `environment` and `event_name`. |
 | Principal | Active, and within its quotas: unexpired sessions at once (`max_active_sessions`, default 4) and exchanges in any rolling hour (`max_exchanges_per_hour`, default 60). |
 
 Trust policies have no wildcards, prefixes or patterns. The numeric repository and
 owner IDs are pinned, so a repository that is deleted and recreated, renamed, or
-moved to another owner doesn't match. Pull request refs (`refs/pull/...`) can't be
-trusted at all, so a pull request from a fork never gets a session. With no
-environment listed, only jobs without a deployment environment match. With some
-listed, the job's environment must be one of them.
+moved to another owner doesn't match. With no environment listed, only jobs
+without a deployment environment match. With some listed, the job's environment
+must be one of them.
+
+A ref and workflow file alone don't keep fork pull requests out. Pull request refs
+(`refs/pull/...`) can't be trusted at all, but GitHub runs `pull_request_target`,
+`workflow_run` and `issue_comment` workflows in the base repository's context, on
+its default branch, so a run that a fork's pull request triggers carries exactly
+the `ref` and `workflow_ref` of a trusted push. Each trust policy therefore also
+lists the triggering events it accepts, `push` by default, and only events a fork
+cannot cause can be listed: `push`, `workflow_dispatch`, `schedule` and `release`.
+A token whose `event_name` is anything else, or missing, never matches.
 
 The answer is a `nest_svc_...` token valid for `NEST_WORKLOAD_TOKEN_TTL` seconds
 (default 600, at most 3600). Only its SHA-256 digest is stored. Revoking the
@@ -67,11 +75,18 @@ then enable the exchange and use it from GitHub Actions.
        --audience https://auth.nest.example.org/workload \
        --repository example-org/pipeline --repository-id 100000001 \
        --repository-owner-id 200000001 \
-       --ref refs/heads/main --workflow .github/workflows/nest.yml \
-       --operator ops --reason "main branch only"
+       --ref refs/heads/main --workflow .github/workflows/nest.yml --event push \
+       --operator ops --reason "pushes to main only"
    nest-db service-principal grant nest-ci --project-id "$PROJECT_ID" \
        --capabilities project.read --operator ops --reason "read Project metadata"
    ```
+
+   Trust only a workflow file that untrusted code can't run in. Nest refuses
+   tokens from fork-triggerable events, but a trusted `push` or
+   `workflow_dispatch` run that checks out and runs code from a pull request, or
+   that a pull request can change before it merges, hands that code the session.
+   Protect the branch, and keep the token step in a workflow that runs only
+   reviewed code.
 
 2. Enable the exchange on the Controller. It needs Google sign-in (the auth
    listener serves the exchange), `NEST_DATABASE_URL` and
@@ -169,7 +184,9 @@ creates one and sets `NEST_WORKLOAD_OIDC_AUDIENCE`.
 
 - **Turn the exchange off** by unsetting `NEST_WORKLOAD_OIDC_AUDIENCE` and
   redeploying. `/auth/workload/token` then answers `404` and every service token
-  is refused (`401` over HTTP, `UNAUTHENTICATED` over gRPC). Revoke the principals
+  is refused as unknown, sessions that haven't expired yet included: `401` over
+  HTTP and `UNAUTHENTICATED` over gRPC, with nothing written to the database.
+  Revoke the principals
   as well if they shouldn't come back when the exchange is enabled again.
 - **Roll the Controller back** as for any migration: restore the backup taken
   before `nest-db upgrade` and deploy the previous image (see

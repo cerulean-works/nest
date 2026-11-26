@@ -38,6 +38,7 @@ logger = get_logger("nest.db.service_principals")
 __all__ = [
     "GITHUB_ACTIONS_ISSUER",
     "SERVICE_CAPABILITIES",
+    "TRUSTED_EVENTS",
     "ExchangeRefusedError",
     "ServiceGrant",
     "ServicePrincipal",
@@ -68,13 +69,24 @@ _WORKFLOW = re.compile(r"\.github/workflows/[A-Za-z0-9_.-]{1,100}\.ya?ml")
 _ENVIRONMENT = re.compile(r"[^*?\s]{1,255}")
 _JTI = re.compile(r"[\x21-\x7e]{1,255}")
 
+TRUSTED_EVENTS = ("push", "workflow_dispatch", "schedule", "release")
+"""GitHub events a trust policy may accept. A fork's pull request can trigger
+`pull_request_target`, `workflow_run`, `issue_comment` and similar events in the
+base repository's context, on its default branch, so none of those is ever
+trusted, whatever ref and workflow match."""
+
+PRUNE_MARGIN_SECONDS = 60
+"""Seconds a token use is kept past `token_expires_at` (which already includes the
+verifier's clock skew), so a pruned `jti` can never be accepted again."""
+
 _PRINCIPAL_COLUMNS = (
     "id, name, description, status, max_active_sessions, max_exchanges_per_hour, "
     "created_at, revoked_at"
 )
 _POLICY_COLUMNS = (
     "id, service_principal_id, issuer, audience, repository, repository_id, "
-    "repository_owner_id, refs, workflows, environments, status, created_at, revoked_at"
+    "repository_owner_id, refs, workflows, environments, event_names, status, created_at, "
+    "revoked_at"
 )
 _GRANT_COLUMNS = (
     "id, service_principal_id, project_id, platform_id, capabilities, status, created_at, "
@@ -158,6 +170,8 @@ class TrustPolicy:
             `.github/workflows/ci.yml`.
         environments (`tuple[str, ...]`): Accepted deployment environments; empty
             accepts only jobs without one.
+        event_names (`tuple[str, ...]`): Accepted triggering events, from
+            [`db.TRUSTED_EVENTS`]. Events a fork can trigger are never accepted.
         status (`str`): `active` or `revoked` (final).
     """
 
@@ -171,6 +185,7 @@ class TrustPolicy:
     refs: tuple[str, ...]
     workflows: tuple[str, ...]
     environments: tuple[str, ...]
+    event_names: tuple[str, ...]
     status: str
     created_at: datetime
     revoked_at: datetime | None
@@ -238,7 +253,7 @@ def _principal(row: Mapping[str, Any]) -> ServicePrincipal:
 
 def _policy(row: Mapping[str, Any]) -> TrustPolicy:
     values = {k: row[k] for k in TrustPolicy.__dataclass_fields__}
-    for name in ("refs", "workflows", "environments"):
+    for name in ("refs", "workflows", "environments", "event_names"):
         values[name] = tuple(values[name])
     return TrustPolicy(**values)
 
@@ -370,6 +385,7 @@ class ServicePrincipalStore:
         refs: Iterable[str],
         workflows: Iterable[str],
         environments: Iterable[str] = (),
+        event_names: Iterable[str] = ("push",),
         operator: str,
         reason: str,
     ) -> TrustPolicy:
@@ -395,6 +411,17 @@ class ServicePrincipalStore:
         ref_list = _exact_list(refs, _REF, "refs", empty=False)
         workflow_list = _exact_list(workflows, _WORKFLOW, "workflows", empty=False)
         environment_list = _exact_list(environments, _ENVIRONMENT, "environments", empty=True)
+        events: list[str] = []
+        for event in event_names:
+            if event not in TRUSTED_EVENTS:
+                raise ValueError(
+                    f"event {str(event)[:40]!r} cannot be trusted; use "
+                    f"{', '.join(TRUSTED_EVENTS)} (events a fork can trigger never are)"
+                )
+            if event not in events:
+                events.append(event)
+        if not events:
+            raise ValueError("event_names must name at least one event")
         with transaction(self.database, None, "add a trust policy") as cursor:
             found = self._lock_principal(cursor, principal)
             if not found.active:
@@ -403,7 +430,7 @@ class ServicePrincipalStore:
                 row = cursor.execute(
                     "INSERT INTO workload_trust_policies (service_principal_id, issuer, audience, "
                     "repository, repository_id, repository_owner_id, refs, workflows, "
-                    f"environments) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                    f"environments, event_names) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
                     f"RETURNING {_POLICY_COLUMNS}",
                     (
                         found.id,
@@ -415,6 +442,7 @@ class ServicePrincipalStore:
                         ref_list,
                         workflow_list,
                         environment_list,
+                        events,
                     ),
                 ).fetchone()
         assert row is not None
@@ -798,7 +826,9 @@ class ServicePrincipalStore:
         """Deletes token uses past their replay window. Returns how many."""
         with transaction(self.database, None, "prune workload token uses") as cursor:
             cursor.execute(
-                "DELETE FROM workload_token_uses WHERE token_expires_at <= now() "
-                "AND used_at <= now() - interval '1 hour'"
+                "DELETE FROM workload_token_uses "
+                "WHERE token_expires_at + make_interval(secs => %s) <= now() "
+                "AND used_at <= now() - interval '1 hour'",
+                (PRUNE_MARGIN_SECONDS,),
             )
             return cursor.rowcount
