@@ -193,9 +193,9 @@ class LocalOpenSSHContractTests(_FakeHpcContract, unittest.TestCase):
             str(self.known_hosts),
             timeout=timeout,
             login_timeout=timeout,
-            control_dir=tempfile.mkdtemp(),
             has_terminal=lambda: True,
         )
+        self.addCleanup(transport.close)
         config = _config(
             ssh_host=FakeHpc.host,
             work_root=f"{self.hpc.base}/jobs",
@@ -206,14 +206,20 @@ class LocalOpenSSHContractTests(_FakeHpcContract, unittest.TestCase):
 
     def test_commands_run_as_the_user_with_pinned_host_keys_and_no_key(self):
         self.backend.status(1)
-        argv = self.hpc.calls("ssh")[-1]["argv"]
+        calls = [call["argv"] for call in self.hpc.calls("ssh")]
+        login = next(argv for argv in calls if argv[-1] == "true")
+        login_options = [login[i + 1] for i, a in enumerate(login) if a == "-o"]
+        self.assertIn("ControlMaster=yes", login_options)  # a new connection, never reused
+        self.assertNotIn("BatchMode=yes", login_options)  # OpenSSH may prompt for password/MFA
+        argv = calls[-1]
         options = [argv[i + 1] for i, a in enumerate(argv) if a == "-o"]
         self.assertEqual(argv[:2], ["-F", "none"])
         self.assertIn("StrictHostKeyChecking=yes", options)
         self.assertIn(f"UserKnownHostsFile={self.known_hosts}", options)
         self.assertIn("ForwardAgent=no", options)
-        self.assertIn("ControlMaster=auto", options)
-        self.assertNotIn("BatchMode=yes", options)  # OpenSSH may prompt for password/MFA
+        # Commands only use the login's connection and never authenticate themselves.
+        self.assertIn("ControlMaster=no", options)
+        self.assertIn("BatchMode=yes", options)
         for option in (
             "PreferredAuthentications=keyboard-interactive,password",
             "PubkeyAuthentication=no",
@@ -395,9 +401,16 @@ class CredentialIsolationTests(unittest.TestCase):
             with self.subTest(user=user), self.assertRaises(ValueError):
                 LocalOpenSSHTransport("login", user, "/pins")
 
-    def test_local_openssh_environment_drops_nest_secrets_and_the_agent(self):
-        transport = self.local(has_terminal=lambda: True, control_dir=tempfile.mkdtemp())
-        agent = {"SSH_AUTH_SOCK": "/run/agent.sock", "SSH_AGENT_PID": "42"}
+    def test_local_openssh_environment_drops_nest_secrets_agent_and_askpass(self):
+        transport = self.local(has_terminal=lambda: True)
+        self.addCleanup(transport.close)
+        agent = {
+            "SSH_AUTH_SOCK": "/run/agent.sock",
+            "SSH_AGENT_PID": "42",
+            "SSH_ASKPASS": "/usr/bin/answer-for-me",
+            "SSH_ASKPASS_REQUIRE": "force",
+            "DISPLAY": ":0",
+        }
         with (
             mock.patch.dict(os.environ, {"NEST_DATABASE_PASSWORD": "s3cret", **agent}),
             mock.patch(
@@ -406,11 +419,13 @@ class CredentialIsolationTests(unittest.TestCase):
             ) as run,
         ):
             transport.run("true")
-        for call in run.call_args_list:  # the -O check, the login and the command
+        self.assertEqual(len(run.call_args_list), 2)  # the login and the command
+        for call in run.call_args_list:
             env = call.kwargs["env"]
             self.assertNotIn("NEST_DATABASE_PASSWORD", env)
-            self.assertNotIn("SSH_AUTH_SOCK", env)
-            self.assertNotIn("SSH_AGENT_PID", env)
+            for name in ("SSH_AUTH_SOCK", "SSH_AGENT_PID", "SSH_ASKPASS", "DISPLAY"):
+                self.assertNotIn(name, env)
+            self.assertEqual(env["SSH_ASKPASS_REQUIRE"], "never")  # prompts only on the tty
 
     def test_controller_ssh_keeps_the_operators_agent(self):
         transport = ControllerSSHTransport(_config())
@@ -469,9 +484,16 @@ class LocalSessionLifecycleTests(unittest.TestCase):
         self.assertEqual(os.stat(transport.control_dir).st_mode & 0o777, 0o700)
 
     def test_a_control_dir_too_long_for_a_socket_is_refused(self):
-        with self.assertRaises(ValueError) as caught:
-            LocalOpenSSHTransport("login", "alice", "/pins", control_dir="/" + "d" * 70)
+        long_dir = tempfile.mkdtemp(prefix="d" * 60)
+        self.addCleanup(shutil.rmtree, long_dir, True)
+        transport = self.local()
+        with (
+            mock.patch("nest.backends.transport.tempfile.mkdtemp", return_value=long_dir),
+            self.assertRaises(ValueError) as caught,
+        ):
+            transport.ssh_argv()
         self.assertIn("too long for a Unix socket", str(caught.exception))
+        self.assertFalse(os.path.exists(long_dir))  # the unusable directory is removed
 
     @unittest.skipUnless(shutil.which("ssh"), "requires OpenSSH")
     def test_openssh_resolves_the_default_control_path(self):
@@ -494,6 +516,18 @@ class LocalSessionLifecycleTests(unittest.TestCase):
         self.assertEqual(resolved_values["gssapiauthentication"], "no")
         identity_files = [value for key, value in settings if key == "identityfile"]
         self.assertFalse([f for f in identity_files if f != "none"])  # no ~/.ssh/id_* keys
+        self.assertEqual(resolved_values["batchmode"], "yes")  # commands never prompt
+        self.assertIn(resolved_values["controlmaster"], ("false", "no"))
+        login = transport.login_argv()
+        login_resolved = subprocess.run(
+            [login[0], "-G", *login[1:]], capture_output=True, text=True, check=True
+        ).stdout
+        login_values = dict(l.split(" ", 1) for l in login_resolved.splitlines() if " " in l)
+        self.assertEqual(login_values["batchmode"], "no")
+        self.assertIn(login_values["controlmaster"], ("true", "yes"))
+        self.assertEqual(
+            login_values["pubkeyauthentication"], resolved_values["pubkeyauthentication"]
+        )
 
     def calls_with(self, connected: bool, login=None):
         transport = self.local(has_terminal=lambda: True, timeout=7, login_timeout=99)
@@ -550,49 +584,91 @@ class LocalSessionLifecycleTests(unittest.TestCase):
             self.assertIn("no remote command ran", str(caught.exception).lower())
             self.assertEqual([c.args[0][-1] for c in run.call_args_list], ["true"])
 
+    def ok(self, **kwargs):
+        return mock.patch(
+            "nest.backends.transport.subprocess.run",
+            return_value=mock.Mock(returncode=0, stdout=b"", stderr=b""),
+            **kwargs,
+        )
+
     def test_close_ends_the_connection_and_removes_its_own_directory(self):
-        with (
-            mock.patch(
-                "nest.backends.transport.subprocess.run",
-                return_value=mock.Mock(returncode=0, stdout=b"", stderr=b""),
-            ) as run,
-            self.local() as transport,
-        ):
+        with self.ok() as run, self.local(has_terminal=lambda: True) as transport:
+            transport.run("true")
             directory = transport.control_dir
             self.assertTrue(os.path.isdir(directory))
         self.assertFalse(os.path.exists(directory))
         self.assertEqual(run.call_args.args[0][-3:], ["-O", "exit", "login.example.edu"])
 
-    def test_close_keeps_a_callers_directory_and_ignores_ssh_failures(self):
-        directory = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, directory, True)
-        transport = self.local(control_dir=directory)
+    def test_close_ignores_ssh_failures(self):
+        transport = self.local(has_terminal=lambda: True)
+        with self.ok():
+            transport.run("true")
+        directory = transport.control_dir
         with mock.patch(
             "nest.backends.transport.subprocess.run",
             side_effect=subprocess.TimeoutExpired(["ssh"], 1),
         ):
             transport.close()
-        self.assertTrue(os.path.isdir(directory))
+        self.assertFalse(os.path.exists(directory))
 
     def test_a_derived_transport_survives_the_parent_closing(self):
         parent = self.local()
-        parent_dir = parent.control_dir  # created and owned by the parent
+        parent_dir = parent.control_dir
         child = parent.for_endpoint("login2.example.edu", 22)
         self.addCleanup(child.close)
         self.assertNotEqual(child.control_dir, parent_dir)
-        with mock.patch(
-            "nest.backends.transport.subprocess.run",
-            return_value=mock.Mock(returncode=0, stdout=b"", stderr=b""),
-        ):
+        with self.ok():
             parent.close()
         self.assertFalse(os.path.exists(parent_dir))
         self.assertTrue(os.path.isdir(child.control_dir))
 
-    def test_a_callers_control_dir_is_shared_by_derived_transports(self):
-        directory = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, directory, True)
-        parent = self.local(control_dir=directory)
-        self.assertEqual(parent.for_endpoint("login2.example.edu", 22).control_dir, directory)
+    def test_every_transport_uses_a_new_private_directory(self):
+        first, second = self.local(), self.local()
+        derived = first.for_endpoint("login.example.edu", 22)  # same user, host and port
+        self.addCleanup(derived.close)
+        directories = {first.control_dir, second.control_dir, derived.control_dir}
+        self.assertEqual(len(directories), 3)
+        for directory in directories:
+            self.assertEqual(os.stat(directory).st_mode & 0o777, 0o700)
+            self.assertEqual(os.listdir(directory), [])
+
+    def test_an_existing_master_is_never_reused_before_this_transports_login(self):
+        # Even if `ssh -O check` would succeed, a transport that has not logged in
+        # does not treat any connection as its own: it logs in itself.
+        transport = self.local(has_terminal=lambda: True)
+        with self.ok() as run:
+            self.assertFalse(transport.connected())
+            run.assert_not_called()
+            transport.run("squeue --me")
+        login = run.call_args_list[0].args[0]
+        self.assertEqual(login[-1], "true")
+        self.assertIn("ControlMaster=yes", login)
+
+    def test_login_without_a_terminal_runs_nothing(self):
+        transport = self.local(has_terminal=lambda: False)
+        for call in (transport.login, lambda: transport.run("true")):
+            with (
+                mock.patch("nest.backends.transport.subprocess.run") as run,
+                self.assertRaises(SessionUnavailableError) as caught,
+            ):
+                call()
+            run.assert_not_called()
+            self.assertTrue(caught.exception.interactive_required)
+
+    def test_a_lost_connection_fails_the_command_instead_of_authenticating(self):
+        # The connection passed `-O check`, then went away before the command ran.
+        transport = self.local(has_terminal=lambda: True)
+        lost = mock.Mock(returncode=255, stdout=b"", stderr=b"Permission denied")
+        with (
+            mock.patch.object(transport, "connected", return_value=True),
+            mock.patch("nest.backends.transport.subprocess.run", return_value=lost) as run,
+            self.assertRaises(SSHError),
+        ):
+            transport.check("squeue --me")
+        (argv,) = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(argv[-1], "squeue --me")  # no login was attempted
+        self.assertIn("BatchMode=yes", argv)  # so OpenSSH could not prompt or use askpass
+        self.assertIn("ControlMaster=no", argv)
 
     def test_close_without_any_command_runs_nothing(self):
         with mock.patch("nest.backends.transport.subprocess.run") as run:

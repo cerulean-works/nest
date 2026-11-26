@@ -74,7 +74,12 @@ pins, and disables agent and port forwarding. It authenticates only with the
 user's password and keyboard-interactive (MFA) answers: public keys (including
 default `~/.ssh/id_*` files), the SSH agent, GSSAPI and host-based authentication
 are disabled, and `SSH_AUTH_SOCK` is not passed to `ssh`, so it cannot log in
-with an identity the running process happens to have. The
+with an identity the running process happens to have. Askpass helpers are
+disabled too (`SSH_ASKPASS_REQUIRE=never`). Authentication happens only in an
+explicit login step that requires the user's terminal and starts a new
+connection in a private directory used by no other transport. Remote commands
+run only through that connection, in batch mode: if it has gone away, they fail
+instead of authenticating again. The
 Controller does not use it: the opaque Controller relay and user-owned
 submission are separate, later work.
 

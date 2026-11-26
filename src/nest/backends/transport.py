@@ -40,6 +40,7 @@ from ..errors import (
     InfrastructureError,
     RemoteCommandError,
     ResultTooLargeError,
+    SessionUnavailableError,
     SSHError,
     SSHTimeoutError,
 )
@@ -478,15 +479,19 @@ class LocalOpenSSHTransport(_OpenSSHTransport):
     file is read, host keys are checked strictly against operator-distributed pins,
     and agent and port forwarding are disabled. Only the user's password and
     keyboard-interactive (MFA) answers authenticate: public keys, including the
-    running process's default `~/.ssh/id_*` keys, the SSH agent, GSSAPI and
-    host-based authentication are disabled, so it can never log in with an
-    identity it happens to find, such as a Controller service account's.
+    running process's default `~/.ssh/id_*` keys, the SSH agent, GSSAPI, host-based
+    authentication and askpass helpers are disabled, so it can never log in with
+    an identity it happens to find, such as a Controller service account's.
 
-    Before the first command, [`backends.transport.LocalOpenSSHTransport.login`]
-    authenticates with OpenSSH's own messages (the server banner,
-    keyboard-interactive MFA instructions) on the user's terminal; remote commands
-    then run with their output captured. Use it as a context manager, or call `close()`, so the
-    authenticated connection and its private directory end with the run.
+    Authentication happens only in
+    [`backends.transport.LocalOpenSSHTransport.login`], which requires the user's
+    terminal and shows OpenSSH's own messages (the server banner,
+    keyboard-interactive MFA instructions) there. It starts the connection in a new
+    private directory that only this transport uses, so it never reuses a
+    connection it did not authenticate. Remote commands then run only through
+    that connection, in batch mode: if it has gone away, a command fails instead of
+    authenticating again. Use the transport as a context manager, or call
+    `close()`, so the connection and its directory end with the run.
 
     Without a terminal and without a live authenticated connection, the session is
     inactive and the Slurm core raises [`errors.SessionUnavailableError`]: a headless
@@ -500,10 +505,6 @@ class LocalOpenSSHTransport(_OpenSSHTransport):
         timeout (`float`, *optional*, defaults to `60`): Seconds per remote command.
         login_timeout (`float`, *optional*, defaults to `300`): Seconds allowed for
             the login, including the time the user takes to answer the prompts.
-        control_dir (`str`, *optional*): Private directory for the control socket.
-            Defaults to a new directory under `/tmp` only this user can read, which
-            [`backends.transport.LocalOpenSSHTransport.close`] removes. Its socket
-            path must fit a Unix socket address (104 bytes on macOS and BSD).
         control_persist (`int`, *optional*, defaults to `600`): Seconds an idle
             authenticated connection stays open for reuse. `close()` (or leaving a
             `with` block) ends it at the end of the run instead.
@@ -522,7 +523,6 @@ class LocalOpenSSHTransport(_OpenSSHTransport):
         port: int = 22,
         timeout: float = 60,
         login_timeout: float = 300,
-        control_dir: str | None = None,
         control_persist: int = 600,
         has_terminal: Callable[[], bool] = _has_terminal,
     ):
@@ -540,15 +540,18 @@ class LocalOpenSSHTransport(_OpenSSHTransport):
         self.timeout = timeout
         self.login_timeout = login_timeout
         self.control_persist = control_persist
-        if control_dir is not None:
-            _check_control_dir(control_dir)
-        self._control_dir = control_dir
-        self._owns_control_dir = False
+        self._control_dir: str | None = None
+        self._logged_in = False
         self._has_terminal = has_terminal
 
     @property
     def control_dir(self) -> str:
-        """The private control-socket directory, created on first use."""
+        """
+        The private control-socket directory, created on first use.
+
+        Always a new directory that only this transport uses, so no connection
+        that it did not authenticate can be found there.
+        """
         if self._control_dir is None:
             # A short base keeps the socket path within the Unix socket address
             # limit; macOS's per-user $TMPDIR alone is about 49 bytes. mkdtemp
@@ -557,14 +560,16 @@ class LocalOpenSSHTransport(_OpenSSHTransport):
             path = tempfile.mkdtemp(prefix="nest-", dir=base)
             try:
                 _check_control_dir(path)
+                info = os.lstat(path)
+                if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+                    raise ValueError(f"SSH control directory {path!r} is not private")
             except ValueError:
                 os.rmdir(path)
                 raise
             self._control_dir = path
-            self._owns_control_dir = True
         return self._control_dir
 
-    def _base_argv(self) -> list[str]:
+    def _common_argv(self) -> list[str]:
         known_hosts = self.known_hosts_file
         return [
             "ssh",
@@ -602,45 +607,69 @@ class LocalOpenSSHTransport(_OpenSSHTransport):
             "-o",
             "GSSAPIAuthentication=no",
             "-o",
-            "ControlMaster=auto",
-            "-o",
             f"ControlPath={os.path.join(self.control_dir, '%C')}",
-            "-o",
-            f"ControlPersist={self.control_persist}",
             "-p",
             str(self.port),
             "-l",
             self.user,
         ]
 
+    def login_argv(self) -> list[str]:
+        """
+        The interactive SSH command line that authenticates and starts the
+        reusable connection, without the remote command.
+
+        No `BatchMode`, so OpenSSH can ask the user for the password and MFA on
+        their terminal; `ControlMaster=yes` starts a new connection, never reusing
+        another one.
+        """
+        return [
+            *self._common_argv(),
+            "-o",
+            "ControlMaster=yes",
+            "-o",
+            f"ControlPersist={self.control_persist}",
+            self.target,
+        ]
+
     def ssh_argv(self) -> list[str]:
         """
-        Builds the interactive SSH command line, without the remote command.
+        The command line for a remote command, without the command itself.
 
-        Unlike the Controller's SSH, there is no `BatchMode`, so OpenSSH can ask the
-        user for the password and MFA on their terminal. Only keyboard-interactive
-        and password authentication are allowed: public keys (default
-        `~/.ssh/id_*` files included), the SSH agent, GSSAPI and host-based
-        authentication are all disabled.
+        Runs only through the connection [`backends.transport.LocalOpenSSHTransport.login`]
+        authenticated (`ControlMaster=no`), in `BatchMode`: if that connection is
+        gone, the command fails instead of authenticating again.
         """
-        return [*self._base_argv(), self.target]
+        return [
+            *self._common_argv(),
+            "-o",
+            "ControlMaster=no",
+            "-o",
+            "BatchMode=yes",
+            self.target,
+        ]
 
-    _AGENT_VARIABLES = ("SSH_AUTH_SOCK", "SSH_AGENT_PID")
-    """Agent variables never passed to the user's `ssh`."""
+    _REMOVED_VARIABLES = ("SSH_AUTH_SOCK", "SSH_AGENT_PID", "SSH_ASKPASS", "DISPLAY")
+    """Agent and askpass variables never passed to the user's `ssh`."""
 
     def _environ(self) -> dict[str, str]:
         env = child_environ()
-        for name in self._AGENT_VARIABLES:
+        for name in self._REMOVED_VARIABLES:
             env.pop(name, None)
+        # Prompts come from the user's terminal, never from an askpass helper.
+        env["SSH_ASKPASS_REQUIRE"] = "never"
         return env
 
     def connected(self) -> bool:
-        """Whether an authenticated connection is open for reuse (`ssh -O check`)."""
-        if self._control_dir is None:
+        """
+        Whether the connection this transport authenticated is still open
+        (`ssh -O check`). Always `False` before a successful login.
+        """
+        if not self._logged_in or self._control_dir is None:
             return False
         try:
             result = subprocess.run(
-                [*self._base_argv(), "-O", "check", self.target],
+                [*self.ssh_argv()[:-1], "-O", "check", self.target],
                 check=False,
                 env=self._environ(),
                 stdin=subprocess.DEVNULL,
@@ -656,7 +685,7 @@ class LocalOpenSSHTransport(_OpenSSHTransport):
 
     def login(self) -> None:
         """
-        Authenticates the reusable connection unless one is already open.
+        Authenticates the reusable connection unless this transport's own is open.
 
         Runs a no-op command that leaves the authenticated master open. OpenSSH's
         standard error goes to the user's terminal here, so the server banner and
@@ -664,14 +693,24 @@ class LocalOpenSSHTransport(_OpenSSHTransport):
         it, with their output captured as usual.
 
         Raises:
+            [`errors.SessionUnavailableError`]: If there is no terminal for the
+                prompts. Nothing is run.
             [`errors.SSHError`]: If the login fails or does not finish within
                 `login_timeout`. No remote command has run.
         """
         if self.connected():
             return
+        if not self._has_terminal():
+            raise SessionUnavailableError(
+                f"SSH login to {self.target} needs an interactive terminal for the HPC "
+                "password and MFA prompts, and none is available. Nest does not use the "
+                "Controller's SSH instead.",
+                interactive_required=True,
+                operation="login",
+            )
         try:
             result = subprocess.run(
-                [*self.ssh_argv(), "true"],
+                [*self.login_argv(), "true"],
                 check=False,
                 env=self._environ(),
                 stdin=subprocess.DEVNULL,
@@ -689,6 +728,7 @@ class LocalOpenSSHTransport(_OpenSSHTransport):
                 f"SSH login to {self.target} failed (exit status {result.returncode}); "
                 "see the SSH output above. No remote command ran."
             )
+        self._logged_in = True
 
     def run(self, command: str, input: bytes | None = None) -> CommandResult:
         self.login()
@@ -707,26 +747,26 @@ class LocalOpenSSHTransport(_OpenSSHTransport):
 
     def close(self) -> None:
         """
-        Ends the reusable authenticated connection, if one is open, and removes the
-        control directory this transport created. Never raises for SSH failures.
+        Ends the reusable authenticated connection, if one is open, and removes its
+        private control directory. Never raises for SSH failures.
         """
         if self._control_dir is None:
             return
-        try:
-            subprocess.run(
-                [*self._base_argv(), "-O", "exit", self.target],
-                check=False,
-                env=self._environ(),
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                timeout=self.timeout,
-            )
-        except subprocess.TimeoutExpired, OSError:
-            logger.debug("Closing the SSH control connection failed host=%s", self.target)
-        if self._owns_control_dir:
-            shutil.rmtree(self._control_dir, ignore_errors=True)
-            self._control_dir = None
-            self._owns_control_dir = False
+        if self._logged_in:
+            try:
+                subprocess.run(
+                    [*self.ssh_argv()[:-1], "-O", "exit", self.target],
+                    check=False,
+                    env=self._environ(),
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    timeout=self.timeout,
+                )
+            except subprocess.TimeoutExpired, OSError:
+                logger.debug("Closing the SSH control connection failed host=%s", self.target)
+        shutil.rmtree(self._control_dir, ignore_errors=True)
+        self._control_dir = None
+        self._logged_in = False
 
     def __enter__(self) -> Self:
         return self
@@ -735,6 +775,8 @@ class LocalOpenSSHTransport(_OpenSSHTransport):
         self.close()
 
     def for_endpoint(self, host: str, port: int | None) -> LocalOpenSSHTransport:
+        # A new transport: its own private directory and its own login, never this
+        # transport's connection.
         return LocalOpenSSHTransport(
             host,
             self.user,
@@ -742,9 +784,6 @@ class LocalOpenSSHTransport(_OpenSSHTransport):
             port=port or 22,
             timeout=self.timeout,
             login_timeout=self.login_timeout,
-            # A directory this transport created is removed by its close(), so a
-            # derived transport gets its own; a caller's directory is shared.
-            control_dir=None if self._owns_control_dir else self._control_dir,
             control_persist=self.control_persist,
             has_terminal=self._has_terminal,
         )
