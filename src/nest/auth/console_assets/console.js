@@ -863,7 +863,7 @@
       profileChoice,
       profiles.length
         ? null
-        : callout('warn', h('p', { text: 'The operator has not published connection settings for this Nest in the Console yet. Ask them for the Controller address, then follow the steps below.' })),
+        : callout('warn', h('p', { text: 'The operator has not published connection settings for this Nest in the Console yet. You can install Nest and sign in below; to select a Project and run work, ask them for the Controller address and transport.' })),
     );
     main().append(setup, steps);
 
@@ -880,7 +880,10 @@
       );
       const exports = profile ? profile.exports : [info.auth_export];
       const pid = project && UUID_RE.test(project.id) ? project.id.toLowerCase() : null;
-      const several = list.filter((p) => eligibility(p.id).eligible).length > 1 || !(e && e.known);
+      // Runnable commands only for a Project the server says can run here: otherwise
+      // the SDK could pick another Project (saved, exported or the only eligible one).
+      const runnable = !!(profile && pid && e && e.known && e.eligible);
+      const several = list.filter((p) => eligibility(p.id).eligible).length > 1;
       const items = [
         h('li', {},
           h('h3', { text: 'Install Nest (once per uv project)' }),
@@ -905,10 +908,20 @@
             callout('warn', h('p', { text: 'Selecting a Project and running functions need the Controller’s connection settings, which the operator has not published here. Ask them for the Controller address and transport, then use: uv run nest projects select' })),
           ),
         );
-        steps.replaceChildren(card(cardHead('Set up your computer', 'steps-h'), h('ol', { class: 'steps' }, items)));
-        return;
-      }
-      if (pid && e && (e.eligible || !e.known)) {
+      } else if (!runnable) {
+        items.push(
+          h('li', { id: 'connect-not-runnable' },
+            h('h3', { text: 'Select the Project and run' }),
+            callout('warn', h('p', { text: !project
+              ? 'Join a Project to run work: accept an invitation, then come back to this page for the commands.'
+              : !pid
+                ? `${labelOf(project)} has no valid Project ID, so no commands are offered for it.`
+                : !e.known
+                  ? `Nest could not confirm that ${labelOf(project)} can run on this Controller, so no commands that would run work are offered. Reload this page to check again.`
+                  : `Selecting and running commands appear here once ${labelOf(project)} can run on this Controller (see what is missing above). Running now could use another of your Projects instead.` })),
+          ),
+        );
+      } else {
         items.push(
           h('li', {},
             h('h3', { text: 'Select the Project' }),
@@ -918,26 +931,25 @@
             codeBlock('Select the Project', [`uv run nest projects use ${pid}`, 'uv run nest projects current']),
             h('p', { class: 'muted small' }, 'An exported NEST_PROJECT_ID always takes precedence over the saved choice.'),
           ),
+          h('li', {},
+            h('h3', { text: 'Run a remote function' }),
+            h('p', { class: 'muted small', text: 'Save this as main.py, then run it. The Controller checks your access again on every call.' }),
+            codeBlock('Example main.py', [
+              'import nest',
+              '',
+              '',
+              '@nest.remote()',
+              'def add(a, b):',
+              '    return a + b',
+              '',
+              '',
+              'print(add.remote(40, 2))  # 42',
+            ]),
+            codeBlock('Run the example', [`NEST_PROJECT_ID=${pid} uv run python main.py`]),
+            h('p', { class: 'muted small', text: `NEST_PROJECT_ID on this one command runs the example in ${labelOf(project)}, even if another Project is saved or NEST_PROJECT_ID is exported. It changes no saved or shell setting; without it, the SDK chooses the Project as usual.` }),
+          ),
         );
       }
-      items.push(
-        h('li', {},
-          h('h3', { text: 'Run a remote function' }),
-          h('p', { class: 'muted small', text: 'Save this as main.py, then run it. The Controller checks your access again on every call.' }),
-          codeBlock('Example main.py', [
-            'import nest',
-            '',
-            '',
-            '@nest.remote()',
-            'def add(a, b):',
-            '    return a + b',
-            '',
-            '',
-            'print(add.remote(40, 2))  # 42',
-          ]),
-          codeBlock('Run the example', ['uv run python main.py']),
-        ),
-      );
       steps.replaceChildren(card(cardHead('Set up your computer', 'steps-h'), h('ol', { class: 'steps' }, items)));
     }
     renderSteps();
