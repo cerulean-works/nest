@@ -16,8 +16,13 @@ It needs no VPN or Tailnet.
 > [rollout runbook](hosted-rollout).
 >
 > Without the Tailnet, you need only the public endpoint to be open to you. Until
-> the operator opens it, the [private path](quickstart) over the Tailnet is the
-> way to reach the hosted Controller.
+> the operator opens it, the [private path](quickstart#connection-settings) over
+> the Tailnet is the way to reach the hosted Controller.
+>
+> The current staging pilot does not use this profile: enrolled participants name
+> the operator's staging endpoint and its CA explicitly, as in run R5 of the
+> [rollout runbook](hosted-rollout). That is staging evidence only, not general
+> availability.
 
 ## The flow
 

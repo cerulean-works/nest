@@ -283,7 +283,7 @@ nest auth status --check
 nest platforms default --project-id "<project-id>"
 ```
 
-and then the [quickstart](quickstart#6-run-a-function) example. A refusal names
+and then the [quickstart](quickstart#4-run) example. A refusal names
 its reason; see [Access and onboarding errors](remote-errors#access-and-onboarding-errors).
 `nest-db audit list --project-id "$PROJECT"` shows every decision and refusal
 for the Project. Tell the kinds of failure apart before changing anything:

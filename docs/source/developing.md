@@ -154,6 +154,14 @@ Documentation lives in `docs/source/`. Put complete workflows in Guide and API
 contracts or settings in Reference. Add every Markdown page exactly once to
 `_toctree.yml`, using a path relative to that folder without the `.md` extension.
 
+Guide sections separate audiences: *Get started* and *User guide* for people who
+call `.remote()`, the *Operator guide* sections for hosts who deploy and onboard,
+and *Contributing*. Keep deployment, recovery and security runbooks out of the
+Quickstart. A page's URL depends only on its file name and on Guide versus
+Reference, not on its section, so moving a page between Guide sections keeps its
+links working; renaming it does not. `tests/test_docs_quickstart.py` runs the
+Quickstart's `main.py` and checks the navigation.
+
 API pages use `[[autodoc]]` markers to render Python docstrings. Keep each
 documented object on one Reference page so cross-references have one target.
 

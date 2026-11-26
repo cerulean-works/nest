@@ -39,8 +39,17 @@ uv run nest --help
 uv run python main.py
 ```
 
-To pin a specific commit or, once releases are tagged, a tag, replace `@main`
-with `@<commit>` or `@<tag>`.
+To pin a specific commit, replace `@main` with `@<commit>`.
+
+### Releases and `@main`
+
+Installing from `main` is the development and Early Access path, and the one the
+[Quickstart](quickstart) uses. The existing release tags (`v0.1.0a1` to `v0.1.0a4`)
+predate sign-in: an SDK installed from one of them has no `nest` command and sends
+no session, so an authenticated Controller refuses it. The release-prep pull
+request for the next tag adds its pinned command (`@<tag>`) here before the tag is
+pushed, so that the tag's own docs show it. See
+[Release status and checklist](releasing).
 
 ### Install with pip
 
@@ -68,8 +77,9 @@ uv sync
 Updated nest v0.1.0a1 (2b2b5f19) -> v0.1.0a1 (cd756014)
 ```
 
-Every build from `main` reports the same version, `0.1.0a1`, so compare
-commits, not versions. Show the commit your environment runs:
+The version string changes only when a maintainer bumps it, so many commits of
+`main` report the same version (`0.1.0a1` in the example). Compare commits, not
+versions. Show the commit your environment runs:
 
 ```bash
 grep -A2 '^name = "nest"' uv.lock
@@ -100,8 +110,7 @@ updates the Controller or the HPC runtime.
 
 ## Next steps
 
-- [Run your first remote function](quickstart) on the team's authenticated
-  Controller: network access, sign-in, Project and a first call.
+- [Quickstart](quickstart): log in, write `main.py` and run it.
 - [Run a local Controller](local-controller) to develop without a cluster or a
   sign-in.
 - Hosts running their own Controller also need the

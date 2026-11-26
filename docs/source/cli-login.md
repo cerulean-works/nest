@@ -47,7 +47,7 @@ Waiting for approval...
 the Controller by its verified MagicDNS name,
 `nest-controller.tail8e5ba1.ts.net:50051`, set
 `NEST_AUTH_URL=https://auth.nest.cerulean.works` so their calls carry the
-session (see [Run your first remote function](quickstart#2-point-the-sdk-at-the-controller)).
+session (see [Run your first remote function](quickstart#connection-settings)).
 With it set, `nest login` prints no *Signing in to Cerulean-hosted Nest* line.
 
 For a self-hosted Nest, name its origin; every `nest` command, and `.remote()`,
