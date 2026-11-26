@@ -82,6 +82,10 @@ def test_console_configuration_is_scoped_and_idempotent(monkeypatch, capsys, lev
     root = logging.getLogger()
     root_state = root.handlers[:], root.level
     try:
+        # Start from no console handler: one left by an earlier in-process entry point
+        # (such as a test that runs `nest.controller.main`) writes to that test's
+        # captured stderr, and configure_logging would rightly reuse it.
+        logger.handlers = [h for h in logger.handlers if not getattr(h, "_nest_console", False)]
         monkeypatch.setenv("NEST_LOG_LEVEL", level)
         configure_logging()
         configure_logging()
