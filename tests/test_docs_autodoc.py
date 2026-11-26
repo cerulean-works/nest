@@ -67,13 +67,20 @@ def signature(obj: object) -> inspect.Signature | None:
         return None
 
 
+# The Controller image smoke test mounts only `tests/`; the Tests workflow, which has
+# the checkout, runs these.
+requires_docs = unittest.skipUnless(DOCS.is_dir(), "requires the repository's docs/source")
+
+
 class AutodocIntrospectionTests(unittest.TestCase):
+    @requires_docs
     def test_the_docs_name_autodoc_objects(self):
         names = {name for _, name in autodoc_entries()}
         # The objects whose annotations broke the main Docs build (#107).
         self.assertIn("backends.transport.ControllerSSHTransport", names)
         self.assertIn("backends.slurm.SlurmBackend", names)
 
+    @requires_docs
     def test_every_documented_signature_evaluates(self):
         for page, name in autodoc_entries():
             with self.subTest(page=page, object=name):
