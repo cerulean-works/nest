@@ -428,11 +428,12 @@ class ExchangeTests(_Base):
         return thread
 
     def test_a_token_whose_deadline_passes_during_a_lock_wait_is_refused(self):
-        # exp a little under 60 seconds ago: still inside the verifier's skew, so
-        # it verifies, but its acceptance deadline (exp + 60 s) is a second away.
+        # Hold the lock first, then mint a token whose exp was 55 seconds ago: still
+        # inside the verifier's skew, so it verifies even on a slow runner, but its
+        # acceptance deadline (exp + 60 s) passes while the exchange waits 7 s.
+        holder = self.hold_principal_lock(7.0)
         now = int(time.time())
-        token = self.issuer.mint(exp=now - 59, iat=now - 300, nbf=now - 300)
-        holder = self.hold_principal_lock(2.5)
+        token = self.issuer.mint(exp=now - 55, iat=now - 300, nbf=now - 300)
         try:
             self.assertEqual(self.refused(token), "invalid_token")
         finally:
@@ -498,6 +499,9 @@ class ExchangeTests(_Base):
         thread.start()
         self.assertTrue(holding.wait(10))
         result: dict[str, object] = {}
+        # Far enough ahead that a slow runner still reaches the unique-index wait
+        # before it; the writer is released only once it has passed.
+        deadline = datetime.now(UTC) + timedelta(seconds=5)
 
         def exchange():
             try:
@@ -506,7 +510,7 @@ class ExchangeTests(_Base):
                     self.policy.id,
                     issuer=issuer,
                     jti="contended",
-                    token_expires_at=datetime.now(UTC) + timedelta(seconds=1.5),
+                    token_expires_at=deadline,
                     token_hash=hash_token(secrets.token_urlsafe()),
                     ttl_seconds=600,
                     provenance={},
@@ -519,7 +523,7 @@ class ExchangeTests(_Base):
         exchanger.start()
         # Wait until the exchange is blocked on the unique index, then past its
         # deadline, then let the writer roll back.
-        for _ in range(100):
+        for _ in range(200):
             waiting = self.sql(
                 "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
                 "AND query LIKE 'INSERT INTO workload_token_uses%%'"
@@ -528,7 +532,7 @@ class ExchangeTests(_Base):
                 break
             time.sleep(0.05)
         self.assertEqual(waiting[0][0], 1, "the exchange should be waiting on the index")
-        time.sleep(2.0)
+        time.sleep(max(0.0, (deadline - datetime.now(UTC)).total_seconds()) + 0.5)
         release.set()
         thread.join()
         exchanger.join(20)
