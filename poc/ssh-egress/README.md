@@ -10,7 +10,7 @@ Controller host, and only after the Platform operator has approved it.
 
 | File | What it is |
 | --- | --- |
-| `egress_probe.py` | No-job smoke: resolve once and validate the addresses, connect over TCP, read the SSH identification line (it sends zero bytes), and compare `ssh-keyscan` output with independent pins. Prints JSON lines |
+| `egress_probe.py` | No-job smoke: resolve once and validate the addresses, connect over TCP, read the SSH identification line (it sends zero bytes), and run `ssh-keyscan` against the validated address, then compare the keys it observed there with independent pins. Prints JSON lines |
 | `egress_policy.py` | Shared checks: public, non-Tailnet addresses, the port allowlist, approved addresses, OpenSSH SHA256 fingerprints |
 | `relay_contract.py` | Synthetic reference model of the relay: request parsing, authorization order, allowlist, rebinding defense, limits, opaque pump with backpressure and half-close, and audit |
 | `relay.proto` | Draft `nest.relay.v1alpha.SshRelay` contract (not compiled) |

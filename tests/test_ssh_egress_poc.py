@@ -17,6 +17,7 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -155,7 +156,7 @@ class EgressProbeTests(unittest.TestCase):
     def test_fixture_smoke_passes_and_sends_nothing(self):
         with FixtureServer() as fixture, tempfile.TemporaryDirectory() as tmp:
             scan = Path(tmp) / "scan.txt"
-            scan.write_text(f"127.0.0.1 ssh-ed25519 {PIN_BLOB}\n")
+            scan.write_text(f"[127.0.0.1]:{fixture.port} ssh-ed25519 {PIN_BLOB}\n")
             code, records = probe(
                 "--host", "127.0.0.1", "--port", str(fixture.port),
                 "--allowed-port", str(fixture.port), "--fixture",
@@ -180,7 +181,7 @@ class EgressProbeTests(unittest.TestCase):
         with FixtureServer() as fixture:
             code, records = probe(
                 "--host", "127.0.0.1", "--port", str(fixture.port),
-                "--allowed-port", str(fixture.port),
+                "--allowed-port", str(fixture.port), "--approved-address", "127.0.0.1",
             )  # fmt: skip
             self.assertEqual(fixture.server.connections, 0)
         self.assertEqual(code, 1)
@@ -188,9 +189,14 @@ class EgressProbeTests(unittest.TestCase):
         self.assertEqual(records[0]["evidence"], "live")
 
     def test_tailnet_resolution_and_unapproved_port_are_refused(self):
-        code, records = probe("--host", "ln.example", resolver=lambda h, p: ["100.101.102.103"])
+        code, records = probe(
+            "--host", "ln.example", "--approved-address", "100.101.102.103",
+            resolver=lambda h, p: ["100.101.102.103"],
+        )  # fmt: skip
         self.assertEqual((code, records[0]["reason"]), (1, "tailnet_address"))
-        code, records = probe("--host", PUBLIC_V4, "--port", "2222")
+        code, records = probe(
+            "--host", PUBLIC_V4, "--port", "2222", "--approved-address", PUBLIC_V4
+        )
         self.assertEqual((code, records[0]["reason"]), (1, "port_not_allowlisted"))
 
     def test_resolution_outside_approved_addresses_is_refused(self):
@@ -210,7 +216,7 @@ class EgressProbeTests(unittest.TestCase):
         self.assertFalse({r.get("check"): r for r in records}["ssh_identification"]["ok"])
         with FixtureServer() as fixture, tempfile.TemporaryDirectory() as tmp:
             scan = Path(tmp) / "scan.txt"
-            scan.write_text(f"127.0.0.1 ssh-ed25519 {PIN_BLOB}\n")
+            scan.write_text(f"[127.0.0.1]:{fixture.port} ssh-ed25519 {PIN_BLOB}\n")
             code, records = probe(
                 "--host", "127.0.0.1", "--port", str(fixture.port),
                 "--allowed-port", str(fixture.port), "--fixture",
@@ -222,13 +228,121 @@ class EgressProbeTests(unittest.TestCase):
     def test_keyscan_without_independent_pin_fails(self):
         with FixtureServer() as fixture, tempfile.TemporaryDirectory() as tmp:
             scan = Path(tmp) / "scan.txt"
-            scan.write_text(f"127.0.0.1 ssh-ed25519 {PIN_BLOB}\n")
+            scan.write_text(f"[127.0.0.1]:{fixture.port} ssh-ed25519 {PIN_BLOB}\n")
             code, records = probe(
                 "--host", "127.0.0.1", "--port", str(fixture.port),
                 "--allowed-port", str(fixture.port), "--fixture", "--keyscan-file", str(scan),
             )  # fmt: skip
         self.assertEqual(code, 1)
         self.assertIn("independent", {r.get("check"): r for r in records}["host_key"]["detail"])
+
+    def test_live_run_requires_the_approved_address_set(self):
+        resolved = []
+        code, records = probe(
+            "--host", "ln.example", resolver=lambda h, p: resolved.append(h) or [PUBLIC_V4]
+        )  # fmt: skip
+        self.assertEqual(code, 1)
+        self.assertEqual(records[0]["check"], "arguments")
+        self.assertIn("--approved-address", records[0]["detail"])
+        self.assertFalse(records[-1]["ok"])
+        self.assertEqual(resolved, [])  # refused before any lookup or connection
+
+    def test_keyscan_must_be_observed_at_the_validated_address(self):
+        hosts = {
+            "name": "ln01.platform.example",
+            "other address": "[127.0.0.2]:{port}",
+            "default port": "127.0.0.1",
+            "hashed": "|1|abc=|def=",
+        }
+        for case, host in hosts.items():
+            with self.subTest(case=case):
+                with FixtureServer() as fixture, tempfile.TemporaryDirectory() as tmp:
+                    scan = Path(tmp) / "scan.txt"
+                    line = host.format(port=fixture.port)
+                    scan.write_text(f"{line} ssh-ed25519 {PIN_BLOB}\n")
+                    code, records = probe(
+                        "--host", "127.0.0.1", "--port", str(fixture.port),
+                        "--allowed-port", str(fixture.port), "--fixture",
+                        "--pin", PIN, "--keyscan-file", str(scan),
+                    )  # fmt: skip
+                key = {r.get("check"): r for r in records}["host_key"]
+                self.assertEqual(code, 1)
+                self.assertFalse(key["ok"])
+                if case != "hashed":
+                    self.assertIn("keyscan_host_mismatch", key["detail"])
+
+    def test_keyscan_runs_against_the_validated_literal(self):
+        with FixtureServer() as fixture, tempfile.TemporaryDirectory() as tmp:
+            calls = Path(tmp) / "argv.json"
+            fake = Path(tmp) / "fake-keyscan"
+            fake.write_text(
+                f"#!{sys.executable}\n"
+                "import json, sys\n"
+                f"open({str(calls)!r}, 'w').write(json.dumps(sys.argv[1:]))\n"
+                "port, host = sys.argv[2], sys.argv[-1]\n"
+                f"print(f'[{{host}}]:{{port}} ssh-ed25519 {PIN_BLOB}')\n"
+            )
+            fake.chmod(0o700)
+            code, records = probe(
+                "--host", "localhost", "--port", str(fixture.port),
+                "--allowed-port", str(fixture.port), "--fixture",
+                "--pin", PIN, "--keyscan", "--keyscan-command", str(fake),
+                resolver=lambda h, p: ["127.0.0.1"],
+            )  # fmt: skip
+            argv = json.loads(calls.read_text())
+        self.assertEqual(code, 0, records)
+        self.assertEqual(argv[-1], "127.0.0.1")  # the literal, never the name
+        self.assertNotIn("localhost", argv)
+        key = {r.get("check"): r for r in records}["host_key"]
+        self.assertEqual(key["observed_at"], [f"127.0.0.1:{fixture.port}"])
+
+    def test_banner_read_is_bounded_against_floods(self):
+        async def flood(reader, writer):
+            try:
+                while True:
+                    writer.write(b"x\n" * 64)
+                    await writer.drain()
+                    await asyncio.sleep(0.001)
+            except ConnectionError, asyncio.CancelledError:
+                pass
+            finally:
+                writer.close()
+
+        with FixtureServer(handler=flood) as fixture:
+            started = time.monotonic()
+            code, records = probe(
+                "--host", "127.0.0.1", "--port", str(fixture.port),
+                "--allowed-port", str(fixture.port), "--fixture", "--timeout", "5",
+            )  # fmt: skip
+            elapsed = time.monotonic() - started
+        ident = {r.get("check"): r for r in records}["ssh_identification"]
+        self.assertEqual(code, 1)
+        self.assertIn("8 KiB", ident["detail"])
+        self.assertLess(elapsed, 5)
+
+    def test_banner_read_honours_the_timeout(self):
+        async def trickle(reader, writer):
+            try:
+                while True:
+                    writer.write(b"x\n")
+                    await writer.drain()
+                    await asyncio.sleep(0.2)
+            except ConnectionError, asyncio.CancelledError:
+                pass
+            finally:
+                writer.close()
+
+        with FixtureServer(handler=trickle) as fixture:
+            started = time.monotonic()
+            code, records = probe(
+                "--host", "127.0.0.1", "--port", str(fixture.port),
+                "--allowed-port", str(fixture.port), "--fixture", "--timeout", "1",
+            )  # fmt: skip
+            elapsed = time.monotonic() - started
+        ident = {r.get("check"): r for r in records}["ssh_identification"]
+        self.assertEqual(code, 1)
+        self.assertFalse(ident["ok"])  # "timed out", or the deadline check between reads
+        self.assertLess(elapsed, 3)
 
 
 class Client:

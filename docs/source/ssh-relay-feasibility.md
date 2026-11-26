@@ -108,30 +108,43 @@ python3 egress_probe.py --host ln01.nano4.example \
 
 The probe resolves the name once and fails unless every address is public, not
 on the Tailnet (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`), and in the approved set.
-It connects to one validated address on port 22, reads the server's `SSH-2.0-...`
-identification line and closes. It sends **zero bytes**: no client banner, so no
-key exchange and no authentication. Its `local_address` is the host's interface
-address. Your public egress address still has to be confirmed against the source
-IP item, from your provider's console, not from a third-party "what is my IP"
-service.
+A live run without `--approved-address` is refused before any lookup: the result
+would not show that the approved endpoint was reached. The probe connects to one
+validated address on port 22, reads the server's `SSH-2.0-...` identification
+line and closes. The read is bounded by `--timeout` and by 8 KiB in total. It
+sends **zero bytes**: no client banner, so no key exchange and no authentication.
+Its `local_address` is the host's interface address. Your public egress address
+still has to be confirmed against the source IP item, from your provider's
+console, not from a third-party "what is my IP" service.
 
-**3. Host-key observation, compared with the independent pin** (live):
+**3. Host-key observation at the validated address, compared with the
+independent pin** (live; needs OpenSSH's `ssh-keyscan` on the Controller host):
 
 ```bash
-ssh-keyscan -p 22 -t ed25519,ecdsa,rsa ln01.nano4.example > keyscan.txt
 python3 egress_probe.py --host ln01.nano4.example --approved-address <approved-ip> \
-  --pin SHA256:<fingerprint-from-the-operator> --keyscan-file keyscan.txt
+  --pin SHA256:<fingerprint-from-the-operator> --keyscan
 ```
 
-`ssh-keyscan` performs only key exchange and never authenticates. The probe
-passes `host_key` only if an observed key matches a `--pin` you got from the
-operator. A key observed from the same path is never trusted on its own, and the
-probe fails if no `--pin` is given.
+With `--keyscan` the probe runs `ssh-keyscan` itself, without a shell, against
+the **address literal it validated**, not the name. A second, separate DNS lookup
+(for example through Tailscale split DNS or MagicDNS) could reach the login node
+over the Tailnet, which is the path D03 must exclude. `ssh-keyscan` performs only
+key exchange and never authenticates. The `host_key` check passes only if:
+
+- every scanned key was observed at a validated address and port (reported as
+  `observed_at`), and
+- an observed key matches a `--pin` you got from the operator.
+
+A key observed over the same path is never trusted on its own, and the check
+fails if no `--pin` is given. If `ssh-keyscan` has to run separately, scan each
+approved literal (`ssh-keyscan -p 22 -t ed25519,ecdsa,rsa <approved-ip>`, without
+`-H`) and pass the output with `--keyscan-file`. Lines for a name, another
+address, another port or a hashed host fail with `keyscan_host_mismatch`.
 
 **4. Attach the output.** Save the JSON lines from steps 2 and 3 with the
 approval record. The summary line always has `slurm_jobs_submitted: 0` and
-`logins_attempted: 0`, and every record has `"evidence": "live"`. Then delete
-`keyscan.txt`.
+`logins_attempted: 0`, and every record has `"evidence": "live"`. Delete any
+saved keyscan file.
 
 Not part of this package, and not to be done without separate approval: an
 interactive `ssh` login (even to check `whoami`), any Slurm command, a relay

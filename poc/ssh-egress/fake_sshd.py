@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 BANNER = b"SSH-2.0-NestFixture_0.1 synthetic\r\n"
@@ -29,18 +30,20 @@ class FakeSshd:
         banner (`bytes`): Sent first on every connection; empty sends nothing.
         echo (`bool`): Echo received bytes back to the peer.
         received (`list[int]`): Bytes received per finished connection.
+        handler: Replaces the greet-and-echo behaviour, for misbehaving-peer tests.
     """
 
     banner: bytes = BANNER
     echo: bool = True
     received: list[int] = field(default_factory=list)
     connections: int = 0
+    handler: Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]] | None = None
     _server: asyncio.Server | None = None
 
     async def start(self, host: str = "127.0.0.1", port: int = 0) -> int:
         if host not in {"127.0.0.1", "::1", "localhost"}:
             raise ValueError("The fixture listens on loopback only")
-        self._server = await asyncio.start_server(self._handle, host, port)
+        self._server = await asyncio.start_server(self.handler or self._handle, host, port)
         return self._server.sockets[0].getsockname()[1]
 
     async def close(self) -> None:
