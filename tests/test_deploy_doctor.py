@@ -17,6 +17,7 @@ import unittest
 import uuid
 from contextlib import redirect_stdout
 from pathlib import Path
+from typing import ClassVar
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -866,6 +867,278 @@ class LogLeakCheckTests(unittest.TestCase):
         self.assertEqual(len(prompts), 1)
         self.assertNotIn(SYNTHETIC_TOKEN, prompts[0])
         self.assertNotIn("--token", " ".join(doctor.parser().format_help().split()))
+
+
+def _proc_word(address: str) -> str:
+    """One IPv4 address as /proc/net/tcp prints it on a little-endian host."""
+    return bytes(int(octet) for octet in address.split("."))[::-1].hex().upper()
+
+
+def proc_tcp(*sockets) -> str:
+    """/proc/net/tcp text for established `(local, lport, remote, rport)` sockets."""
+    lines = ["  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt"]
+    lines.append("   0: 00000000:C383 00000000:0000 0A 00000000:00000000 00:00000000 00000000")
+    for i, (local, lport, remote, rport) in enumerate(sockets, 1):
+        lines.append(
+            f"   {i}: {_proc_word(local)}:{lport:04X} {_proc_word(remote)}:{rport:04X} 01 "
+            "00000000:00000000 00:00000000 00000000"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def proc_tcp6_mapped(*sockets) -> str:
+    """/proc/net/tcp6 text for a dual-stack listener: IPv4 ends as ::ffff:a.b.c.d."""
+    lines = ["  sl  local_address                         remote_address                        st"]
+    for i, (local, lport, remote, rport) in enumerate(sockets, 1):
+        ends = [
+            f"0000000000000000FFFF0000{_proc_word(address)}:{port:04X}"
+            for address, port in ((local, lport), (remote, rport))
+        ]
+        lines.append(f"   {i}: {ends[0]} {ends[1]} 01 00000000:00000000")
+    return "\n".join(lines) + "\n"
+
+
+ORIGIN = "nest_grpc-origin"
+EDGE = "dokploy-network"
+
+
+def runtime_container(service, networks, env, *, started="2026-11-26T15:00:00Z"):
+    found = container(f"nest-{service}-1", "running", service=service, pid=42, started=started)
+    found["Config"]["Env"] = [f"{k}={v}" for k, v in env.items()]
+    found["NetworkSettings"] = {
+        "Networks": {
+            name: {"IPAddress": address, "DNSNames": names, "Aliases": names}
+            for name, (address, names) in networks.items()
+        }
+    }
+    return found
+
+
+class RuntimeDocker(FakeDocker):
+    """Also answers `docker exec`: getent in the gateway, the probe, and each
+    container's socket tables."""
+
+    def __init__(self, containers, *, resolves, sockets, probe=0):
+        super().__init__(containers=containers)
+        self.resolves = resolves  # gateway getent answer, or None when it fails
+        self.sockets = sockets  # container ID -> socket table text, or None
+        self.probe = probe
+
+    def __call__(self, argv):
+        argv = list(argv)
+        if argv[:2] != ["docker", "exec"]:
+            return super().__call__(argv)
+        self.calls.append(argv)
+        R = doctor.Result
+        rest = argv[2:]
+        if rest[0] == "--detach":
+            assert rest[2] == "bash" and "/dev/tcp/" in rest[4], rest
+            return R(self.probe, "")
+        target, command = rest[0], rest[1:]
+        if command[0] == "getent":
+            if self.resolves is None:
+                return R(2, "")
+            return R(0, "".join(f"{a} STREAM {command[2]}\n{a} DGRAM\n" for a in self.resolves))
+        if command[0] == "sh":
+            text = self.sockets.get(target)
+            return R(1, "", "exec failed") if text is None else R(0, text)
+        raise AssertionError(f"unexpected exec {argv}")
+
+
+class GatewayRuntimeTests(unittest.TestCase):
+    """#109: what the running gateway and Controller actually do, from recorded answers
+    shaped like the 2026-11-26 staging host (Controller .2 and Envoy .3 on grpc-origin,
+    both also on dokploy-network)."""
+
+    CONTROLLER_ENV: ClassVar[dict[str, str]] = {
+        "NEST_GRPC_TRUSTED_PROXIES": "10.253.250.3/32",
+        "NEST_GRPC_ALLOWED_PEERS": "10.253.250.3/32,172.20.0.0/16",
+        "NEST_DATABASE_PASSWORD": "never-printed-secret",
+        "NEST_GOOGLE_CLIENT_SECRET": "GOCSPX-never-printed",
+    }
+
+    def setUp(self):
+        patcher = mock.patch.object(doctor.time, "sleep")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def deployment(self, *, upstream="controller-grpc-origin:50051", generic_on_edge=False, **env):
+        origin_names = ["nest-controller-1", "controller", "controller-grpc-origin"]
+        edge_names = ["nest-controller-1", "controller"]
+        if generic_on_edge:
+            origin_names = ["nest-controller-1", "controller"]
+        controller = runtime_container(
+            "controller",
+            {
+                ORIGIN: ("10.253.250.2", origin_names),
+                EDGE: ("10.0.1.12", edge_names),
+                "nest_tailnet": ("172.20.0.3", ["nest-controller-1", "controller"]),
+            },
+            {**self.CONTROLLER_ENV, **env},
+        )
+        gateway = runtime_container(
+            "grpc-gateway",
+            {
+                ORIGIN: ("10.253.250.3", ["nest-grpc-gateway-1"]),
+                EDGE: ("10.0.1.13", ["nest-grpc-gateway-1", "nest-grpc-gateway"]),
+            },
+            {"NEST_GRPC_UPSTREAM": upstream, "NEST_GRPC_EDGE_PROXY": "10.0.1.7/32"},
+            started="2026-11-26T15:00:05Z",
+        )
+        return controller, gateway
+
+    def run_runtime(self, fake):
+        return run(["gateway-runtime", "--project", "nest"], fake)
+
+    def healthy(self, controller, gateway, **overrides):
+        options = {
+            "resolves": ["10.253.250.2"],
+            "sockets": {
+                gateway["Id"]: proc_tcp(("10.253.250.3", 41000, "10.253.250.2", 50051)),
+                controller["Id"]: proc_tcp(("10.253.250.2", 50051, "10.253.250.3", 41000)),
+            },
+        }
+        options.update(overrides)
+        return RuntimeDocker([controller, gateway], **options)
+
+    def test_current_configuration_passes_with_socket_evidence(self):
+        controller, gateway = self.deployment()
+        code, out = self.run_runtime(self.healthy(controller, gateway))
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("FAIL", out)
+        self.assertIn("PASS upstream_dns: controller-grpc-origin -> 10.253.250.2 only", out)
+        self.assertIn(
+            "PASS private_path: gateway 10.253.250.3 -> Controller 10.253.250.2:50051", out
+        )
+        for secret in ("never-printed-secret", "GOCSPX-never-printed"):
+            self.assertNotIn(secret, out)
+
+    def test_staging_topology_with_the_generic_name_fails(self):
+        """The observed failure: `controller` resolves to the edge address and the
+        Controller's socket shows the gateway's edge address."""
+        controller, gateway = self.deployment(upstream="controller:50051", generic_on_edge=True)
+        fake = self.healthy(
+            controller,
+            gateway,
+            resolves=["10.0.1.12"],
+            sockets={
+                gateway["Id"]: proc_tcp(("10.0.1.13", 41000, "10.0.1.12", 50051)),
+                controller["Id"]: proc_tcp6_mapped(("10.0.1.12", 50051, "10.0.1.13", 41000)),
+            },
+        )
+        code, out = self.run_runtime(fake)
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL upstream_setting: NEST_GRPC_UPSTREAM is controller:50051", out)
+        self.assertIn(f"FAIL upstream_alias: controller is a Controller name on {EDGE}", out)
+        self.assertIn("FAIL upstream_dns: controller resolves inside the gateway to 10.0.1.12", out)
+        self.assertIn("FAIL private_path: the gateway reaches the Controller from 10.0.1.13", out)
+
+    def test_ipv4_mapped_controller_sockets_are_recognised(self):
+        """A dual-stack Controller lists the gateway as ::ffff:10.253.250.3."""
+        controller, gateway = self.deployment()
+        sockets = {
+            gateway["Id"]: proc_tcp(("10.253.250.3", 41000, "10.253.250.2", 50051)),
+            controller["Id"]: proc_tcp6_mapped(("10.253.250.2", 50051, "10.253.250.3", 41000)),
+        }
+        code, out = self.run_runtime(self.healthy(controller, gateway, sockets=sockets))
+        self.assertEqual(code, 0, out)
+        self.assertIn("peer for every gateway connection is 10.253.250.3", out)
+
+    def test_any_gateway_connection_over_the_edge_fails(self):
+        controller, gateway = self.deployment()
+        sockets = {
+            gateway["Id"]: proc_tcp(("10.253.250.3", 41000, "10.253.250.2", 50051)),
+            controller["Id"]: proc_tcp(
+                ("10.253.250.2", 50051, "10.253.250.3", 41000),
+                ("10.0.1.12", 50051, "10.0.1.13", 41002),  # a pooled Envoy connection
+                ("172.20.0.3", 50051, "172.20.0.2", 40000),  # Tailscale Serve: not the gateway
+            ),
+        }
+        code, out = self.run_runtime(self.healthy(controller, gateway, sockets=sockets))
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL private_path: the gateway reaches the Controller from 10.0.1.13", out)
+
+    def test_wrong_or_extra_addresses_fail(self):
+        controller, gateway = self.deployment()
+        for resolves in (["10.253.250.2", "10.0.1.12"], ["10.253.250.9"], []):
+            with self.subTest(resolves=resolves):
+                code, out = self.run_runtime(self.healthy(controller, gateway, resolves=resolves))
+                self.assertEqual(code, 1, out)
+                self.assertIn("FAIL upstream_dns", out)
+
+    def test_alias_on_another_network_fails(self):
+        controller, gateway = self.deployment()
+        controller["NetworkSettings"]["Networks"][EDGE]["DNSNames"].append("controller-grpc-origin")
+        code, out = self.run_runtime(self.healthy(controller, gateway))
+        self.assertEqual(code, 1, out)
+        self.assertIn(
+            f"FAIL upstream_alias: controller-grpc-origin is a Controller name on {EDGE}, {ORIGIN}",
+            out,
+        )
+
+    def test_widened_trust_fails(self):
+        for env, message in (
+            ({"NEST_GRPC_TRUSTED_PROXIES": "10.0.1.0/24"}, "is 10.0.1.0/24, not 10.253.250.3/32"),
+            (
+                {"NEST_GRPC_ALLOWED_PEERS": "10.253.250.3/32,10.0.1.0/24"},
+                "NEST_GRPC_ALLOWED_PEERS admits the gateway's non-origin address 10.0.1.13",
+            ),
+            ({"NEST_GRPC_ALLOWED_PEERS": "172.20.0.0/16"}, "does not admit 10.253.250.3/32"),
+            ({"NEST_GRPC_TRUSTED_PROXIES": "not-a-network"}, "does not parse"),
+        ):
+            with self.subTest(env):
+                controller, gateway = self.deployment(**env)
+                code, out = self.run_runtime(self.healthy(controller, gateway))
+                self.assertEqual(code, 1, out)
+                self.assertIn("FAIL controller_trust", out)
+                self.assertIn(message, out)
+
+    def test_unavailable_checks_fail(self):
+        controller, gateway = self.deployment()
+        for label, overrides in (
+            ("getent", {"resolves": None}),
+            ("probe", {"probe": 1}),
+            ("socket table", {"sockets": {gateway["Id"]: None, controller["Id"]: None}}),
+            (
+                "no connection",
+                {"sockets": {gateway["Id"]: proc_tcp(), controller["Id"]: proc_tcp()}},
+            ),
+        ):
+            with self.subTest(label):
+                code, out = self.run_runtime(self.healthy(controller, gateway, **overrides))
+                self.assertEqual(code, 1, out)
+                self.assertRegex(out, r"FAIL (upstream_dns|private_path)")
+
+    def test_stale_or_missing_containers_fail(self):
+        controller, gateway = self.deployment()
+        _, stale = self.deployment()
+        fake = RuntimeDocker([controller, gateway, stale], resolves=["10.253.250.2"], sockets={})
+        code, out = self.run_runtime(fake)
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL grpc-gateway_container: 2 running grpc-gateway containers", out)
+        gateway["State"]["Status"] = "restarting"
+        code, out = self.run_runtime(RuntimeDocker([controller, gateway], resolves=[], sockets={}))
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL grpc-gateway_container: no running grpc-gateway container", out)
+        self.assertIn("found: restarting", out)
+
+    def test_controller_restarted_after_the_gateway_is_reported(self):
+        controller, gateway = self.deployment()
+        controller["State"]["StartedAt"] = "2026-11-26T16:00:00Z"
+        code, out = self.run_runtime(self.healthy(controller, gateway))
+        self.assertEqual(code, 0, out)
+        self.assertIn("WARN containers: the Controller was (re)started after the gateway", out)
+
+    def test_parse_proc_net_byte_order(self):
+        text = proc_tcp(("10.253.250.3", 41000, "10.253.250.2", 50051))
+        ((local, lport, remote, rport),) = doctor.parse_proc_net(text, "little")
+        self.assertEqual(
+            (str(local), lport, str(remote), rport), ("10.253.250.3", 41000, "10.253.250.2", 50051)
+        )
+        big = "   1: 0AFDFA03:A028 0AFDFA02:C383 01 0\n"
+        ((local, _, remote, _),) = doctor.parse_proc_net(big, "big")
+        self.assertEqual((str(local), str(remote)), ("10.253.250.3", "10.253.250.2"))
+        self.assertEqual(doctor.parse_proc_net("   1: zz:1 yy:2 01\n"), [])
 
 
 @unittest.skipUnless(CHECKOUT, "requires the repository checkout")

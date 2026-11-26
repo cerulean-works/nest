@@ -32,8 +32,9 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
-from ipaddress import IPv4Address, IPv6Address, ip_address
+from ipaddress import IPv4Address, IPv4Network, IPv6Address, IPv6Network, ip_address
 from typing import Any
+from urllib.parse import unquote
 
 import grpc
 from google.protobuf.message import DecodeError
@@ -49,6 +50,7 @@ __all__ = [
     "RATE_LIMITED_KIND",
     "RpcGuard",
     "TokenBuckets",
+    "canonical_address",
     "client_address",
     "current_client",
     "peer_address",
@@ -62,6 +64,8 @@ MAX_TRACKED_KEYS = 10_000
 """Most rate-limit buckets kept at once; the least recently used is dropped first."""
 
 Address = IPv4Address | IPv6Address
+_MAPPED = IPv6Network("::ffff:0:0/96")
+"""The IPv4-mapped IPv6 addresses (RFC 4291, section 2.5.5.2)."""
 
 
 def server_options(policy: RpcPolicy) -> list[tuple[str, Any]]:
@@ -86,25 +90,64 @@ def server_options(policy: RpcPolicy) -> list[tuple[str, Any]]:
     ]
 
 
+def canonical_address(address: Address) -> Address:
+    """
+    `address` with an IPv4-mapped IPv6 address (`::ffff:10.0.0.3`) replaced by its
+    IPv4 address (`10.0.0.3`).
+
+    A Controller listening on a dual-stack socket sees an IPv4 client as the mapped
+    IPv6 address, so without this an IPv4 allowlist or trusted proxy would never
+    match it. Every other address, including ordinary IPv6, is returned unchanged.
+    """
+    if isinstance(address, IPv6Address) and address.ipv4_mapped is not None:
+        return address.ipv4_mapped
+    return address
+
+
 def peer_address(peer: str | None) -> Address | None:
-    """The IP address of a gRPC peer string (`ipv4:1.2.3.4:5`, `ipv6:[::1]:5`), or `None`."""
+    """
+    The IP address of a gRPC peer string, or `None` when it names none.
+
+    gRPC renders the peer as a URI: `ipv4:1.2.3.4:5`, and `ipv6:%5B::1%5D:5`
+    (gRPC 1.5x and later) or `ipv6:[::1]:5`. An IPv6 zone (`%25eth0` or `%eth0`) is
+    dropped and an IPv4-mapped IPv6 address becomes its IPv4 address
+    ([`rpc_guard.canonical_address`]). Anything else, such as `unix:` or a malformed
+    string, gives `None`, which an allowlist refuses.
+    """
     if not peer:
         return None
     scheme, _, rest = peer.partition(":")
     if scheme == "ipv4":
         host = rest.rpartition(":")[0]
     elif scheme == "ipv6":
-        host = rest.rpartition(":")[0].removeprefix("[").removesuffix("]")
+        host = unquote(rest).rpartition(":")[0]
+        if not (host.startswith("[") and host.endswith("]")):
+            return None
+        host = host[1:-1]
     else:
         return None
     try:
-        return ip_address(host.split("%", 1)[0])
+        return canonical_address(ip_address(host.split("%", 1)[0]))
     except ValueError:
         return None
 
 
 def _within(address: Address, networks: Iterable[Network]) -> bool:
-    return any(address.version == network.version and address in network for network in networks)
+    """
+    Whether `address` is in one of `networks`. An IPv4 address and its IPv4-mapped
+    form are the same address, and a network written in mapped form
+    (`::ffff:10.0.0.0/104`) is the IPv4 network it maps. No other IPv6 network
+    matches an IPv4 address, so a wide IPv6 entry such as `::/0` admits no IPv4 peer.
+    """
+    address = canonical_address(address)
+    for network in networks:
+        if isinstance(network, IPv6Network) and network.subnet_of(_MAPPED):
+            network = IPv4Network(
+                (int(network.network_address) & 0xFFFFFFFF, network.prefixlen - 96)
+            )
+        if address.version == network.version and address in network:
+            return True
+    return False
 
 
 def client_address(
@@ -122,6 +165,7 @@ def client_address(
     """
     if peer is None:
         return "unknown"
+    peer = canonical_address(peer)
     if not trusted_proxies or not _within(peer, trusted_proxies):
         return str(peer)
     values = [
@@ -133,7 +177,7 @@ def client_address(
         return str(peer)
     for item in reversed(values[0].split(",")):
         try:
-            hop = ip_address(item.strip())
+            hop = canonical_address(ip_address(item.strip()))
         except ValueError:
             return str(peer)
         if not _within(hop, trusted_proxies):

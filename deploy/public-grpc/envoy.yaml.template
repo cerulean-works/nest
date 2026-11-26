@@ -162,6 +162,9 @@ static_resources:
   clusters:
     - name: controller
       type: STRICT_DNS
+      # grpc-origin is IPv4 only; the upstream name is the grpc-origin-only alias,
+      # which the entrypoint checked resolves only inside it (#109).
+      dns_lookup_family: V4_ONLY
       connect_timeout: 5s
       # Above the Controller's own bound (NEST_GRPC_MAX_CONCURRENT_RPCS, 32), so
       # its RESOURCE_EXHAUSTED answer normally wins; never retried.

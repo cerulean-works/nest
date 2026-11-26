@@ -156,8 +156,12 @@ services:
         aliases: [controller]
       # Private network shared only with the public gRPC gateway (profile
       # public-grpc). It is internal: nothing on it reaches or is reached from outside.
+      # The gateway dials controller-grpc-origin, a name that exists only on this
+      # network. The generic `controller` name also resolves on every other network
+      # the Controller joins, including the edge network Dokploy attaches for its
+      # Domain, where it gives the edge address (#109).
       grpc-origin:
-        aliases: [controller]
+        aliases: [controller-grpc-origin]
     # gRPC is reached through Tailscale Serve, or through the public-grpc gateway on
     # grpc-origin; never through Traefik directly, and no port is published. For
     # Google sign-in, add a Dokploy Domain for this service on container port 8080 (HTTPS).
@@ -334,7 +338,10 @@ services:
       # Required (the entrypoint refuses to start without it): Traefik's address
       # on the edge network as a CIDR, such as 10.0.1.7/32.
       NEST_GRPC_EDGE_PROXY: ${NEST_GRPC_EDGE_PROXY:-}
-      NEST_GRPC_UPSTREAM: controller:50051
+      # The grpc-origin-only alias, never the generic `controller` (see above). The
+      # entrypoint refuses to start unless it resolves only inside the subnet.
+      NEST_GRPC_UPSTREAM: controller-grpc-origin:50051
+      NEST_GRPC_ORIGIN_SUBNET: ${NEST_GRPC_ORIGIN_SUBNET:-172.31.250.0/28}
       NEST_GRPC_CERT_DIR: /certs
       NEST_GRPC_RUN_DIR: /tmp/nest-grpc
     depends_on:

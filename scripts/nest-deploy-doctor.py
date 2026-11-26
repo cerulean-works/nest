@@ -10,6 +10,7 @@ Run it on the Docker host as a user who may use the Docker CLI. It needs only Py
     python3 scripts/nest-deploy-doctor.py wait-migrate   --project APP --timeout 300 [--since T]
     python3 scripts/nest-deploy-doctor.py recover-migrate --project APP [--apply]
     python3 scripts/nest-deploy-doctor.py log-leak-check --project APP < token-file
+    python3 scripts/nest-deploy-doctor.py gateway-runtime --project APP
 
 `--project` is the Compose project name: Dokploy's application name (its `appName`,
 shown by `docker compose ls`), or `nest` for a plain `docker compose` run of the
@@ -59,6 +60,24 @@ log-leak-check
     `--canary` searches for a synthetic non-secret marker instead. Exits 1 if it
     occurs anywhere, and 2 if any log cannot be read or a service has no container,
     so a read failure never passes.
+
+gateway-runtime
+    After a deploy with the `public-grpc` profile, and again after any redeploy,
+    restart or Dokploy network change. Preflight reasons about settings and subnets;
+    this checks what the running containers actually do (#109). It requires
+    exactly one running gateway and one running Controller, and checks:
+    `NEST_GRPC_UPSTREAM` names the grpc-origin-only alias, not the generic
+    `controller` name. That name is a DNS name of the Controller on grpc-origin and on
+    no other network. Inside the gateway it resolves (getent) to exactly the
+    Controller's grpc-origin address. The Controller's `NEST_GRPC_TRUSTED_PROXIES` is
+    the gateway's grpc-origin /32, and neither it nor `NEST_GRPC_ALLOWED_PEERS` admits
+    any of the gateway's other addresses. Finally it opens one TCP connection from
+    the gateway to the upstream, without sending a byte, and reads the socket tables:
+    the gateway's end must be its grpc-origin address. Every connection the Controller
+    holds from any gateway address must come from that address, which is the peer
+    `context.peer()` reports, mapped IPv4 included. A check that cannot run fails.
+    Only addresses and network names are printed, never other settings. It changes
+    nothing; the probe connection is closed without data.
 
 Exit codes: 0 ok, 1 a check failed, 2 usage or Docker error, 3 stuck, 4 migration
 failed, 5 still in progress or timed out, 6 no migrate container found.
@@ -213,6 +232,10 @@ class Docker:
 
     def remove(self, container_id: str) -> None:
         self._ok(["docker", "rm", container_id])
+
+    def exec(self, container_id: str, argv: Sequence[str], *, detach: bool = False) -> Result:
+        """Runs `argv` in a running container; the result is returned, not checked."""
+        return self.run(["docker", "exec", *(["--detach"] if detach else []), container_id, *argv])
 
 
 def read_env_file(path: str | None) -> dict[str, tuple[str, bool]]:
@@ -932,6 +955,304 @@ def log_leak_check(args, docker: Docker, stdin=None, prompt=None) -> int:
     return 0
 
 
+# --- gateway-runtime (#109) -------------------------------------------------------
+
+GENERIC_UPSTREAM_NAMES = ("controller",)
+RUNTIME_ENV = ("NEST_GRPC_UPSTREAM", "NEST_GRPC_TRUSTED_PROXIES", "NEST_GRPC_ALLOWED_PEERS")
+PROBE_SECONDS = 4
+
+
+def container_env(container: dict, keys: Sequence[str]) -> dict[str, str]:
+    """Only the named variables of a container's environment; nothing else is kept."""
+    found = {}
+    for item in (container.get("Config") or {}).get("Env") or []:
+        key, _, value = item.partition("=")
+        if key in keys:
+            found[key] = value
+    return found
+
+
+def _attachments(container: dict) -> dict[str, dict]:
+    return (container.get("NetworkSettings") or {}).get("Networks") or {}
+
+
+def _addresses(container: dict) -> dict[str, str]:
+    """Network name -> the container's IPv4 address on it."""
+    return {
+        name: a.get("IPAddress", "")
+        for name, a in _attachments(container).items()
+        if a.get("IPAddress")
+    }
+
+
+def _dns_names(attachment: dict) -> set[str]:
+    return set(attachment.get("DNSNames") or []) | set(attachment.get("Aliases") or [])
+
+
+def _canonical(address: ipaddress.IPv4Address | ipaddress.IPv6Address):
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        return address.ipv4_mapped
+    return address
+
+
+def parse_proc_net(text: str, byteorder: str = sys.byteorder) -> list[tuple]:
+    """
+    Established TCP sockets from /proc/net/tcp and /proc/net/tcp6 text, as
+    `(local address, local port, remote address, remote port)`. The kernel prints
+    each 32-bit word of an address in host byte order; IPv4-mapped IPv6 addresses
+    are returned as IPv4, as the Controller's guard sees them.
+    """
+    sockets = []
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 4 or fields[3] != "01" or ":" not in fields[1]:
+            continue
+        try:
+            ends = []
+            for end in fields[1:3]:
+                hex_address, hex_port = end.split(":")
+                raw = bytes.fromhex(hex_address)
+                if byteorder == "little":
+                    raw = b"".join(raw[i : i + 4][::-1] for i in range(0, len(raw), 4))
+                ends.append((_canonical(ipaddress.ip_address(raw)), int(hex_port, 16)))
+        except ValueError:
+            continue
+        sockets.append((ends[0][0], ends[0][1], ends[1][0], ends[1][1]))
+    return sockets
+
+
+def _read_sockets(docker: Docker, container_id: str) -> list[tuple] | None:
+    result = docker.exec(
+        container_id, ["sh", "-c", "cat /proc/net/tcp; cat /proc/net/tcp6 2>/dev/null; true"]
+    )
+    if result.returncode != 0 or "local_address" not in result.stdout:
+        return None
+    return parse_proc_net(result.stdout)
+
+
+def _one_running(docker: Docker, project: str, service: str) -> tuple[dict | None, Check | None]:
+    found = docker.containers(project, service)
+    running = [c for c in found if (c.get("State") or {}).get("Status") == "running"]
+    if len(running) == 1:
+        return running[0], None
+    if not running:
+        states = ", ".join((c.get("State") or {}).get("Status", "?") for c in found) or "none"
+        detail = f"no running {service} container in project {project} (found: {states})"
+    else:
+        detail = (
+            f"{len(running)} running {service} containers in project {project}; a stale "
+            "container from an earlier deploy is still up. Remove it, then rerun"
+        )
+    return None, Check(f"{service}_container", "FAIL", detail)
+
+
+def gateway_runtime(args, docker: Docker, sleep: Callable[[float], None] | None = None) -> int:
+    sleep = sleep or time.sleep
+    checks: list[Check] = []
+    gateway, problem = _one_running(docker, args.project, "grpc-gateway")
+    controller, problem2 = _one_running(docker, args.project, "controller")
+    checks += [c for c in (problem, problem2) if c]
+    if gateway is None or controller is None:
+        emit(checks, args.json)
+        return 1
+    started = parse_time((gateway.get("State") or {}).get("StartedAt", ""))
+    controller_started = parse_time((controller.get("State") or {}).get("StartedAt", ""))
+    if started and controller_started and controller_started > started:
+        checks.append(
+            Check(
+                "containers",
+                "WARN",
+                "the Controller was (re)started after the gateway; the gateway's start-up "
+                "resolution check predates it, so the checks below are what count",
+            )
+        )
+    else:
+        checks.append(Check("containers", "PASS", "one running gateway and one running Controller"))
+
+    origin_name = f"{args.project}_grpc-origin"
+    gateway_networks = _addresses(gateway)
+    controller_networks = _addresses(controller)
+    gateway_origin = gateway_networks.get(origin_name)
+    controller_origin = controller_networks.get(origin_name)
+    if not gateway_origin or not controller_origin:
+        missing = [
+            n for n, a in (("gateway", gateway_origin), ("Controller", controller_origin)) if not a
+        ]
+        checks.append(
+            Check(
+                "origin_network", "FAIL", f"{' and '.join(missing)} not attached to {origin_name}"
+            )
+        )
+        emit(checks, args.json)
+        return 1
+    checks.append(
+        Check(
+            "origin_network",
+            "PASS",
+            f"{origin_name}: gateway {gateway_origin}, Controller {controller_origin}",
+        )
+    )
+
+    upstream = container_env(gateway, RUNTIME_ENV).get("NEST_GRPC_UPSTREAM", "")
+    host, _, port_text = upstream.rpartition(":")
+    if not host or not port_text.isdigit():
+        checks.append(
+            Check(
+                "upstream_setting", "FAIL", f"gateway NEST_GRPC_UPSTREAM is {upstream or 'unset'}"
+            )
+        )
+        emit(checks, args.json)
+        return 1
+    if host in GENERIC_UPSTREAM_NAMES or host == f"{args.project}-controller-1":
+        checks.append(
+            Check(
+                "upstream_setting",
+                "FAIL",
+                f"NEST_GRPC_UPSTREAM is {upstream}: a name that resolves on every network the "
+                "Controller joins, including Dokploy's edge network; use "
+                "controller-grpc-origin:50051 from the current compose.dokploy.yaml",
+            )
+        )
+    else:
+        checks.append(Check("upstream_setting", "PASS", upstream))
+
+    named_on = sorted(n for n, a in _attachments(controller).items() if host in _dns_names(a))
+    if named_on == [origin_name]:
+        checks.append(
+            Check("upstream_alias", "PASS", f"{host} is a Controller name only on {origin_name}")
+        )
+    else:
+        checks.append(
+            Check(
+                "upstream_alias",
+                "FAIL",
+                f"{host} is a Controller name on {', '.join(named_on) or 'no network'}; it must "
+                f"be on {origin_name} only",
+            )
+        )
+
+    resolved = docker.exec(gateway["Id"], ["getent", "ahosts", host])
+    addresses = sorted({line.split()[0] for line in resolved.stdout.splitlines() if line.split()})
+    if resolved.returncode != 0 or not addresses:
+        checks.append(Check("upstream_dns", "FAIL", f"{host} does not resolve inside the gateway"))
+    elif addresses == [controller_origin]:
+        checks.append(Check("upstream_dns", "PASS", f"{host} -> {controller_origin} only"))
+    else:
+        checks.append(
+            Check(
+                "upstream_dns",
+                "FAIL",
+                f"{host} resolves inside the gateway to {', '.join(addresses)}; expected only "
+                f"{controller_origin} on {origin_name}",
+            )
+        )
+
+    controller_env = container_env(controller, RUNTIME_ENV)
+    gateway_cidr = ipaddress.IPv4Network(f"{gateway_origin}/32")
+    other_gateway = [
+        ipaddress.ip_address(a) for n, a in gateway_networks.items() if n != origin_name
+    ]
+    try:
+        trusted = _cidrs(controller_env.get("NEST_GRPC_TRUSTED_PROXIES", ""))
+        peers = _cidrs(controller_env.get("NEST_GRPC_ALLOWED_PEERS", ""))
+    except ValueError as error:
+        checks.append(
+            Check("controller_trust", "FAIL", f"Controller setting does not parse: {error}")
+        )
+    else:
+        problems = []
+        if trusted != [gateway_cidr]:
+            shown = ",".join(str(n) for n in trusted) or "unset"
+            problems.append(f"NEST_GRPC_TRUSTED_PROXIES is {shown}, not {gateway_cidr}")
+        if not any(gateway_cidr.subnet_of(p) for p in _ipv4(peers)):
+            problems.append(f"NEST_GRPC_ALLOWED_PEERS does not admit {gateway_cidr}")
+        for address in other_gateway:
+            for name, networks in (
+                ("NEST_GRPC_TRUSTED_PROXIES", trusted),
+                ("NEST_GRPC_ALLOWED_PEERS", peers),
+            ):
+                if any(address.version == n.version and address in n for n in networks):
+                    problems.append(
+                        f"{name} admits the gateway's non-origin address {address}; never widen it "
+                        "to the edge network"
+                    )
+        if problems:
+            checks.append(Check("controller_trust", "FAIL", "; ".join(problems)))
+        else:
+            checks.append(Check("controller_trust", "PASS", f"trusts exactly {gateway_cidr}"))
+
+    # Peer identity: a held, silent TCP connection from the gateway to the upstream,
+    # seen from both ends.
+    port = int(port_text)
+    probe = docker.exec(
+        gateway["Id"],
+        [
+            "bash",
+            "-c",
+            f'exec 3<>"/dev/tcp/$1/$2" && sleep {PROBE_SECONDS}',
+            "probe",
+            host,
+            str(port),
+        ],
+        detach=True,
+    )
+    gateway_ips = {ipaddress.ip_address(a) for a in gateway_networks.values()}
+    origin_ip = ipaddress.ip_address(gateway_origin)
+    seen_gateway = seen_controller = None
+    if probe.returncode == 0:
+        for _ in range(PROBE_SECONDS * 2):
+            sleep(0.5)
+            outgoing = _read_sockets(docker, gateway["Id"])
+            incoming = _read_sockets(docker, controller["Id"])
+            if outgoing is None or incoming is None:
+                break
+            seen_gateway = [s for s in outgoing if s[3] == port and s[0] in gateway_ips]
+            seen_controller = [s for s in incoming if s[1] == port and s[2] in gateway_ips]
+            if seen_gateway and seen_controller:
+                break
+    if probe.returncode != 0 or seen_gateway is None or seen_controller is None:
+        checks.append(
+            Check(
+                "private_path",
+                "FAIL",
+                "could not open the probe connection or read the socket tables (needs bash "
+                "in the gateway and sh in the Controller)",
+            )
+        )
+    elif not seen_gateway or not seen_controller:
+        checks.append(
+            Check(
+                "private_path",
+                "FAIL",
+                f"no connection from the gateway reached the Controller on port {port}",
+            )
+        )
+    else:
+        sources = sorted({str(s[0]) for s in seen_gateway})
+        peers_seen = sorted({str(s[2]) for s in seen_controller})
+        wrong = [a for a in sources + peers_seen if ipaddress.ip_address(a) != origin_ip]
+        if wrong:
+            checks.append(
+                Check(
+                    "private_path",
+                    "FAIL",
+                    f"the gateway reaches the Controller from {', '.join(sorted(set(wrong)))}, not "
+                    f"only {origin_ip} on {origin_name}; the Controller would refuse it",
+                )
+            )
+        else:
+            checks.append(
+                Check(
+                    "private_path",
+                    "PASS",
+                    f"gateway {origin_ip} -> Controller {controller_origin}:{port}; the Controller's "
+                    f"peer for every gateway connection is {origin_ip}",
+                )
+            )
+    emit(checks, args.json)
+    return 1 if any(c.status == "FAIL" for c in checks) else 0
+
+
 def emit(checks: list[Check], as_json: bool) -> None:
     for check in checks:
         print(json.dumps(check.__dict__) if as_json else check.line())
@@ -992,6 +1313,11 @@ def parser() -> argparse.ArgumentParser:
     leak.add_argument(
         "--canary", help="a synthetic, non-secret marker to look for instead of a real token"
     )
+    commands.add_parser(
+        "gateway-runtime",
+        parents=[common],
+        help="check the running gateway's upstream DNS, trust and private path (#109)",
+    )
     return top
 
 
@@ -1009,6 +1335,8 @@ def main(argv: Sequence[str] | None = None, docker: Docker | None = None, enviro
             return wait_migrate(args, docker)
         if args.command == "log-leak-check":
             return log_leak_check(args, docker)
+        if args.command == "gateway-runtime":
+            return gateway_runtime(args, docker)
         return recover_migrate(args, docker)
     except (DockerError, OSError, ValueError) as error:
         print(f"nest-deploy-doctor: {error}", file=sys.stderr)

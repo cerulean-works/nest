@@ -1,0 +1,31 @@
+# Test-only override for compose.dokploy.yaml; see tests/smoke_public_grpc_networks.sh.
+# Reproduces the network membership seen on the Dokploy staging host (#109): the
+# Controller also joins the external edge network (Dokploy attaches it for the
+# Controller's HTTPS Domain), so it shares two networks with the gateway and its
+# generic `controller` service name resolves on both. Adds a stand-in for
+# Traefik's TCP passthrough on the edge network and an "outside" network for the
+# external client, which reaches the gateway only through that stand-in.
+# Paths resolve against the repository root (the first Compose file's directory).
+services:
+  controller:
+    networks:
+      edge: {}
+
+  edge-proxy:
+    image: ${NEST_CONTROLLER_IMAGE:-nest-controller:test}
+    pull_policy: never
+    entrypoint: [python, /fixture/edge_relay.py, "443", nest-grpc-gateway, "8443"]
+    volumes:
+      - type: bind
+        source: ./tests/edge_relay.py
+        target: /fixture/edge_relay.py
+        read_only: true
+    networks:
+      edge:
+        ipv4_address: ${NEST_SMOKE_EDGE_PROXY_ADDRESS:-10.231.0.7}
+      outside:
+        aliases: [grpc.smoke.test]
+
+networks:
+  outside:
+    driver: bridge

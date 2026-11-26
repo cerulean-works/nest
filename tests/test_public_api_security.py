@@ -29,7 +29,14 @@ from nest.config import ConfigError, ControllerConfig, RpcPolicy, load_controlle
 from nest.controller import ExecutionService, build_server
 from nest.db import hash_token
 from nest.proto import execution_pb2, execution_pb2_grpc
-from nest.rpc_guard import RpcGuard, TokenBuckets, client_address, peer_address
+from nest.rpc_guard import (
+    ORIGIN_KIND,
+    RpcGuard,
+    TokenBuckets,
+    canonical_address,
+    client_address,
+    peer_address,
+)
 
 EXECUTE = "/nest.ExecutionService/Execute"
 
@@ -186,9 +193,71 @@ class AddressTests(unittest.TestCase):
     def test_peer_strings(self):
         self.assertEqual(peer_address("ipv4:10.1.2.3:5555"), ip_address("10.1.2.3"))
         self.assertEqual(peer_address("ipv6:[::1]:5555"), ip_address("::1"))
-        self.assertEqual(peer_address("ipv6:%5B::1%5D:5"), None)
-        for peer in ("unix:/tmp/sock", "", None, "ipv4:nonsense:1"):
+        # gRPC 1.5x+ renders IPv6 peers URI-escaped (`grpc._channel` errors show
+        # `ipv6:%5B::1%5D:port` for gRPC 1.84); both spellings are the same peer.
+        self.assertEqual(peer_address("ipv6:%5B::1%5D:5"), ip_address("::1"))
+        self.assertEqual(peer_address("ipv6:%5Bfe80::1%25eth0%5D:5"), ip_address("fe80::1"))
+        self.assertEqual(peer_address("ipv6:[fe80::1%eth0]:5"), ip_address("fe80::1"))
+        for peer in (
+            "unix:/tmp/sock",
+            "",
+            None,
+            "ipv4:nonsense:1",
+            "ipv6:::1:5",  # no brackets: the port cannot be told from the address
+            "ipv6:%5Bnot-an-ip%5D:5",
+            "vsock:3:5",
+        ):
             self.assertIsNone(peer_address(peer))
+
+    def test_ipv4_mapped_peers_are_their_ipv4_address(self):
+        """H08 (#109): a dual-stack listener sees an IPv4 gateway as ::ffff:a.b.c.d."""
+        gateway = ip_address("10.253.250.3")
+        for peer in (
+            "ipv4:10.253.250.3:41000",
+            "ipv6:[::ffff:10.253.250.3]:41000",
+            "ipv6:%5B::ffff:10.253.250.3%5D:41000",
+            "ipv6:%5B::ffff:afd:fa03%5D:41000",
+        ):
+            with self.subTest(peer):
+                self.assertEqual(peer_address(peer), gateway)
+        # Ordinary IPv6 is not rewritten, and neither are other embedded forms.
+        for text in ("2001:db8::3", "::1", "64:ff9b::afd:fa03", "::afd:fa03"):
+            self.assertEqual(canonical_address(ip_address(text)), ip_address(text))
+
+    def test_mapped_forms_match_allowlists_written_either_way(self):
+        proxies = (ip_network("10.253.250.3/32"),)
+        mapped_proxies = (ip_network("::ffff:10.253.250.3/128"),)
+        forwarded = [("x-forwarded-for", "198.51.100.1")]
+        for peer in ("10.253.250.3", "::ffff:10.253.250.3"):
+            for trusted in (proxies, mapped_proxies):
+                with self.subTest(peer=peer, trusted=trusted):
+                    got = client_address(ip_address(peer), forwarded, trusted)
+                    self.assertEqual(got, "198.51.100.1")
+        # A mapped hop in the header is the same address as its IPv4 form, so the
+        # gateway's own entry is skipped and a client is reported as IPv4.
+        chained = [("x-forwarded-for", "::ffff:198.51.100.1, ::ffff:10.253.250.3")]
+        self.assertEqual(
+            client_address(ip_address("10.253.250.3"), chained, proxies), "198.51.100.1"
+        )
+
+    def test_untrusted_mapped_peers_cannot_spoof_forwarded_for(self):
+        proxies = (ip_network("10.253.250.3/32"),)
+        spoof = [("x-forwarded-for", "198.51.100.1")]
+        for peer in ("::ffff:10.0.1.9", "::ffff:10.253.250.4", "2001:db8::3", "10.0.1.9"):
+            with self.subTest(peer):
+                expected = str(canonical_address(ip_address(peer)))
+                self.assertEqual(client_address(ip_address(peer), spoof, proxies), expected)
+        # An IPv6 entry admits an IPv4 peer only when written in mapped form:
+        # a wide IPv6 range such as ::/0 or ::/8 never trusts an IPv4 gateway.
+        for wide in ("::/0", "::/8", "::fffe:0:0/95"):
+            with self.subTest(wide=wide):
+                got = client_address(ip_address("10.0.0.1"), spoof, (ip_network(wide),))
+                self.assertEqual(got, "10.0.0.1")
+        mapped_range = (ip_network("::ffff:10.0.0.0/104"),)
+        self.assertEqual(
+            client_address(ip_address("10.0.0.1"), spoof, mapped_range), "198.51.100.1"
+        )
+        self.assertEqual(client_address(ip_address("11.0.0.1"), spoof, mapped_range), "11.0.0.1")
 
     def test_forwarded_for_is_trusted_only_from_a_proxy(self):
         gateway, outsider = ip_address("10.1.0.5"), ip_address("203.0.113.9")
@@ -220,6 +289,98 @@ class AddressTests(unittest.TestCase):
             buckets.allow(key)
         self.assertEqual(len(buckets), 3)
         self.assertIsNone(TokenBuckets(0).allow("x"))
+
+
+class _Aborted(Exception):
+    pass
+
+
+class _Context:
+    """The parts of a gRPC server context the origin guard reads."""
+
+    def __init__(self, peer: str, metadata=()):
+        self._peer = peer
+        self._metadata = tuple(metadata)
+        self.trailers: tuple = ()
+        self.code = None
+
+    def peer(self):
+        return self._peer
+
+    def invocation_metadata(self):
+        return self._metadata
+
+    def set_trailing_metadata(self, trailers):
+        self.trailers = tuple(trailers)
+
+    def abort(self, code, details):
+        self.code = code
+        raise _Aborted(details)
+
+
+class OriginGuardTests(unittest.TestCase):
+    """H08 (#109): the allowlist admits the gateway however gRPC spells its address,
+    and still refuses everything else, failing closed on a peer it cannot parse."""
+
+    GATEWAY = (ip_network("10.253.250.3/32"),)
+
+    def guard(self, allowed_peers=None, trusted_proxies=None):
+        return RpcGuard(
+            RpcPolicy(
+                allowed_peers=allowed_peers or (*self.GATEWAY, ip_network("172.20.0.0/16")),
+                trusted_proxies=self.GATEWAY if trusted_proxies is None else trusted_proxies,
+            )
+        )
+
+    def test_gateway_admitted_in_every_spelling(self):
+        guard = self.guard()
+        forwarded = [("x-forwarded-for", "203.0.113.9")]
+        for peer in (
+            "ipv4:10.253.250.3:40000",
+            "ipv6:[::ffff:10.253.250.3]:40000",
+            "ipv6:%5B::ffff:10.253.250.3%5D:40000",
+        ):
+            with self.subTest(peer):
+                self.assertEqual(guard._admit(_Context(peer, forwarded)), "203.0.113.9")
+
+    def test_edge_and_unparsable_peers_refused(self):
+        guard = self.guard()
+        for peer in (
+            "ipv4:10.0.1.9:40000",  # the Dokploy edge network (#109)
+            "ipv6:%5B::ffff:10.0.1.9%5D:40000",
+            "ipv6:%5B::ffff:10.253.250.4%5D:40000",  # another grpc-origin host
+            "ipv6:%5B2001:db8::3%5D:40000",
+            "ipv6:%5Bgarbage%5D:1",
+            "unix:/run/nest.sock",
+            "",
+        ):
+            with self.subTest(peer):
+                context = _Context(peer, [("x-forwarded-for", "10.253.250.3")])
+                with self.assertRaises(_Aborted), self.assertLogs("nest.rpc_guard", "WARNING"):
+                    guard._admit(context)
+                self.assertEqual(context.code, grpc.StatusCode.PERMISSION_DENIED)
+                self.assertIn(("nest-error-kind", ORIGIN_KIND), context.trailers)
+
+    def test_tailnet_peer_keeps_its_own_address(self):
+        guard = self.guard()
+        context = _Context("ipv6:%5B::ffff:172.20.0.5%5D:1", [("x-forwarded-for", "1.2.3.4")])
+        self.assertEqual(guard._admit(context), "172.20.0.5")
+
+    def test_wide_ipv6_allowlist_admits_no_ipv4_peer(self):
+        guard = self.guard(allowed_peers=(ip_network("::/1"),), trusted_proxies=())
+        for peer in ("ipv4:10.253.250.3:1", "ipv6:%5B::ffff:10.253.250.3%5D:1"):
+            with (
+                self.subTest(peer),
+                self.assertRaises(_Aborted),
+                self.assertLogs("nest.rpc_guard", "WARNING"),
+            ):
+                guard._admit(_Context(peer))
+
+    def test_ipv6_allowlist_still_works(self):
+        guard = self.guard(allowed_peers=(ip_network("fd00:abcd::/64"),), trusted_proxies=())
+        self.assertEqual(guard._admit(_Context("ipv6:%5Bfd00:abcd::7%5D:1")), "fd00:abcd::7")
+        with self.assertRaises(_Aborted), self.assertLogs("nest.rpc_guard", "WARNING"):
+            guard._admit(_Context("ipv6:%5B::ffff:10.253.250.3%5D:1"))
 
 
 class RpcConfigTests(unittest.TestCase):

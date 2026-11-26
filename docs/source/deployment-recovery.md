@@ -90,6 +90,11 @@ NEST_GRPC_GATEWAY_ADDRESS='10.253.250.2'
 
 Run `preflight` again. Never delete a network you did not create to free a subnet.
 
+`preflight` checks settings before a deploy. After a deploy with `public-grpc`,
+`nest-deploy-doctor.py gateway-runtime --project <appName>` checks the running
+gateway's upstream resolution and the address the Controller actually sees (see
+[The upstream name and the private path](public-grpc-gateway#the-upstream-name-and-the-private-path)).
+
 ### Why private deployments still allocate `grpc-origin`
 
 The Controller always joins `grpc-origin`, so every `compose.dokploy.yaml` deploy
