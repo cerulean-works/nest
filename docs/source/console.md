@@ -52,7 +52,19 @@ It shows, for the Project chosen on the page:
    Project that can run here; with exactly one such Project the SDK selects it by
    itself, which the page says. `uv run nest projects select` chooses from a list
    instead.
-4. **Run a remote function**: a minimal `main.py` and `uv run python main.py`.
+4. **Run a remote function**: a minimal `main.py` and
+   `NEST_PROJECT_ID=<id> uv run python main.py`. The Project ID is set on that one
+   command, so the example runs in the chosen Project even when another one is saved
+   or `NEST_PROJECT_ID` is exported, and nothing saved or exported is changed. Outside
+   this command the SDK chooses the Project as usual
+   ([Choose the Project your calls run in](project-selection)).
+
+Steps 3 and 4 are offered only when a connection profile is published and the server
+reports that the chosen Project can run on this Controller. For a Project that cannot
+run yet, whose eligibility could not be checked, or when you are in no Project, the
+page shows only how to install and sign in and says what is missing; it never
+switches to another Project for you. Running the example anyway could run it in
+another of your Projects, so the page offers no command for that.
 
 Every block has a **Copy** button (with a screen-reader announcement; where the
 browser grants no clipboard access, the command is selected instead). Nothing runs
