@@ -189,3 +189,13 @@ admin.project_access(principal, project.id)  # grants, account links, approvals
 [[autodoc]] authz.UnauthenticatedError
 
 [[autodoc]] authz.ProjectRequiredError
+
+## Service principals
+
+[[autodoc]] authz.ServiceAccess
+
+[[autodoc]] authz.ServiceCaller
+
+[[autodoc]] authz.ServiceDeniedError
+
+[[autodoc]] authz.ServicePrincipalCall

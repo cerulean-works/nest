@@ -129,3 +129,32 @@ See [Sign in from the command line](../cli-login). The client side is
 [[autodoc]] db.LoginFlow
 
 [[autodoc]] db.TooManyPendingSignInsError
+
+## CI workload identity
+
+Exchange a GitHub Actions OIDC token for a short-lived service session (see
+[Authenticate CI workloads with GitHub Actions OIDC](../workload-identity)):
+
+```python
+from nest.auth import WorkloadExchange, WorkloadExchangeError
+
+exchange = WorkloadExchange(config.workload, database)
+try:
+    issued = exchange.exchange(oidc_token, service_principal_id)
+except WorkloadExchangeError as exc:
+    respond(exc.status, {"error": exc.reason})  # never echoes a claim value
+else:
+    respond(200, {"access_token": issued.token})  # shown once; only its hash is stored
+```
+
+[[autodoc]] auth.WorkloadExchange
+
+[[autodoc]] auth.WorkloadTokenVerifier
+
+[[autodoc]] auth.WorkloadClaims
+
+[[autodoc]] auth.IssuedServiceToken
+
+[[autodoc]] auth.WorkloadExchangeError
+
+[[autodoc]] auth.match_policy

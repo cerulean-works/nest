@@ -47,6 +47,8 @@ guide:
         title: Sign in with Google
       - local: cli-login
         title: Sign in from the command line
+      - local: workload-identity
+        title: Authenticate CI workloads with GitHub Actions OIDC
       - local: projects
         title: Share Projects and manage roles
       - local: invitations

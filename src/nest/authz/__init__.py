@@ -30,6 +30,7 @@ from .execution import (
     ExecutionAccess,
     ProjectEligibility,
     ProjectRequiredError,
+    ServicePrincipalCall,
     UnauthenticatedError,
 )
 from .invitations import (
@@ -77,18 +78,28 @@ from .service import (
     ProjectService,
     ProviderAuthority,
 )
+from .workload import (
+    HPC_AUTHORITY_REASON,
+    SERVICE_TOKEN_PREFIX,
+    ServiceAccess,
+    ServiceCaller,
+    ServiceDeniedError,
+    is_service_token,
+)
 
 __all__ = [
     "CLI_ACTION_SCOPES",
     "DEFAULT_INVITATION_TTL",
     "DEFAULT_LINK_MAX_USES",
     "ELIGIBILITY_REASONS",
+    "HPC_AUTHORITY_REASON",
     "MAX_ELIGIBLE_PROJECTS",
     "ORGANIZATION_READ_ACTIONS",
     "PLATFORM_SCOPES",
     "PROVIDER_ACTIONS",
     "READ_ACTIONS",
     "SELECTION_ORIGINS",
+    "SERVICE_TOKEN_PREFIX",
     "AccessDeniedError",
     "AccountResolution",
     "AccountResolutionError",
@@ -125,10 +136,15 @@ __all__ = [
     "ProjectService",
     "ProviderAuthority",
     "ProviderPolicy",
+    "ServiceAccess",
+    "ServiceCaller",
+    "ServiceDeniedError",
+    "ServicePrincipalCall",
     "Target",
     "UnauthenticatedError",
     "decide",
     "decide_organization",
+    "is_service_token",
     "may_create_project",
     "resolve_account",
     "select_endpoint",

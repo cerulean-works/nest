@@ -24,6 +24,12 @@ A job with no recorded Project, or one in a Project the caller cannot see, is
 answered as not found. Submissions and cancellations, allowed or refused, and
 every other refusal are recorded in the security audit log (see [`audit.AuditLog`]).
 
+A service principal's token (B09, see [`authz.ServiceAccess`]) is recognized and
+refused on every RPC with `PERMISSION_DENIED` and `nest-error-kind:
+noninteractive_auth_unavailable`, recorded in the audit log: each of these RPCs
+reaches the HPC Platform under the Controller's credentials, and no service
+principal is given that authority, whatever it was granted or the call asks for.
+
 A Nest session is not an HPC credential: the Controller still submits every job
 with its own configured Provider credentials, and Slurm and UNIX permissions on
 the cluster are unchanged by anything here.
@@ -49,6 +55,7 @@ from .accounts import AccountResolutionError, HPCIdentity, resolve_account
 from .platforms import PlatformCatalog
 from .policy import Action, Decision, Principal, Target, decide
 from .service import AccessDeniedError, Authorizer, ProviderAuthority
+from .workload import ServiceAccess, ServiceCaller, is_service_token
 
 logger = get_logger("nest.authz.execution")
 
@@ -64,6 +71,7 @@ __all__ = [
     "JobAccess",
     "ProjectEligibility",
     "ProjectRequiredError",
+    "ServicePrincipalCall",
     "UnauthenticatedError",
 ]
 
@@ -79,6 +87,29 @@ class UnauthenticatedError(Exception):
     def __init__(self, reason: str):
         self.reason = reason
         super().__init__(f"Authentication required: {reason}")
+
+
+class ServicePrincipalCall(Exception):
+    """
+    The call was authenticated as a service principal, not a User.
+
+    Attributes:
+        caller ([`authz.ServiceCaller`]): Who called.
+    """
+
+    def __init__(self, caller: ServiceCaller):
+        self.caller = caller
+        super().__init__("The caller is a service principal")
+
+
+SERVICE_RPC_ACTIONS = {
+    "Execute": "run.submit",
+    "SubmitJob": "run.submit",
+    "GetJobStatus": "run.read",
+    "CancelJob": "run.cancel",
+    "ListEligibleProjects": "run.submit",
+}
+"""The audit event recorded when a service principal calls each RPC."""
 
 
 class ProjectRequiredError(ValueError):
@@ -264,6 +295,7 @@ class ExecutionAccess:
         self.accounts = SlurmAccountStore(database)
         self.platform_id = platform_id
         self.sessions = SessionStore(database)
+        self.services = ServiceAccess(database, self.audit)
         self.provider_id = provider_id
         self._log_only = AuditLog(None)
 
@@ -272,10 +304,13 @@ class ExecutionAccess:
         The caller of a CLI session presented as `authorization: Bearer <token>`.
 
         A browser session's token is never accepted here, as a CLI token is never
-        accepted as a browser cookie.
+        accepted as a browser cookie. A service session's token is never returned
+        as a [`authz.Principal`]: it raises [`authz.ServicePrincipalCall`], which
+        the caller must refuse with [`authz.ExecutionAccess.refuse_service`].
 
         Raises:
             [`authz.UnauthenticatedError`]: If no accepted session was presented.
+            [`authz.ServicePrincipalCall`]: If an accepted service session was.
         """
         values = _metadata(metadata, AUTHORIZATION_METADATA)
         reason = None
@@ -289,6 +324,11 @@ class ExecutionAccess:
             token = token.strip()
             if scheme.lower() != "bearer" or not token or len(token) > 512:
                 reason = "malformed_token"
+        if reason is None and is_service_token(token):
+            caller = self.services.authenticate(token)
+            if caller is not None:
+                raise ServicePrincipalCall(caller)
+            reason = "invalid_token"
         if reason is None:
             grant = self.sessions.authenticate(hash_token(token), kind="cli")
             if grant is not None:
@@ -297,6 +337,29 @@ class ExecutionAccess:
         # Not written to the database: unauthenticated callers cannot fill it.
         self._log_only.record("auth.failed", "denied", reason=reason, details={"rpc": rpc})
         raise UnauthenticatedError(reason)
+
+    def refuse_service(
+        self, caller: ServiceCaller, rpc: str, metadata: Iterable[tuple[str, str | bytes]]
+    ) -> None:
+        """
+        Refuses an execution RPC from a service principal, recorded in the audit
+        log. Always raises: B09 gives service principals no Controller HPC
+        authority, and nothing in the call (Project, Platform, mode or any other
+        metadata) changes that.
+
+        Raises:
+            [`authz.ServiceDeniedError`]: Always, with `noninteractive_auth_unavailable`.
+        """
+        try:
+            project_id: UUID | None = self.project_of(metadata)
+        except ProjectRequiredError:
+            project_id = None
+        self.services.refuse_hpc(
+            caller,
+            SERVICE_RPC_ACTIONS.get(rpc, "run.read"),
+            project_id=project_id,
+            details={"rpc": rpc, "provider": self.provider_id},
+        )
 
     @staticmethod
     def project_of(metadata: Iterable[tuple[str, str | bytes]]) -> UUID:

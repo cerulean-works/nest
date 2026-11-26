@@ -5,6 +5,7 @@ import time
 from concurrent import futures
 from datetime import timedelta
 from functools import wraps
+from typing import NoReturn
 from uuid import UUID
 
 import cloudpickle
@@ -29,6 +30,7 @@ from .admission import (
 )
 from .audit import AuditLog, audit_interface
 from .auth.web import start_auth_service
+from .auth.workload import WorkloadExchange
 from .authz import Action, Principal
 from .authz.admin import ProviderPolicy
 from .authz.execution import (
@@ -36,9 +38,11 @@ from .authz.execution import (
     DatabaseProviderApprovals,
     ExecutionAccess,
     ProjectRequiredError,
+    ServicePrincipalCall,
     UnauthenticatedError,
 )
 from .authz.service import AccessDeniedError, ProviderAuthority
+from .authz.workload import HPC_AUTHORITY_REASON, ServiceDeniedError
 from .backends.slurm import (
     BuildProgress,
     SlurmBackend,
@@ -334,9 +338,34 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 "NEST_AUTH_URL so the SDK can sign in",
             )
             raise AssertionError("context.abort raises") from None
+        except ServicePrincipalCall as call:
+            self._refuse_service(context, access, call.caller, rpc)
         if self.guard is not None:
             self.guard.allow_user(context, principal.user_id)
         return principal
+
+    def _refuse_service(self, context, access: ExecutionAccess, caller, rpc: str) -> NoReturn:
+        """
+        Refuses a service principal's RPC (B09): every execution RPC reaches the HPC
+        Platform under the Controller's credentials, which no service principal is
+        given. Rate-limited like a User, then recorded and answered
+        `PERMISSION_DENIED` with `nest-error-kind: noninteractive_auth_unavailable`.
+        """
+        if self.guard is not None:
+            self.guard.allow_user(context, f"service:{caller.service_principal_id}")
+        try:
+            self._guarded(
+                context, lambda: access.refuse_service(caller, rpc, context.invocation_metadata())
+            )
+        except ServiceDeniedError as exc:
+            context.set_trailing_metadata(((ERROR_KIND_METADATA, exc.reason),))
+            context.abort(
+                grpc.StatusCode.PERMISSION_DENIED,
+                "Service principals cannot run, read or cancel jobs on this Controller: no "
+                "noninteractive HPC authority is available for CI workloads "
+                f"[{HPC_AUTHORITY_REASON}]",
+            )
+        raise AssertionError("context.abort raises")
 
     def _authorize_submit(
         self,
@@ -1528,7 +1557,19 @@ def main():
             ),
             # The Console reports the same eligibility the SDK's Project selection gets.
             eligibility=access,
+            workload=(
+                WorkloadExchange(config.workload, database)
+                if config.workload is not None and database is not None
+                else None
+            ),
         )
+        if config.workload is not None:
+            logger.info(
+                "CI workload identity enabled audience=%s token_ttl=%g: service principals "
+                "get no Controller HPC authority",
+                config.workload.audience,
+                config.workload.token_ttl,
+            )
         logger.info(
             "Controller listening address=%s executor=%s slurm_configured=%s tls=%s auth=%s "
             "database=%s email=%s google_sign_in=%s",
