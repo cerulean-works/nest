@@ -14,6 +14,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -238,6 +239,42 @@ class ConnectionSwitchTests(unittest.TestCase):
         self.assertEqual(config["address"], "127.0.0.1:50051")
         self.assertIsNone(config["auth_url"])
         self.assertIsNone(config["project_id"])
+
+    def test_local_controller_page_after_r5(self):
+        page = (DOCS / "local-controller.md").read_text()
+        script = "\n".join(b for b in blocks(page, "bash") if "unset NEST_" in b)
+        result = config_after(script, {**self.leftovers, "NEST_PROFILE": "hosted"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = json.loads(result.stdout)
+        self.assertEqual(config["address"], "127.0.0.1:50051")
+        self.assertFalse(config["tls"])
+        self.assertIsNone(config["auth_url"])
+
+    def test_every_documented_cleanup_works_after_r5(self):
+        """Any doc block that clears settings must leave a terminal the SDK accepts."""
+        pages = [README, *sorted(DOCS.rglob("*.md"))]
+        found = 0
+        for page in pages:
+            for script in blocks(page.read_text(), "bash"):
+                if not re.search(r"^unset NEST_", script, re.MULTILINE):
+                    continue
+                found += 1
+                with self.subTest(page=page.name, block=script.splitlines()[0]):
+                    result = config_after(script, {**self.leftovers, "NEST_PROFILE": "hosted"})
+                    self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertGreaterEqual(found, 5)
+
+    def test_example_hosted_block_after_the_private_path(self):
+        example = (ROOT / "examples" / "hosted_remote.py").read_text()
+        private, hosted = re.findall(
+            r"^Private path.*?\n\n(.*?)\n\n|^Hosted profile.*?\n\n(.*?)\n\n",
+            example,
+            re.MULTILINE | re.DOTALL,
+        )
+        script = textwrap.dedent(private[0]) + "\n" + textwrap.dedent(hosted[1])
+        result = config_after(script, self.leftovers)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["profile"], "hosted")
 
     def test_readme_private_path_after_r5(self):
         script = "\n".join(blocks(section(README.read_text(), "## Quickstart"), "bash"))

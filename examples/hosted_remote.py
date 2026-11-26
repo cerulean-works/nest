@@ -20,6 +20,8 @@ Hosted profile (public gateway, no Tailscale): production only, once H09 opens
 the public endpoint; the current staging pilot uses the operator's explicit
 staging settings instead (docs/source/hosted-connection.md):
 
+    unset NEST_AUTH_URL NEST_CONTROLLER_ADDRESS NEST_CONTROLLER_TLS NEST_CONTROLLER_TLS_CA_FILE
+    unset NEST_HOSTED_SESSION_ADDRESS
     export NEST_PROFILE=hosted
     uv run nest login            # or let the first call open the browser approval
     uv run examples/hosted_remote.py
