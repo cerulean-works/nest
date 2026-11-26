@@ -457,7 +457,84 @@ class ExchangeTests(_Base):
         [(used_at,)] = self.sql(
             "SELECT used_at FROM workload_token_uses WHERE jti = %s", session.jti
         )
-        self.assertEqual(used_at, session.created_at)
+        # The use is recorded just before the session is issued, after the wait.
+        self.assertLessEqual(used_at, session.created_at)
+        self.assertLess(session.created_at - used_at, timedelta(seconds=1))
+        self.assertGreaterEqual(used_at, started + timedelta(seconds=1.5))
+
+    def test_a_deadline_passing_while_the_replay_key_insert_waits_rolls_everything_back(self):
+        """A writer that takes no advisory lock holds the same (issuer, jti)
+        uncommitted: the exchange passes its locks, its deadline check and the
+        insert trigger, then waits on the unique index. The writer rolls back after
+        the deadline, so the insert succeeds; the exchange must still refuse and
+        leave neither the token use nor a session."""
+        issuer = "https://token.actions.githubusercontent.com"
+        other = self.store.create_principal("nest-other", **OPS)
+        other_policy = self.store.add_trust_policy(
+            other.id,
+            audience=AUDIENCE,
+            repository=REPOSITORY,
+            repository_id=REPOSITORY_ID,
+            repository_owner_id=OWNER_ID,
+            refs=[REF],
+            workflows=[WORKFLOW],
+            **OPS,
+        )
+        holding = threading.Event()
+        release = threading.Event()
+
+        def writer():
+            with connect(self.url) as conn, conn.transaction(force_rollback=True):
+                conn.execute(
+                    "INSERT INTO workload_token_uses (issuer, jti, service_principal_id, "
+                    "trust_policy_id, token_expires_at) VALUES (%s, 'contended', %s, %s, "
+                    "clock_timestamp() + interval '1 hour')",
+                    (issuer, other.id, other_policy.id),
+                )
+                holding.set()
+                release.wait(20)
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        self.assertTrue(holding.wait(10))
+        result: dict[str, object] = {}
+
+        def exchange():
+            try:
+                self.store.exchange(
+                    self.principal.id,
+                    self.policy.id,
+                    issuer=issuer,
+                    jti="contended",
+                    token_expires_at=datetime.now(UTC) + timedelta(seconds=1.5),
+                    token_hash=hash_token(secrets.token_urlsafe()),
+                    ttl_seconds=600,
+                    provenance={},
+                )
+                result["outcome"] = "issued"
+            except ExchangeRefusedError as exc:
+                result["outcome"] = exc.reason
+
+        exchanger = threading.Thread(target=exchange)
+        exchanger.start()
+        # Wait until the exchange is blocked on the unique index, then past its
+        # deadline, then let the writer roll back.
+        for _ in range(100):
+            waiting = self.sql(
+                "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
+                "AND query LIKE 'INSERT INTO workload_token_uses%%'"
+            )
+            if waiting[0][0]:
+                break
+            time.sleep(0.05)
+        self.assertEqual(waiting[0][0], 1, "the exchange should be waiting on the index")
+        time.sleep(2.0)
+        release.set()
+        thread.join()
+        exchanger.join(20)
+        self.assertEqual(result.get("outcome"), "expired")
+        self.assertEqual(self.sql("SELECT count(*) FROM workload_token_uses"), [(0,)])
+        self.assertEqual(self.sql("SELECT count(*) FROM service_sessions"), [(0,)])
 
     def test_a_pruned_jti_past_its_deadline_is_never_recorded_again(self):
         self.backdated_use("pruned-jti", 120)

@@ -106,6 +106,10 @@ class ServicePrincipalNotFoundError(ServicePrincipalError, LookupError):
     """No such service principal, trust policy, grant or session."""
 
 
+class _DeadlinePassed(Exception):
+    """Rolls back an exchange whose token deadline passed during an insert wait."""
+
+
 class ExchangeRefusedError(Exception):
     """
     A workload token exchange was refused. Nothing was issued.
@@ -729,6 +733,12 @@ class ServicePrincipalStore:
                     "WHERE id = %s AND service_principal_id = %s FOR SHARE",
                     (policy_id, principal_id),
                 ).fetchone()
+                # Serialize every exchange of this token before reading the clock,
+                # so the token-use insert below never waits on a concurrent one.
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (f"nest.workload_jti:{issuer}:{jti}",),
+                )
                 # Every time below is read now, after the locks were granted: a token
                 # verified just before its deadline may have waited behind another
                 # transaction, and now() is when this transaction started.
@@ -775,6 +785,14 @@ class ServicePrincipalStore:
                             # Another principal's exchange of the same token won the race.
                             refused = "replayed"
                         else:
+                            # The insert may still have waited on a writer that took no
+                            # advisory lock (a BEFORE INSERT trigger runs before that
+                            # wait). Check the deadline again now, and roll the whole
+                            # transaction back, token use included, if it has passed.
+                            issued = cursor.execute("SELECT clock_timestamp() AS at").fetchone()
+                            assert issued is not None
+                            if token_expires_at <= issued["at"]:
+                                raise _DeadlinePassed
                             # One issuance time for the session's creation and expiry.
                             row = cursor.execute(
                                 "INSERT INTO service_sessions (token_hash, service_principal_id, "
@@ -788,11 +806,14 @@ class ServicePrincipalStore:
                                     issuer,
                                     jti,
                                     Jsonb(dict(provenance)),
-                                    inserted["used_at"],
-                                    inserted["used_at"],
+                                    issued["at"],
+                                    issued["at"],
                                     ttl_seconds,
                                 ),
                             ).fetchone()
+        except _DeadlinePassed:
+            # Raised inside the transaction, so nothing it wrote was committed.
+            refused = "expired"
         except DatabaseError as exc:
             if "workload_token_uses_unexpired" not in str(exc):
                 raise
