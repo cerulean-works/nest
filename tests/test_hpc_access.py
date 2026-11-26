@@ -55,6 +55,7 @@ from nest.db import (
 )
 from nest.db.cli import main as nest_db
 from nest.db.platforms import endpoint_for
+from nest.errors import DatabaseUnavailableError
 from nest.proto import execution_pb2, execution_pb2_grpc
 
 OPS: dict[str, Any] = {"operator": "ops-test", "reason": "hpc access tests"}
@@ -906,6 +907,26 @@ class LegacyPathTests(_AdmissionBase):
         self.access_store.set_platform_policy(self.platform_id, BOTH, **OPS)
         self.submit(self.legacy)
         self.assertEqual(len(self.sbatch_calls()), 1)
+
+    def test_the_database_refuses_old_legacy_writers_under_restrictive_policies(self):
+        # A Controller of an earlier release writes its jobs record with no policy
+        # check of its own: the database refuses it before any SSH command.
+        self.jobs.begin(
+            "batch", secrets.token_hex(16), project_id=self.project,
+            submitted_by_user_id=self.member,
+        )  # fmt: skip
+        self.access_store.set_project_policy(self.project, self.platform_id, [], **OPS)
+        with self.assertRaises(DatabaseUnavailableError):
+            self.jobs.begin(
+                "batch", secrets.token_hex(16), project_id=self.project,
+                submitted_by_user_id=self.member,
+            )  # fmt: skip
+        # Without a Project, the Platform layer still applies.
+        self.jobs.begin("batch", secrets.token_hex(16))
+        self.access_store.set_platform_policy(self.platform_id, ["user_owned"], **OPS)
+        with self.assertRaises(DatabaseUnavailableError):
+            self.jobs.begin("batch", secrets.token_hex(16))
+        self.assertEqual(len(self.jobs_rows()), 2)
 
     def test_the_local_executor_refuses_user_owned_too(self):
         service = ExecutionService(None, executor="local")

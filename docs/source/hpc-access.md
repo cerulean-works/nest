@@ -206,7 +206,21 @@ Migration `0019_hpc_access_policy` is additive. It adds three tables and three
 nullable attempt columns and backfills nothing. As with every Nest migration
 there is no down-migration: to roll back, restore the backup taken before
 `nest-db upgrade` and deploy the previous release (see
-[Database migrations](database#migrations)). A previous release's Controller
-left running against an upgraded database fails closed: the database refuses
-its attempts, because they pin no authority, and nothing is submitted. Upgrade
-and restart together.
+[Database migrations](database#migrations)).
+
+### Cut over: stop every old Controller first
+
+Mixed-version operation is not supported. Before `nest-db upgrade`, and before
+recording any restrictive policy, **stop or drain every Controller replica of an
+earlier release**, registry-backed and legacy alike, and start only replicas of
+this release afterwards.
+
+The database refuses part of what an old replica could do, and only part:
+
+| Old replica | What the database refuses | What it does not |
+| --- | --- | --- |
+| Registry-backed (`required`) | Every attempt: it pins no authority (`execution_attempts_authority_required`), so nothing is submitted | — |
+| Legacy (`legacy`) | A job whose stored Platform or Project policy does not permit `controller_owned` (`jobs_authority_permitted`, checked when its `jobs` record is written, before any SSH command) | A request for `user_owned`: an old replica ignores `x-nest-execution-authority` and runs the call as the Controller wherever the policies still permit `controller_owned` |
+
+The database guards are a backstop for policies, not a substitute for the cutover:
+only a Controller of this release refuses an unsupported authority request.

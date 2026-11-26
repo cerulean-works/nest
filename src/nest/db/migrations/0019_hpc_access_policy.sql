@@ -453,3 +453,44 @@ $$;
 
 CREATE TRIGGER execution_attempts_authority BEFORE INSERT ON execution_attempts
     FOR EACH ROW EXECUTE FUNCTION nest_check_attempt_authority();
+
+-- Legacy job records (jobs) -----------------------------------------------------
+
+-- The legacy path (NEST_EXECUTION_REGISTRY=legacy) writes jobs, not attempts, and
+-- always runs as the Controller. Its record is written before any SSH command, so
+-- refusing it here stops the job for every writer, including a Controller of an
+-- earlier release that knows nothing of these policies: a Platform policy, or a
+-- Project policy on that Platform, that does not permit 'controller_owned' is
+-- never bypassed through the legacy path. Without a Platform the record names no
+-- Slurm namespace and no policy applies.
+CREATE FUNCTION nest_check_job_authority() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    permitted text[];
+BEGIN
+    IF NEW.platform_id IS NULL THEN
+        RETURN NEW;
+    END IF;
+    PERFORM pg_advisory_xact_lock_shared(
+        hashtextextended('nest.hpc_authority:' || NEW.platform_id, 0));
+    IF NEW.project_id IS NULL THEN
+        permitted := COALESCE(
+            (SELECT authorities FROM hpc_platform_authority_policies
+             WHERE platform_id = NEW.platform_id ORDER BY version DESC LIMIT 1),
+            ARRAY['controller_owned']::text[]);
+    ELSE
+        SELECT authorities INTO permitted
+        FROM nest_effective_authority_policy(NEW.project_id, NEW.platform_id);
+    END IF;
+    IF NOT ('controller_owned' = ANY (permitted)) THEN
+        RAISE EXCEPTION 'the execution authority policy does not permit controller_owned, '
+                        'the only authority a legacy job runs under'
+            USING ERRCODE = 'check_violation',
+                  CONSTRAINT = 'jobs_authority_permitted';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER jobs_authority BEFORE INSERT ON jobs
+    FOR EACH ROW EXECUTE FUNCTION nest_check_job_authority();
