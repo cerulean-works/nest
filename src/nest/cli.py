@@ -11,6 +11,7 @@ Usage:
     nest platforms default --project-id UUID [--url URL] [--json]
     nest projects list [--json]              # Projects you may run in on this Controller
     nest projects current [--json]           # the Project the SDK would use, and why
+    nest projects select                     # choose it by name, on a terminal
     nest projects use UUID                   # save the Project the SDK uses here
     nest projects forget                     # forget the saved Project
 
@@ -30,6 +31,8 @@ names none runs on, and why; a Project Owner or Admin chooses it in a browser.
 `NEST_PROFILE`, `NEST_CONTROLLER_ADDRESS` and `NEST_AUTH_URL` settings) which Nest
 Projects you may run in, and keeps the SDK's saved choice for that Controller and
 account in `NEST_PREFERENCES_FILE`. `NEST_PROJECT_ID` always overrides it.
+`nest projects select` lists them by name and role and saves your choice; it needs
+a terminal, and scripts use `nest projects use UUID` instead.
 
 Exit status: 0 on success, 1 when not signed in or the sign-in was denied or
 expired, the Platform or Project is not available, or no Project can be chosen,
@@ -134,6 +137,9 @@ def _parser() -> argparse.ArgumentParser:
     )
     project_actions.add_parser(
         "current", parents=[as_json], help="show the Project the SDK would run in, and why"
+    )
+    project_actions.add_parser(
+        "select", help="choose the Project the SDK runs in here from a list, by name"
     )
     use = project_actions.add_parser("use", help="save the Project the SDK runs in here")
     use.add_argument("project_id", type=UUID, metavar="UUID", help="an eligible Project's ID")
@@ -287,6 +293,8 @@ def _projects(args) -> int:
                     print(f"{choice.project_id} ({choice.source})")
                 return 0
             eligible = selection.list_eligible(channel, session.access_token)
+            if args.action == "select":
+                return _select(client, channel, session.access_token, eligible, store, key)
     except ProjectSelectionError as exc:
         print(f"nest: {exc}", file=sys.stderr)
         return 1
@@ -335,6 +343,75 @@ def _projects(args) -> int:
         for project in eligible:
             marker = "*" if project.id == saved else " "
             print(f"{marker} {selection.describe(project)}")
+    return 0
+
+
+def _select(client, channel, token, eligible, store, key) -> int:
+    """
+    `nest projects select` (E07a): choose the saved Project by name on a terminal.
+
+    The choice is checked against a fresh listing before it is saved, so a Project
+    revoked while the prompt was open is never saved; a cancelled prompt changes
+    nothing. `NEST_PROJECT_ID`, when set, keeps overriding the saved choice, and this
+    says so instead of pretending the choice takes effect.
+    """
+    from . import project_selection as selection
+
+    if eligible is None:
+        print("This Controller needs no Project.")
+        return 0
+    if not eligible:
+        print(
+            f"nest: you have no Project that may run on {client.address}. Ask a Project "
+            "Owner or Admin to invite you, or to have the Project approved for this "
+            "Controller's HPC Platform. Nothing was saved.",
+            file=sys.stderr,
+        )
+        return 1
+    if store is None or key is None:
+        return 2
+    override = client.project_id
+    if override is not None:
+        print(
+            f"nest: NEST_PROJECT_ID is set to {override}, so the SDK runs in that Project "
+            "whatever you choose here. Unset it to use the Project you save.",
+            file=sys.stderr,
+        )
+    if not selection.is_interactive():
+        listed = "\n".join(f"  {selection.describe(p)}" for p in eligible)
+        print(
+            "nest: `nest projects select` needs a terminal to ask. Save a Project with "
+            "`nest projects use <ID>`, or set NEST_PROJECT_ID. Nothing was saved.\n" + listed,
+            file=sys.stderr,
+        )
+        return 1
+    saved = store.get(key)
+    chosen = selection.choose_project(
+        eligible,
+        sys.stderr,
+        input,
+        saved=saved,
+        cancellable=True,
+        heading=f"Nest Projects you may run in on {client.address}:",
+        question="Select a Project",
+    )
+    if chosen is None:
+        print("nest: cancelled; nothing was saved.", file=sys.stderr)
+        return 1
+    # Authorized again now: the list may be stale after a slow answer.
+    current = selection.list_eligible(channel, token) or []
+    if not any(p.id == chosen.id for p in current):
+        print(
+            f"nest: Project {chosen.id} is no longer one you may run in on {client.address}; "
+            "nothing was saved. See `nest projects list`.",
+            file=sys.stderr,
+        )
+        return 1
+    store.set(key, chosen.id)
+    label = selection.labels([chosen])[0]
+    print(f"The SDK now runs in {label} [{chosen.id}] on {client.address}.")
+    if override is not None:
+        print("NEST_PROJECT_ID still overrides it while it is set.")
     return 0
 
 

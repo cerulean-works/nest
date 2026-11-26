@@ -17,6 +17,10 @@ call's Python environment comes from (`remote(project=...)`).
    them and nothing runs.
 5. With none, [`errors.ProjectSelectionError`] explains how to be invited.
 
+`nest projects select` (E07a) asks explicitly with the same prompt,
+[`project_selection.choose_project`], which shows Projects by name and role and
+tells duplicate names apart by ID (see [`project_selection.labels`]).
+
 "Eligible" is the Controller's answer to `ListEligibleProjects`: Projects where
 the signed-in User's role allows submitting, the Provider approves the Project and
 the Controller's Platform is granted to it, read when asked. It is advice only;
@@ -249,27 +253,98 @@ def list_eligible(
     return [EligibleProject(p.id, p.name, p.role) for p in response.projects]
 
 
+def _printable(text: str, limit: int = 80) -> str:
+    """`text` without terminal control characters, at most `limit` characters."""
+    return "".join(ch if ch.isprintable() else "?" for ch in text)[:limit]
+
+
 def describe(project: EligibleProject) -> str:
-    name = "".join(ch if ch.isprintable() else "?" for ch in project.name)[:80]
-    return f"{project.id}  {name} ({project.role})"
+    return f"{project.id}  {_printable(project.name)} ({project.role})"
 
 
-def _ask(
+def labels(projects: list[EligibleProject]) -> list[str]:
+    """
+    How a person tells `projects` apart (E07a): each Project's name and role, and,
+    for names shared by several Projects, the shortest prefix of its ID that tells
+    it apart from the others with that name (never fewer than 8 characters).
+    Names are shown without terminal control characters.
+    """
+    by_name: dict[str, list[str]] = {}
+    for project in projects:
+        by_name.setdefault(project.name.casefold(), []).append(project.id)
+    result = []
+    for project in projects:
+        label = f"{_printable(project.name)} ({project.role})"
+        twins = by_name[project.name.casefold()]
+        if len(twins) > 1:
+            size = 8
+            while size < len(project.id) and any(
+                other != project.id and other[:size] == project.id[:size] for other in twins
+            ):
+                size += 1
+            label += f"  id {project.id[:size]}"
+        result.append(label)
+    return result
+
+
+def choose_project(
     projects: list[EligibleProject],
     out: IO[str],
     read: Callable[[str], str],
-) -> EligibleProject:
-    print("You can run in several Nest Projects on this Controller:", file=out)
-    for number, project in enumerate(projects, 1):
-        print(f"  {number}. {describe(project)}", file=out)
+    *,
+    saved: str | None = None,
+    cancellable: bool = False,
+    heading: str = "You can run in several Nest Projects on this Controller:",
+    question: str = "Run in which Project?",
+) -> EligibleProject | None:
+    """
+    Asks a person to choose one of `projects` (E07a), shown by name and role in the
+    Controller's order, with duplicate names told apart by ID (see
+    [`project_selection.labels`]).
+
+    An answer is a number from the list, a Project's full ID, or a name that exactly
+    one listed Project has (ignoring case); a name several Projects share is never
+    guessed, and the prompt asks for the number instead.
+
+    Args:
+        saved (`str`, *optional*): The saved Project's ID, marked in the list.
+        cancellable (`bool`): Whether an empty answer, `q` or end of input cancels;
+            otherwise only a choice ends the prompt.
+
+    Returns:
+        [`project_selection.EligibleProject`] or `None`: The choice, or `None` when
+            cancelled. Nothing is saved here.
+    """
+    print(heading, file=out)
+    for number, (project, label) in enumerate(zip(projects, labels(projects), strict=True), 1):
+        marker = "  (saved)" if project.id == saved else ""
+        print(f"  {number}. {label}{marker}", file=out)
+    hint = f"[1-{len(projects)}, Enter to cancel]" if cancellable else f"[1-{len(projects)}]"
     while True:
         out.flush()
-        answer = read(f"Run in which Project? [1-{len(projects)}] ").strip()
+        try:
+            answer = read(f"{question} {hint} ").strip()
+        except EOFError:
+            if cancellable:
+                return None
+            raise
+        if cancellable and answer.lower() in ("", "q", "quit"):
+            return None
         if answer.isdecimal() and 1 <= int(answer) <= len(projects):
             return projects[int(answer) - 1]
         match = [p for p in projects if p.id == answer.lower()]
         if match:
             return match[0]
+        named = [p for p in projects if answer and p.name.casefold() == answer.casefold()]
+        if len(named) == 1:
+            return named[0]
+        if named:
+            print(
+                f"Several Projects are named {_printable(answer)!r}; enter the number of "
+                "the one you mean.",
+                file=out,
+            )
+            continue
         print(f"Enter a number from 1 to {len(projects)}.", file=out)
 
 
@@ -365,7 +440,8 @@ def select_project(
             "ambiguous",
             tuple(p.id for p in projects),
         )
-    chosen = _ask(projects, out, read or input)
+    chosen = choose_project(projects, out, read or input)
+    assert chosen is not None
     if store is not None and key is not None:
         store.set(key, chosen.id)
         print(

@@ -520,6 +520,8 @@ class BrowserSessionHTTPTests(PostgresTestCase):
             set(body),
             {
                 "user_id",
+                "display_name",
+                "email",
                 "access_expires_at",
                 "refresh_expires_at",
                 "session_expires_at",

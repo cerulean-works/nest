@@ -153,8 +153,9 @@ class RecordingController(execution_pb2_grpc.ExecutionServiceServicer):
         self._record("ListEligibleProjects", context)
         return execution_pb2.ListEligibleProjectsResponse(
             projects=[
-                execution_pb2.EligibleProject(id=pid, name=name, role="member")
-                for pid, name in self.projects
+                # (id, name) or (id, name, role); the role defaults to member.
+                execution_pb2.EligibleProject(id=p[0], name=p[1], role=(p[2:] or ("member",))[0])
+                for p in self.projects
             ],
             projects_required=self.require_session,
         )

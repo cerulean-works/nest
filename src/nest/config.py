@@ -283,6 +283,21 @@ INVITATION_PAGE_PATH = "/invitations/accept"
 CONSOLE_PATH = "/console"
 """Root of the browser Management Console served by the auth listener."""
 
+CONNECT_API_PATH = "/api/connect"
+"""The Console's *Connect to Project* answer (G02c): the operator's connection
+profiles and the caller's Projects with their compute eligibility."""
+
+CONSOLE_HOSTED_PROFILES = ("off", "pilot")
+"""`NEST_CONSOLE_HOSTED_PROFILE` values: whether the Console offers the hosted
+connection profile (`NEST_PROFILE=hosted`), and only as a pilot until H09."""
+
+CONSOLE_SETTINGS = (
+    "NEST_CONSOLE_CONTROLLER_ADDRESS",
+    "NEST_CONSOLE_CONTROLLER_TLS",
+    "NEST_CONSOLE_HOSTED_PROFILE",
+)
+"""Settings of the Console's connection profiles; see [`config.ConsoleConnectConfig`]."""
+
 CLI_SCOPES: dict[str, str] = {
     "jobs:run": "Run and manage jobs in your Projects",
     "projects:read": "See your Projects and their members",
@@ -775,6 +790,42 @@ class SessionPolicy:
 
 
 @dataclass(frozen=True)
+class ConsoleConnectConfig:
+    """
+    The connection profiles the Management Console's *Connect to Project* panel
+    offers (G02c), set by the operator; a user can never enter an endpoint there.
+
+    Without any setting the panel offers no profile: it explains how to install the
+    SDK and sign in, and that the operator has not published connection settings.
+
+    Attributes:
+        controller_address (`str | None`): `NEST_CONSOLE_CONTROLLER_ADDRESS`, the
+            Controller's `host:port` on the private network its users reach it on
+            (such as the Tailnet MagicDNS name), shown first.
+        controller_tls (`bool | None`): `NEST_CONSOLE_CONTROLLER_TLS`, whether that
+            address serves TLS. Required with a non-loopback address; `false` only for
+            an encrypted, access-controlled private network such as a Tailnet.
+        hosted_profile (`str`): `NEST_CONSOLE_HOSTED_PROFILE`: `off` (the default) or
+            `pilot`, which also offers `NEST_PROFILE=hosted`, labelled as a pilot. Only
+            for the hosted sign-in origin, and only once the operator has approved the
+            gateway pilot; the hosted profile becomes a default only with
+            [`config.HOSTED_PROFILE_DEFAULT`] (H09), which this setting never changes.
+    """
+
+    controller_address: str | None = None
+    controller_tls: bool | None = None
+    hosted_profile: str = "off"
+
+    def summary(self) -> dict[str, object]:
+        """Returns a log-safe description of the Console's connection profiles."""
+        return {
+            "controller_address": self.controller_address,
+            "controller_tls": self.controller_tls,
+            "hosted_profile": self.hosted_profile,
+        }
+
+
+@dataclass(frozen=True)
 class GoogleAuthConfig:
     """
     Google sign-in settings. Present only when `NEST_GOOGLE_CLIENT_ID` is set.
@@ -789,6 +840,8 @@ class GoogleAuthConfig:
             registered with Google. The auth listener serves its path.
         http_bind (`str`): `NEST_AUTH_HTTP_BIND`, the auth listener's `host:port`.
         sessions ([`config.SessionPolicy`]): Browser session lifetimes.
+        console ([`config.ConsoleConnectConfig`]): The connection profiles the
+            Management Console offers.
     """
 
     client_id: str
@@ -797,6 +850,13 @@ class GoogleAuthConfig:
     client_secret_file: str | None = None
     http_bind: str = DEFAULT_AUTH_HTTP_BIND
     sessions: SessionPolicy = field(default_factory=SessionPolicy)
+    console: ConsoleConnectConfig = field(default_factory=ConsoleConnectConfig)
+
+    @property
+    def origin(self) -> str:
+        """The sign-in origin: the scheme and host of the redirect URL."""
+        parts = urlsplit(self.redirect_url)
+        return f"{parts.scheme}://{parts.netloc}"
 
     def read_client_secret(self) -> str:
         """Returns the current client secret, reading the file when one is set. Never log it."""
@@ -825,6 +885,7 @@ class GoogleAuthConfig:
             "redirect_url": self.redirect_url,
             "http_bind": self.http_bind,
             "sessions": self.sessions.summary(),
+            "console": self.console.summary(),
         }
 
 
@@ -1950,6 +2011,12 @@ def _google_redirect_url(reader: _Reader) -> str | None:
             f"use a callback path such as {_REDIRECT_EXAMPLE!r}"
         )
         return None
+    if parts.path == CONNECT_API_PATH or parts.path.startswith(CONNECT_API_PATH + "/"):
+        reader.fail(
+            f"NEST_GOOGLE_REDIRECT_URL must not use {parts.path}, a Management Console API "
+            f"route; use a callback path such as {_REDIRECT_EXAMPLE!r}"
+        )
+        return None
     if parts.path == CONSOLE_PATH or parts.path.startswith(CONSOLE_PATH + "/"):
         reader.fail(
             f"NEST_GOOGLE_REDIRECT_URL must not use {parts.path}, a Management Console route; "
@@ -2005,7 +2072,11 @@ def _google(reader: _Reader, database: DatabaseConfig | None) -> GoogleAuthConfi
     """
     client_id = reader.get("NEST_GOOGLE_CLIENT_ID")
     if client_id is None:
-        stray = [n for n in GOOGLE_SETTINGS if n != "NEST_GOOGLE_CLIENT_ID" and reader.get(n)]
+        stray = [
+            n
+            for n in (*GOOGLE_SETTINGS, *CONSOLE_SETTINGS)
+            if n != "NEST_GOOGLE_CLIENT_ID" and reader.get(n)
+        ]
         if stray:
             reader.fail(f"{', '.join(stray)} needs NEST_GOOGLE_CLIENT_ID")
         return None
@@ -2031,6 +2102,7 @@ def _google(reader: _Reader, database: DatabaseConfig | None) -> GoogleAuthConfi
             "NEST_GOOGLE_CLIENT_ID needs NEST_DATABASE_URL: Users, their Google identities, "
             "sessions and pending sign-ins are stored in the database"
         )
+    console = _console_connect(reader, redirect_url)
     if len(reader.problems) > before or redirect_url is None:
         return None
     return GoogleAuthConfig(
@@ -2040,7 +2112,77 @@ def _google(reader: _Reader, database: DatabaseConfig | None) -> GoogleAuthConfi
         client_secret_file=secret_file,
         http_bind=http_bind,
         sessions=sessions,
+        console=console,
     )
+
+
+def _console_connect(reader: _Reader, redirect_url: str | None) -> ConsoleConnectConfig:
+    """
+    Reads the `NEST_CONSOLE_*` connection profiles (G02c).
+
+    The values end up in commands users copy into a shell, so the address must be a
+    plain `host:port` and nothing else is free text. The rules are the SDK's own: a
+    non-loopback address needs an explicit TLS choice, the hosted public gateway is
+    offered only as the hosted profile, and the hosted session is offered to a
+    custom address only over TLS (the SDK would refuse the copied settings otherwise).
+    """
+    before = len(reader.problems)
+    address = reader.get("NEST_CONSOLE_CONTROLLER_ADDRESS")
+    tls_set = reader.get("NEST_CONSOLE_CONTROLLER_TLS") is not None
+    tls = reader.boolean("NEST_CONSOLE_CONTROLLER_TLS") if tls_set else None
+    hosted = (reader.get("NEST_CONSOLE_HOSTED_PROFILE") or "off").lower()
+    if hosted not in CONSOLE_HOSTED_PROFILES:
+        reader.fail(
+            f"NEST_CONSOLE_HOSTED_PROFILE must be one of {', '.join(CONSOLE_HOSTED_PROFILES)}"
+        )
+    origin = None
+    if redirect_url is not None:
+        parts = urlsplit(redirect_url)
+        origin = f"{parts.scheme}://{parts.netloc}"
+    if address is not None:
+        host, sep, port = address.rpartition(":")
+        if not (
+            sep
+            and _HOST.fullmatch(host)
+            and port.isdecimal()
+            and port.isascii()
+            and 0 < int(port) <= 65535
+        ):
+            reader.fail(
+                "NEST_CONSOLE_CONTROLLER_ADDRESS must be the Controller's host:port, such as "
+                f"'nest-controller.example.ts.net:50051'; got {address!r}"
+            )
+        elif is_hosted_gateway(address):
+            reader.fail(
+                "NEST_CONSOLE_CONTROLLER_ADDRESS names the hosted public gateway; offer it with "
+                "NEST_CONSOLE_HOSTED_PROFILE=pilot instead"
+            )
+        elif tls is None and not _loopback_host(host):
+            reader.fail(
+                "NEST_CONSOLE_CONTROLLER_ADDRESS needs an explicit NEST_CONSOLE_CONTROLLER_TLS "
+                "(true, or false only on an encrypted, access-controlled private network)"
+            )
+        elif (
+            origin == HOSTED_AUTH_URL
+            and not tls
+            and not is_hosted_controller(address)
+            and not any(_same_address(address, alias) for alias in HOSTED_CONTROLLER_ALIASES)
+        ):
+            reader.fail(
+                f"NEST_CONSOLE_CONTROLLER_ADDRESS {address} is not a hosted Controller, so the "
+                "SDK sends it the hosted session only over TLS; set "
+                "NEST_CONSOLE_CONTROLLER_TLS=true"
+            )
+    elif tls_set:
+        reader.fail("NEST_CONSOLE_CONTROLLER_TLS needs NEST_CONSOLE_CONTROLLER_ADDRESS")
+    if hosted == "pilot" and origin is not None and origin != HOSTED_AUTH_URL:
+        reader.fail(
+            "NEST_CONSOLE_HOSTED_PROFILE=pilot offers the Cerulean-hosted profile, which "
+            f"sends only the session of {HOSTED_AUTH_URL}; this Nest signs in at {origin}"
+        )
+    if len(reader.problems) > before:
+        return ConsoleConnectConfig()
+    return ConsoleConnectConfig(address, tls if address is not None else None, hosted)
 
 
 def load_database_config(environ: Mapping[str, str] | None = None) -> DatabaseConfig:

@@ -59,13 +59,44 @@ Controller, never reuses it. An unreadable file is ignored and replaced.
 ```bash
 nest projects list            # the Projects you may run in here; * marks the saved one
 nest projects current         # what the next call would use, and why (never prompts)
+nest projects select          # choose one from a list, by name, and save it
 nest projects use <ID>        # save one (it must be eligible)
 nest projects forget          # forget the saved choice
 ```
 
 `--json` prints machine-readable output for `list` and `current`. In scripts and
 CI, set `NEST_PROJECT_ID` instead: it is the only choice that never depends on what
-is stored on the machine.
+is stored on the machine. The [Management Console](console#connect-to-a-project)
+shows the `nest projects use` command with your Project's ID filled in.
+
+### Choose interactively
+
+`nest projects select` lists the Projects you may run in on this Controller by name
+and role, in the Controller's order, and marks the saved one:
+
+```text
+Nest Projects you may run in on nest-controller.tail8e5ba1.ts.net:50051:
+  1. Protein folding (member)
+  2. Shared lab (admin)  id 3f0c1a2b
+  3. Shared lab (member)  id 9b470c11  (saved)
+Select a Project [1-3, Enter to cancel] 1
+The SDK now runs in Protein folding (member) [5a92...] on nest-controller.tail8e5ba1.ts.net:50051.
+```
+
+- Answer with a number, a full Project ID, or a name exactly one listed Project has
+  (ignoring case). Projects that share a name are told apart by the shortest ID
+  prefix (at least 8 characters) that separates them, and a shared name is never
+  guessed: the prompt asks for the number.
+- Enter, `q`, end of input or Ctrl-C cancel without changing anything (exit status
+  1, or 130 for Ctrl-C).
+- The choice is checked against a fresh listing before it is saved, so a Project
+  revoked while you were choosing is not saved. It is saved exactly like
+  `nest projects use`: for this sign-in origin, Controller and account only.
+- With `NEST_PROJECT_ID` set, it says that the variable keeps overriding what you
+  save, and `nest projects current` keeps reporting the variable.
+- Without a terminal it changes nothing and exits 1, listing the Projects and
+  pointing to `nest projects use <ID>`. With no eligible Project it exits 1 with
+  onboarding guidance.
 
 ## Compatibility
 
@@ -74,6 +105,17 @@ then sends no Project, as before, and that Controller answers as it always did
 (it asks for `NEST_PROJECT_ID` when it needs one). A Controller without session
 authentication needs no Project; nothing is listed or sent. `nest projects`
 reports either case.
+
+## Acceptance checklist (E07a)
+
+- [x] `nest projects select` uses `ListEligibleProjects` and the same preference
+  store as the implicit prompt and `nest projects use`.
+- [x] Choice by name and role; duplicate names disambiguated by ID, never guessed.
+- [x] Cancellation, non-interactive use and no eligible Project change nothing.
+- [x] An active `NEST_PROJECT_ID` is explained and still reported as effective.
+- [x] The choice is re-authorized before it is saved; `list`, `current`, `use`,
+  `forget` and their JSON output are unchanged
+  (`tests/test_project_selection.py::ProjectsCommandTests`).
 
 ## Acceptance checklist (E07)
 

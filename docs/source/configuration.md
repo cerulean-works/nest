@@ -454,6 +454,21 @@ the checks applied to each sign-in.
 | `NEST_AUTH_REFRESH_TTL` | `86400` | Seconds a refresh session stays usable without being refreshed. Each refresh rotates it and starts this period again. At least `NEST_AUTH_ACCESS_TOKEN_TTL`. |
 | `NEST_AUTH_SESSION_MAX_LIFETIME` | `604800` | Seconds after sign-in when the session ends however often it is refreshed; the User then signs in again. At least `NEST_AUTH_REFRESH_TTL`, at most 7776000 (90 days). |
 
+### Console connection profiles
+
+The Management Console's **Connect to Project** page (see
+[Manage Projects in the browser](console#connect-to-a-project)) shows copyable setup
+commands built from these settings. Without them it offers no connection profile:
+it explains how to install Nest and sign in, and that the operator has not published
+connection settings. Users can never enter an endpoint there. Each setting needs
+Google sign-in (`NEST_GOOGLE_CLIENT_ID`).
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `NEST_CONSOLE_CONTROLLER_ADDRESS` | Unset | The Controller's `host:port` as its users reach it privately, such as `nest-controller.tail8e5ba1.ts.net:50051`. Shown first. Only a plain `host:port` is accepted, so nothing in it can change the copied shell commands. The hosted public gateway is refused here: offer it with `NEST_CONSOLE_HOSTED_PROFILE`. |
+| `NEST_CONSOLE_CONTROLLER_TLS` | Unset | Required with a non-loopback address: `true` when that address serves TLS, `false` only for an encrypted, access-controlled private network such as an authorized Tailnet. With the hosted sign-in origin, a non-hosted address must be `true`, because the SDK sends the hosted session to it only over TLS (the copied settings then also name it in `NEST_HOSTED_SESSION_ADDRESS`). |
+| `NEST_CONSOLE_HOSTED_PROFILE` | `off` | `pilot` also offers the hosted connection profile (`NEST_PROFILE=hosted`), labelled as a pilot. Accepted only on the hosted sign-in origin (`https://auth.nest.cerulean.works`); set it only once the operator has approved the [gateway pilot](public-grpc-gateway) and announced it to its cohort. It never changes the SDK's default: the hosted profile becomes the default only with `nest.config.HOSTED_PROFILE_DEFAULT` after H09, and the Console then shows it as needing no setting. |
+
 ### Platform administrator bootstrap
 
 | Variable | Default | Behavior |

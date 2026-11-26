@@ -207,9 +207,10 @@ As Owner you then invite the rest of your group.
 
 **Find your Projects.** In the browser, the
 [Management Console](console) at `https://auth.nest.cerulean.works/console` lists
-every Project you belong to under *Your Projects*. A Project's page address ends
-with its ID (`/console#/projects/<id>`). That is the ID to send the operator in
-step 5.
+every Project you belong to under *Your Projects*, with its ID on its page. That
+is the ID to send the operator in step 5. Its *Connect* page says whether each
+Project can run on the Controller and what is still missing, and shows the
+commands below with your Project's ID filled in.
 
 **Choose the Project your calls run in** with the CLI, using the same settings as
 the SDK (step 2). These show only Projects you may run in now: your role allows
@@ -219,6 +220,7 @@ submitting, and the operator has approved the Project and granted it a Platform
 ```bash
 uv run nest projects list      # Projects you may run in here; * marks the saved one
 uv run nest projects current   # what the next call would use, and why
+uv run nest projects select    # choose one by name and save it
 ```
 
 ```text
@@ -228,7 +230,8 @@ uv run nest projects current   # what the next call would use, and why
 - **One eligible Project:** nothing to do. The SDK uses it, and `current` says
   `only eligible`.
 - **Several:** the first call on a terminal asks you and saves your answer. To
-  choose ahead of time, run `uv run nest projects use <ID>`, and
+  choose ahead of time, run `uv run nest projects select` (or
+  `uv run nest projects use <ID>`), and
   `uv run nest projects forget` to undo it.
 - **None:** `list` says so. Ask for an invitation (above), or for the operator's
   approval (step 5). A call fails with `ProjectSelectionError` (`none_eligible`),

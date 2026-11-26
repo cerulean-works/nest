@@ -269,6 +269,113 @@ class ProjectsCommandTests(_Selection):
         code, out, _ = self.nest("current")
         self.assertEqual(out.strip(), f"{self.alpha} (NEST_PROJECT_ID)")
 
+    def pick(self, *answers, interactive=True, env=None):
+        """`nest projects select` with `answers` typed at the prompt (EOF after them)."""
+        replies = iter(answers)
+
+        def read(_prompt=""):
+            try:
+                return next(replies)
+            except StopIteration:
+                raise EOFError from None
+
+        with (
+            mock.patch.object(selection, "is_interactive", return_value=interactive),
+            mock.patch("builtins.input", read),
+            mock.patch.dict(os.environ, env or {}),
+        ):
+            return self.nest("select")
+
+    def saved(self):
+        key = preference_key(self.config(), self.session.user_id)
+        assert key is not None
+        return PreferenceStore(self.preferences).get(key)
+
+    def test_select_by_number_or_unique_name_and_save(self):
+        self.controller((self.alpha, "Protein folding"), (self.beta, "Course: HPC 101", "admin"))
+        code, out, err = self.pick("9", "course: hpc 101")
+        self.assertEqual(code, 0, err)
+        self.assertIn("1. Protein folding (member)", err)
+        self.assertIn("2. Course: HPC 101 (admin)", err)
+        self.assertIn("Enter a number from 1 to 2", err)
+        self.assertIn(f"The SDK now runs in Course: HPC 101 (admin) [{self.beta}]", out)
+        self.assertEqual(self.saved(), self.beta)
+        # The saved one is marked next time, and a number selects too.
+        code, _, err = self.pick("1")
+        self.assertIn("2. Course: HPC 101 (admin)  (saved)", err)
+        self.assertEqual((code, self.saved()), (0, self.alpha))
+        # `list`, `current` and `use` keep their output for scripts.
+        code, out, _ = self.nest("current", "--json")
+        self.assertEqual(json.loads(out), {"project_id": self.alpha, "source": "saved"})
+
+    def test_duplicate_names_are_told_apart_and_never_guessed(self):
+        twin = self.alpha[:8] + str(uuid.uuid4())[8:]  # same 8-character prefix
+        self.controller((self.alpha, "lab"), (twin, "Lab"), (self.beta, "other"))
+        code, _, err = self.pick("lab", "2")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Several Projects are named 'lab'; enter the number", err)
+        prefixes = [line.split("id ")[1] for line in err.splitlines() if "  id " in line]
+        self.assertEqual(len(prefixes), 2)
+        self.assertNotEqual(prefixes[0], prefixes[1])
+        self.assertTrue(self.alpha.startswith(prefixes[0]) and twin.startswith(prefixes[1]))
+        self.assertEqual(self.saved(), twin)
+
+    def test_cancel_changes_nothing(self):
+        self.controller((self.alpha, "alpha"), (self.beta, "beta"))
+        self.assertEqual(self.nest("use", self.alpha)[0], 0)
+        for answers in ([""], ["q"], []):  # Enter, q, end of input
+            code, _, err = self.pick(*answers)
+            self.assertEqual(code, 1)
+            self.assertIn("cancelled; nothing was saved", err)
+            self.assertEqual(self.saved(), self.alpha)
+        with (
+            mock.patch("builtins.input", side_effect=KeyboardInterrupt),
+            mock.patch.object(selection, "is_interactive", return_value=True),
+        ):
+            code, _, _ = self.nest("select")
+        self.assertEqual((code, self.saved()), (130, self.alpha))
+
+    def test_without_a_terminal_or_eligible_project_nothing_is_saved(self):
+        self.controller((self.alpha, "alpha"), (self.beta, "beta"))
+        code, _, err = self.pick("1", interactive=False)
+        self.assertEqual(code, 1)
+        self.assertIn("needs a terminal", err)
+        self.assertIn("nest projects use <ID>", err)
+        self.assertIn(self.beta, err)
+        self.assertIsNone(self.saved())
+        self.controller()
+        code, _, err = self.pick("1")
+        self.assertEqual(code, 1)
+        self.assertIn("no Project that may run", err)
+        self.assertIsNone(self.saved())
+
+    def test_override_is_explained_and_kept(self):
+        self.controller((self.alpha, "alpha"), (self.beta, "beta"))
+        self.env["NEST_PROJECT_ID"] = self.alpha
+        code, out, err = self.pick("2")
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"NEST_PROJECT_ID is set to {self.alpha}", err)
+        self.assertIn("still overrides it", out)
+        self.assertEqual(self.saved(), self.beta)
+        code, out, _ = self.nest("current")
+        self.assertEqual(out.strip(), f"{self.alpha} (NEST_PROJECT_ID)")
+
+    def test_choice_revoked_while_asking_is_not_saved(self):
+        controller = self.controller((self.alpha, "alpha"), (self.beta, "beta"))
+
+        def read(_prompt=""):
+            controller.projects = [p for p in controller.projects if p[0] != self.beta]
+            return "2"
+
+        with (
+            mock.patch.object(selection, "is_interactive", return_value=True),
+            mock.patch("builtins.input", read),
+        ):
+            code, _, err = self.nest("select")
+        self.assertEqual(code, 1)
+        self.assertIn("no longer one you may run in", err)
+        self.assertIsNone(self.saved())
+
     def test_controller_without_a_session_origin(self):
         port = serve(self, RecordingController())
         self.env = {"NEST_CONTROLLER_ADDRESS": f"127.0.0.1:{port}"}
