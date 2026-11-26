@@ -637,8 +637,10 @@ class LocalOpenSSHTransport(_OpenSSHTransport):
         The command line for a remote command, without the command itself.
 
         Runs only through the connection [`backends.transport.LocalOpenSSHTransport.login`]
-        authenticated (`ControlMaster=no`), in `BatchMode`: if that connection is
-        gone, the command fails instead of authenticating again.
+        authenticated (`ControlMaster=no`). It cannot open a connection of its own:
+        `ProxyCommand=false` fails any new connection before the login node is
+        contacted, and `BatchMode` forbids prompts. If that connection is gone, the
+        command fails instead of authenticating again.
         """
         return [
             *self._common_argv(),
@@ -646,6 +648,11 @@ class LocalOpenSSHTransport(_OpenSSHTransport):
             "ControlMaster=no",
             "-o",
             "BatchMode=yes",
+            # OpenSSH tries the control socket before connecting, so a live
+            # connection is used as normal; without one, this command that always
+            # fails is the only way out, and the login node is never contacted.
+            "-o",
+            "ProxyCommand=false",
             self.target,
         ]
 

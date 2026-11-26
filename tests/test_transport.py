@@ -220,6 +220,8 @@ class LocalOpenSSHContractTests(_FakeHpcContract, unittest.TestCase):
         # Commands only use the login's connection and never authenticate themselves.
         self.assertIn("ControlMaster=no", options)
         self.assertIn("BatchMode=yes", options)
+        self.assertIn("ProxyCommand=false", options)  # can never open its own connection
+        self.assertNotIn("ProxyCommand=false", login_options)
         for option in (
             "PreferredAuthentications=keyboard-interactive,password",
             "PubkeyAuthentication=no",
@@ -525,6 +527,8 @@ class LocalSessionLifecycleTests(unittest.TestCase):
         login_values = dict(l.split(" ", 1) for l in login_resolved.splitlines() if " " in l)
         self.assertEqual(login_values["batchmode"], "no")
         self.assertIn(login_values["controlmaster"], ("true", "yes"))
+        self.assertEqual(resolved_values["proxycommand"], "false")
+        self.assertNotIn("proxycommand", login_values)
         self.assertEqual(
             login_values["pubkeyauthentication"], resolved_values["pubkeyauthentication"]
         )
@@ -669,6 +673,7 @@ class LocalSessionLifecycleTests(unittest.TestCase):
         self.assertEqual(argv[-1], "squeue --me")  # no login was attempted
         self.assertIn("BatchMode=yes", argv)  # so OpenSSH could not prompt or use askpass
         self.assertIn("ControlMaster=no", argv)
+        self.assertIn("ProxyCommand=false", argv)  # and could not reach the login node
 
     def test_close_without_any_command_runs_nothing(self):
         with mock.patch("nest.backends.transport.subprocess.run") as run:
