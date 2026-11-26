@@ -94,6 +94,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
@@ -998,6 +999,22 @@ def _addresses(container: dict) -> dict[str, str]:
     }
 
 
+def _all_addresses(container: dict) -> dict[str, list]:
+    """Network name -> every address of the container on it, both families
+    (`IPAddress`, `GlobalIPv6Address`, `LinkLocalIPv6Address`), IPv4-mapped ones as IPv4."""
+    found: dict[str, list] = {}
+    for name, attachment in _attachments(container).items():
+        for key in ("IPAddress", "GlobalIPv6Address", "LinkLocalIPv6Address"):
+            text = attachment.get(key) or ""
+            if not text:
+                continue
+            try:
+                found.setdefault(name, []).append(_canonical(ipaddress.ip_address(text)))
+            except ValueError:
+                continue
+    return found
+
+
 def _dns_names(attachment: dict) -> set[str]:
     return set(attachment.get("DNSNames") or []) | set(attachment.get("Aliases") or [])
 
@@ -1011,14 +1028,14 @@ def _canonical(address: ipaddress.IPv4Address | ipaddress.IPv6Address):
 def parse_proc_net(text: str, byteorder: str = sys.byteorder) -> list[tuple]:
     """
     Established TCP sockets from /proc/net/tcp and /proc/net/tcp6 text, as
-    `(local address, local port, remote address, remote port)`. The kernel prints
-    each 32-bit word of an address in host byte order; IPv4-mapped IPv6 addresses
-    are returned as IPv4, as the Controller's guard sees them.
+    `(local address, local port, remote address, remote port, inode)`. The kernel
+    prints each 32-bit word of an address in host byte order; IPv4-mapped IPv6
+    addresses are returned as IPv4, as the Controller's guard sees them.
     """
     sockets = []
     for line in text.splitlines():
         fields = line.split()
-        if len(fields) < 4 or fields[3] != "01" or ":" not in fields[1]:
+        if len(fields) < 10 or fields[3] != "01" or ":" not in fields[1]:
             continue
         try:
             ends = []
@@ -1028,19 +1045,43 @@ def parse_proc_net(text: str, byteorder: str = sys.byteorder) -> list[tuple]:
                 if byteorder == "little":
                     raw = b"".join(raw[i : i + 4][::-1] for i in range(0, len(raw), 4))
                 ends.append((_canonical(ipaddress.ip_address(raw)), int(hex_port, 16)))
+            inode = int(fields[9])
         except ValueError:
             continue
-        sockets.append((ends[0][0], ends[0][1], ends[1][0], ends[1][1]))
+        sockets.append((ends[0][0], ends[0][1], ends[1][0], ends[1][1], inode))
     return sockets
 
 
-def _read_sockets(docker: Docker, container_id: str) -> list[tuple] | None:
-    result = docker.exec(
-        container_id, ["sh", "-c", "cat /proc/net/tcp; cat /proc/net/tcp6 2>/dev/null; true"]
-    )
+# Both tables are required where the kernel has them: /proc/net/tcp6 may be absent
+# (no IPv6), but a table that exists and cannot be read fails the check.
+SOCKET_TABLES = (
+    "cat /proc/net/tcp || exit 3; if [ -e /proc/net/tcp6 ]; then cat /proc/net/tcp6 || exit 4; fi"
+)
+# Prints `probe socket:[INODE]` for the probe holding fd 3 whose command line carries
+# the token, then the socket tables.
+PROBE_SOCKET = (
+    "for p in /proc/[0-9]*; do "
+    'if tr "\\0" " " < "$p/cmdline" 2>/dev/null | grep -q -- "$1"; then '
+    'link=$(readlink "$p/fd/3" 2>/dev/null) '
+    '&& case "$link" in socket:*) echo "probe $link";; esac; fi; done; ' + SOCKET_TABLES
+)
+
+
+def _read_sockets(
+    docker: Docker, container_id: str, token: str | None = None
+) -> tuple[list[tuple], set[int]] | None:
+    """The container's established sockets and, with `token`, the inodes the probe
+    holds; `None` when a table cannot be read."""
+    if token is None:
+        result = docker.exec(container_id, ["sh", "-c", SOCKET_TABLES])
+    else:
+        result = docker.exec(container_id, ["sh", "-c", PROBE_SOCKET, "sockets", token])
     if result.returncode != 0 or "local_address" not in result.stdout:
         return None
-    return parse_proc_net(result.stdout)
+    inodes = set()
+    for match in re.finditer(r"^probe socket:\[(\d+)\]$", result.stdout, re.MULTILINE):
+        inodes.add(int(match.group(1)))
+    return parse_proc_net(result.stdout), inodes
 
 
 def _one_running(docker: Docker, project: str, service: str) -> tuple[dict | None, Check | None]:
@@ -1057,6 +1098,123 @@ def _one_running(docker: Docker, project: str, service: str) -> tuple[dict | Non
             "container from an earlier deploy is still up. Remove it, then rerun"
         )
     return None, Check(f"{service}_container", "FAIL", detail)
+
+
+def private_path(
+    docker: Docker,
+    gateway_id: str,
+    controller_id: str,
+    host: str,
+    port: int,
+    *,
+    origin: tuple,
+    gateway_ips: set,
+    controller_ips: set,
+    origin_name: str,
+    sleep: Callable[[float], None],
+) -> Check:
+    """
+    Positive, correlated evidence of the private path. A silent TCP probe from the
+    gateway to the upstream is identified by the socket it holds (its command line
+    carries a fresh token). Its 4-tuple must run from the gateway's grpc-origin
+    address to the Controller's grpc-origin address and port, and the Controller
+    must hold the mirror of that tuple. Every other established connection between
+    any gateway address and any Controller address on that port, in either table,
+    must use the same two origin addresses. Anything that cannot be read or found fails.
+    """
+    gateway_origin, controller_origin = origin
+    token = f"nest-doctor-probe-{uuid.uuid4().hex[:12]}"
+    launched = docker.exec(
+        gateway_id,
+        [
+            "bash",
+            "-c",
+            # `; :` keeps this bash, whose command line carries the token, holding fd 3;
+            # otherwise bash replaces itself with the final `sleep`.
+            f'exec 3<>"/dev/tcp/$1/$2" && sleep {PROBE_SECONDS}; :',
+            token,
+            host,
+            str(port),
+        ],
+        detach=True,
+    )
+    if launched.returncode != 0:
+        return Check(
+            "private_path", "FAIL", "could not start the probe in the gateway (needs bash)"
+        )
+    probe = mirror = None
+    outgoing: list[tuple] = []
+    incoming: list[tuple] = []
+    for _ in range(PROBE_SECONDS * 2):
+        sleep(0.5)
+        read_gateway = _read_sockets(docker, gateway_id, token)
+        read_controller = _read_sockets(docker, controller_id)
+        if read_gateway is None or read_controller is None:
+            return Check(
+                "private_path",
+                "FAIL",
+                "could not read a socket table (/proc/net/tcp or an existing /proc/net/tcp6) "
+                "in the " + ("gateway" if read_gateway is None else "Controller"),
+            )
+        (outgoing, inodes), (incoming, _) = read_gateway, read_controller
+        probe = next((s for s in outgoing if s[4] in inodes), None)
+        if probe is not None:
+            mirror = next(
+                (
+                    s
+                    for s in incoming
+                    if (s[0], s[1], s[2], s[3]) == (probe[2], probe[3], probe[0], probe[1])
+                ),
+                None,
+            )
+            if mirror is not None:
+                break
+    if probe is None:
+        return Check(
+            "private_path",
+            "FAIL",
+            f"the probe never held a connection to {host}:{port}; the gateway cannot reach the "
+            "Controller there",
+        )
+    expected = (gateway_origin, controller_origin, port)
+    if (probe[0], probe[2], probe[3]) != expected:
+        return Check(
+            "private_path",
+            "FAIL",
+            f"the probe connected {probe[0]} -> {probe[2]}:{probe[3]}, not {gateway_origin} -> "
+            f"{controller_origin}:{port} on {origin_name}",
+        )
+    if mirror is None:
+        return Check(
+            "private_path",
+            "FAIL",
+            f"the Controller holds no connection from {probe[0]}:{probe[1]}; it is not the "
+            "endpoint the gateway reached",
+        )
+    wrong = set()
+    expected_pair = (gateway_origin, controller_origin)
+    for local, _, remote, rport, _ in outgoing:
+        between = rport == port and local in gateway_ips and remote in controller_ips
+        if between and (local, remote) != expected_pair:
+            wrong.add(f"{local} -> {remote}")
+    for local, lport, remote, _, _ in incoming:
+        between = lport == port and remote in gateway_ips and local in controller_ips
+        if between and (remote, local) != expected_pair:
+            wrong.add(f"{remote} -> {local}")
+    if wrong:
+        return Check(
+            "private_path",
+            "FAIL",
+            f"the gateway also reaches the Controller as {', '.join(sorted(wrong))}, not only "
+            f"{gateway_origin} -> {controller_origin} on {origin_name}; the Controller would "
+            "refuse it",
+        )
+    return Check(
+        "private_path",
+        "PASS",
+        f"probe {probe[0]}:{probe[1]} -> {probe[2]}:{probe[3]} seen from both ends; every "
+        f"gateway connection to the Controller is {gateway_origin} -> {controller_origin}",
+    )
 
 
 def gateway_runtime(args, docker: Docker, sleep: Callable[[float], None] | None = None) -> int:
@@ -1162,9 +1320,15 @@ def gateway_runtime(args, docker: Docker, sleep: Callable[[float], None] | None 
 
     controller_env = container_env(controller, RUNTIME_ENV)
     gateway_cidr = ipaddress.IPv4Network(f"{gateway_origin}/32")
-    other_gateway = [
-        ipaddress.ip_address(a) for n, a in gateway_networks.items() if n != origin_name
-    ]
+    origin_ip = ipaddress.IPv4Address(gateway_origin)
+    controller_ip = ipaddress.IPv4Address(controller_origin)
+    gateway_all = _all_addresses(gateway)
+    controller_all = _all_addresses(controller)
+    gateway_ips = {a for addresses in gateway_all.values() for a in addresses}
+    controller_ips = {a for addresses in controller_all.values() for a in addresses}
+    # Every gateway address but its grpc-origin IPv4 one, in both families: an IPv6
+    # allowlist entry admits a native IPv6 peer, so an IPv6 edge address counts too.
+    other_gateway = sorted(gateway_ips - {origin_ip}, key=lambda a: (a.version, a))
     try:
         trusted = _cidrs(controller_env.get("NEST_GRPC_TRUSTED_PROXIES", ""))
         peers = _cidrs(controller_env.get("NEST_GRPC_ALLOWED_PEERS", ""))
@@ -1179,7 +1343,7 @@ def gateway_runtime(args, docker: Docker, sleep: Callable[[float], None] | None 
             problems.append(f"NEST_GRPC_TRUSTED_PROXIES is {shown}, not {gateway_cidr}")
         if not any(gateway_cidr.subnet_of(p) for p in _ipv4(peers)):
             problems.append(f"NEST_GRPC_ALLOWED_PEERS does not admit {gateway_cidr}")
-        for address in map(_canonical, other_gateway):
+        for address in other_gateway:
             for name, networks in (
                 ("NEST_GRPC_TRUSTED_PROXIES", trusted),
                 ("NEST_GRPC_ALLOWED_PEERS", peers),
@@ -1193,75 +1357,20 @@ def gateway_runtime(args, docker: Docker, sleep: Callable[[float], None] | None 
             checks.append(Check("controller_trust", "FAIL", "; ".join(problems)))
         else:
             checks.append(Check("controller_trust", "PASS", f"trusts exactly {gateway_cidr}"))
-
-    # Peer identity: a held, silent TCP connection from the gateway to the upstream,
-    # seen from both ends.
-    port = int(port_text)
-    probe = docker.exec(
-        gateway["Id"],
-        [
-            "bash",
-            "-c",
-            f'exec 3<>"/dev/tcp/$1/$2" && sleep {PROBE_SECONDS}',
-            "probe",
+    checks.append(
+        private_path(
+            docker,
+            gateway["Id"],
+            controller["Id"],
             host,
-            str(port),
-        ],
-        detach=True,
+            int(port_text),
+            origin=(origin_ip, controller_ip),
+            gateway_ips=gateway_ips,
+            controller_ips=controller_ips,
+            origin_name=origin_name,
+            sleep=sleep,
+        )
     )
-    gateway_ips = {ipaddress.ip_address(a) for a in gateway_networks.values()}
-    origin_ip = ipaddress.ip_address(gateway_origin)
-    seen_gateway = seen_controller = None
-    if probe.returncode == 0:
-        for _ in range(PROBE_SECONDS * 2):
-            sleep(0.5)
-            outgoing = _read_sockets(docker, gateway["Id"])
-            incoming = _read_sockets(docker, controller["Id"])
-            if outgoing is None or incoming is None:
-                break
-            seen_gateway = [s for s in outgoing if s[3] == port and s[0] in gateway_ips]
-            seen_controller = [s for s in incoming if s[1] == port and s[2] in gateway_ips]
-            if seen_gateway and seen_controller:
-                break
-    if probe.returncode != 0 or seen_gateway is None or seen_controller is None:
-        checks.append(
-            Check(
-                "private_path",
-                "FAIL",
-                "could not open the probe connection or read the socket tables (needs bash "
-                "in the gateway and sh in the Controller)",
-            )
-        )
-    elif not seen_gateway or not seen_controller:
-        checks.append(
-            Check(
-                "private_path",
-                "FAIL",
-                f"no connection from the gateway reached the Controller on port {port}",
-            )
-        )
-    else:
-        sources = sorted({str(s[0]) for s in seen_gateway})
-        peers_seen = sorted({str(s[2]) for s in seen_controller})
-        wrong = [a for a in sources + peers_seen if ipaddress.ip_address(a) != origin_ip]
-        if wrong:
-            checks.append(
-                Check(
-                    "private_path",
-                    "FAIL",
-                    f"the gateway reaches the Controller from {', '.join(sorted(set(wrong)))}, not "
-                    f"only {origin_ip} on {origin_name}; the Controller would refuse it",
-                )
-            )
-        else:
-            checks.append(
-                Check(
-                    "private_path",
-                    "PASS",
-                    f"gateway {origin_ip} -> Controller {controller_origin}:{port}; the Controller's "
-                    f"peer for every gateway connection is {origin_ip}",
-                )
-            )
     emit(checks, args.json)
     return 1 if any(c.status == "FAIL" for c in checks) else 0
 

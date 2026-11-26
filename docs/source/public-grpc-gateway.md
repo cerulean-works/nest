@@ -251,8 +251,8 @@ check that cannot run fails:
 | `upstream_setting` | The gateway's `NEST_GRPC_UPSTREAM` is the generic `controller` (an older checkout) or malformed |
 | `upstream_alias` | The upstream name is a DNS name of the Controller on any network other than `grpc-origin` |
 | `upstream_dns` | Inside the gateway the name does not resolve, or resolves to anything but exactly the Controller's grpc-origin address |
-| `controller_trust` | The Controller's `NEST_GRPC_TRUSTED_PROXIES` is not exactly the gateway's grpc-origin /32, its `NEST_GRPC_ALLOWED_PEERS` misses it, or either admits one of the gateway's other (edge) addresses |
-| `private_path` | A silent TCP probe from the gateway to the upstream (no byte is sent), and every connection the Controller holds from any gateway address, read from both containers' socket tables, does not use the gateway's grpc-origin address. That is the address the Controller's guard sees, IPv4-mapped included. |
+| `controller_trust` | The Controller's `NEST_GRPC_TRUSTED_PROXIES` is not exactly the gateway's grpc-origin /32, its `NEST_GRPC_ALLOWED_PEERS` misses it, or either admits one of the gateway's other addresses. Those include its IPv4 and native IPv6 (`GlobalIPv6Address`) edge addresses. Either setting fails if it contains an IPv4-mapped IPv6 network. |
+| `private_path` | Positive, correlated evidence of the private path. A silent TCP probe runs from the gateway to the upstream; no byte is sent. It is identified by the socket it holds, and its 4-tuple must run from the gateway's grpc-origin address to the Controller's grpc-origin address and port. The Controller must hold the mirror of that tuple. Every other connection between any gateway address and any Controller address on that port, IPv4, IPv4-mapped or native IPv6, read from both containers' socket tables, must use the same two origin addresses. A probe that never connects fails, as does a socket table that exists but cannot be read. An absent `/proc/net/tcp6` (no IPv6) is fine. |
 
 Only addresses and network names are printed. The Controller's environment is
 read for those two settings and nothing else.

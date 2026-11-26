@@ -171,7 +171,7 @@ if grep -q "^FAIL upstream_dns: .*$controller_edge" "$fixture/old-doctor.txt"; t
         > "$fixture/old-verify.txt" && fail "the old configuration passed external verification"
     grep -q 'expected UNAUTHENTICATED, got PERMISSION_DENIED' "$fixture/old-verify.txt" \
         || { cat "$fixture/old-verify.txt"; fail "expected the staging PERMISSION_DENIED"; }
-    grep -q '^FAIL private_path: the gateway reaches the Controller from ' "$fixture/old-doctor.txt" \
+    grep -q "^FAIL private_path: the probe connected [0-9.]* -> $controller_edge:50051" "$fixture/old-doctor.txt" \
         || fail "no socket evidence of the edge path"
     echo "PASS: old configuration reproduces #109 (edge address, PERMISSION_DENIED)"
 else
@@ -210,7 +210,7 @@ check_current() {
     done
     cat "$report"
     grep -q '^FAIL' "$report" && fail "[$label] the runtime doctor failed"
-    grep -q "^PASS private_path: gateway $gateway_origin -> Controller " "$report" \
+    grep -q "^PASS private_path: probe $gateway_origin:[0-9]* -> [0-9.]*:50051 seen from both ends" "$report" \
         || fail "[$label] no socket evidence of the private path"
 
     local controller_edge controller_origin gateway_edge
