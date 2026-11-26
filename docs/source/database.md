@@ -57,8 +57,8 @@ A job record moves through these `status` values:
 | --- | --- |
 | `submitting` | Written before any SSH command. If it stays here, the Controller stopped or lost the database during submission. |
 | `submitted` | `sbatch` returned the Slurm job ID. Batch jobs stay here; `slurm_state` is updated by each `GetJobStatus` call. |
-| `succeeded` | An `Execute` worker finished and its result was returned. A function that raised still counts: Nest returned its exception. |
-| `failed` | SSH or Slurm failed. `error_kind` holds the [error kind](remote-errors). |
+| `succeeded` | An `Execute` worker finished, its function returned, and its result was returned. |
+| `failed` | SSH or Slurm failed, and `error_kind` holds the [error kind](remote-errors); or the worker finished but its function raised (`remote_application_error`; Nest still returned its exception). |
 | `unknown` | `sbatch` may have submitted a job, but no job ID arrived (`submission_unknown`). |
 
 Local execution (`NEST_EXECUTOR=local`) creates no job records. No user payloads,

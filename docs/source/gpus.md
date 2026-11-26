@@ -71,11 +71,12 @@ function; its exception and traceback come back as usual, for example PyTorch's
 *The NVIDIA driver on your system is too old*.
 
 Errors your function raises, CUDA errors included, are its result: the worker
-writes the error record and exits successfully, so Slurm reports `COMPLETED`, and
-an Execution Registry attempt is recorded as `succeeded`. Only scheduler or
-transport failures, including `GPU allocation error`, end the job as `FAILED`
-(`SlurmJobError`). Recording application failures separately in the registry is
-tracked in [#73](https://github.com/cerulean-works/nest/issues/73).
+writes the error record, which the client raises as `RemoteExecutionError`, and
+exits successfully, so Slurm reports `COMPLETED`. The Execution Registry still
+records the attempt as `failed` with error kind `remote_application_error` (see
+[Application failures](execution-registry#application-failures)), so the
+execution can be retried. Only scheduler or transport failures, including
+`GPU allocation error`, end the job as `FAILED` (`SlurmJobError`).
 
 ## Roll out
 

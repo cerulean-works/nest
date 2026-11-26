@@ -23,6 +23,11 @@ except RemoteExecutionError as exc:
 
 The original exception type, message, and remote traceback are preserved.
 
+The Controller records such a call as an application failure, not a success:
+its Execution Registry attempt is `failed` with error kind
+`remote_application_error`, so the same idempotency key may retry it. See
+[Application failures](execution-registry#application-failures).
+
 A `gpu=` function whose allocated GPUs are unusable does not run; it raises
 `RemoteExecutionError` with `remote_type` `nest.gpu.GpuUnavailableError`. See
 [GPU errors](gpus#gpu-errors).

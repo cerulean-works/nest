@@ -18,6 +18,16 @@ interpreter selects the prepared project environment.
 
 [[autodoc]] worker.main
 
+## Outcome record
+
+Next to the result, the worker writes a plain-JSON record of whether the call
+returned or raised, which the Controller reads instead of the result. See
+[Application failures](../execution-registry#application-failures).
+
+[[autodoc]] outcome.RemoteOutcome
+
+[[autodoc]] outcome.parse
+
 ## GPU check
 
 Before a GPU-requesting call, the worker confirms that the GPUs Slurm assigned are

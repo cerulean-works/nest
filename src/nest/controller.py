@@ -25,6 +25,7 @@ from .admission import (
     RecoverySweeper,
     RegistryAdmission,
     SubmissionRequest,
+    completion,
     digest,
 )
 from .audit import AuditLog, audit_interface
@@ -80,6 +81,7 @@ from .errors import (
 )
 from .executor import execute
 from .mail import start_email_service
+from .outcome import InvalidOutcomeError
 from .proto import execution_pb2, execution_pb2_grpc
 from .rpc_guard import RpcGuard, current_client, server_options
 
@@ -582,7 +584,19 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
             if not admission_service.submitted(admission, job_id):
                 self._abort_unrecorded(context, admission, job_id)
             result_bytes = backend.wait_result(job_id, job_dir)
-            admission_service.succeeded(admission, output_ref=f"{job_dir}/output.pkl")
+            try:
+                remote = admission_service.read_outcome(backend, admission.execution_id)
+            except InfrastructureError as exc:
+                # The result is in hand and is returned, but whether the function
+                # raised is unknown: the attempt stays live for the settle sweep or a
+                # status query, never recorded as succeeded.
+                logger.warning(
+                    "Outcome record unreadable; attempt left for settling execution_id=%s kind=%s",
+                    admission.execution_id,
+                    exc.kind,
+                )
+            else:
+                admission_service.completed(admission, remote, output_ref=f"{job_dir}/output.pkl")
             context.set_trailing_metadata(((EXECUTION_ID_METADATA, admission.execution_id),))
             return execution_pb2.ExecuteResponse(result=result_bytes)
         except InfrastructureError as exc:
@@ -696,6 +710,23 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
             error_kind=exc.kind if infrastructure else "internal",
             error_message=str(exc),
         )
+
+    def _finish_completed(self, backend: SlurmBackend, record: int, job_dir: str) -> None:
+        """
+        Legacy `jobs` record of a completed worker, settled like the registry's
+        (see [`admission.completion`]). When the outcome record cannot be read, the
+        record stays `submitted` rather than claim a success.
+        """
+        assert self.jobs is not None
+        try:
+            remote = backend.read_outcome(job_dir)
+        except InvalidOutcomeError as exc:
+            remote = exc
+        except InfrastructureError as exc:
+            logger.warning("Outcome record unreadable record=%s kind=%s", record, exc.kind)
+            return
+        status, error_kind, message = completion(remote)
+        self.jobs.finish(record, status, error_kind=error_kind, error_message=message)
 
     def _require_slurm_backend(self, context) -> SlurmBackend:
         """
@@ -860,7 +891,7 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 # Wait for the result
                 result_bytes = backend.wait_result(job_id, job_dir)
                 if self.jobs is not None and record is not None:
-                    self.jobs.finish(record, "succeeded")
+                    self._finish_completed(backend, record, job_dir)
 
                 return execution_pb2.ExecuteResponse(result=result_bytes)
 

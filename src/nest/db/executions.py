@@ -1342,6 +1342,17 @@ class ExecutionRegistry:
             ).fetchone()
         return row["project_id"] if row else None
 
+    def kind_of(self, execution_id: str) -> str | None:
+        """
+        An execution's kind (`execution` or `batch`), or `None`. Controller-internal,
+        for settling an attempt by its Slurm state; never returned to a User.
+        """
+        with transaction(self.database, None, "read an execution kind") as cursor:
+            row = cursor.execute(
+                "SELECT kind FROM executions WHERE execution_id = %s", (execution_id,)
+            ).fetchone()
+        return row["kind"] if row else None
+
     def get_attempt(self, attempt_id: int) -> Attempt | None:
         """
         Returns one attempt by its record ID, or `None`. Controller-internal, for

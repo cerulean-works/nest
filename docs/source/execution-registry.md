@@ -78,7 +78,7 @@ submission idempotent for its owner and Project:
 | Submitted (`SubmitJob`) | The same `job_id`, without a new `sbatch` |
 | Submitted (`Execute`) | `ALREADY_EXISTS` |
 | Still being submitted, or outcome `unknown` | `ABORTED`; nothing is submitted |
-| Failed, or reconciled as not submitted | A new attempt |
+| Failed (including a function that raised), or reconciled as not submitted | A new attempt |
 | A different request | `FAILED_PRECONDITION` (`idempotency_conflict`) |
 
 Concurrent requests with one key submit at most once: the registry allows a single
@@ -93,6 +93,8 @@ attempt in flight per execution.
 | SSH or `sbatch` refused the job | `failed` | The classified error |
 | `sbatch` may have run, but no job ID arrived | `unknown` | `UNKNOWN`, `nest-error-kind: submission_unknown` |
 | Slurm accepted the job | `submitted`, then `running`, `succeeded`, `failed` or `cancelled` as `Execute` or `GetJobStatus` observe it | The result or job ID |
+| The job completed, but the function raised | `failed`, `slurm_state` `COMPLETED`, `remote_application_error` | The remote error record (`RemoteExecutionError`), unchanged |
+| The job completed, but its outcome record could not be read | stays `submitted` until a status query or the settle sweep reads it | The result, unchanged |
 | Slurm accepted the job, but its job ID could not be stored (after brief retries) | `submitting`; the Controller records the kept job ID at its next recovery sweep, also after the attempt was marked `unknown` | `UNKNOWN`, `nest-error-kind: submission_unknown`, with the job ID in `nest-job-id`; never a success |
 | A timeout or lost status query while waiting | stays `submitted` | The classified error; the job is not cancelled |
 
@@ -101,6 +103,47 @@ Controller marks `submitting` attempts older than
 `NEST_ENVIRONMENT_TIMEOUT + 4 × NEST_SSH_TIMEOUT + 5 minutes` as `unknown`
 (`error_kind` `controller_interrupted`): their Controller stopped between recording
 them and receiving a job ID.
+
+## Application failures
+
+A function that raises is still a job Slurm completed: the worker writes the
+remote error record as the result (`output.pkl`) and exits successfully. To tell
+the two apart without unpickling that result, which would run code the caller
+controls inside the Controller, the worker also writes a plain-JSON outcome
+record, `outcome.json`, next to it:
+
+```json
+{"nest_outcome": 1, "status": "raised", "error_type": "builtins.RuntimeError"}
+```
+
+When Slurm reports `COMPLETED`, the Controller reads at most 1 KiB of it over SSH
+and parses it strictly. The same rule applies however the completion is seen,
+by `Execute`, `GetJobStatus` or the settle sweep, so none of them overwrites
+another's record:
+
+| Outcome record | Attempt | `error_kind` | Execution |
+| --- | --- | --- | --- |
+| `returned` | `succeeded` | — | `succeeded` (closed) |
+| `raised` | `failed`, `slurm_state` `COMPLETED` | `remote_application_error` | `failed`, open for a retry |
+| Malformed | `failed`, `slurm_state` `COMPLETED` | `remote_outcome_invalid` | `failed`, open for a retry |
+| None (a worker that predates it) | `succeeded`, as before | — | `succeeded` (closed) |
+| Unreadable (SSH failed) | left as it was; read again later | — | unchanged |
+
+The attempt's `error_message` names only the exception type. The exception
+message and traceback belong to the caller and are delivered to the client
+unchanged in the result; the Controller does not store them. A failed attempt
+releases its admission reservation like any other failure. Slurm and transport
+failures keep their own kinds, such as `slurm_job_failed`.
+
+A retry with the same idempotency key runs the function again in the same
+execution directory; the Controller removes the previous attempt's outcome
+record before staging the new payload, and the worker removes it again before it
+runs, so a stale record is never read as the new attempt's. Batch jobs
+(`SubmitJob`) have no outcome record: `COMPLETED` is a success.
+
+The legacy path (`NEST_EXECUTION_REGISTRY=legacy`) records the same outcome in
+`jobs`: `failed` with `remote_application_error`, or left `submitted` when the
+record cannot be read.
 
 ## Reconcile an unknown attempt
 
@@ -115,7 +158,8 @@ nest-db execution reconcile ATTEMPT_ID --not-submitted \
   --operator ops --reason "no job in sacct; execution directory has no output"
 ```
 
-The first makes the attempt `submitted`, and status queries follow it; the second
+The first makes the attempt `submitted`, and status queries follow it (a
+completed execution then settles from its outcome record, as above); the second
 marks it `failed` (`reconciled_not_submitted`), so a retry with the same
 idempotency key may start a new attempt. Only an `unknown` attempt can be
 reconciled, and the operator and evidence are recorded as an

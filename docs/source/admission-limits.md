@@ -142,7 +142,8 @@ Controller is waiting on, at most 50 per sweep, each sweep resuming after the la
   reservation until an operator reconciles or finishes the attempt. `nest-db
   execution list` shows such attempts.
 - An application error in the user's function completes the Slurm job and is
-  recorded `succeeded` (issue #73); the reservation is released either way.
+  recorded `failed` (`remote_application_error`); the reservation is released
+  either way. See [Application failures](execution-registry#application-failures).
 - Cancelling the Slurm job of an abandoned `Execute`, and short RPCs that do not
   hold a thread while a job runs, are C04 (detached execution).
 - Environment-build slots are per Controller replica and held in memory, and are

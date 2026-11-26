@@ -11,6 +11,7 @@ as seen from another connection, before `sbatch` runs; and whenever admission or
 the database fails, `sbatch` never runs at all.
 """
 
+import json
 import os
 import secrets
 import shutil
@@ -285,28 +286,6 @@ class _Base(PostgresTestCase):
 
 
 class SubmissionPathTests(_Base):
-    def test_application_error_settles_as_a_completed_attempt_with_its_traceback(self):
-        # Current contract: the function's exception is its result. The worker writes
-        # the remote error record and exits 0, so Slurm reports COMPLETED and the
-        # registry records the attempt and execution as succeeded; the client raises
-        # RemoteExecutionError from the record. Distinguishing application failure in
-        # the registry is a separate follow-up (issue #73).
-        def train():
-            raise RuntimeError("CUDA error: device-side assert triggered")
-
-        record = self.execute(train)
-        self.assertIs(record["__nest_remote_error_v1__"], True)
-        self.assertEqual(record["type"], "builtins.RuntimeError")
-        self.assertEqual(record["message"], "CUDA error: device-side assert triggered")
-        self.assertIn("in train", record["traceback"])
-        [worker] = self.sbatch_calls()
-        self.assertEqual(self.hpc.job_state(worker["job_id"]), "COMPLETED")
-        [attempt] = self.attempts()
-        self.assertEqual((attempt["status"], attempt["slurm_state"]), ("succeeded", "COMPLETED"))
-        self.assertIsNone(attempt["error_kind"])
-        [execution] = self.sql("SELECT status FROM executions")
-        self.assertEqual(execution["status"], "succeeded")
-
     def test_execute_commits_its_attempt_before_sbatch(self):
         seen = self.spy_on_sbatch()
         self.assertEqual(self.execute(), 42)
@@ -392,6 +371,191 @@ class SubmissionPathTests(_Base):
         [after] = self.attempts()
         for column in ("slurm_account", "slurm_account_origin", "login_node_host", "unix_user"):
             self.assertEqual(after[column], before[column])
+
+
+class ApplicationOutcomeTests(_Base):
+    """
+    A function that raises completes in Slurm (`COMPLETED`), but its attempt is
+    `failed` with `remote_application_error`, decided from the worker's plain-JSON
+    outcome sidecar, never by unpickling the result (issue #73).
+    """
+
+    @property
+    def train(self):
+        """A function cloudpickle sends by value, since it is defined here."""
+
+        def train():
+            raise RuntimeError("CUDA error: device-side assert triggered")
+
+        return train
+
+    def outcome_file(self, execution_id: str) -> Path:
+        return self.hpc.base / "jobs" / execution_id / "outcome.json"
+
+    def assert_application_failure(self, attempt):
+        self.assertEqual(
+            (attempt["status"], attempt["slurm_state"], attempt["error_kind"]),
+            ("failed", "COMPLETED", "remote_application_error"),
+        )
+        self.assertIn("builtins.RuntimeError", attempt["error_message"])
+        # The exception message and traceback are the caller's, not the registry's.
+        self.assertNotIn("device-side", attempt["error_message"])
+        self.assertIsNotNone(attempt["finished_at"])
+
+    def record_nothing_on_completion(self):
+        """The Execute RPC records nothing itself, as when a status query wins the race."""
+        patcher = mock.patch.object(RegistryAdmission, "completed", autospec=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_application_error_fails_the_attempt_and_delivers_the_traceback(self):
+        record = self.execute(self.train)
+        # Delivered to the client unchanged.
+        self.assertIs(record["__nest_remote_error_v1__"], True)
+        self.assertEqual(record["type"], "builtins.RuntimeError")
+        self.assertEqual(record["message"], "CUDA error: device-side assert triggered")
+        self.assertIn("in train", record["traceback"])
+        [worker] = self.sbatch_calls()
+        self.assertEqual(self.hpc.job_state(worker["job_id"]), "COMPLETED")
+        [attempt] = self.attempts()
+        self.assert_application_failure(attempt)
+        self.assertEqual(attempt["slurm_job_id"], worker["job_id"])
+        self.assertEqual(
+            attempt["output_ref"], f"{self.hpc.base}/jobs/{attempt['execution_id']}/output.pkl"
+        )
+        # The sidecar the Controller read is plain JSON with only the type.
+        self.assertEqual(
+            json.loads(self.outcome_file(attempt["execution_id"]).read_text()),
+            {"nest_outcome": 1, "status": "raised", "error_type": "builtins.RuntimeError"},
+        )
+        [execution] = self.sql("SELECT status, finished_at FROM executions")
+        self.assertEqual((execution["status"], execution["finished_at"]), ("failed", None))
+        # A later status query or sweep does not overwrite the application outcome.
+        state = self.stub.GetJobStatus(
+            execution_pb2.JobStatusRequest(job_id=worker["job_id"]),
+            timeout=30,
+            metadata=self.metadata(),
+        )
+        self.assertEqual(state.state, "COMPLETED")
+        self.admission.settle(timedelta(0))
+        self.assertEqual(self.attempts(), [attempt])
+
+    def test_returning_function_succeeds(self):
+        self.assertEqual(self.execute(), 42)
+        [attempt] = self.attempts()
+        self.assertEqual(
+            (attempt["status"], attempt["slurm_state"], attempt["error_kind"]),
+            ("succeeded", "COMPLETED", None),
+        )
+        self.assertEqual(
+            json.loads(self.outcome_file(attempt["execution_id"]).read_text()),
+            {"nest_outcome": 1, "status": "returned"},
+        )
+
+    def test_application_failure_may_be_retried_under_the_same_key(self):
+        flag = self.hpc.base.parent / "second-try"
+
+        def flaky():
+            if not os.path.exists(flag):
+                raise RuntimeError("first try fails")
+            return "ok"
+
+        first = self.execute(flaky, x_nest_idempotency_key="train-1")
+        self.assertEqual(first["message"], "first try fails")
+        flag.touch()
+        self.assertEqual(self.execute(flaky, x_nest_idempotency_key="train-1"), "ok")
+        failed, retried = self.attempts()
+        self.assert_application_failure(failed)
+        # The same execution and directory: the stale sidecar was not read as the retry's.
+        self.assertEqual(retried["execution_id"], failed["execution_id"])
+        self.assertEqual(
+            (retried["attempt_number"], retried["status"], retried["error_kind"]),
+            (2, "succeeded", None),
+        )
+        [execution] = self.sql("SELECT status FROM executions")
+        self.assertEqual(execution["status"], "succeeded")
+        self.assertEqual(len(self.sbatch_calls()), 2)
+
+    def test_unreadable_outcome_leaves_the_attempt_live_for_settling(self):
+        self.hpc.drop_ssh("nest-outcome")
+        record = self.execute(self.train)
+        self.assertEqual(record["message"], "CUDA error: device-side assert triggered")
+        [attempt] = self.attempts()
+        # Never recorded as succeeded; the reservation is kept until it is known.
+        self.assertEqual((attempt["status"], attempt["error_kind"]), ("submitted", None))
+        # The sweep cannot read it either: still live.
+        self.admission.settle(timedelta(0))
+        self.assertEqual(self.attempts()[0]["status"], "submitted")
+        (self.hpc.state / "ssh-fault.json").unlink()
+        self.admission.settle(timedelta(0))
+        [attempt] = self.attempts()
+        self.assert_application_failure(attempt)
+
+    def test_status_query_settles_a_completed_application_failure_as_failed(self):
+        self.record_nothing_on_completion()
+        self.execute(self.train)
+        [attempt] = self.attempts()
+        self.assertEqual(attempt["status"], "submitted")
+        state = self.stub.GetJobStatus(
+            execution_pb2.JobStatusRequest(job_id=attempt["slurm_job_id"]),
+            timeout=30,
+            metadata=self.metadata(),
+        )
+        self.assertEqual(state.state, "COMPLETED")
+        [attempt] = self.attempts()
+        self.assert_application_failure(attempt)
+
+    def test_worker_without_an_outcome_record_settles_as_succeeded(self):
+        # A worker that predates the sidecar: COMPLETED is a success, as before.
+        self.record_nothing_on_completion()
+        self.execute(self.train)
+        [attempt] = self.attempts()
+        self.outcome_file(attempt["execution_id"]).unlink()
+        self.admission.settle(timedelta(0))
+        [attempt] = self.attempts()
+        self.assertEqual(
+            (attempt["status"], attempt["slurm_state"], attempt["error_kind"]),
+            ("succeeded", "COMPLETED", None),
+        )
+
+    def test_invalid_outcome_record_fails_the_attempt(self):
+        self.record_nothing_on_completion()
+        self.execute()
+        [attempt] = self.attempts()
+        self.outcome_file(attempt["execution_id"]).write_bytes(b"\x80cloudpickle?")
+        self.admission.settle(timedelta(0))
+        [attempt] = self.attempts()
+        self.assertEqual(
+            (attempt["status"], attempt["slurm_state"], attempt["error_kind"]),
+            ("failed", "COMPLETED", "remote_outcome_invalid"),
+        )
+
+    def test_batch_jobs_complete_without_reading_an_outcome(self):
+        response = self.submit()
+        state = self.stub.GetJobStatus(
+            execution_pb2.JobStatusRequest(job_id=response.job_id),
+            timeout=30,
+            metadata=self.metadata(),
+        )
+        self.assertEqual(state.state, "COMPLETED")
+        [attempt] = self.attempts()
+        self.assertEqual((attempt["status"], attempt["error_kind"]), ("succeeded", None))
+        self.assertFalse(
+            any("nest-outcome" in " ".join(call["argv"]) for call in self.hpc.calls("ssh"))
+        )
+
+    def test_legacy_jobs_record_an_application_failure(self):
+        stub = self.serve(None)
+        response = stub.Execute(
+            execution_pb2.ExecuteRequest(payload=cloudpickle.dumps((self.train, (), {}))),
+            timeout=60,
+            metadata=self.metadata(),
+        )
+        record = cloudpickle.loads(response.result)
+        self.assertEqual(record["type"], "builtins.RuntimeError")
+        [job] = self.sql("SELECT status, error_kind, error_message FROM jobs")
+        self.assertEqual((job["status"], job["error_kind"]), ("failed", "remote_application_error"))
+        self.assertNotIn("device-side", job["error_message"])
 
 
 class DatabaseFailureTests(_Base):

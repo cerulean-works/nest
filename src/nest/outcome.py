@@ -1,0 +1,139 @@
+"""
+The worker's outcome sidecar: whether a remote call returned or raised.
+
+A remote call's result, `output.pkl`, is a cloudpickle stream of either the
+return value or a remote error record. The Controller must never unpickle it,
+since unpickling worker output runs code the caller controls. So next to it the
+worker writes `outcome.json`, a small plain-JSON record that says only whether
+the call returned or raised, and the qualified name of the exception type:
+
+    {"nest_outcome": 1, "status": "raised", "error_type": "builtins.RuntimeError"}
+
+The Controller reads it (bounded, through [`backends.slurm.SlurmBackend.read_outcome`])
+once Slurm reports `COMPLETED`, and records an application failure separately
+from a Slurm job failure. The exception message and traceback stay in
+`output.pkl`, delivered to the caller unchanged; they are never stored by the
+Controller.
+
+A job whose worker predates the sidecar writes none: its completion is recorded
+as before, as a success.
+
+This module needs only the standard library: `user_runner.py` loads it from the
+bootstrap directory inside the user's own interpreter.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+OUTCOME_FILE = "outcome.json"
+"""File name of the sidecar, in the execution directory next to `output.pkl`."""
+
+OUTCOME_VERSION = 1
+
+MAX_OUTCOME_BYTES = 1024
+"""Largest sidecar the Controller reads; a larger one is invalid."""
+
+RETURNED = "returned"
+RAISED = "raised"
+
+_MAX_ERROR_TYPE = 256
+# A module path and qualified name, such as `torch.cuda.OutOfMemoryError` or
+# `__main__.train.<locals>.Boom`.
+_ERROR_TYPE = re.compile(r"[A-Za-z_][\w.<>-]{0,255}")
+
+
+class InvalidOutcomeError(ValueError):
+    """The sidecar exists but is not a valid outcome record."""
+
+
+@dataclass(frozen=True)
+class RemoteOutcome:
+    """
+    What the worker reported about a call.
+
+    Attributes:
+        status (`str`): `returned` or `raised`.
+        error_type (`str | None`): The exception's qualified type when `raised`.
+    """
+
+    status: str
+    error_type: str | None = None
+
+    @property
+    def raised(self) -> bool:
+        return self.status == RAISED
+
+
+def error_type_of(exc: BaseException) -> str:
+    """The qualified name of `exc`'s type, as the remote error record names it."""
+    return f"{type(exc).__module__}.{type(exc).__qualname__}"
+
+
+def _path(job_dir: Path | str) -> Path:
+    return Path(job_dir) / OUTCOME_FILE
+
+
+def clear(job_dir: Path | str) -> None:
+    """Removes a sidecar left by an earlier attempt in the same directory."""
+    try:
+        _path(job_dir).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def write(job_dir: Path | str, status: str, error_type: str | None = None) -> None:
+    """
+    Writes the sidecar atomically, after the result file it describes, so a
+    reader sees either no sidecar or a complete one.
+    """
+    if status not in (RETURNED, RAISED):
+        raise ValueError(f"Unknown outcome status {status!r}")
+    record: dict[str, object] = {"nest_outcome": OUTCOME_VERSION, "status": status}
+    if status == RAISED:
+        name = (error_type or "")[:_MAX_ERROR_TYPE]
+        record["error_type"] = name if _ERROR_TYPE.fullmatch(name) else "unknown"
+    path = _path(job_dir)
+    partial = path.with_name(f".{OUTCOME_FILE}.{os.getpid()}.tmp")
+    with partial.open("w", encoding="utf-8") as f:
+        json.dump(record, f, separators=(",", ":"))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(partial, path)
+
+
+def parse(data: bytes) -> RemoteOutcome:
+    """
+    Parses a sidecar's bytes strictly.
+
+    Raises:
+        [`outcome.InvalidOutcomeError`]: If it is too large, not UTF-8 JSON, of
+            another version, or not exactly one of the two record shapes.
+    """
+    if len(data) > MAX_OUTCOME_BYTES:
+        raise InvalidOutcomeError(f"The outcome record exceeds {MAX_OUTCOME_BYTES} bytes")
+    try:
+        record = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise InvalidOutcomeError("The outcome record is not valid JSON") from exc
+    if not isinstance(record, dict):
+        raise InvalidOutcomeError("The outcome record is not a JSON object")
+    version = record.get("nest_outcome")
+    if type(version) is not int or version != OUTCOME_VERSION:
+        raise InvalidOutcomeError(f"Unsupported outcome record version {version!r}")
+    status = record.get("status")
+    if status == RETURNED and set(record) == {"nest_outcome", "status"}:
+        return RemoteOutcome(RETURNED)
+    error_type = record.get("error_type")
+    if (
+        status == RAISED
+        and set(record) == {"nest_outcome", "status", "error_type"}
+        and isinstance(error_type, str)
+        and (error_type == "unknown" or _ERROR_TYPE.fullmatch(error_type))
+    ):
+        return RemoteOutcome(RAISED, error_type)
+    raise InvalidOutcomeError("The outcome record has an unexpected shape")

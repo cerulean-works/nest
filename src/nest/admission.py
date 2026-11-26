@@ -27,6 +27,16 @@ have run but no job ID arrived (it is never resubmitted; see
 [`db.ExecutionRegistry.reconcile`]), and `running`, `succeeded`, `failed` or
 `cancelled` as Slurm reports it.
 
+A remote call whose function raised still completes in Slurm (`COMPLETED`): the
+worker returns the remote error record as its result. Its attempt is recorded as
+`failed` with `slurm_state` `COMPLETED` and error kind `remote_application_error`
+(see [`admission.completion`]), decided from the worker's plain-JSON outcome
+sidecar ([`outcome`]), never by unpickling the result; the execution stays open
+for a retry. Every path that settles a `COMPLETED` job (`Execute`,
+[`admission.RegistryAdmission.observe`] for `GetJobStatus`, and
+[`admission.RegistryAdmission.settle`]) decides the same way, so none of them
+records an application failure as a success.
+
 Mode B: Nest has no verified per-User HPC binding or per-User transport yet. The
 default [`admission.ControllerIdentitySource`] therefore refuses every Mode B
 submission (`hpc_binding_unavailable`), and even a verified binding is refused at
@@ -74,6 +84,7 @@ from .backends.slurm import (
 from .config import AdmissionLimits, PlatformProfile, slurm_time_seconds
 from .db.connection import Database, DatabaseError
 from .db.executions import (
+    FINAL_ATTEMPT_STATUSES,
     AccountNotPermittedError,
     AdmissionLimitError,
     Attempt,
@@ -105,6 +116,7 @@ from .errors import (
     SlurmJobError,
     SubmissionUnknownError,
 )
+from .outcome import InvalidOutcomeError, RemoteOutcome
 
 logger = get_logger("nest.admission")
 
@@ -119,8 +131,56 @@ __all__ = [
     "RegistryAdmission",
     "SubmissionRequest",
     "TrustedHPCIdentity",
+    "completion",
     "digest",
 ]
+
+REMOTE_APPLICATION_ERROR = "remote_application_error"
+"""Error kind of an attempt whose job completed but whose function raised."""
+
+REMOTE_OUTCOME_INVALID = "remote_outcome_invalid"
+"""Error kind of an attempt whose job completed with an unreadable outcome record."""
+
+
+def completion(
+    remote: RemoteOutcome | InvalidOutcomeError | None,
+) -> tuple[str, str | None, str | None]:
+    """
+    How a job Slurm reports `COMPLETED` settles, from the worker's outcome sidecar.
+
+    Args:
+        remote: The parsed sidecar; `None` when the worker wrote none (a worker
+            that predates it, or a batch job); or the
+            [`outcome.InvalidOutcomeError`] raised parsing it.
+
+    Returns:
+        `tuple`: `(status, error_kind, error_message)`. `succeeded` when the call
+            returned or no sidecar exists, as before the sidecar; `failed` with
+            `remote_application_error` when it raised, or `remote_outcome_invalid`
+            when the record is malformed. A failed attempt leaves its execution open
+            for a retry. The message names only the exception type: the exception
+            message and traceback are the caller's and stay in the result.
+    """
+    if isinstance(remote, InvalidOutcomeError):
+        return (
+            "failed",
+            REMOTE_OUTCOME_INVALID,
+            (
+                f"The job completed, but its outcome record is invalid ({remote}); the "
+                "result was returned to the caller unchanged"
+            ),
+        )
+    if remote is not None and remote.raised:
+        return (
+            "failed",
+            REMOTE_APPLICATION_ERROR,
+            (
+                f"The remote function raised {remote.error_type}; the job completed and "
+                "the traceback was returned to the caller"
+            ),
+        )
+    return "succeeded", None, None
+
 
 _ACCOUNT_DEFAULT_SOURCES = {
     "project_default": "project",
@@ -902,13 +962,53 @@ class RegistryAdmission:
 
     def succeeded(self, admission: Admission, *, output_ref: str | None = None) -> None:
         """Records that the job completed and its result was received."""
+        self.completed(admission, None, output_ref=output_ref)
+
+    def completed(
+        self,
+        admission: Admission,
+        remote: RemoteOutcome | InvalidOutcomeError | None,
+        *,
+        output_ref: str | None = None,
+    ) -> None:
+        """
+        Records that the job completed and its result was received, settled by
+        [`admission.completion`] from the worker's outcome sidecar.
+        """
+        status, error_kind, message = completion(remote)
+        if status == "failed":
+            logger.info(
+                "Remote call raised execution_id=%s error_kind=%s",
+                admission.execution_id,
+                error_kind,
+            )
         self._write(
-            "succeeded",
+            status,
             admission,
             lambda: self.registry.finish_attempt(
-                admission.attempt.id, "succeeded", slurm_state="COMPLETED", output_ref=output_ref
+                admission.attempt.id,
+                status,
+                slurm_state="COMPLETED",
+                output_ref=output_ref,
+                error_kind=error_kind,
+                error_message=message,
             ),
         )
+
+    def read_outcome(
+        self, backend: SlurmBackend, execution_id: str
+    ) -> RemoteOutcome | InvalidOutcomeError | None:
+        """
+        Reads a completed execution's outcome sidecar for [`admission.completion`].
+
+        Raises:
+            [`errors.InfrastructureError`]: If it cannot be read; the attempt must
+                then be left as it is, since its outcome is unknown.
+        """
+        try:
+            return backend.read_outcome(backend.execution_dir(execution_id))
+        except InvalidOutcomeError as exc:
+            return exc
 
     def failed(self, admission: Admission, exc: Exception, *, submitted: bool) -> None:
         """
@@ -994,14 +1094,21 @@ class RegistryAdmission:
         return self.registry.job_owner(self.platform_id, slurm_job_id)
 
     def observe(self, record: Mapping[str, Any], state: str) -> None:
-        """Applies a Slurm state seen by a job status query to the attempt."""
+        """
+        Applies a Slurm state seen by a job status query to the attempt.
+
+        `COMPLETED` settles an `execution` attempt only once its outcome sidecar
+        has been read (see [`admission.completion`]); when it cannot be read, the
+        attempt is left as it is for a later query or sweep, never recorded as
+        `succeeded`. A `batch` job has no sidecar: `COMPLETED` is a success.
+        """
         attempt_id = record["attempt_id"]
         base = state.split()[0] if state else ""
         try:
             if base in _RUNNING_STATES:
                 self.registry.record_running(attempt_id, slurm_state=base)
             elif base == "COMPLETED":
-                self.registry.finish_attempt(attempt_id, "succeeded", slurm_state=base)
+                self._observe_completed(record)
             elif base.startswith("CANCELLED"):
                 self.registry.finish_attempt(attempt_id, "cancelled", slurm_state=base)
             elif base in _FAILED_STATES:
@@ -1012,6 +1119,35 @@ class RegistryAdmission:
             pass  # Already final, or moved on: the earlier record stands.
         except DatabaseError as exc:
             logger.error("Execution attempt state update failed attempt_id=%s: %s", attempt_id, exc)
+
+    def _observe_completed(self, record: Mapping[str, Any]) -> None:
+        attempt_id = record["attempt_id"]
+        if record.get("status") in FINAL_ATTEMPT_STATUSES:
+            return  # Already settled; nothing to read.
+        execution_id = record.get("execution_id")
+        kind = record.get("kind")
+        if execution_id is not None and kind is None:
+            kind = self.registry.kind_of(execution_id)
+        remote: RemoteOutcome | InvalidOutcomeError | None = None
+        if kind == "execution" and execution_id is not None:
+            try:
+                remote = self.read_outcome(self.backend, execution_id)
+            except InfrastructureError as exc:
+                logger.warning(
+                    "Completed attempt not settled; its outcome record could not be read "
+                    "attempt_id=%s kind=%s",
+                    attempt_id,
+                    exc.kind,
+                )
+                return
+        status, error_kind, message = completion(remote)
+        self.registry.finish_attempt(
+            attempt_id,
+            status,
+            slurm_state="COMPLETED",
+            error_kind=error_kind,
+            error_message=message,
+        )
 
     # Recovery -----------------------------------------------------------------
 
@@ -1069,7 +1205,7 @@ class RegistryAdmission:
                     exc.kind,
                 )
                 continue
-            self.observe({"attempt_id": attempt.id}, state)
+            self.observe({"attempt_id": attempt.id, "execution_id": attempt.execution_id}, state)
         return len(candidates)
 
     def recover(self, older_than: timedelta) -> list[Attempt]:

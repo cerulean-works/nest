@@ -10,6 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from .. import outcome
 from .._logging import current_request_id, get_logger, operation
 from ..config import DEFAULT_PARTITION, child_environ, load_log_level
 from ..errors import (
@@ -942,7 +943,9 @@ class SlurmBackend:
     @operation(logger, "Slurm stage_payload")
     def stage_payload(self, payload: bytes, execution_id: str | None = None) -> str:
         """
-        Uploads a payload as `input.pkl` in a new remote execution directory.
+        Uploads a payload as `input.pkl` in a new remote execution directory, and
+        removes any outcome sidecar an earlier attempt left there, so it is never
+        read as this attempt's.
 
         Args:
             payload (`bytes`): Serialized function and arguments.
@@ -967,7 +970,11 @@ class SlurmBackend:
             len(payload),
         )
 
-        command = f"mkdir -p {shlex.quote(job_dir)} && cat > {shlex.quote(input_path)}"
+        outcome_path = f"{job_dir}/{outcome.OUTCOME_FILE}"
+        command = (
+            f"mkdir -p {shlex.quote(job_dir)} && rm -f {shlex.quote(outcome_path)} && "
+            f"cat > {shlex.quote(input_path)}"
+        )
         self._ssh(command, input=payload)
         return job_dir
 
@@ -1304,6 +1311,42 @@ class SlurmBackend:
 
         logger.debug("Result downloaded job_id=%s result_bytes=%s", job_id, len(result))
         return result
+
+    _OUTCOME_PRESENT = b"nest-outcome-present\n"
+    _OUTCOME_ABSENT = b"nest-outcome-absent\n"
+
+    def read_outcome(self, job_dir: str) -> outcome.RemoteOutcome | None:
+        """
+        Reads a completed worker's outcome sidecar (`outcome.json`) over SSH, at most
+        [`outcome.MAX_OUTCOME_BYTES`] of it, and parses it as plain JSON. The
+        result file is never read or unpickled here.
+
+        Args:
+            job_dir (`str`): Remote execution directory, as returned by
+                [`backends.slurm.SlurmBackend.submit_payload`] or
+                [`backends.slurm.SlurmBackend.execution_dir`].
+
+        Returns:
+            [`outcome.RemoteOutcome`] or `None`: `None` when the worker wrote no
+                sidecar, as a worker that predates it does.
+
+        Raises:
+            [`outcome.InvalidOutcomeError`]: If the sidecar is not a valid record.
+            [`errors.SSHError`], [`errors.RemoteCommandError`],
+            [`errors.SSHTimeoutError`]: If it cannot be read; the outcome is unknown.
+        """
+        path = shlex.quote(f"{job_dir}/{outcome.OUTCOME_FILE}")
+        present = self._OUTCOME_PRESENT.decode().strip()
+        absent = self._OUTCOME_ABSENT.decode().strip()
+        data = self._ssh(
+            f"if [ -f {path} ]; then echo {present} && head -c {outcome.MAX_OUTCOME_BYTES + 1} "
+            f"{path}; else echo {absent}; fi"
+        )
+        if data == self._OUTCOME_ABSENT:
+            return None
+        if not data.startswith(self._OUTCOME_PRESENT):
+            raise RemoteCommandError("Unexpected reply while reading the worker's outcome record")
+        return outcome.parse(data[len(self._OUTCOME_PRESENT) :])
 
     def stage_environment_files(self, project_dir: str) -> str:
         """
