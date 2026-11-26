@@ -17,7 +17,7 @@ Leave `NEST_DATABASE_URL` unset. The startup log shows `auth=none database=none`
 In another terminal, clear any shared-Controller settings and call it:
 
 ```bash
-unset NEST_CONTROLLER_ADDRESS NEST_CONTROLLER_TLS NEST_AUTH_URL NEST_PROJECT_ID
+unset NEST_PROFILE NEST_CONTROLLER_ADDRESS NEST_CONTROLLER_TLS NEST_AUTH_URL NEST_PROJECT_ID
 uv run python main.py
 ```
 
