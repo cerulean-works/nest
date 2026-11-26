@@ -70,7 +70,11 @@ user-owned Mode B).
 for the HPC password and MFA on the user's terminal, never through Nest, and
 reuses the authenticated connection through a private control socket. It reads
 no SSH configuration file, checks host keys strictly against operator-distributed
-pins, disables agent and port forwarding, and takes no private key. The
+pins, and disables agent and port forwarding. It authenticates only with the
+user's password and keyboard-interactive (MFA) answers: public keys (including
+default `~/.ssh/id_*` files), the SSH agent, GSSAPI and host-based authentication
+are disabled, and `SSH_AUTH_SOCK` is not passed to `ssh`, so it cannot log in
+with an identity the running process happens to have. The
 Controller does not use it: the opaque Controller relay and user-owned
 submission are separate, later work.
 

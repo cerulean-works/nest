@@ -214,6 +214,16 @@ class LocalOpenSSHContractTests(_FakeHpcContract, unittest.TestCase):
         self.assertIn("ForwardAgent=no", options)
         self.assertIn("ControlMaster=auto", options)
         self.assertNotIn("BatchMode=yes", options)  # OpenSSH may prompt for password/MFA
+        for option in (
+            "PreferredAuthentications=keyboard-interactive,password",
+            "PubkeyAuthentication=no",
+            "IdentitiesOnly=yes",
+            "IdentityFile=none",
+            "IdentityAgent=none",
+            "HostbasedAuthentication=no",
+            "GSSAPIAuthentication=no",
+        ):
+            self.assertIn(option, options)  # never an ambient key, agent or ticket
         self.assertNotIn("-i", argv)
         self.assertEqual(argv[argv.index("-l") + 1], "alice")
         self.assertEqual(self.backend.capabilities.execution_authority, "user_owned")
@@ -385,18 +395,34 @@ class CredentialIsolationTests(unittest.TestCase):
             with self.subTest(user=user), self.assertRaises(ValueError):
                 LocalOpenSSHTransport("login", user, "/pins")
 
-    def test_local_openssh_environment_drops_nest_secrets(self):
+    def test_local_openssh_environment_drops_nest_secrets_and_the_agent(self):
         transport = self.local(has_terminal=lambda: True, control_dir=tempfile.mkdtemp())
+        agent = {"SSH_AUTH_SOCK": "/run/agent.sock", "SSH_AGENT_PID": "42"}
         with (
-            mock.patch.dict(os.environ, {"NEST_DATABASE_PASSWORD": "s3cret"}),
+            mock.patch.dict(os.environ, {"NEST_DATABASE_PASSWORD": "s3cret", **agent}),
             mock.patch(
                 "nest.backends.transport.subprocess.run",
                 return_value=mock.Mock(returncode=0, stdout=b"", stderr=b""),
             ) as run,
         ):
             transport.run("true")
-        env = run.call_args.kwargs["env"]
-        self.assertNotIn("NEST_DATABASE_PASSWORD", env)
+        for call in run.call_args_list:  # the -O check, the login and the command
+            env = call.kwargs["env"]
+            self.assertNotIn("NEST_DATABASE_PASSWORD", env)
+            self.assertNotIn("SSH_AUTH_SOCK", env)
+            self.assertNotIn("SSH_AGENT_PID", env)
+
+    def test_controller_ssh_keeps_the_operators_agent(self):
+        transport = ControllerSSHTransport(_config())
+        with (
+            mock.patch.dict(os.environ, {"SSH_AUTH_SOCK": "/run/agent.sock"}),
+            mock.patch(
+                "nest.backends.transport.subprocess.run",
+                return_value=mock.Mock(returncode=0, stdout=b"", stderr=b""),
+            ) as run,
+        ):
+            transport.run("true")
+        self.assertEqual(run.call_args.kwargs["env"]["SSH_AUTH_SOCK"], "/run/agent.sock")
 
     def test_for_endpoint_keeps_the_transport_and_identity(self):
         backend = SlurmBackend(
@@ -457,6 +483,17 @@ class LocalSessionLifecycleTests(unittest.TestCase):
         line = next(l for l in resolved.splitlines() if l.startswith("controlpath "))
         self.assertTrue(line.split(" ", 1)[1].startswith(transport.control_dir + "/"))
         self.assertLessEqual(len(line.split(" ", 1)[1]) + 17, 103)
+        settings = [l.split(" ", 1) for l in resolved.splitlines() if " " in l]
+        resolved_values = {key: value for key, value in settings}
+        # OpenSSH prints this option as "false" (9.x) or "no".
+        self.assertIn(resolved_values["pubkeyauthentication"], ("no", "false"))
+        self.assertEqual(
+            resolved_values["preferredauthentications"], "keyboard-interactive,password"
+        )
+        self.assertEqual(resolved_values["identityagent"], "none")
+        self.assertEqual(resolved_values["gssapiauthentication"], "no")
+        identity_files = [value for key, value in settings if key == "identityfile"]
+        self.assertFalse([f for f in identity_files if f != "none"])  # no ~/.ssh/id_* keys
 
     def calls_with(self, connected: bool, login=None):
         transport = self.local(has_terminal=lambda: True, timeout=7, login_timeout=99)

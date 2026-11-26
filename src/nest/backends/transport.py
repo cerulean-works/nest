@@ -263,6 +263,10 @@ class _OpenSSHTransport(SlurmTransport):
         """The `ssh` command line, without the remote command."""
         raise NotImplementedError
 
+    def _environ(self) -> dict[str, str]:
+        """The environment `ssh` runs with: never Nest credentials."""
+        return child_environ()
+
     def _process(
         self, command: str, input: bytes | None = None
     ) -> subprocess.CompletedProcess[bytes]:
@@ -278,7 +282,7 @@ class _OpenSSHTransport(SlurmTransport):
             check=False,
             # Never hand Nest credentials to ssh, where a SendEnv setting could
             # forward them to the Login Node.
-            env=child_environ(),
+            env=self._environ(),
             input=input,
             capture_output=True,
             timeout=self.timeout,
@@ -318,7 +322,7 @@ class _OpenSSHTransport(SlurmTransport):
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=child_environ(),
+            env=self._environ(),
         )
         assert process.stdout is not None and process.stderr is not None
         out_fd, err_fd = process.stdout.fileno(), process.stderr.fileno()
@@ -472,8 +476,11 @@ class LocalOpenSSHTransport(_OpenSSHTransport):
     terminal, never through Nest, and one authenticated connection is reused for
     later commands through a private OpenSSH control socket. No SSH configuration
     file is read, host keys are checked strictly against operator-distributed pins,
-    and agent and port forwarding are disabled. It takes no private key and never
-    sees Controller credentials.
+    and agent and port forwarding are disabled. Only the user's password and
+    keyboard-interactive (MFA) answers authenticate: public keys, including the
+    running process's default `~/.ssh/id_*` keys, the SSH agent, GSSAPI and
+    host-based authentication are disabled, so it can never log in with an
+    identity it happens to find, such as a Controller service account's.
 
     Before the first command, [`backends.transport.LocalOpenSSHTransport.login`]
     authenticates with OpenSSH's own messages (the server banner,
@@ -577,6 +584,23 @@ class LocalOpenSSHTransport(_OpenSSHTransport):
             "ClearAllForwardings=yes",
             "-o",
             "PermitLocalCommand=no",
+            # Only the user's own password and keyboard-interactive (MFA) answers
+            # authenticate: never keys, an agent, Kerberos or host-based identity
+            # that the running process happens to have.
+            "-o",
+            "PreferredAuthentications=keyboard-interactive,password",
+            "-o",
+            "PubkeyAuthentication=no",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "IdentityFile=none",
+            "-o",
+            "IdentityAgent=none",
+            "-o",
+            "HostbasedAuthentication=no",
+            "-o",
+            "GSSAPIAuthentication=no",
             "-o",
             "ControlMaster=auto",
             "-o",
@@ -594,10 +618,21 @@ class LocalOpenSSHTransport(_OpenSSHTransport):
         Builds the interactive SSH command line, without the remote command.
 
         Unlike the Controller's SSH, there is no `BatchMode`, so OpenSSH can ask the
-        user for the password and MFA on their terminal, and no `-i`: no key is
-        handed to it.
+        user for the password and MFA on their terminal. Only keyboard-interactive
+        and password authentication are allowed: public keys (default
+        `~/.ssh/id_*` files included), the SSH agent, GSSAPI and host-based
+        authentication are all disabled.
         """
         return [*self._base_argv(), self.target]
+
+    _AGENT_VARIABLES = ("SSH_AUTH_SOCK", "SSH_AGENT_PID")
+    """Agent variables never passed to the user's `ssh`."""
+
+    def _environ(self) -> dict[str, str]:
+        env = child_environ()
+        for name in self._AGENT_VARIABLES:
+            env.pop(name, None)
+        return env
 
     def connected(self) -> bool:
         """Whether an authenticated connection is open for reuse (`ssh -O check`)."""
@@ -607,7 +642,7 @@ class LocalOpenSSHTransport(_OpenSSHTransport):
             result = subprocess.run(
                 [*self._base_argv(), "-O", "check", self.target],
                 check=False,
-                env=child_environ(),
+                env=self._environ(),
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 timeout=self.timeout,
@@ -638,7 +673,7 @@ class LocalOpenSSHTransport(_OpenSSHTransport):
             result = subprocess.run(
                 [*self.ssh_argv(), "true"],
                 check=False,
-                env=child_environ(),
+                env=self._environ(),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=None,
@@ -681,7 +716,7 @@ class LocalOpenSSHTransport(_OpenSSHTransport):
             subprocess.run(
                 [*self._base_argv(), "-O", "exit", self.target],
                 check=False,
-                env=child_environ(),
+                env=self._environ(),
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 timeout=self.timeout,
