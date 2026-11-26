@@ -409,14 +409,19 @@ class ExchangeTests(_Base):
         with self.assertRaises(psycopg.errors.IntegrityConstraintViolation):
             self.sql("DELETE FROM workload_token_uses WHERE jti = 'inside-margin'")
 
-    def hold_principal_lock(self) -> threading.Event:
+    def hold_principal_lock(self) -> tuple[threading.Event, int]:
         """Holds the principal's row lock from another connection until the returned
-        event is set, so an exchange started meanwhile waits for it. Released and
-        joined at cleanup even if the test fails."""
+        event is set, so an exchange started meanwhile waits for it. Returns the
+        event and the holder's backend PID. Released at cleanup before any
+        background exchange is joined (see `in_background`)."""
         held, release = threading.Event(), threading.Event()
+        pid: dict[str, int] = {}
 
         def hold():
             with connect(self.url) as conn, conn.transaction():
+                row = conn.execute("SELECT pg_backend_pid()").fetchone()
+                assert row is not None
+                pid["holder"] = row[0]
                 conn.execute(
                     "SELECT 1 FROM service_principals WHERE id = %s FOR UPDATE",
                     (self.principal.id,),
@@ -426,13 +431,23 @@ class ExchangeTests(_Base):
 
         thread = threading.Thread(target=hold, daemon=True)
         thread.start()
+        self.keep_released(release, thread)
+        self.assertTrue(held.wait(10), "the lock holder never took the lock")
+        return release, pid["holder"]
+
+    def keep_released(self, release: threading.Event, thread: threading.Thread) -> None:
+        """Registers a lock holder or writer: released and joined at cleanup."""
+        if not hasattr(self, "_releases"):
+            self._releases: list[threading.Event] = []
+        self._releases.append(release)
         self.addCleanup(thread.join, 30)
         self.addCleanup(release.set)
-        self.assertTrue(held.wait(10), "the lock holder never took the lock")
-        return release
 
     def in_background(self, call) -> tuple[threading.Thread, dict[str, Any]]:
-        """Runs `call` in a thread; its result or exception lands in the dict."""
+        """Runs `call` in a thread; its result or exception lands in the dict. At
+        cleanup, which runs before the holders' own, every registered holder and
+        writer is released first, then this thread is joined and must have
+        stopped, so no exchange is left on a database being dropped."""
         outcome: dict[str, Any] = {}
 
         def run():
@@ -443,22 +458,40 @@ class ExchangeTests(_Base):
 
         thread = threading.Thread(target=run, daemon=True)
         thread.start()
-        self.addCleanup(thread.join, 30)
+
+        def stop():
+            for release in getattr(self, "_releases", []):
+                release.set()
+            thread.join(30)
+            self.assertFalse(thread.is_alive(), "a background exchange never stopped")
+
+        self.addCleanup(stop)
         return thread, outcome
 
-    def wait_until_blocked(self, query_prefix: str) -> None:
-        """Waits until a backend running a query starting with `query_prefix` is
-        waiting on a lock, so the test knows the exchange is blocked there."""
-        for _ in range(400):
+    def blocked_by(self, blocker_pid: int, query_prefix: str, timeout: float = 10.0) -> bool:
+        """
+        Whether, within `timeout`, a backend of this test's database running a
+        query starting with `query_prefix` waits on a lock held by `blocker_pid`:
+        this test's own holder or writer. Another test's waiter, in another
+        database or behind another blocker, never counts.
+        """
+        give_up = time.monotonic() + timeout
+        while time.monotonic() < give_up:
             [(waiting,)] = self.sql(
                 "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
-                "AND pid <> pg_backend_pid() AND wait_event_type = 'Lock' AND query LIKE %s",
+                "AND pid <> pg_backend_pid() AND wait_event_type = 'Lock' AND query LIKE %s "
+                "AND %s = ANY (pg_blocking_pids(pid))",
                 query_prefix + "%",
+                blocker_pid,
             )
             if waiting:
-                return
+                return True
             time.sleep(0.025)
-        self.fail(f"no backend ever waited on a lock in {query_prefix!r}")
+        return False
+
+    def require_blocked(self, blocker_pid: int, query_prefix: str, timeout: float = 10.0) -> None:
+        if not self.blocked_by(blocker_pid, query_prefix, timeout):
+            self.fail(f"the exchange never waited on {blocker_pid} in {query_prefix!r}")
 
     @staticmethod
     def sleep_past(deadline: datetime) -> None:
@@ -489,14 +522,14 @@ class ExchangeTests(_Base):
             verified.set()
             return dataclasses.replace(claims, expires_at=deadline["at"] - timedelta(seconds=60))
 
-        release = self.hold_principal_lock()
+        release, holder = self.hold_principal_lock()
         with unittest.mock.patch.object(verifier, "verify", verify_then_set_deadline):
             thread, outcome = self.in_background(
                 lambda: self.exchanger.exchange(token, str(self.principal.id))
             )
             try:
                 self.assertTrue(verified.wait(verification_delay + 10), "not verified")
-                self.wait_until_blocked("SELECT id, name, description, status")
+                self.require_blocked(holder, "SELECT id, name, description, status")
                 self.assertLess(datetime.now(UTC), deadline["at"], "blocked too late")
                 self.sleep_past(deadline["at"])
             finally:
@@ -522,11 +555,11 @@ class ExchangeTests(_Base):
         self.lock_wait_expiry(verification_delay=6)
 
     def test_issuance_uses_the_clock_after_the_lock_wait(self):
-        release = self.hold_principal_lock()
+        release, holder = self.hold_principal_lock()
         started = datetime.now(UTC)
         thread, outcome = self.in_background(self.exchange)
         try:
-            self.wait_until_blocked("SELECT id, name, description, status")
+            self.require_blocked(holder, "SELECT id, name, description, status")
             time.sleep(2.0)
         finally:
             release.set()
@@ -564,9 +597,13 @@ class ExchangeTests(_Base):
             **OPS,
         )
         holding, release = threading.Event(), threading.Event()
+        writer_pid: dict[str, int] = {}
 
         def writer():
             with connect(self.url) as conn, conn.transaction(force_rollback=True):
+                row = conn.execute("SELECT pg_backend_pid()").fetchone()
+                assert row is not None
+                writer_pid["pid"] = row[0]
                 conn.execute(
                     "INSERT INTO workload_token_uses (issuer, jti, service_principal_id, "
                     "trust_policy_id, token_expires_at) VALUES (%s, 'contended', %s, %s, "
@@ -578,8 +615,7 @@ class ExchangeTests(_Base):
 
         writer_thread = threading.Thread(target=writer, daemon=True)
         writer_thread.start()
-        self.addCleanup(writer_thread.join, 30)
-        self.addCleanup(release.set)
+        self.keep_released(release, writer_thread)
         self.assertTrue(holding.wait(10), "the writer never inserted")
         deadline = datetime.now(UTC) + timedelta(seconds=10)
 
@@ -604,7 +640,9 @@ class ExchangeTests(_Base):
         # now blocked on the unique index; only after the deadline does the writer
         # roll back.
         try:
-            self.wait_until_blocked("INSERT INTO workload_token_uses")
+            # Blocked on the index entry of this test's own writer: past the advisory
+            # lock and the pre-insert deadline check, which precede the insert.
+            self.require_blocked(writer_pid["pid"], "INSERT INTO workload_token_uses")
             self.assertLess(datetime.now(UTC), deadline, "blocked too late")
             self.sleep_past(deadline)
         finally:
@@ -614,6 +652,60 @@ class ExchangeTests(_Base):
         self.assertEqual(outcome.get("result"), "expired", outcome)
         self.assertEqual(self.sql("SELECT count(*) FROM workload_token_uses"), [(0,)])
         self.assertEqual(self.sql("SELECT count(*) FROM service_sessions"), [(0,)])
+
+    def test_the_lock_wait_barrier_ignores_unrelated_waiters(self):
+        """The barrier the deadline tests rely on accepts only a waiter blocked by
+        this test's own holder: an unrelated backend waiting on a lock with a
+        matching query does not pass it. A failed barrier still releases the holder
+        and stops the background exchange."""
+        release, holder = self.hold_principal_lock()
+        # An unrelated waiter: blocked on another row, behind another holder, with a
+        # query that matches the barrier's prefix.
+        other = self.store.create_principal("nest-unrelated", **OPS)
+        other_held, other_release = threading.Event(), threading.Event()
+        other_pid: dict[str, int] = {}
+
+        def other_holder():
+            with connect(self.url) as conn, conn.transaction():
+                row = conn.execute("SELECT pg_backend_pid()").fetchone()
+                assert row is not None
+                other_pid["pid"] = row[0]
+                conn.execute(
+                    "SELECT 1 FROM service_principals WHERE id = %s FOR UPDATE", (other.id,)
+                )
+                other_held.set()
+                other_release.wait(60)
+
+        holder_thread = threading.Thread(target=other_holder, daemon=True)
+        holder_thread.start()
+        self.keep_released(other_release, holder_thread)
+        self.assertTrue(other_held.wait(10))
+        waiter, _ = self.in_background(
+            lambda: self.sql(
+                "SELECT id, name, description, status FROM service_principals "
+                "WHERE id = %s FOR UPDATE",
+                other.id,
+            )
+        )
+        # Positive control: the unrelated waiter really is waiting, on its holder.
+        self.assertTrue(self.blocked_by(other_pid["pid"], "SELECT id, name, description, status"))
+        # It is waiting, but not on this test's holder: the barrier does not pass.
+        self.assertFalse(
+            self.blocked_by(holder, "SELECT id, name, description, status", timeout=1.0)
+        )
+        # A forced barrier failure: the holder is released and the paused exchange
+        # stops; nothing is left running.
+        thread, outcome = self.in_background(self.exchange)
+        try:
+            with self.assertRaises(AssertionError):
+                self.require_blocked(0, "SELECT id, name, description, status", timeout=1.0)
+        finally:
+            release.set()
+            other_release.set()
+            thread.join(30)
+            waiter.join(30)
+        self.assertFalse(thread.is_alive())
+        self.assertNotIn("error", outcome)
 
     def test_a_pruned_jti_past_its_deadline_is_never_recorded_again(self):
         self.backdated_use("pruned-jti", 120)
