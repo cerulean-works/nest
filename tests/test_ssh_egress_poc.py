@@ -496,6 +496,31 @@ class EgressProbeTests(unittest.TestCase):
                 self.assertFalse(key["ok"])
                 self.assertEqual(key["detail"], "no key observed at this address")
 
+    def test_an_approved_address_left_untested_blocks_acceptance(self):
+        with FixtureServer() as fixture:
+            code, records = probe(
+                "--host", "ln.example", "--port", str(fixture.port),
+                "--allowed-port", str(fixture.port), "--fixture",
+                "--approved-address", "127.0.0.1", "--approved-address", "127.0.0.2",
+                resolver=lambda h, p: ["127.0.0.1"],
+            )  # fmt: skip
+        summary = records[-1]
+        self.assertEqual(code, 0)
+        self.assertEqual(summary["addresses_tested"], ["127.0.0.1"])
+        self.assertIn("approved address(es) not tested: 127.0.0.2", summary["acceptance_blockers"])
+
+    def test_live_run_refuses_a_substitute_keyscan_command(self):
+        resolved = []
+        code, records = probe(
+            "--host", "ln.example", "--approved-address", PUBLIC_V4,
+            "--context", "controller-namespace", "--keyscan",
+            "--keyscan-command", "/bin/true",
+            resolver=lambda h, p: resolved.append(h) or [PUBLIC_V4],
+        )  # fmt: skip
+        self.assertEqual((code, records[0]["check"]), (1, "arguments"))
+        self.assertIn("--keyscan-command", records[0]["detail"])
+        self.assertEqual(resolved, [])
+
     def test_summary_records_where_it_ran(self):
         with FixtureServer() as fixture:
             code, records = probe(

@@ -197,6 +197,7 @@ def run(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, resolver
     context = "fixture" if args.fixture else args.context
     failures = 0
     tested: list[str] = []
+    approved: set[IPAddress] = set()
 
     def report(check: str, ok: bool, **fields: Any) -> None:
         nonlocal failures
@@ -212,6 +213,9 @@ def run(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, resolver
             blockers.append("not run in the Controller's network namespace")
         if not scanned:
             blockers.append("no built-in --keyscan against every tested address")
+        untested = sorted(approved - {ipaddress.ip_address(a) for a in tested}, key=str)
+        if untested:
+            blockers.append("approved address(es) not tested: " + ",".join(map(str, untested)))
         if failures:
             blockers.append("a check failed")
         record = {
@@ -238,6 +242,9 @@ def run(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, resolver
             raise ValueError("a live run needs the operator-approved --approved-address set")
         if not args.fixture and context is None:
             raise ValueError("a live run needs --context (where the probe runs)")
+        if not args.fixture and args.keyscan_command != "ssh-keyscan":
+            raise ValueError("--keyscan-command is a fixture hook; a live run uses ssh-keyscan")
+        approved = {ipaddress.ip_address(a) for a in args.approved_address or ()}
         port = validate_port(args.port, args.allowed_port or {22})
         addresses = resolve_once(
             args.host,
