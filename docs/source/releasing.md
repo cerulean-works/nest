@@ -28,8 +28,9 @@ initiative.
 **Consequence for users:** install from `main`, as the [Quickstart](quickstart)
 does. The existing tags predate session authentication: an SDK installed from
 `v0.1.0a4` has no `nest` command and sends no session, so an authenticated
-Controller refuses its calls with `UNAUTHENTICATED`. Do not document a
-release-pinned install until a tag that contains the authenticated SDK exists.
+Controller refuses its calls with `UNAUTHENTICATED`. A release-pinned install is
+added only by the release-prep pull request for an approved target tag that
+contains the authenticated SDK (checklist step 2).
 
 ## What a `v*` tag triggers
 
@@ -43,35 +44,58 @@ release-pinned install until a tag that contains the authenticated SDK exists.
 
 ## Release-prep checklist
 
-Before tagging, the maintainer:
+A tag publishes the tagged commit's **own, immutable** documentation, and pushing
+it also starts the operator's Dokploy deployment. Everything the tagged release
+should say, including its pinned install command, must therefore be on `main`
+**before** the tag: a later commit to `main` cannot change the tag's docs. The
+order below follows from that.
 
-1. **Chooses the tag.** The next pre-release follows `v0.1.0a4`; the exact name
-   is the maintainer's decision. Confirm it does not already exist.
-2. **Decides the version metadata**, in a reviewed pull request merged before the
-   tag (the changes below are not made by this page):
-   - `version` in `pyproject.toml`, so that the package reports the tag's
-     version (PEP 440: tag `v0.1.0aN` matches version `0.1.0aN`); run `uv lock`
-     so the `nest` entry in `uv.lock` matches;
-   - the version badge and the Early Access line in `README.md`;
-   - the example `uv.lock` entry and `uv lock --upgrade-package nest` output in
-     [Install Nest](installation), which show the current version string.
-3. **Checks `main` at the commit to tag:** all `main` push workflows succeeded
-   (Tests, Code Quality, Controller container, HPC runtime image, Docs), and the
-   HPC runtime image's `sha-<commit>` tag is published.
+**Before the tag (release-prep pull request).** The maintainer:
+
+1. **Chooses the target tag.** The next pre-release follows `v0.1.0a4`; the exact
+   name is the maintainer's decision. Confirm it does not exist yet. Until it is
+   published, the docs call it planned and never tell users to install it.
+2. **Merges a reviewed release-prep pull request** that names the approved target
+   (nothing on this page makes these changes):
+   - `version` in `pyproject.toml`, so that the package reports the tag's version
+     (PEP 440: tag `v0.1.0aN` matches version `0.1.0aN`), and `uv lock` so the
+     `nest` entry in `uv.lock` matches;
+   - the Early Access paragraph in `README.md`. The README release badge reads the
+     newest GitHub pre-release by itself: it shows `v0.1.0a4` until the new tag is
+     published, then the new tag, with no edit;
+   - [Install Nest](installation): the release-pinned command for the target,
+     `uv add "nest @ git+https://github.com/cerulean-works/nest@<target-tag>"`, as
+     the supported release install; the *Releases and `@main`* section; and the
+     example `uv.lock` entry and upgrade output that show the version string;
+   - the [Quickstart](quickstart) install step, if the tagged docs should install
+     the release rather than `main`, and this page's *Current state* table;
+   - `@main` stays documented as the development and Early Access path.
+3. **Checks `main` at the commit to tag:** all `main` push workflows succeeded on
+   that exact commit (Tests, Code Quality, Controller container, HPC runtime
+   image, Docs), and the HPC runtime image's `sha-<commit>` tag is published.
 4. **Writes the release notes:** the changes since the last tag, the minimum
    Controller schema, the HPC runtime image digest, and the compatibility rule
    *SDK at or after the Controller's commit*. Mark Early Access, and state which
    live acceptance (for example H09) is still pending.
 5. **Runs the deployment preflight** in
-   [Preflight and recover a Dokploy deployment](deployment-recovery) and has the
-   operator's approval for the tag-triggered rollout.
-6. **Tags and publishes the GitHub Release** as a pre-release.
-7. **Verifies after the tag:** the tag's docs version is published, the runtime
-   image tag points at the reviewed digest, and the operator confirms the deployed
-   checkout SHA and a healthy Controller.
-8. **Updates the install docs** with the release-pinned command for that tag, for
-   example `uv add "nest @ git+https://github.com/cerulean-works/nest@<tag>"`,
-   keeping `@main` as the development and Early Access path.
+   [Preflight and recover a Dokploy deployment](deployment-recovery) and records
+   the operator's explicit approval of the rollout. Pushing the tag **is** the
+   rollout trigger, so this approval comes before step 6, never after.
+
+**The tag.**
+
+6. **Pushes the tag** on the commit checked in step 3, and publishes the GitHub
+   Release as a pre-release.
+
+**After the tag.**
+
+7. **Verifies the published release:** the tag's docs version exists and its
+   Install page shows the pinned command for this tag; the runtime image tag points
+   at the reviewed digest; and the operator confirms the deployed checkout SHA, a
+   healthy Controller and a migration success.
+8. **Fixes forward, never by moving the tag.** If the tagged docs or release are
+   wrong, publish a corrected follow-up tag through the same steps; published tags
+   and image tags are not rewritten.
 
 A release does not switch on the hosted profile default
 (`nest.config.HOSTED_PROFILE_DEFAULT`), change DNS or open the public gateway:

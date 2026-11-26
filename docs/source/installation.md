@@ -46,9 +46,10 @@ To pin a specific commit, replace `@main` with `@<commit>`.
 Installing from `main` is the development and Early Access path, and the one the
 [Quickstart](quickstart) uses. The existing release tags (`v0.1.0a1` to `v0.1.0a4`)
 predate sign-in: an SDK installed from one of them has no `nest` command and sends
-no session, so an authenticated Controller refuses it. A release-pinned command
-(`@<tag>`) will be documented here once a tag that contains the authenticated SDK
-is published. See [Release status and checklist](releasing).
+no session, so an authenticated Controller refuses it. The release-prep pull
+request for the next tag adds its pinned command (`@<tag>`) here before the tag is
+pushed, so that the tag's own docs show it. See
+[Release status and checklist](releasing).
 
 ### Install with pip
 

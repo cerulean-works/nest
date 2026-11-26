@@ -8,10 +8,12 @@ settings are accepted by the SDK's own loader and send the hosted session, and
 check that the docs navigation lists every page exactly once.
 """
 
+import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -72,7 +74,8 @@ class QuickstartTests(unittest.TestCase):
     def test_happy_path_needs_no_project_id_and_no_gpu(self):
         text = QUICKSTART.read_text()
         happy_path = text[text.index("## Connection settings") : text.index("## 4. Run")]
-        self.assertNotIn("NEST_PROJECT_ID", happy_path)
+        # Clearing a leftover override is fine; setting one is not needed.
+        self.assertNotRegex(happy_path, r"(export |\b)NEST_PROJECT_ID=")
         self.assertIn("@nest.remote(cpu=1)", quickstart_main())
         self.assertNotIn("gpu", quickstart_main())
 
@@ -132,6 +135,115 @@ class QuickstartTests(unittest.TestCase):
         example = (ROOT / "examples" / "hosted_remote.py").read_text()
         self.assertIn("@nest.remote(cpu=1)\ndef compute(x):", example)
         self.assertIn("return x * 2", example)
+
+
+def r5_environment(ca_file: str) -> dict[str, str]:
+    """The settings the rollout runbook's staging run R5 leaves in a terminal."""
+    runbook = (DOCS / "hosted-rollout.md").read_text()
+    block = blocks(section(runbook, "### R5. Signed in, hosted SDK, one execution"), "bash")[0]
+    settings = {
+        name: value.replace("<domain>", "example.org") for name, value in exports(block).items()
+    }
+    settings["NEST_CONTROLLER_TLS_CA_FILE"] = ca_file
+    return settings
+
+
+def config_after(script: str, inherited: dict[str, str]) -> subprocess.CompletedProcess:
+    """
+    Runs the setting lines of a documented shell block in a terminal that already
+    has `inherited`, then loads the SDK's client settings as `.remote()` would.
+    Network and `uv run` lines are left out.
+    """
+    lines = [
+        line
+        for line in script.replace("\\\n", " ").splitlines()
+        if line.strip().startswith(("export ", "unset "))
+    ]
+    probe = (
+        "import json; from nest.config import load_client_config as load; c = load(); "
+        "print(json.dumps({'address': c.address, 'tls': c.tls, 'auth_url': c.auth_url, "
+        "'project_id': c.project_id, 'profile': c.profile}))"
+    )
+    env = {key: value for key, value in os.environ.items() if not key.startswith("NEST_")}
+    env.update(inherited)
+    return subprocess.run(
+        ["bash", "-c", "\n".join([*lines, f'exec "{sys.executable}" -c "{probe}"'])],
+        check=False,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+@requires_docs
+class ConnectionSwitchTests(unittest.TestCase):
+    """
+    Each documented connection block must work in a terminal that a previous
+    connection (the staging run R5, the hosted profile, an old Project override)
+    left settings in, without weakening TLS or the session binding.
+    """
+
+    def setUp(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as handle:
+            handle.write("-----BEGIN CERTIFICATE-----\nsynthetic\n-----END CERTIFICATE-----\n")
+        self.addCleanup(os.unlink, handle.name)
+        self.leftovers = {
+            **r5_environment(handle.name),
+            "NEST_PROJECT_ID": "00000000-0000-4000-8000-000000000001",
+        }
+
+    def load(self, heading: str, inherited: dict[str, str]) -> dict:
+        script = "\n".join(blocks(section(QUICKSTART.read_text(), heading), "bash"))
+        result = config_after(script, inherited)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_r5_settings_are_what_the_runbook_says(self):
+        result = config_after("", self.leftovers)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["address"], "grpc.staging.example.org:443")
+
+    def test_the_private_path_without_cleanup_is_refused(self):
+        quickstart = blocks(section(QUICKSTART.read_text(), "## Connection settings"), "bash")[0]
+        exports_only = "\n".join(l for l in quickstart.splitlines() if l.startswith("export "))
+        result = config_after(exports_only, self.leftovers)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("NEST_CONTROLLER_TLS_CA_FILE", result.stderr)
+
+    def test_private_path_after_r5(self):
+        config = self.load("## Connection settings", self.leftovers)
+        self.assertEqual(config["address"], "nest-controller.tail8e5ba1.ts.net:50051")
+        self.assertFalse(config["tls"])
+        self.assertEqual(config["auth_url"], HOSTED_AUTH_URL)
+        self.assertIsNone(config["project_id"])
+
+    def test_private_path_after_the_hosted_profile(self):
+        config = self.load("## Connection settings", {"NEST_PROFILE": "hosted"})
+        self.assertEqual(config["profile"], "custom")
+        self.assertEqual(config["address"], "nest-controller.tail8e5ba1.ts.net:50051")
+        self.assertEqual(config["auth_url"], HOSTED_AUTH_URL)
+
+    def test_self_hosted_after_r5(self):
+        config = self.load("## Use a self-hosted Nest", self.leftovers)
+        self.assertEqual(config["address"], "controller.example.com:50051")
+        self.assertTrue(config["tls"])
+        self.assertEqual(config["auth_url"], "https://nest.example.com")
+        self.assertIsNone(config["project_id"])
+
+    def test_local_flow_after_r5(self):
+        config = self.load(
+            "## Local development flow (no session)", {**self.leftovers, "NEST_PROFILE": "hosted"}
+        )
+        self.assertEqual(config["address"], "127.0.0.1:50051")
+        self.assertIsNone(config["auth_url"])
+        self.assertIsNone(config["project_id"])
+
+    def test_readme_private_path_after_r5(self):
+        script = "\n".join(blocks(section(README.read_text(), "## Quickstart"), "bash"))
+        result = config_after(script, self.leftovers)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["auth_url"], HOSTED_AUTH_URL)
 
 
 @requires_docs

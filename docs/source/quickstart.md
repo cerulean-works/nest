@@ -26,14 +26,24 @@ go; the SDK never guesses an address for a shared Controller.
 
 **Cerulean-hosted Nest, private path** (available today). Connect Tailscale to
 the authorized Tailnet, or accept the Controller node share the operator sent you
-([details](tailscale-shared)), then:
+([details](tailscale-shared)), then, in a new terminal or after clearing settings
+left from another connection:
 
 ```bash
+unset NEST_PROFILE NEST_CONTROLLER_TLS_CA_FILE NEST_HOSTED_SESSION_ADDRESS NEST_PROJECT_ID
 tailscale ping nest-controller.tail8e5ba1.ts.net    # the Controller must answer
 export NEST_AUTH_URL="https://auth.nest.cerulean.works"
 export NEST_CONTROLLER_ADDRESS="nest-controller.tail8e5ba1.ts.net:50051"
 export NEST_CONTROLLER_TLS=false    # plaintext gRPC, only inside the encrypted Tailnet
 ```
+
+The `unset` line clears what another connection, such as a staging pilot or a
+self-hosted Nest, may have left in the terminal. The SDK refuses conflicting
+settings instead of guessing: for example a leftover CA file with
+`NEST_CONTROLLER_TLS=false`, or `NEST_PROFILE=hosted` together with an explicit
+address. It also clears an old `NEST_PROJECT_ID`, which would override the Project
+choice in step 2; set it again afterwards only if you chose that Project
+deliberately for this Controller.
 
 Use the MagicDNS name, never a Tailscale IP address copied from someone else.
 `NEST_CONTROLLER_TLS=false` is safe only because the Tailnet encrypts and
@@ -91,9 +101,13 @@ uv run nest projects current
 3f0c1a2b-4d5e-4f60-8a7b-9c0d1e2f3a4b (only eligible)
 ```
 
-`only eligible` means you may run in exactly one Project, so Nest uses it: you
-need no Project ID. With several Projects or none, see
-[Several Projects, or none](#several-projects-or-none).
+`only eligible` means the Controller just listed exactly one Project you may run
+in, so Nest uses it: you need no Project ID. `saved` is a choice you made earlier
+that the Controller still lists. If the line ends in `(NEST_PROJECT_ID)` instead,
+it is your own override, printed without asking the Controller: use
+`uv run nest projects list` to see the Projects you may actually run in. Either
+way the Controller authorizes every call again when it runs. With several
+Projects or none, see [Several Projects, or none](#several-projects-or-none).
 
 ## 3. Create main.py
 
@@ -177,6 +191,7 @@ For a Nest your organization runs, the operator gives you its sign-in origin and
 Controller address. Use them instead of the connection settings above:
 
 ```bash
+unset NEST_PROFILE NEST_CONTROLLER_TLS_CA_FILE NEST_HOSTED_SESSION_ADDRESS NEST_PROJECT_ID
 export NEST_AUTH_URL="https://nest.example.com"   # or: nest login --url https://nest.example.com
 export NEST_CONTROLLER_ADDRESS="controller.example.com:50051"
 export NEST_CONTROLLER_TLS=true                   # false only on a trusted private network
@@ -202,7 +217,8 @@ uv run python -m nest.controller
 
 ```bash
 # terminal 2: unset the shared Controller's settings first
-unset NEST_PROFILE NEST_CONTROLLER_ADDRESS NEST_CONTROLLER_TLS NEST_AUTH_URL NEST_PROJECT_ID
+unset NEST_PROFILE NEST_CONTROLLER_ADDRESS NEST_CONTROLLER_TLS NEST_CONTROLLER_TLS_CA_FILE \
+      NEST_AUTH_URL NEST_HOSTED_SESSION_ADDRESS NEST_PROJECT_ID
 uv run python main.py
 ```
 

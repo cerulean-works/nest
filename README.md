@@ -29,9 +29,11 @@ see [Get access to a Project](docs/source/get-access.md)).
 
 **Connection settings.** Cerulean-hosted Nest is reachable today over its
 authorized Tailnet. Connect Tailscale (Tailnet membership or the Controller node
-share), then set, in each terminal:
+share), then, in a new terminal or after clearing settings left from another
+connection (the SDK refuses conflicting settings instead of guessing):
 
 ```bash
+unset NEST_PROFILE NEST_CONTROLLER_TLS_CA_FILE NEST_HOSTED_SESSION_ADDRESS NEST_PROJECT_ID
 export NEST_AUTH_URL="https://auth.nest.cerulean.works"
 export NEST_CONTROLLER_ADDRESS="nest-controller.tail8e5ba1.ts.net:50051"
 export NEST_CONTROLLER_TLS=false    # plaintext gRPC, only inside the encrypted Tailnet
@@ -55,6 +57,9 @@ uv add "nest @ git+https://github.com/cerulean-works/nest@main"
 uv run nest login
 uv run nest projects current    # "<project-id> (only eligible)": no Project ID needed
 ```
+
+`only eligible` (or `saved`) is checked against the Controller's list of Projects
+you may run in; `uv run nest projects list` shows that list.
 
 **3. Create `main.py`:**
 

@@ -5,18 +5,23 @@
 """
 The smallest program that runs a function on Cerulean-hosted Nest, with uv.
 
-Hosted path (no Tailscale; only once the operator has opened the public endpoint
-to you, see docs/source/hosted-rollout.md):
+Private path (over the Controller's Tailnet; available today, see
+docs/source/quickstart.md), in a terminal without settings from another
+connection:
 
-    export NEST_PROFILE=hosted
-    uv run nest login            # or let the first call open the browser approval
-    uv run examples/hosted_remote.py
-
-Private path (over the Controller's Tailnet), with the same program:
-
+    unset NEST_PROFILE NEST_CONTROLLER_TLS_CA_FILE NEST_HOSTED_SESSION_ADDRESS NEST_PROJECT_ID
     export NEST_AUTH_URL=https://auth.nest.cerulean.works
     export NEST_CONTROLLER_ADDRESS=nest-controller.tail8e5ba1.ts.net:50051
     export NEST_CONTROLLER_TLS=false
+    uv run nest login
+    uv run examples/hosted_remote.py
+
+Hosted profile (public gateway, no Tailscale): production only, once H09 opens
+the public endpoint; the current staging pilot uses the operator's explicit
+staging settings instead (docs/source/hosted-connection.md):
+
+    export NEST_PROFILE=hosted
+    uv run nest login            # or let the first call open the browser approval
     uv run examples/hosted_remote.py
 
 No `NEST_PROJECT_ID` is needed when you may run in one Project only; see
