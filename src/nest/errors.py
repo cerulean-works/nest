@@ -245,6 +245,35 @@ class DatabaseUnavailableError(InfrastructureError):
     status = grpc.StatusCode.UNAVAILABLE
 
 
+class SessionUnavailableError(InfrastructureError):
+    """
+    The Slurm operation needs a user-owned SSH session that is not available now.
+
+    Raised before any remote command runs, for example when the user's session has
+    ended or a headless run cannot answer the HPC password/MFA prompts. Nest never
+    falls back to Controller-owned SSH: reconnect from an interactive terminal.
+
+    Attributes:
+        interactive_required (`bool`): Reconnecting needs a person at a terminal.
+        operation (`str`, *optional*): The operation refused, such as `status`.
+    """
+
+    kind = "session_unavailable"
+    status = grpc.StatusCode.FAILED_PRECONDITION
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        job_id: int | None = None,
+        interactive_required: bool = False,
+        operation: str | None = None,
+    ):
+        super().__init__(message, job_id=job_id)
+        self.interactive_required = interactive_required
+        self.operation = operation
+
+
 class AuthenticationRequiredError(PermissionError):
     """
     The Controller requires a Nest session and the call presented none it accepts.
@@ -298,6 +327,7 @@ INFRASTRUCTURE_ERRORS: dict[str, type[InfrastructureError]] = {
         RpcTimeoutError,
         DatabaseUnavailableError,
         ResultTooLargeError,
+        SessionUnavailableError,
     )
 }
 """Maps each `kind` to its exception class."""

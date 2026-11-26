@@ -1,8 +1,11 @@
 # Slurm backend
 
-`SlurmBackend` manages batch jobs and stages files through noninteractive SSH.
-The Controller uses it for remote execution, but hosts can also use it directly
-for job submission, status queries, cancellation, and environment preparation.
+`SlurmBackend` is the shared Slurm execution core: it prepares environments,
+stages payloads, submits jobs, and reads status, logs, results and accounting,
+and cancels jobs. It runs every remote command through a transport that owns the
+SSH connection. The Controller uses it for remote execution with its own
+noninteractive SSH, but hosts can also use it directly for job submission, status
+queries, cancellation, and environment preparation.
 
 See [Deploy a Slurm Controller](../deploy) for the required remote directory
 layout. The examples in
@@ -39,6 +42,50 @@ A job pending for a reason it cannot outwait for `blocked_timeout` seconds raise
 
 [[autodoc]] backends.slurm.SlurmJobInfo
 
+[[autodoc]] backends.slurm.SlurmAccounting
+
 [[autodoc]] backends.slurm.classify_pending_reason
 
 [[autodoc]] backends.slurm.new_execution_id
+
+## Transports and session capabilities
+
+A transport runs the core's commands and advertises, through
+`TransportCapabilities`, whose HPC identity runs them
+(`execution_authority`), whether a person must answer prompts
+(`interactive_required`), and what it can do without the user's live session
+(`can_query_offline`, `can_cancel_offline`, `can_submit_offline`).
+
+| Transport | Authority | Interactive | Offline status/logs/result/accounting | Offline cancel | Status |
+| --- | --- | --- | --- | --- | --- |
+| `ControllerSSHTransport` | `controller_owned` | No | Yes | Yes | Current (trusted Mode A; the default) |
+| `LocalOpenSSHTransport` | `user_owned` | Yes | No | No | Client-side building block for planned Mode B |
+
+`ControllerSSHTransport` is what `SlurmBackend(config)` always used: the same
+`ssh` command line for `NEST_SLURM_SSH_MODE=A` and the managed-key
+`NEST_SLURM_SSH_MODE=B` (which is still Controller-owned SSH, not the planned
+user-owned Mode B).
+
+`LocalOpenSSHTransport` runs the user's own OpenSSH on the client. OpenSSH asks
+for the HPC password and MFA on the user's terminal, never through Nest, and
+reuses the authenticated connection through a private control socket. It reads
+no SSH configuration file, checks host keys strictly against operator-distributed
+pins, disables agent and port forwarding, and takes no private key. The
+Controller does not use it: the opaque Controller relay and user-owned
+submission are separate, later work.
+
+When a user-owned session is not active (the client exited, or a headless run
+has no terminal for the prompts), the core raises
+[`errors.SessionUnavailableError`] before running any command. Nest never falls
+back to Controller-owned SSH, and a `SlurmBackend` refuses to pair a user-owned
+transport with a configuration that carries Controller SSH credentials.
+
+[[autodoc]] backends.transport.TransportCapabilities
+
+[[autodoc]] backends.transport.ExecutionAuthority
+
+[[autodoc]] backends.transport.SlurmTransport
+
+[[autodoc]] backends.transport.ControllerSSHTransport
+
+[[autodoc]] backends.transport.LocalOpenSSHTransport

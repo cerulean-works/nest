@@ -6,7 +6,9 @@ on `PATH`. The real Controller, `SlurmBackend`, and `scripts/*.sbatch` files
 then run unmodified:
 
 - `ssh -o BatchMode=yes <host> <command>` runs `<command>` with local bash.
-- `sbatch` runs the batch script synchronously and records its final state.
+- `sbatch` runs the batch script synchronously and records its final state, and
+  copies its output where the script's `#SBATCH --output` names.
+- `sacct` honors `--format` for the fields the accounting query reads.
 - `sbatch` emulates the node's GPU allocation: `--gpus-per-node`, or the script's
   `#SBATCH --gpus-per-node` default, sets `SLURM_GPUS_ON_NODE`, `SLURM_JOB_GPUS`,
   and `CUDA_VISIBLE_DEVICES` as Slurm does. `FakeHpc.gpu_environment` overrides them.
@@ -148,6 +150,12 @@ else:
             stderr=subprocess.STDOUT,
         ).returncode
     state_file(job_id).write_text("COMPLETED" if code == 0 else f"FAILED")
+    # Slurm writes the job's output where the script's #SBATCH --output names, from
+    # the submission directory.
+    for line in Path(script).read_text().splitlines():
+        if line.startswith("#SBATCH --output="):
+            name = line.split("=", 1)[1].strip().replace("%j", str(job_id))
+            (Path.cwd() / name).write_bytes((STATE / f"job-{job_id}.out").read_bytes())
 print(f"{job_id};fake-cluster" if "--parsable" in flags else f"Submitted batch job {job_id}")
 """,
     "squeue": """
@@ -172,9 +180,23 @@ else:
     sys.exit(1)
 """,
     "sacct": """
-path = state_file(job_flag(sys.argv[1:]))
+job_id = job_flag(sys.argv[1:])
+path = state_file(job_id)
+fmt = next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--format=")), "State")
 if path.exists():
-    print(path.read_text())
+    info = meta(job_id)
+    state = path.read_text()
+    fields = {
+        "JobID": job_id,
+        "State": state,
+        "ExitCode": "0:0" if state == "COMPLETED" else "1:0",
+        "Elapsed": "00:00:01",
+        "Account": info.get("account", ""),
+        "User": os.environ.get("USER", "nest"),
+        "NodeList": "fake-node1",
+        "AllocTRES": f"cpu=1,gres/gpu={info.get('gpus', '0')},node=1",
+    }
+    print("|".join(fields[field] for field in fmt.split(",")))
 """,
     "scancel": """
 job_id = sys.argv[1]

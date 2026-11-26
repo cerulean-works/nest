@@ -62,7 +62,7 @@ def backend(**config):
 class SubmitTests(unittest.TestCase):
     def submit_command(self, result, **kwargs):
         slurm = backend()
-        with mock.patch.object(slurm, "_ssh_process", return_value=result) as run:
+        with mock.patch.object(slurm.transport, "_process", return_value=result) as run:
             job_id = slurm.submit("/work", "job.sbatch", **kwargs)
         run.assert_called_once()
         return job_id, run.call_args.args[0]
@@ -95,7 +95,7 @@ class SubmitTests(unittest.TestCase):
     def test_negative_cpu_is_rejected_without_ssh(self):
         slurm = backend()
         with (
-            mock.patch.object(slurm, "_ssh_process") as run,
+            mock.patch.object(slurm.transport, "_process") as run,
             self.assertRaisesRegex(ValueError, "CPU count cannot be negative"),
         ):
             slurm.submit("/work", cpu=-1)
@@ -110,7 +110,7 @@ class SubmitTests(unittest.TestCase):
         slurm = backend(ssh_timeout=7)
         timeout = subprocess.TimeoutExpired(["ssh"], 7, output=b"nest-sbatch-started\n")
         with (
-            mock.patch.object(slurm, "_ssh_process", side_effect=timeout) as run,
+            mock.patch.object(slurm.transport, "_process", side_effect=timeout) as run,
             self.assertRaises(SubmissionUnknownError) as caught,
         ):
             slurm.submit("/work", "job.sbatch")
@@ -123,7 +123,7 @@ class SubmitTests(unittest.TestCase):
         result = completed(255, stderr=b"ssh: connect to host hpc port 22: Connection refused")
         slurm = backend()
         with (
-            mock.patch.object(slurm, "_ssh_process", return_value=result),
+            mock.patch.object(slurm.transport, "_process", return_value=result),
             self.assertRaises(SSHError),
         ):
             slurm.submit("/work")
@@ -134,7 +134,7 @@ class SubmitTests(unittest.TestCase):
         )
         slurm = backend()
         with (
-            mock.patch.object(slurm, "_ssh_process", return_value=result) as run,
+            mock.patch.object(slurm.transport, "_process", return_value=result) as run,
             self.assertRaises(SubmissionUnknownError),
         ):
             slurm.submit("/work")
@@ -144,7 +144,7 @@ class SubmitTests(unittest.TestCase):
         result = completed(1, stdout=b"nest-sbatch-started\n", stderr=b"Invalid account")
         slurm = backend()
         with (
-            mock.patch.object(slurm, "_ssh_process", return_value=result),
+            mock.patch.object(slurm.transport, "_process", return_value=result),
             self.assertRaises(RemoteCommandError) as caught,
         ):
             slurm.submit("/work")
@@ -155,7 +155,7 @@ class SubmitTests(unittest.TestCase):
         slurm = backend()
         with (
             mock.patch.object(
-                slurm, "_ssh_process", return_value=completed(stdout=b"nest-sbatch-started\n")
+                slurm.transport, "_process", return_value=completed(stdout=b"nest-sbatch-started\n")
             ),
             self.assertRaisesRegex(SubmissionUnknownError, "Unexpected sbatch output"),
         ):
@@ -180,7 +180,7 @@ class SshClassificationTests(unittest.TestCase):
         slurm = backend(ssh_timeout=3)
         with (
             mock.patch(
-                "nest.backends.slurm.subprocess.run",
+                "nest.backends.transport.subprocess.run",
                 side_effect=subprocess.TimeoutExpired(["ssh"], 3),
             ),
             self.assertRaises(SSHTimeoutError) as caught,
@@ -197,7 +197,7 @@ class SshClassificationTests(unittest.TestCase):
         slurm = backend()
         with (
             mock.patch(
-                "nest.backends.slurm.subprocess.run",
+                "nest.backends.transport.subprocess.run",
                 side_effect=subprocess.TimeoutExpired(["ssh"], 60),
             ),
             self.assertRaises(SSHTimeoutError),
@@ -208,14 +208,16 @@ class SshClassificationTests(unittest.TestCase):
         slurm = backend()
         with (
             mock.patch(
-                "nest.backends.slurm.subprocess.run", return_value=completed(255, stderr=b"denied")
+                "nest.backends.transport.subprocess.run",
+                return_value=completed(255, stderr=b"denied"),
             ),
             self.assertRaises(SSHError),
         ):
             slurm.cancel(1)
         with (
             mock.patch(
-                "nest.backends.slurm.subprocess.run", return_value=completed(1, stderr=b"bad job")
+                "nest.backends.transport.subprocess.run",
+                return_value=completed(1, stderr=b"bad job"),
             ),
             self.assertRaises(RemoteCommandError),
         ):
@@ -224,7 +226,7 @@ class SshClassificationTests(unittest.TestCase):
     def test_ssh_timeout_comes_from_config(self):
         slurm = backend(ssh_timeout=12.5)
         with mock.patch(
-            "nest.backends.slurm.subprocess.run", return_value=completed(stdout=b"RUNNING\n")
+            "nest.backends.transport.subprocess.run", return_value=completed(stdout=b"RUNNING\n")
         ) as run:
             self.assertEqual(slurm.status(5), "RUNNING")
         self.assertEqual(run.call_args.kwargs["timeout"], 12.5)
