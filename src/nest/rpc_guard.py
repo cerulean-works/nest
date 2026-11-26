@@ -32,7 +32,7 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
-from ipaddress import IPv4Address, IPv4Network, IPv6Address, IPv6Network, ip_address
+from ipaddress import IPv4Address, IPv6Address, ip_address
 from typing import Any
 from urllib.parse import unquote
 
@@ -64,8 +64,6 @@ MAX_TRACKED_KEYS = 10_000
 """Most rate-limit buckets kept at once; the least recently used is dropped first."""
 
 Address = IPv4Address | IPv6Address
-_MAPPED = IPv6Network("::ffff:0:0/96")
-"""The IPv4-mapped IPv6 addresses (RFC 4291, section 2.5.5.2)."""
 
 
 def server_options(policy: RpcPolicy) -> list[tuple[str, Any]]:
@@ -134,20 +132,14 @@ def peer_address(peer: str | None) -> Address | None:
 
 def _within(address: Address, networks: Iterable[Network]) -> bool:
     """
-    Whether `address` is in one of `networks`. An IPv4 address and its IPv4-mapped
-    form are the same address, and a network written in mapped form
-    (`::ffff:10.0.0.0/104`) is the IPv4 network it maps. No other IPv6 network
-    matches an IPv4 address, so a wide IPv6 entry such as `::/0` admits no IPv4 peer.
+    Whether `address` is in one of `networks` of the same IP version. An
+    IPv4-mapped address is compared as its IPv4 address, so it matches only IPv4
+    networks. No IPv6 network ever matches an IPv4 peer: mapped-form networks such as
+    `::ffff:10.0.0.0/104` are refused when the settings are read (`config._networks`),
+    so every IPv4 range in an allowlist is one the pilot checks can see.
     """
     address = canonical_address(address)
-    for network in networks:
-        if isinstance(network, IPv6Network) and network.subnet_of(_MAPPED):
-            network = IPv4Network(
-                (int(network.network_address) & 0xFFFFFFFF, network.prefixlen - 96)
-            )
-        if address.version == network.version and address in network:
-            return True
-    return False
+    return any(address.version == network.version and address in network for network in networks)
 
 
 def client_address(

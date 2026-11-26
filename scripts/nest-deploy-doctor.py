@@ -310,12 +310,25 @@ def settings(env_file: str | None, environ: dict[str, str]) -> tuple[dict[str, s
     return values, checks
 
 
+IPV4_MAPPED_NETWORK = ipaddress.IPv6Network("::ffff:0:0/96")
+
+
 def _cidrs(value: str) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
-    return [
-        ipaddress.ip_network(part.strip(), strict=False)
-        for part in value.split(",")
-        if part.strip()
-    ]
+    """The networks of a comma-separated setting. Like the Controller, refuses an
+    IPv4 range written in IPv4-mapped IPv6 form, so every IPv4 range is checked as
+    IPv4 (#109)."""
+    networks = []
+    for part in value.split(","):
+        if not part.strip():
+            continue
+        network = ipaddress.ip_network(part.strip(), strict=False)
+        if isinstance(network, ipaddress.IPv6Network) and network.subnet_of(IPV4_MAPPED_NETWORK):
+            raise ValueError(
+                f"{part.strip()} is an IPv4-mapped IPv6 network, which the Controller refuses; "
+                "write the IPv4 network"
+            )
+        networks.append(network)
+    return networks
 
 
 def _ipv4(networks: list) -> list[ipaddress.IPv4Network]:
@@ -1166,7 +1179,7 @@ def gateway_runtime(args, docker: Docker, sleep: Callable[[float], None] | None 
             problems.append(f"NEST_GRPC_TRUSTED_PROXIES is {shown}, not {gateway_cidr}")
         if not any(gateway_cidr.subnet_of(p) for p in _ipv4(peers)):
             problems.append(f"NEST_GRPC_ALLOWED_PEERS does not admit {gateway_cidr}")
-        for address in other_gateway:
+        for address in map(_canonical, other_gateway):
             for name, networks in (
                 ("NEST_GRPC_TRUSTED_PROXIES", trusted),
                 ("NEST_GRPC_ALLOWED_PEERS", peers),

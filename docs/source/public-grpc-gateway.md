@@ -232,7 +232,12 @@ allowlist:
   compared as its IPv4 address, for `NEST_GRPC_ALLOWED_PEERS`, for
   `NEST_GRPC_TRUSTED_PROXIES` and for `x-forwarded-for` hops alike. Ordinary IPv6
   is unchanged, and a peer it cannot parse is still refused.
-  `x-forwarded-for` is still read only from a trusted proxy.
+  `x-forwarded-for` is still read only from a trusted proxy. Write both settings
+  with IPv4 networks: an entry in IPv4-mapped form (`::ffff:10.0.0.0/104`) stops
+  the Controller at start-up, and both doctor commands fail on it. Such an entry
+  would otherwise be an IPv4 range that the pilot's checks do not see (for
+  example, `::ffff:0:0/96` is every IPv4 address). No IPv6 entry ever admits an
+  IPv4 peer.
 
 `nest-deploy-doctor.py gateway-runtime --project <appName>` checks the running
 result. Run it after every deploy, restart or recreate of the gateway or the

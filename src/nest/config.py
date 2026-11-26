@@ -2816,17 +2816,37 @@ def _execution_authorities(reader: _Reader, execution_registry: str) -> tuple[st
     return authorities
 
 
+IPV4_MAPPED_NETWORK = IPv6Network("::ffff:0:0/96")
+"""The IPv4-mapped IPv6 addresses (RFC 4291, section 2.5.5.2)."""
+
+
 def _networks(reader: _Reader, name: str) -> tuple[Network, ...]:
-    """Reads a comma-separated list of IP addresses or CIDR networks."""
+    """
+    Reads a comma-separated list of IP addresses or CIDR networks.
+
+    An IPv4 range written in IPv4-mapped IPv6 form (`::ffff:10.0.0.0/104`) is
+    refused: the gRPC guard compares a mapped peer as its IPv4 address, so such an
+    entry would match nothing. Accepting it as an IPv4 range instead would hide
+    that range (`::ffff:0:0/96` is every IPv4 address) from the checks that only
+    look at IPv4 networks and prefix lengths (#109).
+    """
     networks: list[Network] = []
     for item in (reader.get(name) or "").split(","):
         item = item.strip()
         if not item:
             continue
         try:
-            networks.append(ip_network(item, strict=False))
+            network = ip_network(item, strict=False)
         except ValueError:
             reader.fail(f"{name} has {item[:60]!r}, which is not an IP address or CIDR network")
+            continue
+        if isinstance(network, IPv6Network) and network.subnet_of(IPV4_MAPPED_NETWORK):
+            reader.fail(
+                f"{name} has {item[:60]!r}, an IPv4-mapped IPv6 network; write the IPv4 "
+                "address or CIDR network instead (mapped peers are compared as IPv4)"
+            )
+            continue
+        networks.append(network)
     return tuple(networks)
 
 

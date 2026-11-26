@@ -592,6 +592,15 @@ class PreflightTests(unittest.TestCase):
             "edge unset": ({"NEST_GRPC_EDGE_PROXY": ""}, "edge_proxy"),
             "edge too wide": ({"NEST_GRPC_EDGE_PROXY": "10.0.1.0/24"}, "edge_proxy"),
             "pilot off": ({"NEST_PUBLIC_PILOT": ""}, "public_pilot"),
+            # #109 review: a mapped-form IPv4 range is refused, not passed over as IPv6.
+            "mapped allowed peers": (
+                {"NEST_GRPC_ALLOWED_PEERS": "10.253.250.0/28,172.18.0.0/16,::ffff:0:0/96"},
+                "allowed_peers",
+            ),
+            "mapped trusted proxy": (
+                {"NEST_GRPC_TRUSTED_PROXIES": "::ffff:10.253.250.2/128"},
+                "trusted_proxies",
+            ),
         }
         for label, (changes, check) in cases.items():
             with self.subTest(label):
@@ -1085,6 +1094,16 @@ class GatewayRuntimeTests(unittest.TestCase):
             ),
             ({"NEST_GRPC_ALLOWED_PEERS": "172.20.0.0/16"}, "does not admit 10.253.250.3/32"),
             ({"NEST_GRPC_TRUSTED_PROXIES": "not-a-network"}, "does not parse"),
+            # #109 review: a mapped-form entry covering the edge address would admit it
+            # in an older guard; it is refused, never skipped as "IPv6".
+            (
+                {"NEST_GRPC_ALLOWED_PEERS": "10.253.250.3/32,::ffff:10.0.1.0/120"},
+                "::ffff:10.0.1.0/120 is an IPv4-mapped IPv6 network",
+            ),
+            (
+                {"NEST_GRPC_TRUSTED_PROXIES": "::ffff:10.253.250.3/128"},
+                "is an IPv4-mapped IPv6 network",
+            ),
         ):
             with self.subTest(env):
                 controller, gateway = self.deployment(**env)

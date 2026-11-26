@@ -224,15 +224,13 @@ class AddressTests(unittest.TestCase):
         for text in ("2001:db8::3", "::1", "64:ff9b::afd:fa03", "::afd:fa03"):
             self.assertEqual(canonical_address(ip_address(text)), ip_address(text))
 
-    def test_mapped_forms_match_allowlists_written_either_way(self):
+    def test_mapped_peers_match_ipv4_allowlists(self):
         proxies = (ip_network("10.253.250.3/32"),)
-        mapped_proxies = (ip_network("::ffff:10.253.250.3/128"),)
         forwarded = [("x-forwarded-for", "198.51.100.1")]
         for peer in ("10.253.250.3", "::ffff:10.253.250.3"):
-            for trusted in (proxies, mapped_proxies):
-                with self.subTest(peer=peer, trusted=trusted):
-                    got = client_address(ip_address(peer), forwarded, trusted)
-                    self.assertEqual(got, "198.51.100.1")
+            with self.subTest(peer=peer):
+                got = client_address(ip_address(peer), forwarded, proxies)
+                self.assertEqual(got, "198.51.100.1")
         # A mapped hop in the header is the same address as its IPv4 form, so the
         # gateway's own entry is skipped and a client is reported as IPv4.
         chained = [("x-forwarded-for", "::ffff:198.51.100.1, ::ffff:10.253.250.3")]
@@ -247,17 +245,13 @@ class AddressTests(unittest.TestCase):
             with self.subTest(peer):
                 expected = str(canonical_address(ip_address(peer)))
                 self.assertEqual(client_address(ip_address(peer), spoof, proxies), expected)
-        # An IPv6 entry admits an IPv4 peer only when written in mapped form:
-        # a wide IPv6 range such as ::/0 or ::/8 never trusts an IPv4 gateway.
-        for wide in ("::/0", "::/8", "::fffe:0:0/95"):
+        # No IPv6 network, however wide and even in mapped form (which the settings
+        # refuse, #109 review), ever trusts an IPv4 peer.
+        for wide in ("::/0", "::/8", "::fffe:0:0/95", "::ffff:0:0/96", "::ffff:10.0.0.0/104"):
             with self.subTest(wide=wide):
-                got = client_address(ip_address("10.0.0.1"), spoof, (ip_network(wide),))
-                self.assertEqual(got, "10.0.0.1")
-        mapped_range = (ip_network("::ffff:10.0.0.0/104"),)
-        self.assertEqual(
-            client_address(ip_address("10.0.0.1"), spoof, mapped_range), "198.51.100.1"
-        )
-        self.assertEqual(client_address(ip_address("11.0.0.1"), spoof, mapped_range), "11.0.0.1")
+                for peer in ("10.0.0.1", "::ffff:10.0.0.1"):
+                    got = client_address(ip_address(peer), spoof, (ip_network(wide),))
+                    self.assertEqual(got, "10.0.0.1")
 
     def test_forwarded_for_is_trusted_only_from_a_proxy(self):
         gateway, outsider = ip_address("10.1.0.5"), ip_address("203.0.113.9")
@@ -367,7 +361,9 @@ class OriginGuardTests(unittest.TestCase):
         self.assertEqual(guard._admit(context), "172.20.0.5")
 
     def test_wide_ipv6_allowlist_admits_no_ipv4_peer(self):
-        guard = self.guard(allowed_peers=(ip_network("::/1"),), trusted_proxies=())
+        guard = self.guard(
+            allowed_peers=(ip_network("::/1"), ip_network("::ffff:0:0/96")), trusted_proxies=()
+        )
         for peer in ("ipv4:10.253.250.3:1", "ipv6:%5B::ffff:10.253.250.3%5D:1"):
             with (
                 self.subTest(peer),

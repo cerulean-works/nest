@@ -382,6 +382,28 @@ class PublicPilotConfigTests(unittest.TestCase):
         self.assertIn("NEST_EXECUTOR=slurm", self.problems(NEST_EXECUTOR="local"))
         self.assertEqual(len(PUBLIC_PILOT_REQUIREMENTS), 11)
 
+    def test_mapped_form_networks_cannot_hide_an_ipv4_range(self):
+        """#109 review: `::ffff:0:0/96` is every IPv4 address; it must not slip past
+        the default-route check, nor a mapped trusted proxy past the inside check."""
+        for name, value in (
+            ("NEST_GRPC_ALLOWED_PEERS", "::ffff:0:0/96,172.31.250.2/32"),
+            ("NEST_GRPC_ALLOWED_PEERS", "::ffff:0.0.0.0/97,172.31.250.2/32"),
+            ("NEST_GRPC_ALLOWED_PEERS", "172.31.250.0/28,::ffff:10.0.1.0/120"),
+            ("NEST_GRPC_TRUSTED_PROXIES", "::ffff:10.9.9.9"),
+            ("NEST_GRPC_TRUSTED_PROXIES", "::ffff:172.31.250.2/128"),
+        ):
+            with self.subTest(name=name, value=value):
+                problems = self.problems(**{name: value})
+                self.assertIn(f"{name} has", problems)
+                self.assertIn("IPv4-mapped IPv6 network", problems)
+        # The same refusal outside the pilot: no setting can be a hidden IPv4 range.
+        with self.assertRaises(ConfigError):
+            load_controller_config({"NEST_GRPC_ALLOWED_PEERS": "::ffff:0:0/96"})
+        # Ordinary IPv6, including ranges that contain the mapped block, still loads;
+        # it never matches an IPv4 peer (see test_public_api_security).
+        rpc = load_controller_config({"NEST_GRPC_ALLOWED_PEERS": "fd00::/64,::/1"}).rpc
+        self.assertEqual([str(n) for n in rpc.allowed_peers], ["fd00::/64", "::/1"])
+
     def test_tls_or_an_explicit_private_plaintext_is_required(self):
         problems = self.problems(NEST_CONTROLLER_ALLOW_PLAINTEXT=None)
         self.assertIn("ALLOW_PLAINTEXT", problems)
