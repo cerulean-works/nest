@@ -201,7 +201,8 @@ compose=("${base[@]}")
 
 check_current() {
     local label=$1 report since
-    since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    # Nanoseconds: the previous phase's Tailnet probe can end in the same second.
+    since=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)
     report="$fixture/doctor-$label.txt"
     for _ in $(seq 20); do
         "${doctor[@]}" gateway-runtime --project "$project" > "$report" && break
