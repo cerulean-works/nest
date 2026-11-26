@@ -128,7 +128,7 @@ record, `outcome.json`, next to it:
 Before staging an `Execute`, the Controller reads the protocol that the
 Platform's deployed worker script declares (`# nest-worker-protocol: 2` in
 `project/scripts/worker.sbatch`) and pins it on the attempt (`worker_protocol`,
-migration `0020_attempt_worker_protocol`), before `sbatch`. The pinned value, not
+migration `0021_attempt_worker_protocol`), before `sbatch`. The pinned value, not
 whatever is deployed later, decides how the attempt settles.
 
 A protocol 2 attempt has its own artifact directory,
@@ -149,7 +149,7 @@ once the Platform's Nest checkout is updated. During a rollout an operator can s
 shared execution directory, as before, and its completion without a record is an
 **unverified** success. Anything that depends on a verified success must exclude
 attempts whose `worker_protocol` is not 2 or more. Attempts recorded before
-migration 0020 have no `worker_protocol` and settle the same way.
+migration 0021 have no `worker_protocol` and settle the same way.
 
 ### How a completed `Execute` settles
 
@@ -196,7 +196,7 @@ not apply to it.
 
 1. Update each Platform's Nest checkout (the worker script and worker) first, or
    set `NEST_LEGACY_WORKERS=allow` for the rollout.
-2. Run `nest-db upgrade` (migration `0020_attempt_worker_protocol` is additive),
+2. Run `nest-db upgrade` (migration `0021_attempt_worker_protocol` is additive),
    then update the Controller.
 3. Once every Platform's worker declares protocol 2, unset `NEST_LEGACY_WORKERS`.
 

@@ -1,4 +1,4 @@
--- 0020: Pin the worker protocol of each execution attempt (#73).
+-- 0021: Pin the worker protocol of each execution attempt (#73).
 --
 -- Applied migrations are immutable: never edit this file. Change the schema by
 -- adding the next numbered file (see "Database migrations" in the docs).

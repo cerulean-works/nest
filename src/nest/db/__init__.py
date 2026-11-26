@@ -151,6 +151,18 @@ from .projects import (
     ProjectStore,
     UserNotFoundError,
 )
+from .service_principals import (
+    GITHUB_ACTIONS_ISSUER,
+    SERVICE_CAPABILITIES,
+    ExchangeRefusedError,
+    ServiceGrant,
+    ServicePrincipal,
+    ServicePrincipalError,
+    ServicePrincipalNotFoundError,
+    ServicePrincipalStore,
+    ServiceSession,
+    TrustPolicy,
+)
 from .sessions import AccessGrant, Rotation, SessionRefreshError, SessionStore
 from .store import JobStore, PlatformIdentityError, sync_platforms, sync_providers
 
@@ -163,8 +175,10 @@ __all__ = [
     "BINDING_STATUSES",
     "DEFAULT_AUTHORITIES",
     "EXECUTION_AUTHORITIES",
+    "GITHUB_ACTIONS_ISSUER",
     "GOOGLE_ISSUERS",
     "PROJECT_ROLES",
+    "SERVICE_CAPABILITIES",
     "TRANSPORT_MODES",
     "VERIFICATION_METHODS",
     "Acceptance",
@@ -202,6 +216,7 @@ __all__ = [
     "EmailOutbox",
     "EndpointNotApprovedError",
     "EnvironmentManagedError",
+    "ExchangeRefusedError",
     "Execution",
     "ExecutionClosedError",
     "ExecutionNotFoundError",
@@ -259,6 +274,12 @@ __all__ = [
     "ResolvedOption",
     "Rotation",
     "SchemaStatus",
+    "ServiceGrant",
+    "ServicePrincipal",
+    "ServicePrincipalError",
+    "ServicePrincipalNotFoundError",
+    "ServicePrincipalStore",
+    "ServiceSession",
     "Session",
     "SessionRefreshError",
     "SessionStore",
@@ -270,6 +291,7 @@ __all__ = [
     "SubmitterNotAuthorizedError",
     "TooManyPendingCLILoginsError",
     "TooManyPendingSignInsError",
+    "TrustPolicy",
     "User",
     "UserCodeCollisionError",
     "UserNotActiveError",

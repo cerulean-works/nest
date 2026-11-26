@@ -112,7 +112,7 @@ _ATTEMPT_COLUMNS = (
     "AS platform_authority_policy_version, "
     "(to_jsonb(a) ->> 'project_authority_policy_version')::integer "
     "AS project_authority_policy_version, "
-    # Added by 0020, read the same way.
+    # Added by 0021, read the same way.
     "(to_jsonb(a) ->> 'worker_protocol')::integer AS worker_protocol"
 )
 _ATTEMPT_FROM = "execution_attempts a JOIN hpc_platforms p ON p.id = a.platform_id"

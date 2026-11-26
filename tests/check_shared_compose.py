@@ -111,6 +111,8 @@ CONTROLLER_SETTINGS = {
     "NEST_AUTH_ACCESS_TOKEN_TTL",
     "NEST_AUTH_REFRESH_TTL",
     "NEST_AUTH_SESSION_MAX_LIFETIME",
+    "NEST_WORKLOAD_OIDC_AUDIENCE",
+    "NEST_WORKLOAD_TOKEN_TTL",
     "NEST_PLATFORMS_ENV",
 }
 # Variables that only the Dokploy file's sidecar or PostgreSQL may see.
@@ -355,6 +357,18 @@ def check_dokploy(dokploy):
         "services"
     ]["controller"]["environment"]
     assert google["NEST_AUTH_HTTP_BIND"] == "0.0.0.0:8080"
+    # CI workload identity stays off unless its audience is set, and both of its
+    # settings reach the Controller unchanged when they are.
+    assert controller["environment"]["NEST_WORKLOAD_OIDC_AUDIENCE"] == ""
+    assert controller["environment"]["NEST_WORKLOAD_TOKEN_TTL"] == ""
+    workload = render(
+        "compose.dokploy.yaml",
+        NEST_TAILSCALE_AUTHKEY="",
+        NEST_WORKLOAD_OIDC_AUDIENCE="https://auth.nest.example.org/workload",
+        NEST_WORKLOAD_TOKEN_TTL="300",
+    )["services"]["controller"]["environment"]
+    assert workload["NEST_WORKLOAD_OIDC_AUDIENCE"] == "https://auth.nest.example.org/workload"
+    assert workload["NEST_WORKLOAD_TOKEN_TTL"] == "300"
     # Optional PostgreSQL and migrations: the password reaches PostgreSQL as a file
     # from NEST_DATABASE_PASSWORD; only the database settings reach `migrate`.
     full = render(
