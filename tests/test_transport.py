@@ -93,7 +93,9 @@ class _FakeHpcContract(_ContractBase):
     def setUp(self):
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root, True)
-        self.hpc = FakeHpc(root)
+        # No worker container runs here, so no fake NVIDIA driver (or C compiler)
+        # is needed; the Controller image has none.
+        self.hpc = FakeHpc(root, nvidia_driver=False)
         settings = self.hpc.controller_settings()
         patcher = mock.patch.dict(
             os.environ, {k: v for k, v in settings.items() if k.startswith(("PATH", "FAKE_"))}

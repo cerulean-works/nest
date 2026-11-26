@@ -347,7 +347,14 @@ class FakeHpc:
 
     host = "fake-hpc"
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, nvidia_driver: bool = True):
+        """
+        Args:
+            root (`Path`): Empty directory to build the fake login node in.
+            nvidia_driver (`bool`, *optional*, defaults to `True`): Build the fake
+                NVIDIA driver `apptainer exec --nv` exposes, which needs a C
+                compiler. Tests that never run a worker container can skip it.
+        """
         self.base = root / "nest"
         self.bin = root / "bin"
         self.state = root / "state"
@@ -361,7 +368,8 @@ class FakeHpc:
         shutil.copytree(REPOSITORY / "scripts", self.base / "project" / "scripts")
 
         self.nvidia_libs = root / "nvidia"
-        build_fake_libcuda(self.nvidia_libs)
+        if nvidia_driver:
+            build_fake_libcuda(self.nvidia_libs)
 
         for name, body in _SHIMS.items():
             path = self.bin / name
