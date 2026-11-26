@@ -147,7 +147,11 @@ class GatewayConfigurationTests(unittest.TestCase):
         self.assertNotIn("connection_keepalive", clusters)
         self.assertIn("connection_keepalive", listener)
         self.assertIn("address: 127.0.0.1, port_value: 9901", text)
-        self.assertIn('socket_address: { address: "controller", port_value: 50051 }', clusters)
+        # The grpc-origin-only alias, never the generic `controller` name (#109).
+        self.assertIn(
+            'socket_address: { address: "controller-grpc-origin", port_value: 50051 }', clusters
+        )
+        self.assertIn("dns_lookup_family: V4_ONLY", clusters)
         # The access log names no header except the path.
         log = next(line for line in text.splitlines() if "inline_string" in line)
         self.assertEqual(log.count("%REQ("), 1)
@@ -165,6 +169,73 @@ class GatewayConfigurationTests(unittest.TestCase):
         self.assertIn("port_value: 9443", text)
         self.assertIn("/run/certs/fullchain.pem", (self.out / "certificate-sds.yaml").read_text())
         self.assertNotRegex(text, r"@[A-Z][A-Z_]*@")
+
+    def start(self, addresses: str | None, **env) -> subprocess.CompletedProcess:
+        """Runs the entrypoint (not --render) with a stub getent answering `addresses`
+        and a stub Envoy that only reports it was started."""
+        stubs = self.out / "stubs"
+        stubs.mkdir(exist_ok=True)
+        getent = stubs / "getent"
+        if addresses is not None:
+            getent.write_text(
+                f'#!/bin/sh\nfor a in {addresses}; do echo "$a STREAM $2"; echo "$a DGRAM"; done\n'
+            )
+            getent.chmod(0o755)
+        else:
+            # Only the tools the script needs, so there is no getent anywhere on PATH.
+            for tool in ("awk", "cat", "dirname", "grep", "mkdir", "mv", "sed", "sort"):
+                found = shutil.which(tool)
+                assert found, tool
+                (stubs / tool).symlink_to(found)
+        envoy = stubs / "envoy"
+        envoy.write_text("#!/bin/sh\necho ENVOY-STARTED\n")
+        envoy.chmod(0o755)
+        environment = {
+            "PATH": f"{stubs}:/usr/bin:/bin" if addresses is not None else str(stubs),
+            "NEST_GRPC_EDGE_PROXY": "10.0.1.7/32",
+            "NEST_GRPC_RUN_DIR": str(self.out / "run"),
+            "NEST_ENVOY_BINARY": str(envoy),
+            **env,
+        }
+        return subprocess.run(
+            ["/bin/sh", str(GATEWAY / "gateway-entrypoint.sh")],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_upstream_must_resolve_only_inside_grpc_origin(self):
+        """#109: Envoy is not started when the upstream name also resolves elsewhere."""
+        origin = {"NEST_GRPC_ORIGIN_SUBNET": "10.253.250.0/28"}
+        accepted = self.start("10.253.250.2", **origin)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertIn("ENVOY-STARTED", accepted.stdout)
+        self.assertIn("resolves only inside 10.253.250.0/28", accepted.stderr)
+        refused = {
+            "edge address": ("10.0.1.5", "outside grpc-origin"),
+            "edge and origin": ("10.253.250.2 10.0.1.5", "outside grpc-origin"),
+            "next subnet": ("10.253.250.16", "outside grpc-origin"),
+            "IPv6": ("fd00::2", "not IPv4"),
+            "unresolved": ("", "does not resolve"),
+        }
+        for label, (addresses, message) in refused.items():
+            with self.subTest(label):
+                result = self.start(addresses, **origin)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(message, result.stderr)
+                self.assertNotIn("ENVOY-STARTED", result.stdout)
+        for subnet in ("10.253.250.0", "10.253.250.0/31", "10.253.250.0/7", "fd00::/64", "x/28"):
+            with self.subTest(subnet=subnet):
+                result = self.start("10.253.250.2", NEST_GRPC_ORIGIN_SUBNET=subnet)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("NEST_GRPC_ORIGIN_SUBNET must be", result.stderr)
+
+    def test_resolution_check_fails_closed_without_getent(self):
+        result = self.start(None, NEST_GRPC_ORIGIN_SUBNET="10.253.250.0/28")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("getent is missing", result.stderr)
+        self.assertNotIn("ENVOY-STARTED", result.stdout)
 
     def test_localhost_is_accepted_for_local_tests(self):
         text = self.rendered(NEST_GRPC_PUBLIC_HOST="localhost")
@@ -310,6 +381,28 @@ class PublicPilotConfigTests(unittest.TestCase):
                 self.assertIn(expected, self.problems(**changes))
         self.assertIn("NEST_EXECUTOR=slurm", self.problems(NEST_EXECUTOR="local"))
         self.assertEqual(len(PUBLIC_PILOT_REQUIREMENTS), 11)
+
+    def test_mapped_form_networks_cannot_hide_an_ipv4_range(self):
+        """#109 review: `::ffff:0:0/96` is every IPv4 address; it must not slip past
+        the default-route check, nor a mapped trusted proxy past the inside check."""
+        for name, value in (
+            ("NEST_GRPC_ALLOWED_PEERS", "::ffff:0:0/96,172.31.250.2/32"),
+            ("NEST_GRPC_ALLOWED_PEERS", "::ffff:0.0.0.0/97,172.31.250.2/32"),
+            ("NEST_GRPC_ALLOWED_PEERS", "172.31.250.0/28,::ffff:10.0.1.0/120"),
+            ("NEST_GRPC_TRUSTED_PROXIES", "::ffff:10.9.9.9"),
+            ("NEST_GRPC_TRUSTED_PROXIES", "::ffff:172.31.250.2/128"),
+        ):
+            with self.subTest(name=name, value=value):
+                problems = self.problems(**{name: value})
+                self.assertIn(f"{name} has", problems)
+                self.assertIn("IPv4-mapped IPv6 network", problems)
+        # The same refusal outside the pilot: no setting can be a hidden IPv4 range.
+        with self.assertRaises(ConfigError):
+            load_controller_config({"NEST_GRPC_ALLOWED_PEERS": "::ffff:0:0/96"})
+        # Ordinary IPv6, including ranges that contain the mapped block, still loads;
+        # it never matches an IPv4 peer (see test_public_api_security).
+        rpc = load_controller_config({"NEST_GRPC_ALLOWED_PEERS": "fd00::/64,::/1"}).rpc
+        self.assertEqual([str(n) for n in rpc.allowed_peers], ["fd00::/64", "::/1"])
 
     def test_tls_or_an_explicit_private_plaintext_is_required(self):
         problems = self.problems(NEST_CONTROLLER_ALLOW_PLAINTEXT=None)

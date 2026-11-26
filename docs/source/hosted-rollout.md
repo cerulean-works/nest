@@ -35,6 +35,7 @@ implementation ([#88](https://github.com/cerulean-works/nest/pull/88),
 | --- | --- | --- | --- | --- |
 | A1. Deploy fails at network creation on an overlapping subnet; operator override | Yes | **CI**: `tests/repro_migrate_stall.sh` step 1, `test_deploy_doctor.py` | Seen on 2026-11-26 (override `10.253.250.0/28`); `preflight` not yet run on the host: **PENDING** | n/a |
 | A2. Subnet, gateway, trusted-proxy, allowed-peer and edge consistency preflight | Yes (`nest-deploy-doctor.py preflight`) | **CI** | **PENDING** (run R1) | n/a |
+| A6. Gateway upstream resolves only to grpc-origin; the Controller's actual peer is the gateway's /32 (#109) | Yes (`controller-grpc-origin` alias, entrypoint resolution check, mapped-address handling, `nest-deploy-doctor.py gateway-runtime`) | **CI**: `smoke_public_grpc_networks.sh` (Dokploy-like multi-network topology, old configuration fails, current passes), `test_deploy_doctor.py`, `test_public_api_security.py` | Failure seen on 2026-11-26: preflight passed, but the generic upstream resolved to the edge address and `unauthenticated_refused` got `PERMISSION_DENIED`. Fix not yet deployed: **PENDING** (R1, then R4) | n/a |
 | A3. Stuck `migrate` (interrupted recreate) detected, bounded, recovered without bypassing the migration | Yes (`migrate-status`, `wait-migrate`, `recover-migrate`) | **CI**: reproduced with Compose v5.7.1, Engine 29.9.3 | Incident recovered by hand on 2026-11-26; doctor not yet run on the host: **PENDING** (R1) | n/a |
 | A4. Failed migration fails closed; repeated migrations; volumes, sign-in and Tailnet kept | Yes (existing) | **CI**: `smoke_compose_env.sh`, `smoke_compose_postgres_upgrade.sh`, repro step 4 | Private SDK login, Project selection and a remote call passed after the 2026-11-26 recovery (operator report) | n/a |
 | A5. Cause of the 2026-11-26 interruption | n/a | Mechanism verified; trigger **not confirmed** (see [Preflight and recover](deployment-recovery#verified-cause-and-open-hypotheses)) | **BLOCKED**: needs Compose v5.8.0 and Dokploy's deploy log of the failed attempt | n/a |
@@ -116,6 +117,8 @@ python3 scripts/nest-deploy-doctor.py preflight      --project "$APP" --env-file
 # Start this as you press Deploy in Dokploy (or pass --since <deploy start, RFC 3339>):
 python3 scripts/nest-deploy-doctor.py wait-migrate   --project "$APP" --timeout 300
 python3 scripts/nest-deploy-doctor.py migrate-status --project "$APP"
+# With public-grpc, once the deploy is up (and after every redeploy or restart):
+python3 scripts/nest-deploy-doctor.py gateway-runtime --project "$APP"
 ```
 
 Expected: every preflight line `PASS` (a `SKIP` only with the reason checked by
@@ -124,8 +127,11 @@ migration that finished after the wait started. A timeout while `migrate-status`
 shows `waiting-dependency` means PostgreSQL is not healthy; check it, and do not
 recover `migrate`. On exit 3, follow
 [Recover a stuck migrate](deployment-recovery#recover-a-stuck-migrate). On exit 4,
-fix the cause from `--logs 40`. Then check that the private path still works, from
-a Tailnet client: `nest projects current` and one small remote call.
+fix the cause from `--logs 40`. With `public-grpc`, every `gateway-runtime` line
+must be `PASS` before R4 (see
+[The upstream name and the private path](public-grpc-gateway#the-upstream-name-and-the-private-path)).
+Then check that the private path still works, from a Tailnet client:
+`nest projects current` and one small remote call.
 
 ### R2. Edge route (B1)
 

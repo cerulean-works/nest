@@ -12,7 +12,13 @@
 #                          10.0.1.7/32 (Dokploy's Traefik on dokploy-network). Only
 #                          connections from it are accepted, and only it may send the
 #                          PROXY protocol header that names the client.
-#   NEST_GRPC_UPSTREAM     Controller host:port on the private network (controller:50051)
+#   NEST_GRPC_UPSTREAM     Controller host:port on the private network
+#                          (controller-grpc-origin:50051, a name that exists only on
+#                          grpc-origin; the generic `controller` name also resolves on
+#                          the edge network Dokploy attaches, #109)
+#   NEST_GRPC_ORIGIN_SUBNET the private network's IPv4 CIDR. When set, Envoy is not
+#                          started unless every address the upstream name resolves to
+#                          lies inside it (checked with getent; not with --render)
 #   NEST_GRPC_LISTEN_PORT  TLS listener port (8443); never published on the host
 #   NEST_GRPC_ADMIN_PORT   admin port on 127.0.0.1 only (9901)
 #   NEST_GRPC_CERT_DIR     directory holding fullchain.pem and privkey.pem (/certs)
@@ -38,7 +44,8 @@ fi
 
 host=${NEST_GRPC_PUBLIC_HOST:-grpc.nest.cerulean.works}
 edge=${NEST_GRPC_EDGE_PROXY:-}
-upstream=${NEST_GRPC_UPSTREAM:-controller:50051}
+upstream=${NEST_GRPC_UPSTREAM:-controller-grpc-origin:50051}
+origin_subnet=${NEST_GRPC_ORIGIN_SUBNET:-}
 listen=${NEST_GRPC_LISTEN_PORT:-8443}
 admin=${NEST_GRPC_ADMIN_PORT:-9901}
 certs=${NEST_GRPC_CERT_DIR:-/certs}
@@ -84,6 +91,48 @@ esac
 echo "$certs" | grep -Eqx '[A-Za-z0-9/._-]+' || fail "NEST_GRPC_CERT_DIR has unsupported characters"
 [ -r "$template" ] || fail "cannot read the template $template"
 
+# IPv4 dotted quad to an integer, or fail.
+ipv4_int() {
+    echo "$1" | grep -Eqx '([0-9]{1,3}\.){3}[0-9]{1,3}' || return 1
+    old_ifs=$IFS
+    IFS=.
+    # shellcheck disable=SC2086
+    set -- $1
+    IFS=$old_ifs
+    for octet in "$@"; do
+        [ "$octet" -le 255 ] || return 1
+    done
+    echo $(( ($1 << 24) + ($2 << 16) + ($3 << 8) + $4 ))
+}
+
+if [ -n "$origin_subnet" ]; then
+    origin_address=${origin_subnet%/*}
+    origin_prefix=${origin_subnet##*/}
+    [ "$origin_address" != "$origin_subnet" ] \
+        && echo "$origin_prefix" | grep -Eqx '[0-9]{1,2}' \
+        && [ "$origin_prefix" -ge 8 ] && [ "$origin_prefix" -le 30 ] \
+        && origin_base=$(ipv4_int "$origin_address") \
+        || fail "NEST_GRPC_ORIGIN_SUBNET must be an IPv4 CIDR /8 to /30, got '$origin_subnet'"
+    origin_mask=$(( (0xFFFFFFFF << (32 - origin_prefix)) & 0xFFFFFFFF ))
+    origin_base=$(( origin_base & origin_mask ))
+fi
+
+# Fails unless the upstream name resolves, and only to grpc-origin addresses: a
+# name that also resolves on another network (the edge network Dokploy attaches)
+# would let Envoy reach the Controller from outside its allowlist (#109).
+check_upstream_resolution() {
+    command -v getent >/dev/null 2>&1 || fail "cannot check NEST_GRPC_UPSTREAM: getent is missing"
+    resolved=$(getent ahosts "$upstream_host" | awk '{print $1}' | sort -u) || resolved=
+    [ -n "$resolved" ] || fail "NEST_GRPC_UPSTREAM host '$upstream_host' does not resolve; is the Controller on grpc-origin with that alias?"
+    for address in $resolved; do
+        value=$(ipv4_int "$address") \
+            || fail "NEST_GRPC_UPSTREAM host '$upstream_host' resolves to $address, which is not IPv4 on grpc-origin ($origin_subnet)"
+        [ $(( value & origin_mask )) -eq "$origin_base" ] \
+            || fail "NEST_GRPC_UPSTREAM host '$upstream_host' resolves to $address, outside grpc-origin ($origin_subnet); point it at the grpc-origin-only alias (docs/source/public-grpc-gateway.md)"
+    done
+    echo "nest-grpc-gateway: upstream $upstream_host resolves only inside $origin_subnet:" $resolved >&2
+}
+
 umask 077
 mkdir -p "$out"
 sds="$out/certificate-sds.yaml"
@@ -114,4 +163,5 @@ mv "$out/envoy.yaml.tmp" "$out/envoy.yaml"
 echo "nest-grpc-gateway: rendered for $host, edge proxy $edge, upstream $upstream" >&2
 
 [ -z "$render_only" ] || exit 0
+[ -z "$origin_subnet" ] || check_upstream_resolution
 exec "${NEST_ENVOY_BINARY:-envoy}" -c "$out/envoy.yaml" --log-level "${NEST_ENVOY_LOG_LEVEL:-info}"

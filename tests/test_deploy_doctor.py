@@ -17,6 +17,7 @@ import unittest
 import uuid
 from contextlib import redirect_stdout
 from pathlib import Path
+from typing import ClassVar
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -591,6 +592,15 @@ class PreflightTests(unittest.TestCase):
             "edge unset": ({"NEST_GRPC_EDGE_PROXY": ""}, "edge_proxy"),
             "edge too wide": ({"NEST_GRPC_EDGE_PROXY": "10.0.1.0/24"}, "edge_proxy"),
             "pilot off": ({"NEST_PUBLIC_PILOT": ""}, "public_pilot"),
+            # #109 review: a mapped-form IPv4 range is refused, not passed over as IPv6.
+            "mapped allowed peers": (
+                {"NEST_GRPC_ALLOWED_PEERS": "10.253.250.0/28,172.18.0.0/16,::ffff:0:0/96"},
+                "allowed_peers",
+            ),
+            "mapped trusted proxy": (
+                {"NEST_GRPC_TRUSTED_PROXIES": "::ffff:10.253.250.2/128"},
+                "trusted_proxies",
+            ),
         }
         for label, (changes, check) in cases.items():
             with self.subTest(label):
@@ -866,6 +876,482 @@ class LogLeakCheckTests(unittest.TestCase):
         self.assertEqual(len(prompts), 1)
         self.assertNotIn(SYNTHETIC_TOKEN, prompts[0])
         self.assertNotIn("--token", " ".join(doctor.parser().format_help().split()))
+
+
+def _proc_word(address: str) -> str:
+    """One IPv4 address as /proc/net/tcp prints it on a little-endian host."""
+    return bytes(int(octet) for octet in address.split("."))[::-1].hex().upper()
+
+
+def _proc_word6(address: str) -> str:
+    """One IPv6 address as /proc/net/tcp6 prints it: four host-order (little-endian)
+    32-bit words. IPv4 addresses are written in mapped form."""
+    import ipaddress
+
+    parsed = ipaddress.ip_address(address)
+    if parsed.version == 4:
+        parsed = ipaddress.IPv6Address(f"::ffff:{parsed}")
+    raw = parsed.packed
+    return "".join(raw[i : i + 4][::-1].hex().upper() for i in range(0, 16, 4))
+
+
+def _socket_line(i, word, socket):
+    local, lport, remote, rport, *rest = socket
+    inode = rest[0] if rest else 1000 + i
+    return (
+        f"   {i}: {word(local)}:{lport:04X} {word(remote)}:{rport:04X} 01 "
+        f"00000000:00000000 00:00000000 00000000   101        0 {inode} 1 0000000000000000"
+    )
+
+
+def proc_tcp(*sockets) -> str:
+    """/proc/net/tcp text for established `(local, lport, remote, rport[, inode])`
+    sockets, after a listening socket that must be ignored."""
+    header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt"
+    header += "   uid  timeout inode"
+    listening = "   0: 00000000:C383 00000000:0000 0A 00000000:00000000 00:00000000 00000000"
+    listening += "   101        0 999 1 0000000000000000"
+    lines = [header, listening]
+    lines += [_socket_line(i, _proc_word, s) for i, s in enumerate(sockets, 1)]
+    return "\n".join(lines) + "\n"
+
+
+def proc_tcp6(*sockets) -> str:
+    """/proc/net/tcp6 text: IPv4 ends in mapped form (a dual-stack listener), IPv6
+    ends native."""
+    header = "  sl  local_address                         remote_address                        st"
+    lines = [header + " tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"]
+    lines += [_socket_line(i, _proc_word6, s) for i, s in enumerate(sockets, 1)]
+    return "\n".join(lines) + "\n"
+
+
+ORIGIN = "nest_grpc-origin"
+EDGE = "dokploy-network"
+PROBE_INODE = 5555
+PROBE = ("10.253.250.3", 41000, "10.253.250.2", 50051, PROBE_INODE)
+MIRROR = ("10.253.250.2", 50051, "10.253.250.3", 41000, 7777)
+
+
+def runtime_container(service, networks, env, *, started="2026-11-26T15:00:00Z"):
+    found = container(f"nest-{service}-1", "running", service=service, pid=42, started=started)
+    found["Config"]["Env"] = [f"{k}={v}" for k, v in env.items()]
+    found["NetworkSettings"] = {
+        "Networks": {
+            name: {"IPAddress": address, "DNSNames": names, "Aliases": names}
+            for name, (address, names) in networks.items()
+        }
+    }
+    return found
+
+
+class RuntimeDocker(FakeDocker):
+    """Also answers `docker exec`: getent in the gateway, the detached probe, and each
+    container's socket tables. The gateway's table read names the probe's socket
+    inode (`probe_inode`) only when it is given the probe's token."""
+
+    def __init__(self, containers, *, resolves, sockets, probe=0, probe_inode=PROBE_INODE):
+        super().__init__(containers=containers)
+        self.resolves = resolves  # gateway getent answer, or None when it fails
+        self.sockets = sockets  # container ID -> socket table text, or None (read fails)
+        self.probe = probe  # exit status of `docker exec --detach`
+        self.probe_inode = probe_inode  # None: the probe never connected
+        self.token = None
+
+    def __call__(self, argv):
+        argv = list(argv)
+        if argv[:2] != ["docker", "exec"]:
+            return super().__call__(argv)
+        self.calls.append(argv)
+        R = doctor.Result
+        rest = argv[2:]
+        if rest[0] == "--detach":
+            assert rest[2:4] == ["bash", "-c"] and "/dev/tcp/" in rest[4], rest
+            self.token = rest[5]
+            assert self.token.startswith("nest-doctor-probe-"), rest
+            return R(self.probe, "")
+        target, command = rest[0], rest[1:]
+        if command[0] == "getent":
+            if self.resolves is None:
+                return R(2, "")
+            return R(0, "".join(f"{a} STREAM {command[2]}\n{a} DGRAM\n" for a in self.resolves))
+        if command[:2] == ["sh", "-c"]:
+            text = self.sockets.get(target)
+            if text is None:
+                return R(3, "", "cat: /proc/net/tcp: Permission denied")
+            if command[3:] == ["sockets", self.token] and self.probe_inode is not None:
+                text = f"probe socket:[{self.probe_inode}]\n" + text
+            return R(0, text)
+        raise AssertionError(f"unexpected exec {argv}")
+
+
+class GatewayRuntimeTests(unittest.TestCase):
+    """#109: what the running gateway and Controller actually do, from recorded answers
+    shaped like the 2026-11-26 staging host (Controller .2 and Envoy .3 on grpc-origin,
+    both also on dokploy-network)."""
+
+    CONTROLLER_ENV: ClassVar[dict[str, str]] = {
+        "NEST_GRPC_TRUSTED_PROXIES": "10.253.250.3/32",
+        "NEST_GRPC_ALLOWED_PEERS": "10.253.250.3/32,172.20.0.0/16",
+        "NEST_DATABASE_PASSWORD": "never-printed-secret",
+        "NEST_GOOGLE_CLIENT_SECRET": "GOCSPX-never-printed",
+    }
+
+    def setUp(self):
+        patcher = mock.patch.object(doctor.time, "sleep")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def deployment(self, *, upstream="controller-grpc-origin:50051", generic_on_edge=False, **env):
+        origin_names = ["nest-controller-1", "controller", "controller-grpc-origin"]
+        edge_names = ["nest-controller-1", "controller"]
+        if generic_on_edge:
+            origin_names = ["nest-controller-1", "controller"]
+        controller = runtime_container(
+            "controller",
+            {
+                ORIGIN: ("10.253.250.2", origin_names),
+                EDGE: ("10.0.1.12", edge_names),
+                "nest_tailnet": ("172.20.0.3", ["nest-controller-1", "controller"]),
+            },
+            {**self.CONTROLLER_ENV, **env},
+        )
+        gateway = runtime_container(
+            "grpc-gateway",
+            {
+                ORIGIN: ("10.253.250.3", ["nest-grpc-gateway-1"]),
+                EDGE: ("10.0.1.13", ["nest-grpc-gateway-1", "nest-grpc-gateway"]),
+            },
+            {"NEST_GRPC_UPSTREAM": upstream, "NEST_GRPC_EDGE_PROXY": "10.0.1.7/32"},
+            started="2026-11-26T15:00:05Z",
+        )
+        return controller, gateway
+
+    def dual_stack_edge(self, controller, gateway):
+        """Both containers also get a native IPv6 address on the edge network."""
+        controller["NetworkSettings"]["Networks"][EDGE]["GlobalIPv6Address"] = "fd00:1::12"
+        gateway["NetworkSettings"]["Networks"][EDGE]["GlobalIPv6Address"] = "fd00:1::13"
+
+    def run_runtime(self, fake):
+        return run(["gateway-runtime", "--project", "nest"], fake)
+
+    def healthy(self, controller, gateway, **overrides):
+        options = {
+            "resolves": ["10.253.250.2"],
+            "sockets": {gateway["Id"]: proc_tcp(PROBE), controller["Id"]: proc_tcp(MIRROR)},
+        }
+        options.update(overrides)
+        return RuntimeDocker([controller, gateway], **options)
+
+    def test_current_configuration_passes_with_socket_evidence(self):
+        controller, gateway = self.deployment()
+        fake = self.healthy(controller, gateway)
+        code, out = self.run_runtime(fake)
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("FAIL", out)
+        self.assertIn("PASS upstream_dns: controller-grpc-origin -> 10.253.250.2 only", out)
+        self.assertIn(
+            "PASS private_path: probe 10.253.250.3:41000 -> 10.253.250.2:50051 seen from both ends",
+            out,
+        )
+        for secret in ("never-printed-secret", "GOCSPX-never-printed"):
+            self.assertNotIn(secret, out)
+        # The gateway's table read looked for this run's probe token, and the
+        # Controller's read is the strict table script.
+        reads = [c for c in fake.calls if c[:2] == ["docker", "exec"] and c[3:5] == ["sh", "-c"]]
+        self.assertIn(["sockets", fake.token], [c[6:] for c in reads])
+        self.assertIn(doctor.SOCKET_TABLES, [c[5] for c in reads])
+
+    def test_staging_topology_with_the_generic_name_fails(self):
+        """The observed failure: `controller` resolves to the edge address and the
+        Controller's socket shows the gateway's edge address."""
+        controller, gateway = self.deployment(upstream="controller:50051", generic_on_edge=True)
+        fake = self.healthy(
+            controller,
+            gateway,
+            resolves=["10.0.1.12"],
+            sockets={
+                gateway["Id"]: proc_tcp(("10.0.1.13", 41000, "10.0.1.12", 50051, PROBE_INODE)),
+                controller["Id"]: proc_tcp6(("10.0.1.12", 50051, "10.0.1.13", 41000)),
+            },
+        )
+        code, out = self.run_runtime(fake)
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL upstream_setting: NEST_GRPC_UPSTREAM is controller:50051", out)
+        self.assertIn(f"FAIL upstream_alias: controller is a Controller name on {EDGE}", out)
+        self.assertIn("FAIL upstream_dns: controller resolves inside the gateway to 10.0.1.12", out)
+        self.assertIn(
+            "FAIL private_path: the probe connected 10.0.1.13 -> 10.0.1.12:50051, not "
+            "10.253.250.3 -> 10.253.250.2:50051",
+            out,
+        )
+
+    def test_ipv4_mapped_controller_sockets_are_recognised(self):
+        """A dual-stack Controller lists the gateway as ::ffff:10.253.250.3."""
+        controller, gateway = self.deployment()
+        sockets = {gateway["Id"]: proc_tcp(PROBE), controller["Id"]: proc_tcp6(MIRROR)}
+        code, out = self.run_runtime(self.healthy(controller, gateway, sockets=sockets))
+        self.assertEqual(code, 0, out)
+        self.assertIn(
+            "every gateway connection to the Controller is 10.253.250.3 -> 10.253.250.2", out
+        )
+
+    def test_any_gateway_connection_over_the_edge_fails(self):
+        controller, gateway = self.deployment()
+        sockets = {
+            gateway["Id"]: proc_tcp(PROBE),
+            controller["Id"]: proc_tcp(
+                MIRROR,
+                ("10.0.1.12", 50051, "10.0.1.13", 41002),  # a pooled Envoy connection
+                ("172.20.0.3", 50051, "172.20.0.2", 40000),  # Tailscale Serve: not the gateway
+            ),
+        }
+        code, out = self.run_runtime(self.healthy(controller, gateway, sockets=sockets))
+        self.assertEqual(code, 1, out)
+        self.assertIn(
+            "FAIL private_path: the gateway also reaches the Controller as 10.0.1.13 -> 10.0.1.12",
+            out,
+        )
+        self.assertNotIn("172.20.0.2", out)
+
+    def test_gateway_side_connection_to_another_controller_address_fails(self):
+        """An origin-sourced connection to the Controller's edge address is refused too."""
+        controller, gateway = self.deployment()
+        sockets = {
+            gateway["Id"]: proc_tcp(PROBE, ("10.253.250.3", 41005, "10.0.1.12", 50051)),
+            controller["Id"]: proc_tcp(MIRROR),
+        }
+        code, out = self.run_runtime(self.healthy(controller, gateway, sockets=sockets))
+        self.assertEqual(code, 1, out)
+        self.assertIn("as 10.253.250.3 -> 10.0.1.12", out)
+
+    def test_failed_probe_with_existing_healthy_sockets_fails(self):
+        """#110 review: the detached probe is acknowledged at launch; pooled healthy
+        connections must not stand in for a probe that never connected."""
+        controller, gateway = self.deployment()
+        pooled = ("10.253.250.3", 41000, "10.253.250.2", 50051, 4242)
+        sockets = {gateway["Id"]: proc_tcp(pooled), controller["Id"]: proc_tcp(MIRROR)}
+        fake = self.healthy(controller, gateway, sockets=sockets, probe_inode=None)
+        code, out = self.run_runtime(fake)
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL private_path: the probe never held a connection", out)
+        # The probe socket named but absent from the tables is the same failure.
+        code, out = self.run_runtime(self.healthy(controller, gateway, sockets=sockets))
+        self.assertIn("FAIL private_path: the probe never held a connection", out)
+
+    def test_probe_without_a_controller_mirror_fails(self):
+        """The Controller must hold the exact mirror of the probe's 4-tuple."""
+        controller, gateway = self.deployment()
+        other = ("10.253.250.2", 50051, "10.253.250.3", 41999)
+        sockets = {gateway["Id"]: proc_tcp(PROBE), controller["Id"]: proc_tcp(other)}
+        code, out = self.run_runtime(self.healthy(controller, gateway, sockets=sockets))
+        self.assertEqual(code, 1, out)
+        self.assertIn(
+            "FAIL private_path: the Controller holds no connection from 10.253.250.3:41000", out
+        )
+
+    def test_probe_to_the_wrong_destination_fails(self):
+        controller, gateway = self.deployment()
+        for probe in (
+            ("10.253.250.3", 41000, "10.253.250.9", 50051, PROBE_INODE),  # another host
+            ("10.253.250.3", 41000, "10.253.250.2", 50052, PROBE_INODE),  # another port
+        ):
+            with self.subTest(probe=probe):
+                mirror = (probe[2], probe[3], probe[0], probe[1])
+                sockets = {gateway["Id"]: proc_tcp(probe), controller["Id"]: proc_tcp(mirror)}
+                code, out = self.run_runtime(self.healthy(controller, gateway, sockets=sockets))
+                self.assertEqual(code, 1, out)
+                self.assertIn("FAIL private_path: the probe connected", out)
+
+    def test_dual_stack_edge_allowlist_fails(self):
+        """#110 review: an IPv6 allowlist entry admits a native IPv6 peer, so the
+        gateway's IPv6 edge address counts as a non-origin address."""
+        controller, gateway = self.deployment(
+            NEST_GRPC_ALLOWED_PEERS="10.253.250.3/32,172.20.0.0/16,fd00:1::/64"
+        )
+        self.dual_stack_edge(controller, gateway)
+        code, out = self.run_runtime(self.healthy(controller, gateway))
+        self.assertEqual(code, 1, out)
+        self.assertIn(
+            "FAIL controller_trust: NEST_GRPC_ALLOWED_PEERS admits the gateway's non-origin "
+            "address fd00:1::13",
+            out,
+        )
+        # A healthy IPv4 probe and no IPv6 allowlist: the dual-stack edge alone passes.
+        controller, gateway = self.deployment()
+        self.dual_stack_edge(controller, gateway)
+        code, out = self.run_runtime(self.healthy(controller, gateway))
+        self.assertEqual(code, 0, out)
+
+    def test_dual_stack_edge_socket_fails(self):
+        """A held native IPv6 edge connection fails, though the IPv4 probe is healthy."""
+        controller, gateway = self.deployment()
+        self.dual_stack_edge(controller, gateway)
+        sockets = {
+            gateway["Id"]: proc_tcp(PROBE),
+            controller["Id"]: proc_tcp(MIRROR)
+            + proc_tcp6(("fd00:1::12", 50051, "fd00:1::13", 41007)),
+        }
+        code, out = self.run_runtime(self.healthy(controller, gateway, sockets=sockets))
+        self.assertEqual(code, 1, out)
+        self.assertIn("as fd00:1::13 -> fd00:1::12", out)
+
+    def test_wrong_or_extra_addresses_fail(self):
+        controller, gateway = self.deployment()
+        for resolves in (["10.253.250.2", "10.0.1.12"], ["10.253.250.9"], []):
+            with self.subTest(resolves=resolves):
+                code, out = self.run_runtime(self.healthy(controller, gateway, resolves=resolves))
+                self.assertEqual(code, 1, out)
+                self.assertIn("FAIL upstream_dns", out)
+
+    def test_alias_on_another_network_fails(self):
+        controller, gateway = self.deployment()
+        controller["NetworkSettings"]["Networks"][EDGE]["DNSNames"].append("controller-grpc-origin")
+        code, out = self.run_runtime(self.healthy(controller, gateway))
+        self.assertEqual(code, 1, out)
+        self.assertIn(
+            f"FAIL upstream_alias: controller-grpc-origin is a Controller name on {EDGE}, {ORIGIN}",
+            out,
+        )
+
+    def test_widened_trust_fails(self):
+        for env, message in (
+            ({"NEST_GRPC_TRUSTED_PROXIES": "10.0.1.0/24"}, "is 10.0.1.0/24, not 10.253.250.3/32"),
+            (
+                {"NEST_GRPC_ALLOWED_PEERS": "10.253.250.3/32,10.0.1.0/24"},
+                "NEST_GRPC_ALLOWED_PEERS admits the gateway's non-origin address 10.0.1.13",
+            ),
+            ({"NEST_GRPC_ALLOWED_PEERS": "172.20.0.0/16"}, "does not admit 10.253.250.3/32"),
+            ({"NEST_GRPC_TRUSTED_PROXIES": "not-a-network"}, "does not parse"),
+            # #109 review: a mapped-form entry covering the edge address would admit it
+            # in an older guard; it is refused, never skipped as "IPv6".
+            (
+                {"NEST_GRPC_ALLOWED_PEERS": "10.253.250.3/32,::ffff:10.0.1.0/120"},
+                "::ffff:10.0.1.0/120 is an IPv4-mapped IPv6 network",
+            ),
+            (
+                {"NEST_GRPC_TRUSTED_PROXIES": "::ffff:10.253.250.3/128"},
+                "is an IPv4-mapped IPv6 network",
+            ),
+        ):
+            with self.subTest(env):
+                controller, gateway = self.deployment(**env)
+                code, out = self.run_runtime(self.healthy(controller, gateway))
+                self.assertEqual(code, 1, out)
+                self.assertIn("FAIL controller_trust", out)
+                self.assertIn(message, out)
+
+    def test_unavailable_checks_fail(self):
+        controller, gateway = self.deployment()
+        for label, overrides, message in (
+            ("getent", {"resolves": None}, "FAIL upstream_dns"),
+            ("probe launch", {"probe": 1}, "FAIL private_path: could not start the probe"),
+            (
+                "gateway table",
+                {"sockets": {gateway["Id"]: None, controller["Id"]: proc_tcp(MIRROR)}},
+                "FAIL private_path: could not read a socket table",
+            ),
+            (
+                "Controller table",
+                {"sockets": {gateway["Id"]: proc_tcp(PROBE), controller["Id"]: None}},
+                "in the Controller",
+            ),
+            (
+                "no connection",
+                {"sockets": {gateway["Id"]: proc_tcp(), controller["Id"]: proc_tcp()}},
+                "FAIL private_path: the probe never held a connection",
+            ),
+        ):
+            with self.subTest(label):
+                code, out = self.run_runtime(self.healthy(controller, gateway, **overrides))
+                self.assertEqual(code, 1, out)
+                self.assertIn(message, out)
+
+    def test_stale_or_missing_containers_fail(self):
+        controller, gateway = self.deployment()
+        _, stale = self.deployment()
+        fake = RuntimeDocker([controller, gateway, stale], resolves=["10.253.250.2"], sockets={})
+        code, out = self.run_runtime(fake)
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL grpc-gateway_container: 2 running grpc-gateway containers", out)
+        gateway["State"]["Status"] = "restarting"
+        code, out = self.run_runtime(RuntimeDocker([controller, gateway], resolves=[], sockets={}))
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL grpc-gateway_container: no running grpc-gateway container", out)
+        self.assertIn("found: restarting", out)
+
+    def test_controller_restarted_after_the_gateway_is_reported(self):
+        controller, gateway = self.deployment()
+        controller["State"]["StartedAt"] = "2026-11-26T16:00:00Z"
+        code, out = self.run_runtime(self.healthy(controller, gateway))
+        self.assertEqual(code, 0, out)
+        self.assertIn("WARN containers: the Controller was (re)started after the gateway", out)
+
+    def test_parse_proc_net_byte_order(self):
+        text = proc_tcp(PROBE)
+        ((local, lport, remote, rport, inode),) = doctor.parse_proc_net(text, "little")
+        self.assertEqual(
+            (str(local), lport, str(remote), rport, inode),
+            ("10.253.250.3", 41000, "10.253.250.2", 50051, PROBE_INODE),
+        )
+        big = "   1: 0AFDFA03:A028 0AFDFA02:C383 01 0 0 0 101 0 31337 1 0\n"
+        ((local, _, remote, _, inode),) = doctor.parse_proc_net(big, "big")
+        self.assertEqual((str(local), str(remote), inode), ("10.253.250.3", "10.253.250.2", 31337))
+        native = doctor.parse_proc_net(proc_tcp6(("fd00:1::12", 50051, "fd00:1::13", 1)))
+        self.assertEqual([str(native[0][0]), str(native[0][2])], ["fd00:1::12", "fd00:1::13"])
+        self.assertEqual(doctor.parse_proc_net("   1: zz:1 yy:2 01 0 0 0 0 0 1\n"), [])
+        self.assertEqual(doctor.parse_proc_net("   1: 0AFDFA03:A028 0AFDFA02:C383 01\n"), [])
+
+
+class SocketTableScriptTests(unittest.TestCase):
+    """The table scripts the doctor runs in the containers, against a stand-in /proc."""
+
+    def run_script(self, script, proc, *args):
+        text = script.replace("/proc/net/", f"{proc}/net/").replace(
+            "/proc/[0-9]*", f"{proc}/[0-9]*"
+        )
+        return subprocess.run(
+            ["sh", "-c", text, "sockets", *args], capture_output=True, text=True, check=False
+        )
+
+    def setUp(self):
+        self.proc = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (self.proc / "net").mkdir()
+        (self.proc / "net" / "tcp").write_text(proc_tcp(PROBE))
+
+    def test_an_absent_tcp6_table_is_fine(self):
+        result = self.run_script(doctor.SOCKET_TABLES, self.proc)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(doctor.parse_proc_net(result.stdout)), 1)
+
+    def test_an_unreadable_existing_table_fails(self):
+        (self.proc / "net" / "tcp6").mkdir()  # exists, but cat cannot read it
+        result = self.run_script(doctor.SOCKET_TABLES, self.proc)
+        self.assertEqual(result.returncode, 4)
+        (self.proc / "net" / "tcp").unlink()
+        result = self.run_script(doctor.SOCKET_TABLES, self.proc)
+        self.assertEqual(result.returncode, 3)
+
+    def test_the_probe_socket_is_found_by_its_token(self):
+        token = "nest-doctor-probe-0123456789ab"
+        for pid, cmdline, fd3 in (
+            (
+                "41",
+                f"bash\0-c\0exec 3<>...\0{token}\0controller-grpc-origin\050051\0",
+                "socket:[5555]",
+            ),
+            ("42", "bash\0-c\0exec 3<>...\0nest-doctor-probe-other\0", "socket:[6666]"),
+            ("43", "envoy\0-c\0/tmp/nest-grpc/envoy.yaml\0", "socket:[7777]"),
+            ("44", f"sh\0-c\0for p in ...\0sockets\0{token}\0", "pipe:[8888]"),
+        ):
+            (self.proc / pid / "fd").mkdir(parents=True)
+            (self.proc / pid / "cmdline").write_text(cmdline)
+            (self.proc / pid / "fd" / "3").symlink_to(fd3)
+        result = self.run_script(doctor.PROBE_SOCKET, self.proc, token)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("probe socket:[5555]", result.stdout)
+        self.assertNotIn("6666", result.stdout)
+        self.assertNotIn("7777", result.stdout)
+        self.assertNotIn("8888", result.stdout)  # the reader's own pipe, not a socket
 
 
 @unittest.skipUnless(CHECKOUT, "requires the repository checkout")

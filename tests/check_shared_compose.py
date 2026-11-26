@@ -439,7 +439,18 @@ def check_public_gateway():
     assert config["source"] == str(ROOT / "deploy/public-grpc") and config["read_only"]
     assert certificates["source"] == "grpc-certificates" and certificates["read_only"]
     assert gateway["environment"]["NEST_GRPC_EDGE_PROXY"] == "10.0.1.7/32"
-    assert gateway["environment"]["NEST_GRPC_UPSTREAM"] == "controller:50051"
+    # #109: the gateway dials a name that exists only on grpc-origin. The generic
+    # `controller` name also resolves on the edge network Dokploy attaches.
+    assert gateway["environment"]["NEST_GRPC_UPSTREAM"] == "controller-grpc-origin:50051"
+    assert gateway["environment"]["NEST_GRPC_ORIGIN_SUBNET"] == "172.31.250.0/28"
+    assert controller["networks"]["grpc-origin"]["aliases"] == ["controller-grpc-origin"]
+    for name, attachment in controller["networks"].items():
+        if name != "grpc-origin":
+            assert "controller-grpc-origin" not in (attachment or {}).get("aliases", []), name
+    for name, service in services.items():
+        if name != "controller":
+            for attachment in (service.get("networks") or {}).values():
+                assert "controller-grpc-origin" not in (attachment or {}).get("aliases", []), name
     assert acme["networks"] == {"acme": None} or set(acme["networks"]) == {"acme"}
     assert "edge" not in acme["networks"] and "grpc-origin" not in acme["networks"]
     assert gateway["labels"]["traefik.enable"] == "false"
