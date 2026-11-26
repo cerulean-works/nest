@@ -24,13 +24,15 @@ to Controller-owned SSH.
 
 import os
 import selectors
+import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Self
 
 from .._logging import get_logger
 from ..config import child_environ
@@ -261,10 +263,6 @@ class _OpenSSHTransport(SlurmTransport):
         """The `ssh` command line, without the remote command."""
         raise NotImplementedError
 
-    def _command_timeout(self) -> float:
-        """Seconds allowed for the next command."""
-        return self.timeout
-
     def _process(
         self, command: str, input: bytes | None = None
     ) -> subprocess.CompletedProcess[bytes]:
@@ -283,7 +281,7 @@ class _OpenSSHTransport(SlurmTransport):
             env=child_environ(),
             input=input,
             capture_output=True,
-            timeout=self._command_timeout(),
+            timeout=self.timeout,
         )
 
     def run(self, command: str, input: bytes | None = None) -> CommandResult:
@@ -314,7 +312,7 @@ class _OpenSSHTransport(SlurmTransport):
             [`errors.SSHTimeoutError`], [`errors.SSHError`],
             [`errors.RemoteCommandError`]: As [`backends.transport.SlurmTransport.check`].
         """
-        deadline = time.monotonic() + self._command_timeout()
+        deadline = time.monotonic() + self.timeout
         process = subprocess.Popen(
             [*self.ssh_argv(), command],
             stdin=subprocess.DEVNULL,
@@ -431,6 +429,31 @@ class ControllerSSHTransport(_OpenSSHTransport):
         return ControllerSSHTransport(replace(self.config, ssh_host=host, ssh_port=port))
 
 
+_CONTROL_SOCKET_NAME = 40
+"""Length of OpenSSH's `%C` control socket name (a SHA-1 hex digest)."""
+
+_CONTROL_SOCKET_SUFFIX = 17
+"""Length of the `.<16 random characters>` name a master listens on before renaming."""
+
+
+def _socket_path_limit() -> int:
+    """Longest Unix socket path, excluding its terminating NUL, on this platform."""
+    return (108 if sys.platform.startswith("linux") else 104) - 1
+
+
+def _check_control_dir(control_dir: str) -> None:
+    """
+    Raises `ValueError` if OpenSSH's control socket in `control_dir` would not fit a
+    Unix socket address, which would make every connection fail.
+    """
+    length = len(os.fsencode(control_dir)) + 1 + _CONTROL_SOCKET_NAME + _CONTROL_SOCKET_SUFFIX
+    if length > _socket_path_limit():
+        raise ValueError(
+            f"SSH control directory {control_dir!r} is too long for a Unix socket "
+            f"({length} > {_socket_path_limit()} bytes); choose a shorter one"
+        )
+
+
 def _has_terminal() -> bool:
     """Whether this process has a controlling terminal OpenSSH can prompt on."""
     try:
@@ -452,6 +475,12 @@ class LocalOpenSSHTransport(_OpenSSHTransport):
     and agent and port forwarding are disabled. It takes no private key and never
     sees Controller credentials.
 
+    Before the first command, [`backends.transport.LocalOpenSSHTransport.login`]
+    authenticates with OpenSSH's own messages (the server banner,
+    keyboard-interactive MFA instructions) on the user's terminal; remote commands
+    then run with their output captured. Use it as a context manager, or call `close()`, so the
+    authenticated connection and its private directory end with the run.
+
     Without a terminal and without a live authenticated connection, the session is
     inactive and the Slurm core raises [`errors.SessionUnavailableError`]: a headless
     run fails clearly instead of hanging on a prompt or using another identity.
@@ -461,14 +490,16 @@ class LocalOpenSSHTransport(_OpenSSHTransport):
         user (`str`): The user's own HPC username.
         known_hosts_file (`str`): Operator-distributed, verified host keys.
         port (`int`, *optional*, defaults to `22`): SSH port.
-        timeout (`float`, *optional*, defaults to `60`): Seconds per command once a
-            connection is authenticated.
-        login_timeout (`float`, *optional*, defaults to `300`): Seconds allowed for a
-            command that may first prompt for the password and MFA.
+        timeout (`float`, *optional*, defaults to `60`): Seconds per remote command.
+        login_timeout (`float`, *optional*, defaults to `300`): Seconds allowed for
+            the login, including the time the user takes to answer the prompts.
         control_dir (`str`, *optional*): Private directory for the control socket.
-            Defaults to a new directory only this user can read.
+            Defaults to a new directory under `/tmp` only this user can read, which
+            [`backends.transport.LocalOpenSSHTransport.close`] removes. Its socket
+            path must fit a Unix socket address (104 bytes on macOS and BSD).
         control_persist (`int`, *optional*, defaults to `600`): Seconds an idle
-            authenticated connection stays open for reuse.
+            authenticated connection stays open for reuse. `close()` (or leaving a
+            `with` block) ends it at the end of the run instead.
         has_terminal (`Callable[[], bool]`, *optional*): Whether prompts can be shown.
             Defaults to checking for a controlling terminal.
     """
@@ -502,14 +533,28 @@ class LocalOpenSSHTransport(_OpenSSHTransport):
         self.timeout = timeout
         self.login_timeout = login_timeout
         self.control_persist = control_persist
+        if control_dir is not None:
+            _check_control_dir(control_dir)
         self._control_dir = control_dir
+        self._owns_control_dir = False
         self._has_terminal = has_terminal
 
     @property
     def control_dir(self) -> str:
         """The private control-socket directory, created on first use."""
         if self._control_dir is None:
-            self._control_dir = tempfile.mkdtemp(prefix="nest-ssh-")
+            # A short base keeps the socket path within the Unix socket address
+            # limit; macOS's per-user $TMPDIR alone is about 49 bytes. mkdtemp
+            # creates a new directory only this user can access.
+            base = "/tmp" if os.path.isdir("/tmp") else None
+            path = tempfile.mkdtemp(prefix="nest-", dir=base)
+            try:
+                _check_control_dir(path)
+            except ValueError:
+                os.rmdir(path)
+                raise
+            self._control_dir = path
+            self._owns_control_dir = True
         return self._control_dir
 
     def _base_argv(self) -> list[str]:
@@ -574,13 +619,58 @@ class LocalOpenSSHTransport(_OpenSSHTransport):
     def session_active(self) -> bool:
         return self._has_terminal() or self.connected()
 
-    def _command_timeout(self) -> float:
-        # A command that may prompt includes the time the user takes to answer.
-        return self.timeout if self.connected() else self.login_timeout
+    def login(self) -> None:
+        """
+        Authenticates the reusable connection unless one is already open.
+
+        Runs a no-op command that leaves the authenticated master open. OpenSSH's
+        standard error goes to the user's terminal here, so the server banner and
+        keyboard-interactive MFA instructions are shown. Remote commands run after
+        it, with their output captured as usual.
+
+        Raises:
+            [`errors.SSHError`]: If the login fails or does not finish within
+                `login_timeout`. No remote command has run.
+        """
+        if self.connected():
+            return
+        try:
+            result = subprocess.run(
+                [*self.ssh_argv(), "true"],
+                check=False,
+                env=child_environ(),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=None,
+                timeout=self.login_timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise SSHError(
+                f"SSH login to {self.target} did not finish within "
+                f"{self.login_timeout:g} seconds; no remote command ran"
+            ) from exc
+        if result.returncode != 0:
+            raise SSHError(
+                f"SSH login to {self.target} failed (exit status {result.returncode}); "
+                "see the SSH output above. No remote command ran."
+            )
+
+    def run(self, command: str, input: bytes | None = None) -> CommandResult:
+        self.login()
+        return super().run(command, input)
+
+    def run_bounded(self, command: str, limit: int) -> bytes:
+        self.login()
+        return super().run_bounded(command, limit)
 
     def close(self) -> None:
-        """Closes the reusable authenticated connection, if one is open."""
-        if self._control_dir is not None:
+        """
+        Ends the reusable authenticated connection, if one is open, and removes the
+        control directory this transport created. Never raises for SSH failures.
+        """
+        if self._control_dir is None:
+            return
+        try:
             subprocess.run(
                 [*self._base_argv(), "-O", "exit", self.target],
                 check=False,
@@ -589,6 +679,18 @@ class LocalOpenSSHTransport(_OpenSSHTransport):
                 capture_output=True,
                 timeout=self.timeout,
             )
+        except subprocess.TimeoutExpired, OSError:
+            logger.debug("Closing the SSH control connection failed host=%s", self.target)
+        if self._owns_control_dir:
+            shutil.rmtree(self._control_dir, ignore_errors=True)
+            self._control_dir = None
+            self._owns_control_dir = False
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
 
     def for_endpoint(self, host: str, port: int | None) -> LocalOpenSSHTransport:
         return LocalOpenSSHTransport(

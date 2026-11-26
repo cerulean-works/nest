@@ -9,6 +9,7 @@ user-owned session advertises.
 
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
@@ -410,6 +411,123 @@ class CredentialIsolationTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             backend.for_endpoint("elsewhere", None)
+
+
+MACOS_TMPDIR = "/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/T"
+"""A typical per-user macOS `$TMPDIR`, about 49 bytes long."""
+
+
+def _control_path(transport: LocalOpenSSHTransport) -> str:
+    option = next(a for a in transport.ssh_argv() if a.startswith("ControlPath="))
+    return option.split("=", 1)[1]
+
+
+class LocalSessionLifecycleTests(unittest.TestCase):
+    """The control socket fits every platform, prompts reach the user, and runs clean up."""
+
+    def local(self, **kwargs):
+        transport = LocalOpenSSHTransport("login.example.edu", "alice", "/pins", **kwargs)
+        self.addCleanup(transport.close)
+        return transport
+
+    def test_default_control_path_fits_macos_with_a_long_tmpdir(self):
+        with (
+            mock.patch.dict(os.environ, {"TMPDIR": MACOS_TMPDIR}),
+            mock.patch.object(tempfile, "tempdir", None),
+        ):
+            transport = self.local()
+            path = _control_path(transport)
+        self.assertTrue(transport.control_dir.startswith("/tmp/nest-"))
+        expanded = path.replace("%C", "c" * 40) + "." + "r" * 16
+        self.assertLessEqual(len(expanded), 103)  # macOS sun_path, without its NUL
+        self.assertEqual(os.stat(transport.control_dir).st_mode & 0o777, 0o700)
+
+    def test_a_control_dir_too_long_for_a_socket_is_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            LocalOpenSSHTransport("login", "alice", "/pins", control_dir="/" + "d" * 70)
+        self.assertIn("too long for a Unix socket", str(caught.exception))
+
+    @unittest.skipUnless(shutil.which("ssh"), "requires OpenSSH")
+    def test_openssh_resolves_the_default_control_path(self):
+        transport = self.local()
+        argv = transport.ssh_argv()
+        resolved = subprocess.run(
+            [argv[0], "-G", *argv[1:]], capture_output=True, text=True, check=True
+        ).stdout
+        line = next(l for l in resolved.splitlines() if l.startswith("controlpath "))
+        self.assertTrue(line.split(" ", 1)[1].startswith(transport.control_dir + "/"))
+        self.assertLessEqual(len(line.split(" ", 1)[1]) + 17, 103)
+
+    def calls_with(self, connected: bool, login=None):
+        transport = self.local(has_terminal=lambda: True, timeout=7, login_timeout=99)
+        login = login or mock.Mock(returncode=0)
+        command = mock.Mock(returncode=0, stdout=b"ok", stderr=b"")
+
+        def run(argv, **kwargs):
+            return login if argv[-1] == "true" else command
+
+        with (
+            mock.patch.object(transport, "connected", return_value=connected),
+            mock.patch("nest.backends.transport.subprocess.run", side_effect=run) as patched,
+        ):
+            self.assertEqual(transport.check("squeue --me"), b"ok")
+        return [(call.args[0][-1], call.kwargs) for call in patched.call_args_list]
+
+    def test_login_shows_openssh_messages_then_commands_capture_output(self):
+        (login, login_kwargs), (command, kwargs) = self.calls_with(connected=False)
+        self.assertEqual(login, "true")
+        self.assertIsNone(login_kwargs["stderr"])  # banner and MFA instructions are shown
+        self.assertEqual(login_kwargs["timeout"], 99)
+        self.assertEqual(command, "squeue --me")
+        self.assertTrue(kwargs["capture_output"])  # remote errors stay classifiable
+        self.assertEqual(kwargs["timeout"], 7)
+
+    def test_an_open_connection_is_reused_without_logging_in(self):
+        self.assertEqual([c for c, _ in self.calls_with(connected=True)], ["squeue --me"])
+
+    def test_a_failed_or_slow_login_is_an_ssh_error_before_any_command(self):
+        for outcome in ([mock.Mock(returncode=255)], subprocess.TimeoutExpired(["ssh"], 99)):
+            transport = self.local(has_terminal=lambda: True)
+            backend = SlurmBackend(_config(ssh_host="login.example.edu"), transport)
+            with (
+                self.subTest(outcome=outcome),
+                mock.patch.object(transport, "connected", return_value=False),
+                mock.patch("nest.backends.transport.subprocess.run", side_effect=outcome) as run,
+                self.assertRaises(SSHError) as caught,
+            ):
+                backend.submit("/nest", "job.sbatch")  # definitely not submitted
+            self.assertNotIsInstance(caught.exception, SubmissionUnknownError)
+            self.assertIn("no remote command ran", str(caught.exception).lower())
+            self.assertEqual([c.args[0][-1] for c in run.call_args_list], ["true"])
+
+    def test_close_ends_the_connection_and_removes_its_own_directory(self):
+        with (
+            mock.patch(
+                "nest.backends.transport.subprocess.run",
+                return_value=mock.Mock(returncode=0, stdout=b"", stderr=b""),
+            ) as run,
+            self.local() as transport,
+        ):
+            directory = transport.control_dir
+            self.assertTrue(os.path.isdir(directory))
+        self.assertFalse(os.path.exists(directory))
+        self.assertEqual(run.call_args.args[0][-3:], ["-O", "exit", "login.example.edu"])
+
+    def test_close_keeps_a_callers_directory_and_ignores_ssh_failures(self):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, True)
+        transport = self.local(control_dir=directory)
+        with mock.patch(
+            "nest.backends.transport.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(["ssh"], 1),
+        ):
+            transport.close()
+        self.assertTrue(os.path.isdir(directory))
+
+    def test_close_without_any_command_runs_nothing(self):
+        with mock.patch("nest.backends.transport.subprocess.run") as run:
+            self.local().close()
+        run.assert_not_called()
 
 
 if __name__ == "__main__":
