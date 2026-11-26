@@ -2,143 +2,93 @@
 
 # Nest
 
-[![Version](https://img.shields.io/badge/version-0.1.0a1-blue)](https://github.com/cerulean-works/nest/releases)
+[![Release](https://img.shields.io/github/v/release/cerulean-works/nest?include_prereleases&label=release)](https://github.com/cerulean-works/nest/releases)
 ![Python](https://img.shields.io/badge/python-3.14%2B-blue)
 ![Status](https://img.shields.io/badge/status-early_access-orange)
 
-Nest is a Python SDK for executing Python functions on remote Slurm clusters.
+Nest runs Python functions on HPC clusters without Slurm scripts: decorate a
+function, call `.local()` while you develop and `.remote()` to run it on the
+cluster.
 
-**Documentation:** [Guides and API reference](https://docs.cerulean.works/nest/main/guide/)
+**Documentation:** [Quickstart](https://docs.cerulean.works/nest/main/guide/quickstart),
+[guides and API reference](https://docs.cerulean.works/nest/main/guide/)
 
 ## Early Access
 
-Nest is currently in Early Access (`0.1.0a1`).
+Nest is in Early Access. Install it from `main` (below); the API is experimental
+and may change before 1.0. The published pre-release tags (newest: `v0.1.0a4`)
+predate sign-in and do not work with the authenticated Controller, and the package
+still reports version `0.1.0a1`, so compare commits rather than version strings.
+See [Release status and checklist](docs/source/releasing.md).
 
-The API is experimental and may change before version 1.0.0.
+## Quickstart
 
-## Installation
+You need [uv](https://docs.astral.sh/uv/), a Google account, and a Nest Project you
+may run in (an invitation from its Owner or an Admin, and the operator's approval;
+see [Get access to a Project](docs/source/get-access.md)).
 
-Nest requires Python 3.14 or later. Add it to a [uv](https://docs.astral.sh/uv/)
-project from GitHub:
+**Connection settings.** Cerulean-hosted Nest is reachable today over its
+authorized Tailnet. Connect Tailscale (Tailnet membership or the Controller node
+share), then set, in each terminal:
 
 ```bash
+export NEST_AUTH_URL="https://auth.nest.cerulean.works"
+export NEST_CONTROLLER_ADDRESS="nest-controller.tail8e5ba1.ts.net:50051"
+export NEST_CONTROLLER_TLS=false    # plaintext gRPC, only inside the encrypted Tailnet
+```
+
+The public gateway (no Tailscale) is an operator-run staging pilot until the H09
+production sign-off, not a default; for your own Nest or local development, see
+the [full Quickstart](docs/source/quickstart.md).
+
+**1. Install**
+
+```bash
+uv init --python 3.14 hello-nest
+cd hello-nest
 uv add "nest @ git+https://github.com/cerulean-works/nest@main"
 ```
 
-`uv.lock` pins the commit that `main` pointed to when you added it. To update to
-the current SDK later, run `uv lock --upgrade-package nest && uv sync`. Without
-uv, use `pip install "git+https://github.com/cerulean-works/nest.git@main"`. See
-[Install Nest](docs/source/installation.md) for checking the installed commit and
-how SDK, Controller and HPC runtime versions relate.
+**2. Log in** by approving the CLI in a browser, then check your Project:
 
-A versioned release installation command will be provided when the first Early Access release is tagged.
+```bash
+uv run nest login
+uv run nest projects current    # "<project-id> (only eligible)": no Project ID needed
+```
 
-## Quick Start
-
-The Cerulean-hosted Controller is authenticated (M1): each call carries your Nest
-session and runs in a Project that the operator has approved. The
-[full walkthrough](docs/source/quickstart.md) explains each step; in short:
-
-1. Connect to the authorized Tailscale network, or accept the Controller node
-   share, and point the SDK at the hosted Controller by its MagicDNS name. These
-   settings stay explicit because the Controller's gRPC is plaintext inside the
-   encrypted Tailnet, and the SDK never assumes that
-   ([why](docs/source/configuration.md#why-the-hosted-controller-is-not-a-default)):
-
-   ```bash
-   export NEST_AUTH_URL="https://auth.nest.cerulean.works"
-   export NEST_CONTROLLER_ADDRESS="nest-controller.tail8e5ba1.ts.net:50051"
-   export NEST_CONTROLLER_TLS=false
-   ```
-
-   `NEST_AUTH_URL` is required with this address: the SDK applies the hosted
-   sign-in on its own only for `nest.cerulean.works:50051`, which has not been
-   verified end to end in this deployment. Use the MagicDNS name rather than a
-   Tailscale IP, which can differ between Tailnets.
-
-2. Sign in by approving the CLI in a browser:
-
-   ```bash
-   uv run nest login
-   uv run nest auth status --check
-   ```
-
-3. Join a Project through an invitation from its Owner or an Admin, or ask the
-   operator to create one for you, and select it by ID (see
-   [Join or create a Project](docs/source/quickstart.md#4-join-or-create-a-project)):
-
-   ```bash
-   export NEST_PROJECT_ID="<project-id>"
-   ```
-
-4. Ask the operator to approve the Project: Provider approval, an HPC Platform
-   grant and a Slurm account ([Onboard a Project](docs/source/project-onboarding.md)).
-   `uv run nest platforms default --project-id "$NEST_PROJECT_ID"` shows the
-   granted Platform.
-
-Then create `main.py`:
+**3. Create `main.py`:**
 
 ```python
 import nest
 
 
-@nest.remote(gpu=1)
+@nest.remote(cpu=1)
 def compute(x):
     """Returns twice the input value."""
     return x * 2
 
 
-print(compute.local(21))  # 42
-print(compute.remote(21))  # 42
+print(compute.local(21))  # runs here
+print(compute.remote(21))  # runs on HPC
 ```
 
-Run:
+**4. Run**
 
 ```bash
 uv run python main.py
 ```
 
-- `.local()` executes the function on your machine.
-- `.remote()` sends the function to the Nest Controller, which checks your session
-  and Project and schedules execution on the HPC cluster.
-
-A refused call raises `AuthenticationRequiredError` (`UNAUTHENTICATED`) or
-`RemoteAccessDeniedError` (`PERMISSION_DENIED`, `NOT_FOUND`) and names the reason;
-see [Access and onboarding errors](docs/source/remote-errors.md#access-and-onboarding-errors).
-
-### Self-hosted Nest
-
-Name your Nest's sign-in origin, and your Controller, explicitly:
-
-```bash
-export NEST_AUTH_URL="https://nest.example.com"   # or: nest login --url ...
-export NEST_CONTROLLER_ADDRESS="controller.example.com:50051"
-export NEST_CONTROLLER_TLS=true
+```text
+42
+42
 ```
 
-`--url` wins over `NEST_AUTH_URL`, which wins over the hosted default. Without
-`NEST_AUTH_URL`, a Controller other than `nest.cerulean.works:50051` receives no
-session. See
-[Sign-in origin](docs/source/configuration.md#sign-in-origin).
-
-### Local development without a session
-
-The SDK defaults to a [local Controller](docs/source/local-controller.md) at
-`127.0.0.1:50051`. A Controller started without a database has no sign-in,
-Projects or authorization, so use it only on loopback:
-
-```bash
-NEST_EXECUTOR=local NEST_CONTROLLER_BIND=127.0.0.1:50051 uv run python -m nest.controller
-```
-
-In another terminal, with `NEST_CONTROLLER_ADDRESS`, `NEST_CONTROLLER_TLS`,
-`NEST_AUTH_URL` and `NEST_PROJECT_ID` unset, run `uv run python main.py`.
-
-### Using a TLS Controller
-
-For a Controller with its own TLS certificate, set `NEST_CONTROLLER_TLS=true`. The
-client verifies the server certificate with gRPC's default trust roots or the PEM
-roots specified by `NEST_CONTROLLER_TLS_CA_FILE`.
+`.local()` runs the function in your process; `.remote()` sends it to the
+Controller, which checks your session and Project and runs it as a Slurm job. With
+several Projects, choose one with `uv run nest projects select` (scripts and CI set
+`NEST_PROJECT_ID`). A refused call raises `AuthenticationRequiredError` or
+`RemoteAccessDeniedError` and names the reason; see
+[Access and onboarding errors](docs/source/remote-errors.md#access-and-onboarding-errors).
 
 ## Project Dependencies
 
@@ -172,7 +122,7 @@ print(compute.remote())
 
 Nest transfers the project's `pyproject.toml` and `uv.lock` to the Controller.
 `project=` names this uv project directory; it is unrelated to the Nest Project
-selected by `NEST_PROJECT_ID`.
+your calls run in.
 
 The HPC backend prepares an isolated Python environment and caches it for reuse.
 
@@ -203,15 +153,18 @@ except RemoteExecutionError as exc:
 
 The original exception type, message, and remote traceback are preserved.
 
-## Controller Deployment
+## Operator Guide
 
-This section is intended for hosts who operate a Nest Controller.
+This section is for hosts who operate a Nest Controller; users do not need it.
+The [Operator guide](https://docs.cerulean.works/nest/main/guide/#operator-guide)
+lists every runbook.
 
 - [Deploy on Dokploy from environment variables](docs/source/dokploy.md) with
   [compose.dokploy.yaml](compose.dokploy.yaml): the complete M1 Controller
   (PostgreSQL and migrations, Google sign-in, Project and Platform authorization,
   the Execution Registry, Tailscale, SSH) configured only from Dokploy's
-  Environment panel.
+  Environment panel, with a
+  [preflight and recovery runbook](docs/source/deployment-recovery.md).
 - [Deploy with Docker Compose](docs/source/docker-compose.md) with
   [compose.yaml](compose.yaml), adding [PostgreSQL](docs/source/database.md) and
   [Google sign-in](docs/source/authentication.md) for authentication, and
@@ -221,9 +174,13 @@ This section is intended for hosts who operate a Nest Controller.
   (`NEST_SLURM_WORKDIR`), Slurm scripts and runtime, and
   [Build and roll out the HPC runtime image](docs/source/runtime-image.md) for
   `images/uv-python314.sif`, which includes Git for `uv.lock` Git dependencies.
-- [Onboard a Project](docs/source/project-onboarding.md): approve it in
-  `NEST_PROVIDER_ALLOWED_PROJECTS`, grant an HPC Platform and link a Slurm account
-  with `nest-db`.
+- [Onboard a Project](docs/source/project-onboarding.md): create it for its
+  Owner, approve it for the Provider, grant an HPC Platform and link a Slurm
+  account, with `nest-db`, the privileged API or the Console's administration
+  pages.
+- [Release status and checklist](docs/source/releasing.md) before tagging a
+  pre-release: a `v*` tag publishes docs and runtime image tags and is followed by
+  the operator's tag-triggered deployment.
 
 Requirements: Python 3.14+ (or the Controller image), SSH access to the HPC login
 node, a Slurm account, and the Nest runtime and Apptainer image deployed in the
@@ -268,12 +225,17 @@ See [Security and limitations](docs/source/security.md).
 - No automatic project source or data synchronization.
 - The SDK wraps only the synchronous `Execute` call; `SubmitJob`, `GetJobStatus`
   and `CancelJob` are available as gRPC RPCs.
-- No authentication without a database; no Web UI or CLI command to create Projects.
+- No authentication without a database (local development mode).
+- Users cannot create Projects themselves: a platform administrator or operator
+  creates them for a named Owner.
+- The public gateway is a staging pilot; the hosted profile is not a default until
+  the H09 production sign-off.
 - Controller and backend deployment are managed by the host.
 
 ## Development
 
-Install development dependencies:
+See [Develop Nest and its docs](docs/source/developing.md) for tests and the docs
+preview. Install development dependencies:
 
 ```bash
 uv sync

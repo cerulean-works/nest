@@ -27,7 +27,7 @@ Platform. Submits one small Slurm job.
 import nest
 
 
-@nest.remote()
+@nest.remote(cpu=1)
 def compute(x):
     """
     Returns twice the input value.

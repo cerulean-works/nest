@@ -5,11 +5,13 @@ guide:
     sections:
       - local: index
         title: Nest
-      - local: installation
-        title: Install Nest
       - local: quickstart
-        title: Run your first remote function
-  - title: Run functions
+        title: Quickstart
+      - local: installation
+        title: Install and update Nest
+      - local: get-access
+        title: Get access to a Project
+  - title: User guide
     sections:
       - local: project-dependencies
         title: Use project dependencies
@@ -19,42 +21,46 @@ guide:
         title: Handle remote errors
       - local: project-selection
         title: Choose the Project your calls run in
-      - local: hosted-connection
-        title: Connect to Cerulean-hosted Nest
-  - title: Hosting
-    sections:
-      - local: docker-compose
-        title: Deploy with Docker Compose
-      - local: tailscale-shared
-        title: Share a Controller over Tailscale
-      - local: dokploy
-        title: Deploy on Dokploy from environment variables
-      - local: deployment-recovery
-        title: Preflight and recover a Dokploy deployment
-      - local: deploy
-        title: Deploy a Slurm Controller
-      - local: runtime-image
-        title: Build and roll out the HPC runtime image
-      - local: project-onboarding
-        title: Onboard a Project
-      - local: local-controller
-        title: Run a local Controller
-      - local: database
-        title: Store Controller records in PostgreSQL
-      - local: email
-        title: Send email with SMTP
-      - local: authentication
-        title: Sign in with Google
       - local: cli-login
         title: Sign in from the command line
-      - local: workload-identity
-        title: Authenticate CI workloads with GitHub Actions OIDC
       - local: projects
         title: Share Projects and manage roles
       - local: invitations
         title: Invite people to a Project
       - local: console
         title: Manage Projects in the browser
+      - local: hosted-connection
+        title: Connect to Cerulean-hosted Nest
+      - local: local-controller
+        title: Run a local Controller
+  - title: "Operator guide: deploy"
+    sections:
+      - local: dokploy
+        title: Deploy on Dokploy from environment variables
+      - local: deployment-recovery
+        title: Preflight and recover a Dokploy deployment
+      - local: docker-compose
+        title: Deploy with Docker Compose
+      - local: tailscale-shared
+        title: Share a Controller over Tailscale
+      - local: deploy
+        title: Deploy a Slurm Controller
+      - local: runtime-image
+        title: Build and roll out the HPC runtime image
+      - local: database
+        title: Store Controller records in PostgreSQL
+      - local: email
+        title: Send email with SMTP
+      - local: authentication
+        title: Sign in with Google
+  - title: "Operator guide: access and onboarding"
+    sections:
+      - local: project-onboarding
+        title: Onboard a Project
+      - local: platform-admin
+        title: Bootstrap and recover platform administration
+      - local: privileged-api
+        title: Use the privileged management API
       - local: platforms
         title: Register HPC Platforms and login nodes
       - local: slurm-accounts
@@ -65,28 +71,30 @@ guide:
         title: Authorize execution authority and HPC account bindings
       - local: admission-limits
         title: Admission limits for the trusted pilot (F02a)
-      - local: platform-admin
-        title: Bootstrap and recover platform administration
-      - local: privileged-api
-        title: Use the privileged management API
+      - local: workload-identity
+        title: Authenticate CI workloads with GitHub Actions OIDC
       - local: audit-log
         title: Review the security audit log
-      - local: deployment-architecture
-        title: Deployment validation and roadmap
-      - local: public-grpc-transport
-        title: Public gRPC transport feasibility (H06)
-      - local: public-api-security
-        title: Public API security and abuse controls (H07)
+  - title: "Operator guide: public gateway and design records"
+    sections:
       - local: public-grpc-gateway
         title: Run the public gRPC gateway pilot (H08)
       - local: hosted-rollout
         title: Hosted gRPC rollout runbook and evidence (H09)
+      - local: public-api-security
+        title: Public API security and abuse controls (H07)
+      - local: public-grpc-transport
+        title: Public gRPC transport feasibility (H06)
+      - local: deployment-architecture
+        title: Deployment validation and roadmap
       - local: ssh-relay-feasibility
         title: Public SSH egress feasibility and relay contract (D03)
   - title: Contributing
     sections:
       - local: developing
         title: Develop Nest and its docs
+      - local: releasing
+        title: Release status and checklist
 reference:
   - title: Python SDK
     sections:

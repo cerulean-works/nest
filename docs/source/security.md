@@ -236,8 +236,9 @@ changes and bootstrap events are kept in an append-only audit log. See
   [Execution service and RPCs](api/controller).
 - The SDK does not choose an HPC Platform per call: Runs use the Project's
   default Platform (see [Default Platform](platforms#project-eligibility-and-default-platform)).
-- Projects are created through the Projects API from a browser session; there is
-  no Web UI page or CLI command for it yet.
+- Users cannot create their own Projects. A platform administrator creates them
+  (the Console's *Administration* page or the [privileged management API](privileged-api)),
+  or an operator with `nest-db project create`, each time with an explicit Owner.
 - Controller and backend deployment are managed by the host.
 
 ## Execution behavior
