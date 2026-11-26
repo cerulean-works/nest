@@ -36,6 +36,7 @@ when every check below passes. Any failure is refused and nothing is issued.
 | Issuer | Exactly `https://token.actions.githubusercontent.com`. |
 | Audience | Exactly `NEST_WORKLOAD_OIDC_AUDIENCE`, a single audience. The trust policy must name the same value. |
 | Time | `exp`, `iat` and `nbf` are present and hold, with 60 seconds of clock skew. The token lives at most an hour. |
+| Deadline | Checked again with the wall clock once the exchange holds its locks, and by the database when the token's use is recorded. A token whose `exp` plus skew passed while the exchange waited is refused as `invalid_token` and leaves no record. |
 | Replay | The token's `jti` has never been exchanged before, for any principal. Concurrent exchanges of one token issue at most one session. A used `jti` is kept at least until the token's `exp` plus the 60 seconds of skew, and 60 seconds more, so pruning can never make it acceptable again. |
 | Trust policy | One active policy of the named principal matches exactly: `repository`, `repository_id`, `repository_owner_id`, `ref`, the workflow file in `workflow_ref` (which must name the same repository and ref), `environment` and `event_name`. |
 | Principal | Active, and within its quotas: unexpired sessions at once (`max_active_sessions`, default 4) and exchanges in any rolling hour (`max_exchanges_per_hour`, default 60). |
@@ -95,6 +96,13 @@ then enable the exchange and use it from GitHub Actions.
    ```bash
    NEST_WORKLOAD_OIDC_AUDIENCE=https://auth.nest.example.org/workload
    ```
+
+   Every supported Compose file (`compose.yaml`, `compose-nop.yaml`,
+   `compose.tailscale-shared.yaml` and `compose.dokploy.yaml`) forwards
+   `NEST_WORKLOAD_OIDC_AUDIENCE` and `NEST_WORKLOAD_TOKEN_TTL` to the Controller,
+   empty by default. With Dokploy or Compose, set them in the deployment's
+   environment and redeploy. Leaving them unset keeps the exchange off, and
+   nothing else enables it.
 
    Pick an audience unique to this deployment. GitHub lets any workflow request a
    token for any audience, so the audience together with the trust policy is what

@@ -111,8 +111,8 @@ class ExchangeRefusedError(Exception):
     A workload token exchange was refused. Nothing was issued.
 
     Attributes:
-        reason (`str`): `principal_inactive`, `policy_inactive`, `replayed`,
-            `exchange_quota` or `session_quota`.
+        reason (`str`): `expired`, `principal_inactive`, `policy_inactive`,
+            `replayed`, `exchange_quota` or `session_quota`.
     """
 
     def __init__(self, reason: str):
@@ -702,6 +702,11 @@ class ServicePrincipalStore:
         principal's quotas. The session expires `ttl_seconds` from now, at most an
         hour.
 
+        `token_expires_at` is when the caller stops accepting the token. It is
+        checked again with the wall clock once the locks are held, and by the
+        schema when the token's use is recorded, so a token whose deadline passed
+        while the exchange waited is refused (`expired`) and leaves no record.
+
         Raises:
             [`db.ExchangeRefusedError`]: If refused; nothing is written.
         """
@@ -713,67 +718,86 @@ class ServicePrincipalStore:
             raise ExchangeRefusedError("replayed")
         refused: str | None = None
         row = None
-        with transaction(self.database, None, "exchange a workload token") as cursor:
-            principal = cursor.execute(
-                f"SELECT {_PRINCIPAL_COLUMNS} FROM service_principals WHERE id = %s FOR UPDATE",
-                (principal_id,),
-            ).fetchone()
-            policy = cursor.execute(
-                "SELECT status FROM workload_trust_policies "
-                "WHERE id = %s AND service_principal_id = %s FOR SHARE",
-                (policy_id, principal_id),
-            ).fetchone()
-            if principal is None or principal["status"] != "active":
-                refused = "principal_inactive"
-            elif policy is None or policy["status"] != "active":
-                refused = "policy_inactive"
-            else:
-                used = cursor.execute(
-                    "SELECT count(*) AS n FROM workload_token_uses "
-                    "WHERE service_principal_id = %s AND used_at > now() - interval '1 hour'",
+        try:
+            with transaction(self.database, None, "exchange a workload token") as cursor:
+                principal = cursor.execute(
+                    f"SELECT {_PRINCIPAL_COLUMNS} FROM service_principals WHERE id = %s FOR UPDATE",
                     (principal_id,),
                 ).fetchone()
-                active = cursor.execute(
-                    "SELECT count(*) AS n FROM service_sessions WHERE service_principal_id = %s "
-                    "AND revoked_at IS NULL AND expires_at > now()",
-                    (principal_id,),
+                policy = cursor.execute(
+                    "SELECT status FROM workload_trust_policies "
+                    "WHERE id = %s AND service_principal_id = %s FOR SHARE",
+                    (policy_id, principal_id),
                 ).fetchone()
-                assert used is not None and active is not None
-                if cursor.execute(
-                    "SELECT 1 FROM workload_token_uses WHERE issuer = %s AND jti = %s",
-                    (issuer, jti),
-                ).fetchone():
-                    refused = "replayed"
-                elif used["n"] >= principal["max_exchanges_per_hour"]:
-                    refused = "exchange_quota"
-                elif active["n"] >= principal["max_active_sessions"]:
-                    refused = "session_quota"
+                # Every time below is read now, after the locks were granted: a token
+                # verified just before its deadline may have waited behind another
+                # transaction, and now() is when this transaction started.
+                clock = cursor.execute("SELECT clock_timestamp() AS at").fetchone()
+                assert clock is not None
+                if token_expires_at <= clock["at"]:
+                    refused = "expired"
+                elif principal is None or principal["status"] != "active":
+                    refused = "principal_inactive"
+                elif policy is None or policy["status"] != "active":
+                    refused = "policy_inactive"
                 else:
-                    inserted = cursor.execute(
-                        "INSERT INTO workload_token_uses (issuer, jti, service_principal_id, "
-                        "trust_policy_id, token_expires_at) VALUES (%s, %s, %s, %s, %s) "
-                        "ON CONFLICT DO NOTHING RETURNING jti",
-                        (issuer, jti, principal_id, policy_id, token_expires_at),
+                    used = cursor.execute(
+                        "SELECT count(*) AS n FROM workload_token_uses "
+                        "WHERE service_principal_id = %s AND used_at > %s - interval '1 hour'",
+                        (principal_id, clock["at"]),
                     ).fetchone()
-                    if inserted is None:
-                        # Another principal's exchange of the same token won the race.
+                    active = cursor.execute(
+                        "SELECT count(*) AS n FROM service_sessions WHERE service_principal_id = %s "
+                        "AND revoked_at IS NULL AND expires_at > %s",
+                        (principal_id, clock["at"]),
+                    ).fetchone()
+                    assert used is not None and active is not None
+                    if cursor.execute(
+                        "SELECT 1 FROM workload_token_uses WHERE issuer = %s AND jti = %s",
+                        (issuer, jti),
+                    ).fetchone():
                         refused = "replayed"
+                    elif used["n"] >= principal["max_exchanges_per_hour"]:
+                        refused = "exchange_quota"
+                    elif active["n"] >= principal["max_active_sessions"]:
+                        refused = "session_quota"
                     else:
-                        row = cursor.execute(
-                            "INSERT INTO service_sessions (token_hash, service_principal_id, "
-                            "trust_policy_id, issuer, jti, provenance, expires_at) VALUES "
-                            "(%s, %s, %s, %s, %s, %s, now() + make_interval(secs => %s)) "
-                            f"RETURNING {_SESSION_COLUMNS}",
-                            (
-                                token_hash,
-                                principal_id,
-                                policy_id,
-                                issuer,
-                                jti,
-                                Jsonb(dict(provenance)),
-                                ttl_seconds,
-                            ),
+                        # The insert can wait for a concurrent exchange of the same
+                        # token; the schema refuses it if the token's deadline passed.
+                        inserted = cursor.execute(
+                            "INSERT INTO workload_token_uses (issuer, jti, service_principal_id, "
+                            "trust_policy_id, token_expires_at, used_at) "
+                            "VALUES (%s, %s, %s, %s, %s, clock_timestamp()) "
+                            "ON CONFLICT DO NOTHING RETURNING jti, used_at",
+                            (issuer, jti, principal_id, policy_id, token_expires_at),
                         ).fetchone()
+                        if inserted is None:
+                            # Another principal's exchange of the same token won the race.
+                            refused = "replayed"
+                        else:
+                            # One issuance time for the session's creation and expiry.
+                            row = cursor.execute(
+                                "INSERT INTO service_sessions (token_hash, service_principal_id, "
+                                "trust_policy_id, issuer, jti, provenance, created_at, expires_at) "
+                                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s + make_interval(secs => %s)) "
+                                f"RETURNING {_SESSION_COLUMNS}",
+                                (
+                                    token_hash,
+                                    principal_id,
+                                    policy_id,
+                                    issuer,
+                                    jti,
+                                    Jsonb(dict(provenance)),
+                                    inserted["used_at"],
+                                    inserted["used_at"],
+                                    ttl_seconds,
+                                ),
+                            ).fetchone()
+        except DatabaseError as exc:
+            if "workload_token_uses_unexpired" not in str(exc):
+                raise
+            # The deadline passed between the check above and the insert.
+            refused = "expired"
         if refused is not None:
             raise ExchangeRefusedError(refused)
         assert row is not None

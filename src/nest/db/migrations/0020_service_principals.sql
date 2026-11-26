@@ -247,6 +247,23 @@ $$;
 CREATE TRIGGER workload_token_uses_prune BEFORE DELETE ON workload_token_uses
     FOR EACH ROW EXECUTE FUNCTION nest_prune_workload_token_use();
 
+-- A token is recorded, and so a session issued, only before its deadline by the
+-- wall clock at the moment of the insert, whatever the transaction waited for.
+CREATE FUNCTION nest_check_workload_token_use() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.token_expires_at <= clock_timestamp() THEN
+        RAISE EXCEPTION 'the workload token is past its acceptance deadline'
+            USING ERRCODE = 'check_violation',
+                  CONSTRAINT = 'workload_token_uses_unexpired';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER workload_token_uses_unexpired BEFORE INSERT ON workload_token_uses
+    FOR EACH ROW EXECUTE FUNCTION nest_check_workload_token_use();
+
 -- Operator managed: principals, trust policies and grants are created and
 -- revoked only by a named operator (nest-db), never by a User or a principal.
 CREATE TRIGGER service_principals_operator_managed

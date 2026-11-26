@@ -69,6 +69,7 @@ from nest.controller import ExecutionService
 from nest.db import (
     Database,
     DatabaseError,
+    ExchangeRefusedError,
     IdentityStore,
     JobStore,
     PlatformStore,
@@ -181,6 +182,25 @@ class _Base(PostgresTestCase):
         with self.assertRaises(WorkloadExchangeError) as caught:
             self.exchange(token, principal, **claims)
         return caught.exception.reason
+
+    def backdated_use(self, jti: str, expired_seconds_ago: int) -> None:
+        """Records a token use from two hours ago, as though it had been exchanged
+        then. The schema refuses such an insert (its deadline has passed), so the
+        insert check is turned off for this one statement, as a superuser."""
+        with connect(self.url) as conn:
+            conn.execute(
+                "ALTER TABLE workload_token_uses DISABLE TRIGGER workload_token_uses_unexpired"
+            )
+            conn.execute(
+                "INSERT INTO workload_token_uses (issuer, jti, service_principal_id, "
+                "trust_policy_id, token_expires_at, used_at) VALUES "
+                "('https://token.actions.githubusercontent.com', %s, %s, %s, "
+                "now() - make_interval(secs => %s), now() - interval '2 hours')",
+                (jti, self.principal.id, self.policy.id, expired_seconds_ago),
+            )
+            conn.execute(
+                "ALTER TABLE workload_token_uses ENABLE TRIGGER workload_token_uses_unexpired"
+            )
 
     def sql(self, query: str, *params):
         with connect(self.url) as conn:
@@ -381,21 +401,90 @@ class ExchangeTests(_Base):
         # Boundary: a use whose token stopped being accepted 30 seconds ago, an hour
         # after it was used, is still kept; one from 2 minutes ago may be pruned.
         for jti, ago in (("inside-margin", 30), ("past-margin", 120)):
-            self.sql(
-                "INSERT INTO workload_token_uses (issuer, jti, service_principal_id, "
-                "trust_policy_id, token_expires_at, used_at) VALUES "
-                "('https://token.actions.githubusercontent.com', %s, %s, %s, "
-                "now() - make_interval(secs => %s), now() - interval '2 hours')",
-                jti,
-                self.principal.id,
-                self.policy.id,
-                ago,
-            )
+            self.backdated_use(jti, ago)
         self.assertEqual(self.store.prune_token_uses(), 1)
         remaining = {row[0] for row in self.sql("SELECT jti FROM workload_token_uses")}
         self.assertEqual(remaining, {claims["jti"], "inside-margin"})
         with self.assertRaises(psycopg.errors.IntegrityConstraintViolation):
             self.sql("DELETE FROM workload_token_uses WHERE jti = 'inside-margin'")
+
+    def hold_principal_lock(self, seconds: float) -> threading.Thread:
+        """Holds the principal's row lock from another connection for `seconds`, so
+        an exchange started meanwhile waits for it."""
+        held = threading.Event()
+
+        def hold():
+            with connect(self.url) as conn, conn.transaction():
+                conn.execute(
+                    "SELECT 1 FROM service_principals WHERE id = %s FOR UPDATE",
+                    (self.principal.id,),
+                )
+                held.set()
+                time.sleep(seconds)
+
+        thread = threading.Thread(target=hold)
+        thread.start()
+        self.assertTrue(held.wait(10))
+        return thread
+
+    def test_a_token_whose_deadline_passes_during_a_lock_wait_is_refused(self):
+        # exp a little under 60 seconds ago: still inside the verifier's skew, so
+        # it verifies, but its acceptance deadline (exp + 60 s) is a second away.
+        now = int(time.time())
+        token = self.issuer.mint(exp=now - 59, iat=now - 300, nbf=now - 300)
+        holder = self.hold_principal_lock(2.5)
+        try:
+            self.assertEqual(self.refused(token), "invalid_token")
+        finally:
+            holder.join()
+        self.assertEqual(self.sql("SELECT count(*) FROM workload_token_uses"), [(0,)])
+        self.assertEqual(self.sql("SELECT count(*) FROM service_sessions"), [(0,)])
+        [denied] = [e for e in self.events("workload.exchange") if e.reason == "expired"]
+        self.assertEqual(denied.outcome, "denied")
+
+    def test_issuance_uses_the_clock_after_the_lock_wait(self):
+        holder = self.hold_principal_lock(2.0)
+        started = datetime.now(UTC)
+        try:
+            issued = self.exchange()
+        finally:
+            holder.join()
+        session = issued.session
+        # Created when it was issued, not when its transaction began, and its
+        # lifetime counts from then.
+        self.assertGreaterEqual(session.created_at, started + timedelta(seconds=1.5))
+        self.assertEqual(session.expires_at - session.created_at, timedelta(seconds=600))
+        [(used_at,)] = self.sql(
+            "SELECT used_at FROM workload_token_uses WHERE jti = %s", session.jti
+        )
+        self.assertEqual(used_at, session.created_at)
+
+    def test_a_pruned_jti_past_its_deadline_is_never_recorded_again(self):
+        self.backdated_use("pruned-jti", 120)
+        self.assertEqual(self.store.prune_token_uses(), 1)
+        with self.assertRaises(ExchangeRefusedError) as caught:
+            self.store.exchange(
+                self.principal.id,
+                self.policy.id,
+                issuer="https://token.actions.githubusercontent.com",
+                jti="pruned-jti",
+                token_expires_at=datetime.now(UTC) - timedelta(seconds=1),
+                token_hash=hash_token(secrets.token_urlsafe()),
+                ttl_seconds=600,
+                provenance={},
+            )
+        self.assertEqual(caught.exception.reason, "expired")
+        self.assertEqual(self.sql("SELECT count(*) FROM workload_token_uses"), [(0,)])
+        # The schema refuses it even if the application did not check.
+        with self.assertRaises(psycopg.errors.CheckViolation):
+            self.sql(
+                "INSERT INTO workload_token_uses (issuer, jti, service_principal_id, "
+                "trust_policy_id, token_expires_at) VALUES (%s, 'pruned-jti', %s, %s, "
+                "clock_timestamp() - interval '1 second')",
+                "https://token.actions.githubusercontent.com",
+                self.principal.id,
+                self.policy.id,
+            )
 
     def test_a_token_is_exchanged_once(self):
         token = self.issuer.mint()

@@ -442,7 +442,10 @@ class WorkloadExchange:
                 provenance={**claims.provenance, "subject": claims.subject[:255]},
             )
         except ExchangeRefusedError as exc:
-            reason = exc.reason if exc.reason in WORKLOAD_ERRORS else "not_trusted"
+            if exc.reason == "expired":
+                reason = "invalid_token"
+            else:
+                reason = exc.reason if exc.reason in WORKLOAD_ERRORS else "not_trusted"
             self.audit.record(
                 "workload.exchange",
                 "denied",
