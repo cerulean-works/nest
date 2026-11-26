@@ -111,25 +111,41 @@ def write(job_dir: Path | str, status: str, error_type: str | None = None) -> No
     os.replace(partial, path)
 
 
+class _DuplicateKeyError(Exception):
+    pass
+
+
+def _unique_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    record = dict(pairs)
+    if len(record) != len(pairs):
+        raise _DuplicateKeyError
+    return record
+
+
 def parse(data: bytes) -> RemoteOutcome:
     """
     Parses a sidecar's bytes strictly.
 
     Raises:
-        [`outcome.InvalidOutcomeError`]: If it is too large, not UTF-8 JSON, of
-            another version, or not exactly one of the two record shapes.
+        [`outcome.InvalidOutcomeError`]: If it is too large, not UTF-8 JSON, repeats
+            a key, is of another version, or is not exactly one of the two record
+            shapes. Its message is one of a fixed set and never quotes the record.
     """
+    # Every message is a constant: nothing from the record, which the worker and
+    # the user's code can write, reaches a stored error message or a log.
     if len(data) > MAX_OUTCOME_BYTES:
         raise InvalidOutcomeError(f"The outcome record exceeds {MAX_OUTCOME_BYTES} bytes")
     try:
-        record = json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as exc:
-        raise InvalidOutcomeError("The outcome record is not valid JSON") from exc
+        record = json.loads(data.decode("utf-8"), object_pairs_hook=_unique_keys)
+    except _DuplicateKeyError:
+        raise InvalidOutcomeError("The outcome record repeats a key") from None
+    except UnicodeDecodeError, ValueError:
+        raise InvalidOutcomeError("The outcome record is not valid JSON") from None
     if not isinstance(record, dict):
         raise InvalidOutcomeError("The outcome record is not a JSON object")
     version = record.get("nest_outcome")
     if type(version) is not int or version != OUTCOME_VERSION:
-        raise InvalidOutcomeError(f"Unsupported outcome record version {version!r}")
+        raise InvalidOutcomeError("The outcome record has an unsupported version")
     status = record.get("status")
     if status == RETURNED and set(record) == {"nest_outcome", "status"}:
         return RemoteOutcome(RETURNED)

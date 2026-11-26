@@ -522,13 +522,16 @@ class ApplicationOutcomeTests(_Base):
         self.record_nothing_on_completion()
         self.execute()
         [attempt] = self.attempts()
-        self.outcome_file(attempt["execution_id"]).write_bytes(b"\x80cloudpickle?")
+        self.outcome_file(attempt["execution_id"]).write_bytes(
+            b'{"nest_outcome": "sk-live-SECRET-SENTINEL", "status": "returned"}'
+        )
         self.admission.settle(timedelta(0))
         [attempt] = self.attempts()
         self.assertEqual(
             (attempt["status"], attempt["slurm_state"], attempt["error_kind"]),
             ("failed", "COMPLETED", "remote_outcome_invalid"),
         )
+        self.assertNotIn("SECRET-SENTINEL", attempt["error_message"])
 
     def test_batch_jobs_complete_without_reading_an_outcome(self):
         response = self.submit()

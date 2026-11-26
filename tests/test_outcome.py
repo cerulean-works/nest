@@ -87,6 +87,35 @@ def test_parse_rejects_anything_but_the_two_record_shapes(data):
         outcome.parse(data)
 
 
+SENTINEL = "sk-live-SECRET-SENTINEL"
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        b'{"nest_outcome": "%s", "status": "returned"}',
+        b'{"nest_outcome": {"k": "%s"}, "status": "returned"}',
+        b'{"nest_outcome": 1, "status": "%s"}',
+        b'{"nest_outcome": 1, "status": "raised", "error_type": "%s!"}',
+        b'{"nest_outcome": 1, "status": "returned", "%s": 1}',
+        b"%s",
+    ],
+)
+def test_invalid_records_never_echo_their_content(data):
+    with pytest.raises(outcome.InvalidOutcomeError) as caught:
+        outcome.parse(data.replace(b"%s", SENTINEL.encode()))
+    _, _, message = completion(caught.value)
+    assert SENTINEL not in str(caught.value)
+    assert message is not None and SENTINEL not in message
+    # No chained JSON error carries the content into a logged traceback either.
+    assert caught.value.__cause__ is None
+
+
+def test_parse_rejects_repeated_keys():
+    with pytest.raises(outcome.InvalidOutcomeError, match="repeats a key"):
+        outcome.parse(b'{"nest_outcome": 1, "status": "raised", "status": "returned"}')
+
+
 def test_completion_semantics():
     assert completion(None) == ("succeeded", None, None)
     assert completion(outcome.RemoteOutcome("returned")) == ("succeeded", None, None)
