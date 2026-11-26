@@ -344,6 +344,33 @@ class EgressProbeTests(unittest.TestCase):
         self.assertFalse(ident["ok"])  # "timed out", or the deadline check between reads
         self.assertLess(elapsed, 3)
 
+    def test_banner_read_stops_at_the_deadline_under_a_fast_trickle(self):
+        # Faster than any per-recv timeout, far below the 8 KiB cap: only the
+        # deadline check between reads can end it.
+        async def fast_trickle(reader, writer):
+            try:
+                while True:
+                    writer.write(b"x\n")
+                    await writer.drain()
+                    await asyncio.sleep(0.005)
+            except ConnectionError, asyncio.CancelledError:
+                pass
+            finally:
+                writer.close()
+
+        with FixtureServer(handler=fast_trickle) as fixture:
+            started = time.monotonic()
+            code, records = probe(
+                "--host", "127.0.0.1", "--port", str(fixture.port),
+                "--allowed-port", str(fixture.port), "--fixture", "--timeout", "0.2",
+            )  # fmt: skip
+            elapsed = time.monotonic() - started
+        ident = {r.get("check"): r for r in records}["ssh_identification"]
+        self.assertEqual(code, 1)
+        # Ends on the deadline: the check between reads, or the last recv timing out.
+        self.assertIn(ident["detail"], {"no identification line before --timeout", "timed out"})
+        self.assertLess(elapsed, 2)
+
 
 class Client:
     """A fake gRPC client side: queued frames in, collected frames out."""
