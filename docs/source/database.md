@@ -60,7 +60,7 @@ A job record moves through these `status` values:
 | `submitted` | `sbatch` returned the Slurm job ID. Batch jobs stay here; `slurm_state` is updated by each `GetJobStatus` call. |
 | `succeeded` | An `Execute` worker finished, its function returned, and its result was returned. |
 | `failed` | SSH or Slurm failed, and `error_kind` holds the [error kind](remote-errors); or the worker finished but its function raised (`remote_application_error`; Nest still returned its exception). |
-| `unknown` | `sbatch` may have submitted a job, but no job ID arrived (`submission_unknown`); or an `Execute` worker finished but its outcome record could not be read (`remote_outcome_unreadable`). |
+| `unknown` | `sbatch` may have submitted a job, but no job ID arrived (`submission_unknown`); or an `Execute` worker finished but its outcome record could not be read (`remote_outcome_unreadable`) or, from a protocol 2 worker, is missing (`remote_outcome_missing`). |
 
 Local execution (`NEST_EXECUTOR=local`) creates no job records. No user payloads,
 results, or credentials are stored, nor are `SubmitJob` script arguments.
@@ -429,6 +429,7 @@ and a database upgraded release by release end with the same schema.
 | 0015 | `project_platform_policy` | `project_default_platforms`; immutable Project and Organization IDs |
 | 0016 | `platform_role_boundaries` | Platform roles can only be granted to an active User |
 | 0019 | `hpc_access_policy` | **D01/D02:** `hpc_platform_authority_policies`, `project_platform_authority_policies`, `hpc_account_bindings`; each new attempt pins `execution_authority` and its policy versions |
+| 0020 | `attempt_worker_protocol` | **#73:** each `Execute` attempt pins `worker_protocol`, set once before `sbatch`, which decides its artifact directory and whether a completion without an outcome record can be a success |
 
 D07 (0012) owns Platform identity: the Platform UUID and slug, its login nodes and
 its Project grants. D08 (0013) owns Slurm accounts, which reference D07's Platform,

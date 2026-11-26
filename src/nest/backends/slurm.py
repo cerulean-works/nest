@@ -65,6 +65,9 @@ def new_execution_id() -> str:
     return uuid.uuid4().hex
 
 
+WORKER_SCRIPT = "project/scripts/worker.sbatch"
+"""The deployed worker batch script, relative to `worker_workdir`."""
+
 _SUBMIT_MARKER = "nest-sbatch-started"
 """Printed before `sbatch` so an SSH failure can show whether submission began."""
 
@@ -971,28 +974,78 @@ class SlurmBackend:
             raise ValueError("Slurm work_root must be an absolute path")
         return f"{work_root.rstrip('/')}/{execution_id}"
 
-    @operation(logger, "Slurm stage_payload")
-    def stage_payload(self, payload: bytes, execution_id: str | None = None) -> str:
+    def attempt_dir(self, execution_id: str, attempt: int | None) -> str:
         """
-        Uploads a payload as `input.pkl` in a new remote execution directory, and
-        removes any outcome sidecar an earlier attempt left there, so it is never
-        read as this attempt's.
+        Returns an attempt's artifact directory. Runs no command.
+
+        Args:
+            execution_id (`str`): ID from [`backends.slurm.new_execution_id`].
+            attempt (`int`, *optional*): Attempt number, for a worker that speaks
+                [`outcome.WORKER_PROTOCOL`]. `None` selects the shared execution
+                directory, as a legacy worker uses.
+
+        Returns:
+            `str`: `<work_root>/<execution_id>/attempts/<attempt>`, or the execution
+                directory.
+
+        Raises:
+            `ValueError`: If the ID or attempt number is malformed, or `work_root`
+                is missing or relative.
+        """
+        execution = self.execution_dir(execution_id)
+        if attempt is None:
+            return execution
+        if type(attempt) is not int or not 1 <= attempt < 10**9:
+            raise ValueError("Invalid attempt number")
+        return f"{execution}/attempts/{attempt}"
+
+    def worker_protocol(self) -> int:
+        """
+        Reads the protocol the deployed worker script declares
+        (`# nest-worker-protocol: N`), before a submission. A script without the
+        line predates the outcome record: protocol 1.
+
+        Raises:
+            `ValueError`: If `worker_workdir` is not configured.
+            [`errors.SessionUnavailableError`], [`errors.SSHError`],
+            [`errors.RemoteCommandError`], [`errors.SSHTimeoutError`]: If the
+                script cannot be read; nothing is submitted then.
+        """
+        if not self.config.worker_workdir:
+            raise ValueError("worker_workdir is not configured")
+        self._require_session(Operation.SUBMIT)
+        script = shlex.quote(f"{self.config.worker_workdir.rstrip('/')}/{WORKER_SCRIPT}")
+        output = self._run_remote(
+            f"test -r {script} && sed -n 's/^# nest-worker-protocol: \\([1-9][0-9]\\{{0,2\\}}\\)$/\\1/p' "
+            f"{script} | head -n 1"
+        )
+        return int(output) if output.isdigit() else 1
+
+    @operation(logger, "Slurm stage_payload")
+    def stage_payload(
+        self, payload: bytes, execution_id: str | None = None, *, attempt: int | None = None
+    ) -> str:
+        """
+        Uploads a payload as `input.pkl` in the attempt's artifact directory (see
+        [`backends.slurm.SlurmBackend.attempt_dir`]), and removes any outcome
+        record already there, so it is never read as this attempt's.
 
         Args:
             payload (`bytes`): Serialized function and arguments.
             execution_id (`str`, *optional*): Execution ID naming the directory. The
                 Controller passes the ID it already recorded; omitted, a new one is
                 generated.
+            attempt (`int`, *optional*): Attempt number, for a protocol 2 worker.
 
         Returns:
-            `str`: Remote directory under `work_root`, named with the Execution ID.
+            `str`: The artifact directory under `work_root`.
 
         Raises:
             `ValueError`: If the ID is malformed, or `work_root` is missing or relative.
             [`errors.SSHError`] or [`errors.RemoteCommandError`]: If the upload fails.
             [`errors.SSHTimeoutError`]: If the upload exceeds `ssh_timeout`.
         """
-        job_dir = self.execution_dir(execution_id or new_execution_id())
+        job_dir = self.attempt_dir(execution_id or new_execution_id(), attempt)
         self._require_session(Operation.SUBMIT)
         input_path = f"{job_dir}/input.pkl"
         logger.info(
@@ -1023,6 +1076,7 @@ class SlurmBackend:
         time: str | None = None,
         bounded: bool = False,
         before_submit: Callable[[], None] | None = None,
+        attempt: int | None = None,
     ) -> tuple[int, str]:
         """
         Stages a serialized call and submits the deployed worker batch script once.
@@ -1054,9 +1108,14 @@ class SlurmBackend:
             before_submit (`Callable[[], None]`, *optional*): Called after staging,
                 immediately before `sbatch`. An exception it raises propagates and
                 nothing is submitted.
+            attempt (`int`, *optional*): Attempt number. Given, the payload, result
+                and outcome record live in the attempt's own directory and the
+                worker receives it as its seventh argument; only a worker that
+                declares protocol 2 (see
+                [`backends.slurm.SlurmBackend.worker_protocol`]) honors it.
 
         Returns:
-            `tuple[int, str]`: Submitted job ID and remote execution directory.
+            `tuple[int, str]`: Submitted job ID and the attempt's artifact directory.
 
         Raises:
             `ValueError`: If required working paths are missing or invalid, the
@@ -1075,11 +1134,13 @@ class SlurmBackend:
             raise ValueError("Resource counts cannot be negative")
 
         # Validate before any SSH command.
-        self.execution_dir(execution_id or new_execution_id())
+        execution_id = execution_id or new_execution_id()
+        self.attempt_dir(execution_id, attempt)
 
-        # Upload payload into the directory named by the Execution ID
-        job_dir = self.stage_payload(payload, execution_id)
-        execution_id = job_dir.rsplit("/", 1)[-1]
+        # Upload payload into the attempt's directory
+        job_dir = self.stage_payload(payload, execution_id, attempt=attempt)
+        if attempt is None:
+            execution_id = job_dir.rsplit("/", 1)[-1]
 
         # Prepare script arguments
         script_args = (
@@ -1091,6 +1152,7 @@ class SlurmBackend:
             # The worker enables GPU passthrough only for an explicit request, since the
             # script's own `#SBATCH` GPU default applies when `gpu` is `0`.
             str(gpu),
+            "" if attempt is None else str(attempt),
         )
 
         if before_submit is not None:
@@ -1100,7 +1162,7 @@ class SlurmBackend:
         try:
             job_id = self.submit(
                 workdir=self.config.worker_workdir,
-                script="project/scripts/worker.sbatch",
+                script=WORKER_SCRIPT,
                 gpu=gpu,
                 cpu=(worker_allocation(gpu, cpu)[1] if bounded else cpu),
                 account=account,
@@ -1347,36 +1409,50 @@ class SlurmBackend:
 
     _OUTCOME_PRESENT = b"nest-outcome-present\n"
     _OUTCOME_ABSENT = b"nest-outcome-absent\n"
+    _OUTCOME_NO_ACCESS = b"nest-outcome-no-access\n"
 
     def read_outcome(self, job_dir: str) -> outcome.RemoteOutcome | None:
         """
-        Reads a completed worker's outcome sidecar (`outcome.json`) over SSH, at most
+        Reads a completed worker's outcome record (`outcome.json`) over SSH, at most
         [`outcome.MAX_OUTCOME_BYTES`] of it, and parses it as plain JSON. The
         result file is never read or unpickled here.
 
         Args:
-            job_dir (`str`): Remote execution directory, as returned by
+            job_dir (`str`): The attempt's artifact directory, as returned by
                 [`backends.slurm.SlurmBackend.submit_payload`] or
-                [`backends.slurm.SlurmBackend.execution_dir`].
+                [`backends.slurm.SlurmBackend.attempt_dir`].
 
         Returns:
-            [`outcome.RemoteOutcome`] or `None`: `None` when the worker wrote no
-                sidecar, as a worker that predates it does.
+            [`outcome.RemoteOutcome`] or `None`: `None` when no record exists there.
 
         Raises:
-            [`outcome.InvalidOutcomeError`]: If the sidecar is not a valid record.
-            [`errors.SSHError`], [`errors.RemoteCommandError`],
-            [`errors.SSHTimeoutError`]: If it cannot be read; the outcome is unknown.
+            [`outcome.OutcomeUnreadableError`]: If the path exists but is not a
+                regular file, or the directory or file cannot be read.
+            [`outcome.InvalidOutcomeError`]: If the record is not valid.
+            [`errors.SessionUnavailableError`], [`errors.SSHError`],
+            [`errors.RemoteCommandError`], [`errors.SSHTimeoutError`]: If it cannot
+                be read now; the outcome is unknown.
         """
+        self._require_session(Operation.RESULT)
+        directory = shlex.quote(job_dir)
         path = shlex.quote(f"{job_dir}/{outcome.OUTCOME_FILE}")
-        present = self._OUTCOME_PRESENT.decode().strip()
-        absent = self._OUTCOME_ABSENT.decode().strip()
+        present, absent, no_access = (
+            marker.decode().strip()
+            for marker in (self._OUTCOME_PRESENT, self._OUTCOME_ABSENT, self._OUTCOME_NO_ACCESS)
+        )
         data = self._ssh(
-            f"if [ -f {path} ]; then echo {present} && head -c {outcome.MAX_OUTCOME_BYTES + 1} "
-            f"{path}; else echo {absent}; fi"
+            f"if [ -e {directory} ] && ! [ -x {directory} ]; then echo {no_access}; "
+            f"elif [ -e {path} ] || [ -L {path} ]; then "
+            f"if [ -f {path} ] && [ -r {path} ]; then echo {present} && "
+            f"head -c {outcome.MAX_OUTCOME_BYTES + 1} {path}; else echo {no_access}; fi; "
+            f"else echo {absent}; fi"
         )
         if data == self._OUTCOME_ABSENT:
             return None
+        if data == self._OUTCOME_NO_ACCESS:
+            raise outcome.OutcomeUnreadableError(
+                "The outcome record is not a readable regular file"
+            )
         if not data.startswith(self._OUTCOME_PRESENT):
             raise RemoteCommandError("Unexpected reply while reading the worker's outcome record")
         return outcome.parse(data[len(self._OUTCOME_PRESENT) :])

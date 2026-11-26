@@ -362,6 +362,42 @@ class OutageTests(_LimitsBase):
 class LifecycleTests(_LimitsBase):
     ssh_timeout = 2.0
 
+    def test_a_missing_outcome_keeps_its_reservation_until_the_sweep_decides(self):
+        # The job completes, but its outcome record is not visible yet.
+        original = SlurmBackend.wait_result
+
+        def hide(backend, job_id, job_dir, *args, **kwargs):
+            result = original(backend, job_id, job_dir, *args, **kwargs)
+            os.unlink(os.path.join(job_dir, "outcome.json"))
+            return result
+
+        with mock.patch.object(SlurmBackend, "wait_result", autospec=True, side_effect=hide):
+            self.assertEqual(self.execute(lambda: 7), 7)
+        [held] = self.held()
+        self.assertEqual(held["status"], "submitted")
+        # Never a success: the sweep fails it only after a full threshold, and only
+        # then is the reservation released.
+        self.admission.settle(timedelta(hours=1))
+        self.assertEqual(len(self.held()), 1)
+        self.admission.settle(timedelta(0))
+        self.assertEqual(self.held(), [])
+        [attempt] = self.attempts()
+        self.assertEqual(
+            (attempt["status"], attempt["error_kind"]), ("failed", "remote_outcome_missing")
+        )
+
+    def test_an_application_failure_releases_its_reservation(self):
+        def boom():
+            raise ValueError("bad input")
+
+        record = self.execute(boom)
+        self.assertEqual(record["type"], "builtins.ValueError")
+        self.assertEqual(self.held(), [])
+        [attempt] = self.attempts()
+        self.assertEqual(
+            (attempt["status"], attempt["error_kind"]), ("failed", "remote_application_error")
+        )
+
     def test_unknown_outcome_keeps_its_reservation_until_reconciled(self):
         self.hpc.hang_ssh("sbatch --parsable", after=True)
         error = self.refused(self.batch)
@@ -1036,7 +1072,7 @@ class BoundedResultTests(_LimitsBase):
         self.assertEqual(self.held(), [])
         # The result stays on the cluster.
         [execution] = self.sql("SELECT execution_id FROM executions")
-        output = self.hpc.base / "jobs" / execution["execution_id"] / "output.pkl"
+        output = self.hpc.base / "jobs" / execution["execution_id"] / "attempts/1/output.pkl"
         self.assertGreater(output.stat().st_size, self.LIMIT)
 
     def test_result_within_the_bound_is_returned(self):

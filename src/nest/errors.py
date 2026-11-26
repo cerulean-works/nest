@@ -251,6 +251,18 @@ class DatabaseUnavailableError(InfrastructureError):
     status = grpc.StatusCode.UNAVAILABLE
 
 
+class WorkerProtocolError(InfrastructureError):
+    """
+    The deployed worker script predates the outcome record (worker protocol 1), and
+    this Controller refuses legacy workers (`NEST_LEGACY_WORKERS=refuse`, the
+    default). Raised before anything is staged or submitted: update the Platform's
+    Nest checkout, or have the operator allow legacy workers during a rollout.
+    """
+
+    kind = "worker_protocol_unsupported"
+    status = grpc.StatusCode.FAILED_PRECONDITION
+
+
 class SessionUnavailableError(InfrastructureError):
     """
     The Slurm operation needs a user-owned SSH session that is not available now.
@@ -327,6 +339,7 @@ INFRASTRUCTURE_ERRORS: dict[str, type[InfrastructureError]] = {
         NestTimeoutError,
         SSHTimeoutError,
         SubmissionUnknownError,
+        WorkerProtocolError,
         QueueTimeoutError,
         JobBlockedError,
         ExecutionTimeoutError,

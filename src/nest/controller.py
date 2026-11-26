@@ -27,6 +27,7 @@ from .admission import (
     SubmissionRequest,
     completion,
     digest,
+    missing_outcome,
 )
 from .audit import AuditLog, audit_interface
 from .auth.web import start_auth_service
@@ -82,7 +83,7 @@ from .errors import (
 )
 from .executor import execute
 from .mail import start_email_service
-from .outcome import InvalidOutcomeError
+from .outcome import WORKER_PROTOCOL, InvalidOutcomeError
 from .proto import execution_pb2, execution_pb2_grpc
 from .rpc_guard import RpcGuard, current_client, server_options
 
@@ -638,6 +639,9 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
             # The build slot is only needed for the build itself.
             slot.release()
             self._abandon_if_gone(context, admission_service, admission, "staging the payload")
+            # Pinned before staging: decides the attempt's artifact directory and how
+            # its completion settles, whatever is deployed later.
+            protocol = admission_service.pin_worker_protocol(admission, backend)
             job_id, job_dir = backend.submit_payload(
                 request.payload,
                 gpu=request.gpu,
@@ -650,6 +654,8 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 bounded=admission.bounded,
                 # Staging takes time: check again right before the worker's sbatch.
                 before_submit=still_wanted("the worker's sbatch"),
+                # Its own directory: a retry under the same key never touches it.
+                attempt=(admission.attempt.attempt_number if protocol >= WORKER_PROTOCOL else None),
             )
             submitted = True
             logger.info("Worker submitted job_id=%s job_dir=%s", job_id, job_dir)
@@ -657,7 +663,7 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 self._abort_unrecorded(context, admission, job_id)
             result_bytes = backend.wait_result(job_id, job_dir)
             try:
-                remote = admission_service.read_outcome(backend, admission.execution_id)
+                remote = admission_service.read_outcome(backend, job_dir)
             except InfrastructureError as exc:
                 # The result is in hand and is returned, but whether the function
                 # raised is unknown: the attempt stays live for the settle sweep or a
@@ -668,7 +674,12 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                     exc.kind,
                 )
             else:
-                admission_service.completed(admission, remote, output_ref=f"{job_dir}/output.pkl")
+                admission_service.completed(
+                    admission,
+                    remote,
+                    worker_protocol=protocol,
+                    output_ref=f"{job_dir}/output.pkl",
+                )
             context.set_trailing_metadata(((EXECUTION_ID_METADATA, admission.execution_id),))
             return execution_pb2.ExecuteResponse(result=result_bytes)
         except InfrastructureError as exc:
@@ -783,12 +794,15 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
             error_message=str(exc),
         )
 
-    def _finish_completed(self, backend: SlurmBackend, record: int, job_dir: str) -> None:
+    def _finish_completed(
+        self, backend: SlurmBackend, record: int, job_dir: str, protocol: int | None
+    ) -> None:
         """
         Legacy `jobs` record of a completed worker, settled like the registry's
-        (see [`admission.completion`]). The legacy path has no settle sweep, so when
-        the outcome record cannot be read the record becomes `unknown`
-        (`remote_outcome_unreadable`) rather than claim a success or look in flight.
+        (see [`admission.completion`]). The legacy path runs every execution once,
+        in its own execution directory, and has no settle sweep: when the outcome
+        record cannot be read, or a protocol 2 worker left none, the record becomes
+        `unknown` rather than claim a success or look in flight.
         """
         assert self.jobs is not None
         try:
@@ -807,7 +821,11 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 ),
             )
             return
-        status, error_kind, message = completion(remote)
+        decided = completion(remote, worker_protocol=protocol)
+        if decided is None:
+            status, error_kind, message = "unknown", *missing_outcome()[1:]
+        else:
+            status, error_kind, message = decided
         self.jobs.finish(record, status, error_kind=error_kind, error_message=message)
 
     def _require_slurm_backend(self, context) -> SlurmBackend:
@@ -961,6 +979,13 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
 
                     logger.info("Environment ready environment_id=%s", environment_id)
 
+                # Read before sbatch, so the record settles by the worker that ran.
+                protocol = (
+                    backend.worker_protocol()
+                    if self.jobs is not None and record is not None
+                    else None
+                )
+
                 # Submit worker with environment ID
                 job_id, job_dir = backend.submit_payload(
                     request.payload,
@@ -977,7 +1002,7 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
                 # Wait for the result
                 result_bytes = backend.wait_result(job_id, job_dir)
                 if self.jobs is not None and record is not None:
-                    self._finish_completed(backend, record, job_dir)
+                    self._finish_completed(backend, record, job_dir, protocol)
 
                 return execution_pb2.ExecuteResponse(result=result_bytes)
 
@@ -1469,6 +1494,7 @@ def build_admission(
         ),
         limits=config.limits,
         authorities=config.execution_authorities,
+        legacy_workers=config.legacy_workers,
     )
 
 
@@ -1524,6 +1550,7 @@ def record_start(config: ControllerConfig, database: Database | None) -> None:
             "email_enabled": config.email is not None,
             "google_sign_in": config.google is not None,
             "execution_registry": config.execution_registry,
+            "legacy_workers": config.legacy_workers,
             "execution_authorities": ",".join(config.execution_authorities),
             "grpc_allowed_peers": len(config.rpc.allowed_peers),
             "grpc_trusted_proxies": len(config.rpc.trusted_proxies),

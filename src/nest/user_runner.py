@@ -55,7 +55,7 @@ def _execute(input_path, output_path, cloudpickle, outcome, logger):
 
         result = func(*args, **kwargs)
 
-        with output_path.open("wb") as f:
+        with outcome.publish(output_path) as f:
             cloudpickle.dump(result, f)
 
     except Exception as exc:
@@ -67,7 +67,7 @@ def _execute(input_path, output_path, cloudpickle, outcome, logger):
             "traceback": traceback.format_exc(),
         }
 
-        with output_path.open("wb") as f:
+        with outcome.publish(output_path) as f:
             cloudpickle.dump(error, f)
         outcome.write(output_path.parent, outcome.RAISED, error["type"])
         return

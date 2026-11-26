@@ -15,8 +15,12 @@ from a Slurm job failure. The exception message and traceback stay in
 `output.pkl`, delivered to the caller unchanged; they are never stored by the
 Controller.
 
-A job whose worker predates the sidecar writes none: its completion is recorded
-as before, as a success.
+Each attempt of a worker that speaks [`outcome.WORKER_PROTOCOL`] runs in its own
+artifact directory, and both files are published atomically (written beside
+their final name, then renamed), so a reader never sees a partial result or
+another attempt's record. For such an attempt a missing record is never a
+success. Only a worker that predates the record (protocol 1), admitted when the
+operator allows legacy workers, completes without one.
 
 This module needs only the standard library: `user_runner.py` loads it from the
 bootstrap directory inside the user's own interpreter.
@@ -27,13 +31,23 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 
 OUTCOME_FILE = "outcome.json"
 """File name of the sidecar, in the execution directory next to `output.pkl`."""
 
 OUTCOME_VERSION = 1
+
+WORKER_PROTOCOL = 2
+"""
+Protocol of this worker: per-attempt artifact directories, atomic publication and
+a mandatory outcome record. `scripts/worker.sbatch` declares it on a line
+`# nest-worker-protocol: 2`, which the Controller reads before submitting.
+"""
 
 MAX_OUTCOME_BYTES = 1024
 """Largest sidecar the Controller reads; a larger one is invalid."""
@@ -50,6 +64,10 @@ _ERROR_TYPE = re.compile(r"[A-Za-z_][\w.<>-]{0,255}", re.ASCII)
 
 class InvalidOutcomeError(ValueError):
     """The sidecar exists but is not a valid outcome record."""
+
+
+class OutcomeUnreadableError(InvalidOutcomeError):
+    """The sidecar's path exists but cannot be read: not a regular file, or no access."""
 
 
 @dataclass(frozen=True)
@@ -87,6 +105,28 @@ def clear(job_dir: Path | str) -> None:
         pass
 
 
+@contextmanager
+def publish(path: Path | str) -> Generator[BinaryIO]:
+    """
+    Opens a file beside `path` for writing and renames it to `path` once the block
+    completes, so readers see either the previous state or the whole new file.
+    On an exception nothing is published.
+    """
+    final = Path(path)
+    partial = final.with_name(f".{final.name}.{os.getpid()}.tmp")
+    try:
+        with partial.open("wb") as f:
+            yield f
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(partial, final)
+    finally:
+        try:
+            partial.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def write(job_dir: Path | str, status: str, error_type: str | None = None) -> None:
     """
     Writes the sidecar atomically, after the result file it describes, so a
@@ -102,13 +142,8 @@ def write(job_dir: Path | str, status: str, error_type: str | None = None) -> No
     if len(data.encode()) > MAX_OUTCOME_BYTES:  # never larger than parse() accepts
         record["error_type"] = "unknown"
         data = json.dumps(record, separators=(",", ":"))
-    path = _path(job_dir)
-    partial = path.with_name(f".{OUTCOME_FILE}.{os.getpid()}.tmp")
-    with partial.open("w", encoding="utf-8") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(partial, path)
+    with publish(_path(job_dir)) as f:
+        f.write(data.encode())
 
 
 class _DuplicateKeyError(Exception):

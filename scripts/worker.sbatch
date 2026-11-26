@@ -6,6 +6,9 @@
 #SBATCH --mem=1G
 #SBATCH --time=00:05:00
 #SBATCH --output=worker-%j.out
+#
+# The Controller reads the next line before submitting; see nest.outcome.WORKER_PROTOCOL.
+# nest-worker-protocol: 2
 
 set -euo pipefail
 
@@ -28,6 +31,20 @@ REQUEST_ID="${4:-}"
 LOG_LEVEL="${5:-INFO}"
 # GPUs per node the caller requested; unset when an older Controller submitted the job.
 GPU_REQUEST="${6-}"
+# Attempt number: its artifacts live in jobs/<execution ID>/attempts/<attempt>.
+# Unset or empty (an older Controller, or the legacy jobs path) uses jobs/<execution ID>.
+ATTEMPT="${7-}"
+
+if [[ -n "$ATTEMPT" ]]; then
+    if [[ ! "$ATTEMPT" =~ ^[1-9][0-9]{0,8}$ ]]; then
+        printf 'Invalid attempt number: %q\n' "$ATTEMPT"
+        exit 1
+    fi
+    JOB_PATH="$JOB_ID/attempts/$ATTEMPT"
+else
+    JOB_PATH="$JOB_ID"
+fi
+echo "Artifact directory: jobs/$JOB_PATH"
 
 echo "Nest worker job_id=${SLURM_JOB_ID:-unknown} execution_id=$JOB_ID request_id=${REQUEST_ID:-none} environment_id=${ENV_ID:-none}"
 
@@ -204,8 +221,10 @@ apptainer exec \
             "/workspace/jobs/$1/input.pkl" \
             "/workspace/jobs/$1/output.pkl" \
             "$2"
-    ' sh "$JOB_ID" "$USER_PYTHON_CONTAINER"
+    ' sh "$JOB_PATH" "$USER_PYTHON_CONTAINER"
 
-test -s "$BASE/jobs/$JOB_ID/output.pkl"
+# Both the result and its outcome record must exist for the job to complete.
+test -s "$BASE/jobs/$JOB_PATH/output.pkl"
+test -s "$BASE/jobs/$JOB_PATH/outcome.json"
 
 echo "Worker finished successfully"

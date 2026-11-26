@@ -169,7 +169,9 @@ def test_slurm_job_executes_and_returns_result(slurm_controller, hpc):
     assert result["total"] == 6
 
     [job] = _worker_jobs(hpc)
-    execution_id, environment_id, workdir, request_id, log_level, gpu = job["args"]
+    execution_id, environment_id, workdir, request_id, log_level, gpu, attempt = job["args"]
+    # This Controller records only the legacy jobs table: one directory per execution.
+    assert attempt == ""
     job_dir = hpc.base / "jobs" / execution_id
     assert (job_dir / "input.pkl").is_file()
     assert (job_dir / "output.pkl").stat().st_size > 0
@@ -536,7 +538,8 @@ def test_controller_ssh_and_sbatch_commands_are_stable(slurm_controller, hpc, pr
     # Positional contract with scripts/environment-smoke.sbatch and worker.sbatch.
     assert build["args"] == [build["args"][0], str(hpc.base)]
     for job, environment_id, gpus in ((gpu_job, build["args"][0], "1"), (cpu_job, "", "0")):
-        execution_id, env, workdir, request_id, log_level, gpu = job["args"]
+        execution_id, env, workdir, request_id, log_level, gpu, attempt = job["args"]
+        assert attempt == ""
         assert re.fullmatch(r"[0-9a-f]{32}", execution_id)
         assert re.fullmatch(r"[0-9a-f]{32}", request_id)
         assert (env, workdir, log_level, gpu) == (environment_id, str(hpc.base), "INFO", gpus)

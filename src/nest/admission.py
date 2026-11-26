@@ -34,11 +34,16 @@ A remote call whose function raised still completes in Slurm (`COMPLETED`): the
 worker returns the remote error record as its result. Its attempt is recorded as
 `failed` with `slurm_state` `COMPLETED` and error kind `remote_application_error`
 (see [`admission.completion`]), decided from the worker's plain-JSON outcome
-sidecar ([`outcome`]), never by unpickling the result; the execution stays open
-for a retry. Every path that settles a `COMPLETED` job (`Execute`,
+record ([`outcome`]), never by unpickling the result; the execution stays open
+for a retry. Before staging, the worker protocol the deployed script declares is
+pinned on the attempt ([`admission.RegistryAdmission.pin_worker_protocol`]): a
+protocol 2 attempt has its own artifact directory, so a retry never touches an
+earlier attempt's result or record, and its completion is never a success
+without a record. Every path that settles a `COMPLETED` job (`Execute`,
 [`admission.RegistryAdmission.observe`] for `GetJobStatus`, and
-[`admission.RegistryAdmission.settle`]) decides the same way, so none of them
-records an application failure as a success.
+[`admission.RegistryAdmission.settle`]) decides the same way, from the
+attempt's own directory, so none of them records an application failure as a
+success.
 
 Execution authority (D01): a `user_owned` (Mode B, User SSH Proxy) submission
 that the policies permit and whose caller has a verified binding is still refused
@@ -124,12 +129,19 @@ from .db.platforms import (
     PlatformNotFoundError,
 )
 from .errors import (
+    DatabaseUnavailableError,
     InfrastructureError,
     ResultTooLargeError,
     SlurmJobError,
     SubmissionUnknownError,
+    WorkerProtocolError,
 )
-from .outcome import InvalidOutcomeError, RemoteOutcome
+from .outcome import (
+    WORKER_PROTOCOL,
+    InvalidOutcomeError,
+    OutcomeUnreadableError,
+    RemoteOutcome,
+)
 
 logger = get_logger("nest.admission")
 
@@ -146,34 +158,69 @@ __all__ = [
     "TrustedHPCIdentity",
     "completion",
     "digest",
+    "missing_outcome",
 ]
 
 REMOTE_APPLICATION_ERROR = "remote_application_error"
 """Error kind of an attempt whose job completed but whose function raised."""
 
 REMOTE_OUTCOME_INVALID = "remote_outcome_invalid"
-"""Error kind of an attempt whose job completed with an unreadable outcome record."""
+"""Error kind of an attempt whose job completed with a malformed outcome record."""
+
+REMOTE_OUTCOME_UNREADABLE = "remote_outcome_unreadable"
+"""Error kind of an attempt whose outcome record is not a readable regular file."""
+
+REMOTE_OUTCOME_MISSING = "remote_outcome_missing"
+"""Error kind of a protocol 2 attempt whose job completed without an outcome record."""
+
+REMOTE_OUTCOME_PENDING = "remote_outcome_pending"
+"""
+Error kind of a live attempt whose job completed but whose outcome record was not
+there yet; the settle sweep decides once it has stayed so for a full threshold.
+"""
+
+
+_PENDING = (
+    "The job completed, but its outcome record is not readable yet; the Controller "
+    "reads it again before settling the attempt"
+)
 
 
 def completion(
     remote: RemoteOutcome | InvalidOutcomeError | None,
-) -> tuple[str, str | None, str | None]:
+    *,
+    worker_protocol: int | None,
+) -> tuple[str, str | None, str | None] | None:
     """
-    How a job Slurm reports `COMPLETED` settles, from the worker's outcome sidecar.
+    How an `execution` job Slurm reports `COMPLETED` settles, from the worker's
+    outcome record and the worker protocol pinned on its attempt.
 
     Args:
-        remote: The parsed sidecar; `None` when the worker wrote none (a worker
-            that predates it, or a batch job); or the
-            [`outcome.InvalidOutcomeError`] raised parsing it.
+        remote: The parsed record; `None` when there is none; or the
+            [`outcome.InvalidOutcomeError`] (or [`outcome.OutcomeUnreadableError`])
+            raised reading it.
+        worker_protocol: The attempt's pinned protocol. `None` for an attempt
+            recorded before protocols were pinned.
 
     Returns:
-        `tuple`: `(status, error_kind, error_message)`. `succeeded` when the call
-            returned or no sidecar exists, as before the sidecar; `failed` with
-            `remote_application_error` when it raised, or `remote_outcome_invalid`
-            when the record is malformed. A failed attempt leaves its execution open
-            for a retry. The message names only the exception type: the exception
-            message and traceback are the caller's and stay in the result.
+        `(status, error_kind, error_message)`, or `None` when it cannot be decided
+            yet. `succeeded` only when the call returned, or, for a legacy worker
+            (protocol 1 or unpinned), when it wrote no record: an unverified
+            success, identified by the attempt's `worker_protocol`. `failed` with
+            `remote_application_error` when it raised, `remote_outcome_invalid`
+            for a malformed record, `remote_outcome_unreadable` for a path that is
+            not a readable regular file. A protocol 2 attempt without a record
+            returns `None`: never a success (see
+            [`admission.RegistryAdmission.settle`]). The message names only the
+            exception type: the exception message and traceback are the caller's
+            and stay in the result.
     """
+    if isinstance(remote, OutcomeUnreadableError):
+        return (
+            "failed",
+            REMOTE_OUTCOME_UNREADABLE,
+            "The job completed, but its outcome record is not a readable regular file",
+        )
     if isinstance(remote, InvalidOutcomeError):
         return (
             "failed",
@@ -192,7 +239,18 @@ def completion(
                 "the traceback was returned to the caller"
             ),
         )
+    if remote is None and worker_protocol is not None and worker_protocol >= WORKER_PROTOCOL:
+        return None
     return "succeeded", None, None
+
+
+def missing_outcome() -> tuple[str, str, str]:
+    """How a protocol 2 attempt whose record stayed missing for a full threshold settles."""
+    return (
+        "failed",
+        REMOTE_OUTCOME_MISSING,
+        "The job completed, but its worker wrote no outcome record; it is not a success",
+    )
 
 
 _ACCOUNT_DEFAULT_SOURCES = {
@@ -491,7 +549,11 @@ class RegistryAdmission:
         provider_revocations: str | None = None,
         limits: AdmissionLimits | None = None,
         authorities: Collection[str] = ("controller_owned",),
+        legacy_workers: str = "refuse",
     ):
+        if legacy_workers not in ("refuse", "allow"):
+            raise ValueError(f"Unknown legacy worker policy {legacy_workers!r}")
+        self.legacy_workers = legacy_workers
         self.registry = ExecutionRegistry(database)
         self.limits = limits
         self._builds = threading.BoundedSemaphore(limits.environment_builds) if limits else None
@@ -1024,25 +1086,87 @@ class RegistryAdmission:
             with self._unrecorded_lock:
                 self._unrecorded.pop(attempt_id, None)
 
-    def succeeded(self, admission: Admission, *, output_ref: str | None = None) -> None:
-        """Records that the job completed and its result was received."""
-        self.completed(admission, None, output_ref=output_ref)
+    def pin_worker_protocol(self, admission: Admission, backend: SlurmBackend) -> int:
+        """
+        Reads the deployed worker script's protocol and pins it on the attempt,
+        before anything is staged or submitted, so its completion settles by the
+        protocol it actually ran with.
+
+        Returns:
+            `int`: The protocol. With 2 or more, the caller stages the attempt in its
+                own artifact directory (see [`admission.RegistryAdmission.artifact_dir`]).
+
+        Raises:
+            [`errors.WorkerProtocolError`]: If the worker predates the outcome record
+                and legacy workers are refused (`NEST_LEGACY_WORKERS=refuse`).
+            [`errors.DatabaseUnavailableError`]: If it cannot be recorded; nothing is
+                submitted then.
+            [`errors.InfrastructureError`]: If the script cannot be read.
+        """
+        protocol = backend.worker_protocol()
+        if protocol < WORKER_PROTOCOL and self.legacy_workers != "allow":
+            raise WorkerProtocolError(
+                f"The worker script on {self.profile.id!r} declares protocol {protocol}, which "
+                f"predates the outcome record (protocol {WORKER_PROTOCOL}), so this Controller "
+                "could not tell a function that raised from one that returned. Nothing was "
+                "submitted. Update the Platform's Nest checkout, or allow legacy workers "
+                "during the rollout (NEST_LEGACY_WORKERS=allow)."
+            )
+        try:
+            self.registry.record_worker_protocol(admission.attempt.id, protocol)
+        except (DatabaseError, ExecutionRegistryError) as exc:
+            raise DatabaseUnavailableError(
+                f"The attempt's worker protocol could not be recorded ({exc}); nothing was "
+                "submitted"
+            ) from exc
+        logger.info(
+            "Worker protocol pinned execution_id=%s attempt=%s protocol=%s",
+            admission.execution_id,
+            admission.attempt.attempt_number,
+            protocol,
+        )
+        return protocol
+
+    @staticmethod
+    def artifact_dir(
+        backend: SlurmBackend, execution_id: str, attempt_number: int, protocol: int | None
+    ) -> str:
+        """
+        Where an attempt's payload, result and outcome record live: its own
+        directory for protocol 2, the shared execution directory otherwise.
+        """
+        own = protocol is not None and protocol >= WORKER_PROTOCOL
+        return backend.attempt_dir(execution_id, attempt_number if own else None)
 
     def completed(
         self,
         admission: Admission,
         remote: RemoteOutcome | InvalidOutcomeError | None,
         *,
+        worker_protocol: int | None,
         output_ref: str | None = None,
     ) -> None:
         """
         Records that the job completed and its result was received, settled by
-        [`admission.completion`] from the worker's outcome sidecar.
+        [`admission.completion`]. A protocol 2 attempt whose record is not there
+        yet stays live, marked `remote_outcome_pending`, for the settle sweep.
         """
-        status, error_kind, message = completion(remote)
+        decided = completion(remote, worker_protocol=worker_protocol)
+        if decided is None:
+            logger.warning(
+                "Outcome record missing; attempt left for settling execution_id=%s",
+                admission.execution_id,
+            )
+            self._write(
+                "outcome pending",
+                admission,
+                lambda: self.registry.note_outcome_pending(admission.attempt.id, _PENDING),
+            )
+            return
+        status, error_kind, message = decided
         if status == "failed":
             logger.info(
-                "Remote call raised execution_id=%s error_kind=%s",
+                "Remote call failed execution_id=%s error_kind=%s",
                 admission.execution_id,
                 error_kind,
             )
@@ -1059,18 +1183,20 @@ class RegistryAdmission:
             ),
         )
 
+    @staticmethod
     def read_outcome(
-        self, backend: SlurmBackend, execution_id: str
+        backend: SlurmBackend, job_dir: str
     ) -> RemoteOutcome | InvalidOutcomeError | None:
         """
-        Reads a completed execution's outcome sidecar for [`admission.completion`].
+        Reads a completed attempt's outcome record from its artifact directory, for
+        [`admission.completion`].
 
         Raises:
-            [`errors.InfrastructureError`]: If it cannot be read; the attempt must
+            [`errors.InfrastructureError`]: If it cannot be read now; the attempt must
                 then be left as it is, since its outcome is unknown.
         """
         try:
-            return backend.read_outcome(backend.execution_dir(execution_id))
+            return backend.read_outcome(job_dir)
         except InvalidOutcomeError as exc:
             return exc
 
@@ -1157,14 +1283,18 @@ class RegistryAdmission:
         """The owner of the served Platform's latest attempt with `slurm_job_id`."""
         return self.registry.job_owner(self.platform_id, slurm_job_id)
 
-    def observe(self, record: Mapping[str, Any], state: str) -> None:
+    def observe(self, record: Mapping[str, Any], state: str, *, sweep: bool = False) -> None:
         """
         Applies a Slurm state seen by a job status query to the attempt.
 
-        `COMPLETED` settles an `execution` attempt only once its outcome sidecar
-        has been read (see [`admission.completion`]); when it cannot be read, the
-        attempt is left as it is for a later query or sweep, never recorded as
-        `succeeded`. A `batch` job has no sidecar: `COMPLETED` is a success.
+        `COMPLETED` settles an `execution` attempt only from the outcome record in
+        the attempt's own artifact directory (see [`admission.completion`]). When it
+        cannot be read now, the attempt is left as it is; when a protocol 2 record
+        is missing, the attempt is marked `remote_outcome_pending`, and only the
+        settle sweep (`sweep`) fails it (`remote_outcome_missing`) once it has
+        stayed missing for a full threshold. Never `succeeded` without a record,
+        except for a legacy worker. A `batch` job has no record: `COMPLETED` is a
+        success.
         """
         attempt_id = record["attempt_id"]
         base = state.split()[0] if state else ""
@@ -1172,7 +1302,7 @@ class RegistryAdmission:
             if base in _RUNNING_STATES:
                 self.registry.record_running(attempt_id, slurm_state=base)
             elif base == "COMPLETED":
-                self._observe_completed(record)
+                self._observe_completed(record, sweep=sweep)
             elif base.startswith("CANCELLED"):
                 self.registry.finish_attempt(attempt_id, "cancelled", slurm_state=base)
             elif base in _FAILED_STATES:
@@ -1184,31 +1314,43 @@ class RegistryAdmission:
         except DatabaseError as exc:
             logger.error("Execution attempt state update failed attempt_id=%s: %s", attempt_id, exc)
 
-    def _observe_completed(self, record: Mapping[str, Any]) -> None:
+    def _observe_completed(self, record: Mapping[str, Any], *, sweep: bool) -> None:
         attempt_id = record["attempt_id"]
         if record.get("status") in FINAL_ATTEMPT_STATUSES:
             return  # Already settled; nothing to read.
-        execution_id = record.get("execution_id")
-        kind = record.get("kind")
-        if execution_id is not None and kind is None:
-            kind = self.registry.kind_of(execution_id)
-        remote: RemoteOutcome | InvalidOutcomeError | None = None
-        if kind == "execution" and execution_id is not None:
-            try:
-                remote = self.read_outcome(self.backend, execution_id)
-            except InfrastructureError as exc:
-                logger.warning(
-                    "Completed attempt not settled; its outcome record could not be read "
-                    "attempt_id=%s kind=%s",
-                    attempt_id,
-                    exc.kind,
-                )
+        attempt = self.registry.get_attempt(attempt_id)
+        if attempt is None or attempt.status in FINAL_ATTEMPT_STATUSES:
+            return
+        kind = record.get("kind") or self.registry.kind_of(attempt.execution_id)
+        if kind != "execution":
+            self.registry.finish_attempt(attempt_id, "succeeded", slurm_state="COMPLETED")
+            return
+        job_dir = self.artifact_dir(
+            self.backend, attempt.execution_id, attempt.attempt_number, attempt.worker_protocol
+        )
+        try:
+            remote = self.read_outcome(self.backend, job_dir)
+        except InfrastructureError as exc:
+            logger.warning(
+                "Completed attempt not settled; its outcome record could not be read "
+                "attempt_id=%s kind=%s",
+                attempt_id,
+                exc.kind,
+            )
+            return
+        decided = completion(remote, worker_protocol=attempt.worker_protocol)
+        if decided is None:
+            if sweep and attempt.error_kind == REMOTE_OUTCOME_PENDING:
+                decided = missing_outcome()
+            else:
+                self.registry.note_outcome_pending(attempt_id, _PENDING)
                 return
-        status, error_kind, message = completion(remote)
+        status, error_kind, message = decided
         self.registry.finish_attempt(
             attempt_id,
             status,
             slurm_state="COMPLETED",
+            output_ref=f"{job_dir}/output.pkl",
             error_kind=error_kind,
             error_message=message,
         )
@@ -1269,7 +1411,11 @@ class RegistryAdmission:
                     exc.kind,
                 )
                 continue
-            self.observe({"attempt_id": attempt.id, "execution_id": attempt.execution_id}, state)
+            self.observe(
+                {"attempt_id": attempt.id, "execution_id": attempt.execution_id},
+                state,
+                sweep=True,
+            )
         return len(candidates)
 
     def recover(self, older_than: timedelta) -> list[Attempt]:

@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 from unittest import mock
 
 import cloudpickle
@@ -13,6 +14,8 @@ from nest import outcome
 from nest.admission import completion
 from nest.backends.slurm import SlurmBackend, SlurmConfig
 from nest.errors import RemoteCommandError, SSHError
+
+REPOSITORY = Path(__file__).resolve().parent.parent
 
 
 def backend() -> SlurmBackend:
@@ -104,7 +107,9 @@ SENTINEL = "sk-live-SECRET-SENTINEL"
 def test_invalid_records_never_echo_their_content(data):
     with pytest.raises(outcome.InvalidOutcomeError) as caught:
         outcome.parse(data.replace(b"%s", SENTINEL.encode()))
-    _, _, message = completion(caught.value)
+    decided = completion(caught.value, worker_protocol=2)
+    assert decided is not None
+    _, _, message = decided
     assert SENTINEL not in str(caught.value)
     assert message is not None and SENTINEL not in message
     # No chained JSON error carries the content into a logged traceback either.
@@ -117,13 +122,28 @@ def test_parse_rejects_repeated_keys():
 
 
 def test_completion_semantics():
-    assert completion(None) == ("succeeded", None, None)
-    assert completion(outcome.RemoteOutcome("returned")) == ("succeeded", None, None)
-    status, kind, message = completion(outcome.RemoteOutcome("raised", "builtins.KeyError"))
-    assert (status, kind) == ("failed", "remote_application_error")
-    assert message is not None and "builtins.KeyError" in message
-    status, kind, _ = completion(outcome.InvalidOutcomeError("bad"))
-    assert (status, kind) == ("failed", "remote_outcome_invalid")
+    raised = outcome.RemoteOutcome("raised", "builtins.KeyError")
+    for protocol in (None, 1, 2):
+        assert completion(outcome.RemoteOutcome("returned"), worker_protocol=protocol) == (
+            "succeeded",
+            None,
+            None,
+        )
+        decided = completion(raised, worker_protocol=protocol)
+        assert decided is not None
+        status, kind, message = decided
+        assert (status, kind) == ("failed", "remote_application_error")
+        assert message is not None and "builtins.KeyError" in message
+        invalid = completion(outcome.InvalidOutcomeError("bad"), worker_protocol=protocol)
+        assert invalid is not None and invalid[:2] == ("failed", "remote_outcome_invalid")
+        unreadable = completion(outcome.OutcomeUnreadableError("x"), worker_protocol=protocol)
+        assert unreadable is not None and unreadable[:2] == ("failed", "remote_outcome_unreadable")
+    # No record: an unverified success only for a legacy (or unpinned) worker; for
+    # protocol 2 it is undecided, never a success.
+    assert completion(None, worker_protocol=None) == ("succeeded", None, None)
+    assert completion(None, worker_protocol=1) == ("succeeded", None, None)
+    assert completion(None, worker_protocol=2) is None
+    assert completion(None, worker_protocol=3) is None
 
 
 # Reading over SSH --------------------------------------------------------------
@@ -145,6 +165,89 @@ def test_read_outcome_is_bounded_plain_json_and_never_touches_the_result():
 def test_read_outcome_without_a_record_is_none():
     with mock.patch.object(SlurmBackend, "_ssh", return_value=b"nest-outcome-absent\n"):
         assert backend().read_outcome("/nest/jobs/x") is None
+
+
+def test_read_outcome_reports_a_path_it_cannot_read():
+    with (
+        mock.patch.object(SlurmBackend, "_ssh", return_value=b"nest-outcome-no-access\n"),
+        pytest.raises(outcome.OutcomeUnreadableError),
+    ):
+        backend().read_outcome("/nest/jobs/x")
+
+
+@pytest.mark.parametrize(
+    ("setup", "expected"),
+    [
+        ("absent", None),
+        ("returned", outcome.RemoteOutcome("returned")),
+        ("directory", outcome.OutcomeUnreadableError),
+        ("dangling", outcome.OutcomeUnreadableError),
+        ("no-directory", None),
+    ],
+)
+def test_read_outcome_command_distinguishes_absent_from_unreadable(tmp_path, setup, expected):
+    job_dir = tmp_path / "attempts" / "1"
+    if setup != "no-directory":
+        job_dir.mkdir(parents=True)
+    record = job_dir / "outcome.json"
+    if setup == "returned":
+        outcome.write(job_dir, outcome.RETURNED)
+    elif setup == "directory":
+        record.mkdir()
+    elif setup == "dangling":
+        record.symlink_to(tmp_path / "gone")
+
+    def run(command):
+        return subprocess.run(["bash", "-c", command], capture_output=True, check=True).stdout
+
+    with mock.patch.object(SlurmBackend, "_ssh", side_effect=run):
+        if isinstance(expected, type):
+            with pytest.raises(expected):
+                backend().read_outcome(str(job_dir))
+        else:
+            assert backend().read_outcome(str(job_dir)) == expected
+
+
+def test_attempt_directories_are_per_attempt_under_the_execution():
+    slurm = backend()
+    execution = "c" * 32
+    assert slurm.attempt_dir(execution, None) == f"/nest/jobs/{execution}"
+    assert slurm.attempt_dir(execution, 3) == f"/nest/jobs/{execution}/attempts/3"
+    for bad in (0, -1, 10**9, True, "1"):
+        with pytest.raises(ValueError):
+            slurm.attempt_dir(execution, bad)  # ty: ignore[invalid-argument-type]
+
+
+@pytest.mark.parametrize(
+    ("script", "protocol"),
+    [
+        ("#!/bin/bash\n# nest-worker-protocol: 2\nset -e\n", 2),
+        ("#!/bin/bash\nset -e\n", 1),
+        ("#!/bin/bash\n#  nest-worker-protocol: 2\n", 1),
+        ("#!/bin/bash\n# nest-worker-protocol: two\n", 1),
+    ],
+)
+def test_worker_protocol_is_read_from_the_deployed_script(tmp_path, script, protocol):
+    (tmp_path / "project" / "scripts").mkdir(parents=True)
+    (tmp_path / "project" / "scripts" / "worker.sbatch").write_text(script)
+    slurm = SlurmBackend(
+        SlurmConfig(
+            ssh_host="hpc", account="acct", work_root="/nest/jobs", worker_workdir=str(tmp_path)
+        )
+    )
+
+    def run(command):
+        return subprocess.run(
+            ["bash", "-c", command], check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    with mock.patch.object(SlurmBackend, "_run_remote", side_effect=run):
+        assert slurm.worker_protocol() == protocol
+
+
+def test_the_repository_worker_script_declares_this_protocol():
+    script = (REPOSITORY / "scripts" / "worker.sbatch").read_text()
+    assert f"\n# nest-worker-protocol: {outcome.WORKER_PROTOCOL}\n" in script
 
 
 def test_read_outcome_reports_an_invalid_or_oversized_record():
@@ -170,11 +273,27 @@ def test_read_outcome_failures_are_infrastructure_errors():
         backend().read_outcome("/nest/jobs/x")
 
 
-def test_staging_removes_a_stale_record():
+def test_staging_uses_the_attempt_directory_and_removes_a_stale_record():
     with mock.patch.object(SlurmBackend, "_ssh", return_value=b"") as ssh:
-        job_dir = backend().stage_payload(b"payload", "b" * 32)
+        job_dir = backend().stage_payload(b"payload", "b" * 32, attempt=2)
+    assert job_dir == f"/nest/jobs/{'b' * 32}/attempts/2"
     [command] = ssh.call_args.args
+    assert f"mkdir -p {job_dir} " in command
     assert f"rm -f {job_dir}/outcome.json" in command
+    assert f"cat > {job_dir}/input.pkl" in command
+
+
+def test_publish_replaces_atomically_and_leaves_nothing_on_failure(tmp_path):
+    target = tmp_path / "output.pkl"
+    target.write_bytes(b"old")
+    with pytest.raises(RuntimeError), outcome.publish(target) as f:
+        f.write(b"partial")
+        raise RuntimeError("pickling failed")
+    assert target.read_bytes() == b"old"
+    with outcome.publish(target) as f:
+        f.write(b"new")
+    assert target.read_bytes() == b"new"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["output.pkl"]
 
 
 # The worker --------------------------------------------------------------------

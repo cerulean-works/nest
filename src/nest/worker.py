@@ -123,7 +123,7 @@ def main():
         result = func(*args, **kwargs)
 
         # Serializing return value
-        with output_path.open("wb") as f:
+        with outcome.publish(output_path) as f:
             cloudpickle.dump(result, f)
 
     except Exception as exc:
@@ -146,7 +146,7 @@ def _write_error(output_path: Path, exc: BaseException) -> None:
         "traceback": "".join(traceback.format_exception(exc)),
     }
 
-    with output_path.open("wb") as f:
+    with outcome.publish(output_path) as f:
         cloudpickle.dump(error, f)
     outcome.write(output_path.parent, outcome.RAISED, error["type"])
 
