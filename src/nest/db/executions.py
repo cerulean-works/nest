@@ -56,6 +56,7 @@ from ..backends.slurm import new_execution_id
 from ..config import AdmissionLimits
 from ._transaction import as_uuid, transaction
 from .connection import Database
+from .hpc_access import AuthorityPin, effective_policy
 from .identity import lock_session_family
 from .platforms import DEFAULT_SSH_PORT, EndpointNotApprovedError, LoginEndpoint
 
@@ -104,7 +105,13 @@ _ATTEMPT_COLUMNS = (
     "a.slurm_account_origin, a.source_digest, "
     "a.environment_digest, a.runtime_digest, a.status, a.slurm_job_id, a.slurm_state, "
     "a.output_ref, a.usage_ref, a.error_kind, a.error_message, a.created_at, a.updated_at, "
-    "a.submitted_at, a.finished_at"
+    "a.submitted_at, a.finished_at, "
+    # Added by 0019. Read through to_jsonb so a database not yet upgraded reads NULL.
+    "to_jsonb(a) ->> 'execution_authority' AS execution_authority, "
+    "(to_jsonb(a) ->> 'platform_authority_policy_version')::integer "
+    "AS platform_authority_policy_version, "
+    "(to_jsonb(a) ->> 'project_authority_policy_version')::integer "
+    "AS project_authority_policy_version"
 )
 _ATTEMPT_FROM = "execution_attempts a JOIN hpc_platforms p ON p.id = a.platform_id"
 # Restricts an attempt query to one Project; its parameter comes first.
@@ -151,6 +158,21 @@ class SubmitterNotAuthorizedError(ExecutionRegistryError):
     """
     The submitter's session was revoked or expired, the User was disabled, or their
     membership no longer allows `run.submit`, since the call was authorized.
+    """
+
+
+class AuthorityNotPermittedError(ExecutionRegistryError):
+    """
+    The execution authority is not permitted for the Project on the Platform by the
+    policies in force, or the policies changed since the attempt was resolved.
+    """
+
+
+class BindingNotVerifiedError(ExecutionRegistryError):
+    """
+    A `user_owned` attempt's HPC binding is not the execution owner's current,
+    verified binding on the attempt's Platform (it was revoked, replaced, never
+    verified, or belongs to someone else).
     """
 
 
@@ -548,6 +570,9 @@ class Attempt:
     finished_at: datetime | None
     nodes: tuple[str, ...] = ()
     options: dict[str, ResolvedOption] = field(default_factory=dict)
+    authority: AuthorityPin | None = None
+    """The execution authority and policy versions it was admitted under; `None`
+    for an attempt recorded before migration 0019, which is not reinterpreted."""
 
 
 def request_digest(kind: str, requested_options: Mapping[str, Any]) -> bytes:
@@ -620,7 +645,71 @@ def _attempt(
         finished_at=row["finished_at"],
         nodes=tuple(sorted(nodes)),
         options=dict(options),
+        authority=(
+            AuthorityPin(
+                row["execution_authority"],
+                row["platform_authority_policy_version"],
+                row["project_authority_policy_version"],
+            )
+            if row.get("execution_authority") is not None
+            else None
+        ),
     )
+
+
+def _check_authority(
+    cursor: Any,
+    endpoint: LoginEndpoint,
+    execution: Mapping[str, Any],
+    principal: HPCPrincipal,
+    authority: AuthorityPin,
+) -> None:
+    """
+    Re-checks the attempt's execution authority against the policies in force and,
+    for `user_owned`, the owner's verified binding, under the Platform's authority
+    lock (shared; policy changes take it exclusively) and a share lock on the
+    binding, so a concurrent policy change or revocation waits or wins outright.
+    """
+    cursor.execute(
+        "SELECT pg_advisory_xact_lock_shared(hashtextextended('nest.hpc_authority:' || %s, 0))",
+        (str(endpoint.platform_id),),
+    )
+    policy = effective_policy(cursor, execution["project_id"], endpoint.platform_id)
+    if (policy.platform_version, policy.project_version) != (
+        authority.platform_policy_version,
+        authority.project_policy_version,
+    ):
+        raise AuthorityNotPermittedError(
+            "The execution authority policy changed since the submission was resolved"
+        )
+    if authority.authority not in policy.authorities:
+        raise AuthorityNotPermittedError(
+            f"Execution authority {authority.authority} is not permitted for this Project "
+            "on the Platform"
+        )
+    if authority.authority == "controller_owned":
+        if principal.binding_id is not None:
+            raise ValueError("A controller_owned attempt runs as no User binding")
+        return
+    if principal.binding_id is None:
+        raise BindingNotVerifiedError("A user_owned attempt needs its owner's verified binding")
+    binding = cursor.execute(
+        "SELECT user_id, platform_id, version, unix_user, unix_uid, status "
+        "FROM hpc_account_bindings WHERE id::text = %s FOR SHARE",
+        (principal.binding_id,),
+    ).fetchone()
+    if (
+        binding is None
+        or binding["status"] != "verified"
+        or binding["user_id"] != execution["owner_user_id"]
+        or binding["platform_id"] != endpoint.platform_id
+        or binding["version"] != principal.binding_version
+        or binding["unix_user"] != principal.unix_user
+        or (principal.unix_uid is not None and binding["unix_uid"] != principal.unix_uid)
+    ):
+        raise BindingNotVerifiedError(
+            "The HPC account binding is no longer the owner's verified binding on the Platform"
+        )
 
 
 def _check_endpoint(cursor: Any, endpoint: LoginEndpoint, project_id: UUID) -> None:
@@ -822,6 +911,7 @@ class ExecutionRegistry:
         submitter: Submitter | None = None,
         reservation: Reservation | None = None,
         limits: AdmissionLimits | None = None,
+        authority: AuthorityPin | None = None,
     ) -> Attempt:
         """
         Durably records a new `submitting` attempt before anything is submitted.
@@ -891,7 +981,20 @@ class ExecutionRegistry:
             [`db.AdmissionLimitError`]: If `limits` would be exceeded.
             [`db.EndpointNotApprovedError`]: If the login node no longer matches an
                 approved endpoint of the Platform.
+            [`db.executions.AuthorityNotPermittedError`]: If `authority` is not
+                permitted by the policies in force, or names other versions.
+            [`db.executions.BindingNotVerifiedError`]: If a `user_owned` attempt's
+                binding is not its owner's current, verified binding.
             [`db.DatabaseError`]: If the database refuses a row.
+
+        Args:
+            authority ([`db.AuthorityPin`]): The execution authority and the policy
+                versions it was resolved under (D01). Required by every database at
+                migration 0019 or later, which refuses an attempt without one; it
+                is re-checked here against the policies in force, and a
+                `user_owned` attempt against its owner's verified binding
+                (`principal.binding_id` and `binding_version`). A
+                `controller_owned` attempt names no binding.
         """
         if (principal.binding_id is None) != (principal.binding_version is None):
             raise ValueError("binding_id and binding_version must be given together")
@@ -963,15 +1066,39 @@ class ExecutionRegistry:
                 slurm_account_id,
                 slurm_account_origin,
             )
+            if authority is not None:
+                _check_authority(cursor, endpoint, execution, principal, authority)
+            # The authority columns exist from 0019 on; without a pin the insert
+            # names none, and a database at 0019 or later refuses it.
+            pinned = (
+                ()
+                if authority is None
+                else (
+                    authority.authority,
+                    authority.platform_policy_version,
+                    authority.project_policy_version,
+                )
+            )
+            authority_columns: LiteralString = (
+                ""
+                if authority is None
+                else ", execution_authority, platform_authority_policy_version, "
+                "project_authority_policy_version"
+            )
+            authority_values: LiteralString = "" if authority is None else ", %s, %s, %s"
             row = cursor.execute(
                 """
                 INSERT INTO execution_attempts (execution_id, attempt_number, platform_id,
                     login_node_id, login_node_host, login_node_port, transport_mode,
                     host_key_pin_ref, hpc_binding_id, hpc_binding_version, unix_user, unix_uid,
                     slurm_account_id, slurm_account, slurm_account_origin, source_digest,
-                    environment_digest, runtime_digest)
+                    environment_digest, runtime_digest"""
+                + authority_columns
+                + """)
                 SELECT %s, COALESCE(max(attempt_number), 0) + 1, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s"""
+                + authority_values
+                + """
                 FROM execution_attempts WHERE execution_id = %s
                 RETURNING id
                 """,
@@ -993,6 +1120,7 @@ class ExecutionRegistry:
                     source_digest,
                     environment_digest,
                     runtime_digest,
+                    *pinned,
                     execution_id,
                 ),
             ).fetchone()

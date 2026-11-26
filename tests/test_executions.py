@@ -16,14 +16,17 @@ from postgres_fixture import PostgresTestCase, connect
 
 from nest.config import load_database_config
 from nest.db import (
+    EXECUTION_AUTHORITIES,
     AccountNotPermittedError,
     AttemptInFlightError,
+    AuthorityPin,
     Database,
     DatabaseError,
     EndpointNotApprovedError,
     ExecutionClosedError,
     ExecutionNotFoundError,
     ExecutionRegistry,
+    HPCAccessStore,
     HPCPrincipal,
     IdempotencyConflictError,
     IdentityStore,
@@ -42,6 +45,14 @@ from nest.db.platforms import endpoint_for
 DIGEST = "sha256:" + "ab" * 32
 PIN = "SHA256:abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"
 OPS: dict[str, Any] = {"operator": "ops-test", "reason": "execution registry tests"}
+# The owner's own HPC identity: a user_owned attempt (D01) under a verified binding (D02).
+USER_OWNED = AuthorityPin("user_owned", 1, 1)
+# Columns a raw attempt INSERT needs since 0019 for a controller_owned attempt.
+CONTROLLER_PIN_COLUMNS = (
+    ", execution_authority, platform_authority_policy_version, project_authority_policy_version"
+)
+CONTROLLER_PIN_VALUES = ", 'controller_owned', 1, 1"
+# An attempt recorded at schema 0014, before bindings existed (no authority pin).
 ALICE = HPCPrincipal("alice", 1001, binding_id="binding-1", binding_version=3)
 
 
@@ -93,6 +104,23 @@ class _Base(PostgresTestCase):
             registered = accounts.register_account(platform.id, name, **OPS)
             accounts.link_project(self.project, platform.id, name, modes=modes, **OPS)
             self.account_ids[platform.id, name] = registered.id
+        # Both authorities permitted for both Projects, and the owner's verified
+        # binding to UNIX user "alice" (uid 1001) on each Platform.
+        access = HPCAccessStore(self.db)
+        self.bindings = {}
+        for platform in (self.alpha, self.beta):
+            access.set_platform_policy(platform.id, EXECUTION_AUTHORITIES, **OPS)
+            for project in (self.project, self.other_project):
+                access.set_project_policy(project, platform.id, EXECUTION_AUTHORITIES, **OPS)
+            self.bindings[platform.id] = access.attest(
+                self.owner,
+                platform.id,
+                "alice",
+                method="operator_attestation",
+                evidence_ref="TICKET-1",
+                unix_uid=1001,
+                **OPS,
+            )
         self.A1 = endpoint_for(self.alpha, a1, "A")
         self.A2 = endpoint_for(self.alpha, a2, "B")
         self.B1 = endpoint_for(self.beta, b1, "B")
@@ -127,12 +155,18 @@ class _Base(PostgresTestCase):
             "slurm_account_origin": origin,
         }
 
+    def alice(self, endpoint=None):
+        """The owner's verified HPC identity on the endpoint's Platform."""
+        binding = self.bindings[(endpoint or self.A1).platform_id]
+        return HPCPrincipal("alice", 1001, binding_id=str(binding.id), binding_version=1)
+
     def begin(self, execution_id, endpoint=None, account="proj", **kw):
         endpoint = endpoint or self.A1
         return self.registry.begin_attempt(
             execution_id,
             endpoint=endpoint,
-            principal=kw.pop("principal", ALICE),
+            principal=kw.pop("principal", self.alice(endpoint)),
+            authority=kw.pop("authority", USER_OWNED),
             **kw.pop("account_fields", self.account(endpoint, account)),
             options=kw.pop(
                 "options",
@@ -246,8 +280,8 @@ class AttemptTests(_Base):
                 self.A1.node_id,
                 "alice",
                 1001,
-                "binding-1",
-                3,
+                str(self.bindings[self.alpha.id].id),
+                1,
                 "proj",
                 self.account_ids[self.alpha.id, "proj"],
                 "explicit",
@@ -256,7 +290,8 @@ class AttemptTests(_Base):
         self.assertEqual(attempt.attempt_number, 1)
         self.assertEqual(attempt.endpoint, self.A1)
         self.assertEqual(attempt.platform_id, self.alpha.id)
-        self.assertEqual(attempt.principal, ALICE)
+        self.assertEqual(attempt.principal, self.alice())
+        self.assertEqual(attempt.authority, USER_OWNED)
 
     def test_resolved_options_keep_value_and_provenance(self):
         execution, _ = self.register()
@@ -376,8 +411,12 @@ class AttemptTests(_Base):
             self.conn.execute(
                 "INSERT INTO execution_attempts (execution_id, attempt_number, platform_id, "
                 "login_node_id, login_node_host, transport_mode, unix_user, "
-                "slurm_account_id, slurm_account, slurm_account_origin) "
-                "VALUES (%s, 2, %s, %s, 'h', 'A', 'alice', %s, 'proj', 'explicit')",
+                "slurm_account_id, slurm_account, slurm_account_origin"
+                + CONTROLLER_PIN_COLUMNS
+                + ") "
+                "VALUES (%s, 2, %s, %s, 'h', 'A', 'alice', %s, 'proj', 'explicit'"
+                + CONTROLLER_PIN_VALUES
+                + ")",
                 (
                     execution.execution_id,
                     self.alpha.id,
@@ -441,9 +480,10 @@ class RecoveryTests(_Base):
             restarted.begin_attempt(
                 execution.execution_id,
                 endpoint=self.A2,
-                principal=ALICE,
+                principal=self.alice(),
                 **self.account(self.A2),
                 options={},
+                authority=USER_OWNED,
             )
         # Reconciliation found the job after all.
         found = restarted.record_submission(attempt.id, 99)
@@ -633,8 +673,10 @@ class AccountRegistryTests(_Base):
         insert = (
             "INSERT INTO execution_attempts (execution_id, attempt_number, platform_id, "
             "login_node_id, login_node_host, transport_mode, unix_user, "
-            "slurm_account_id, slurm_account, slurm_account_origin) "
-            "VALUES (%s, 2, %s, %s, 'h', 'A', 'alice', %s, %s, 'explicit')"
+            "slurm_account_id, slurm_account, slurm_account_origin" + CONTROLLER_PIN_COLUMNS + ") "
+            "VALUES (%s, 2, %s, %s, 'h', 'A', 'alice', %s, %s, 'explicit'"
+            + CONTROLLER_PIN_VALUES
+            + ")"
         )
         for account_id, name, error in (
             (
