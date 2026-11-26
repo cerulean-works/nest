@@ -263,6 +263,20 @@ class WorkerProtocolError(InfrastructureError):
     status = grpc.StatusCode.FAILED_PRECONDITION
 
 
+class SharedArtifactsRetryError(InfrastructureError):
+    """
+    A retry under the same idempotency key would run on a legacy worker (protocol
+    1) in the execution directory an earlier attempt already used, where it could
+    overwrite that attempt's result while it is still being read. Raised before
+    anything is staged or submitted: retry with a new idempotency key, or once the
+    Platform's worker declares protocol 2 (its attempts each get their own
+    directory).
+    """
+
+    kind = "retry_needs_isolated_worker"
+    status = grpc.StatusCode.FAILED_PRECONDITION
+
+
 class SessionUnavailableError(InfrastructureError):
     """
     The Slurm operation needs a user-owned SSH session that is not available now.
@@ -340,6 +354,7 @@ INFRASTRUCTURE_ERRORS: dict[str, type[InfrastructureError]] = {
         SSHTimeoutError,
         SubmissionUnknownError,
         WorkerProtocolError,
+        SharedArtifactsRetryError,
         QueueTimeoutError,
         JobBlockedError,
         ExecutionTimeoutError,

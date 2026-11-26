@@ -132,6 +132,7 @@ from .errors import (
     DatabaseUnavailableError,
     InfrastructureError,
     ResultTooLargeError,
+    SharedArtifactsRetryError,
     SlurmJobError,
     SubmissionUnknownError,
     WorkerProtocolError,
@@ -1099,6 +1100,9 @@ class RegistryAdmission:
         Raises:
             [`errors.WorkerProtocolError`]: If the worker predates the outcome record
                 and legacy workers are refused (`NEST_LEGACY_WORKERS=refuse`).
+            [`errors.SharedArtifactsRetryError`]: If the worker predates it, and an
+                earlier attempt of the execution already reached Slurm in the
+                shared directory this retry would use.
             [`errors.DatabaseUnavailableError`]: If it cannot be recorded; nothing is
                 submitted then.
             [`errors.InfrastructureError`]: If the script cannot be read.
@@ -1111,6 +1115,15 @@ class RegistryAdmission:
                 "could not tell a function that raised from one that returned. Nothing was "
                 "submitted. Update the Platform's Nest checkout, or allow legacy workers "
                 "during the rollout (NEST_LEGACY_WORKERS=allow)."
+            )
+        if protocol < WORKER_PROTOCOL and self._shares_artifacts(admission):
+            raise SharedArtifactsRetryError(
+                f"Execution {admission.execution_id} already ran an attempt in its shared "
+                f"execution directory, and the worker script on {self.profile.id!r} "
+                f"(protocol {protocol}) would run this retry there too, where it could "
+                "overwrite that attempt's result. Nothing was submitted. Retry with a new "
+                "idempotency key, or once the Platform's worker declares protocol "
+                f"{WORKER_PROTOCOL}."
             )
         try:
             self.registry.record_worker_protocol(admission.attempt.id, protocol)
@@ -1126,6 +1139,22 @@ class RegistryAdmission:
             protocol,
         )
         return protocol
+
+    def _shares_artifacts(self, admission: Admission) -> bool:
+        """
+        Whether an earlier attempt of this execution reached Slurm in the shared
+        execution directory (a legacy or unpinned worker), which a legacy retry
+        would reuse.
+        """
+        earlier = self.registry.attempts(
+            admission.execution_id, project_id=admission.execution.project_id
+        )
+        return any(
+            attempt.id != admission.attempt.id
+            and attempt.slurm_job_id is not None
+            and (attempt.worker_protocol is None or attempt.worker_protocol < WORKER_PROTOCOL)
+            for attempt in earlier
+        )
 
     @staticmethod
     def artifact_dir(
@@ -1283,7 +1312,9 @@ class RegistryAdmission:
         """The owner of the served Platform's latest attempt with `slurm_job_id`."""
         return self.registry.job_owner(self.platform_id, slurm_job_id)
 
-    def observe(self, record: Mapping[str, Any], state: str, *, sweep: bool = False) -> None:
+    def observe(
+        self, record: Mapping[str, Any], state: str, *, pending_grace: timedelta | None = None
+    ) -> None:
         """
         Applies a Slurm state seen by a job status query to the attempt.
 
@@ -1291,8 +1322,9 @@ class RegistryAdmission:
         the attempt's own artifact directory (see [`admission.completion`]). When it
         cannot be read now, the attempt is left as it is; when a protocol 2 record
         is missing, the attempt is marked `remote_outcome_pending`, and only the
-        settle sweep (`sweep`) fails it (`remote_outcome_missing`) once it has
-        stayed missing for a full threshold. Never `succeeded` without a record,
+        settle sweep (`pending_grace`) fails it (`remote_outcome_missing`), and only
+        if it has stayed pending and unchanged for the whole `pending_grace`,
+        checked under the lock that fails it. Never `succeeded` without a record,
         except for a legacy worker. A `batch` job has no record: `COMPLETED` is a
         success.
         """
@@ -1302,7 +1334,7 @@ class RegistryAdmission:
             if base in _RUNNING_STATES:
                 self.registry.record_running(attempt_id, slurm_state=base)
             elif base == "COMPLETED":
-                self._observe_completed(record, sweep=sweep)
+                self._observe_completed(record, pending_grace=pending_grace)
             elif base.startswith("CANCELLED"):
                 self.registry.finish_attempt(attempt_id, "cancelled", slurm_state=base)
             elif base in _FAILED_STATES:
@@ -1314,7 +1346,9 @@ class RegistryAdmission:
         except DatabaseError as exc:
             logger.error("Execution attempt state update failed attempt_id=%s: %s", attempt_id, exc)
 
-    def _observe_completed(self, record: Mapping[str, Any], *, sweep: bool) -> None:
+    def _observe_completed(
+        self, record: Mapping[str, Any], *, pending_grace: timedelta | None
+    ) -> None:
         attempt_id = record["attempt_id"]
         if record.get("status") in FINAL_ATTEMPT_STATUSES:
             return  # Already settled; nothing to read.
@@ -1339,12 +1373,14 @@ class RegistryAdmission:
             )
             return
         decided = completion(remote, worker_protocol=attempt.worker_protocol)
+        pending_for = None
         if decided is None:
-            if sweep and attempt.error_kind == REMOTE_OUTCOME_PENDING:
-                decided = missing_outcome()
-            else:
+            if pending_grace is None or attempt.error_kind != REMOTE_OUTCOME_PENDING:
                 self.registry.note_outcome_pending(attempt_id, _PENDING)
                 return
+            # Fails only if still pending, and for the whole grace, under the row lock:
+            # a mark made by a concurrent observation restarts the wait.
+            decided, pending_for = missing_outcome(), pending_grace
         status, error_kind, message = decided
         self.registry.finish_attempt(
             attempt_id,
@@ -1353,6 +1389,7 @@ class RegistryAdmission:
             output_ref=f"{job_dir}/output.pkl",
             error_kind=error_kind,
             error_message=message,
+            pending_for=pending_for,
         )
 
     # Recovery -----------------------------------------------------------------
@@ -1414,7 +1451,7 @@ class RegistryAdmission:
             self.observe(
                 {"attempt_id": attempt.id, "execution_id": attempt.execution_id},
                 state,
-                sweep=True,
+                pending_grace=older_than,
             )
         return len(candidates)
 

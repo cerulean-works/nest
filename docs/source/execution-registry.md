@@ -151,6 +151,14 @@ shared execution directory, as before, and its completion without a record is an
 attempts whose `worker_protocol` is not 2 or more. Attempts recorded before
 migration 0021 have no `worker_protocol` and settle the same way.
 
+The shared directory gives such an attempt no isolation from a retry, so a
+legacy attempt never reuses it: a same-key retry that would run on a legacy
+worker after an earlier attempt of the execution reached Slurm in the shared
+directory (a legacy or unpinned attempt) is refused before anything is staged,
+with `FAILED_PRECONDITION` (`retry_needs_isolated_worker`). Retry with a new
+idempotency key, or once the Platform's worker declares protocol 2: a protocol 2
+retry runs in its own directory and leaves the earlier attempt's files alone.
+
 ### How a completed `Execute` settles
 
 When Slurm reports `COMPLETED`, the Controller reads at most 1 KiB of the
@@ -174,7 +182,10 @@ or the file was removed. `Execute` and `GetJobStatus` only mark such an attempt
 `remote_outcome_pending`. The settle sweep reads it again once the attempt has
 been unchanged for a full settle threshold after that, and fails it
 (`remote_outcome_missing`) only if the record is still missing then; a record
-that appears in the meantime settles the attempt as usual.
+that appears in the meantime settles the attempt as usual. That wait is checked
+in the same locked transaction that fails the attempt, against the attempt as it
+is then, so a mark made by a concurrent status query or another replica's sweep
+restarts the wait rather than being failed at once.
 
 The attempt's `error_message` names only the exception type, or a fixed reason;
 it never quotes the record. The exception message and traceback belong to the

@@ -1236,9 +1236,15 @@ class ExecutionRegistry:
         usage_ref: str | None = None,
         error_kind: str | None = None,
         error_message: str | None = None,
+        pending_for: timedelta | None = None,
     ) -> Attempt:
         """
         Moves an attempt to `succeeded`, `failed`, `cancelled` or `unknown`.
+
+        With `pending_for`, the move happens only if the attempt is still marked
+        `remote_outcome_pending` and has stayed unchanged for at least that long,
+        checked under the row lock that makes the move, so an earlier snapshot or a
+        concurrent observation can never shorten the wait.
 
         A final status also updates the execution: `succeeded` and `cancelled` close
         it, and `failed` leaves it open for a retry.
@@ -1250,7 +1256,8 @@ class ExecutionRegistry:
         Raises:
             [`db.executions.ExecutionNotFoundError`]: If the attempt does not exist.
             [`db.executions.InvalidTransitionError`]: If the attempt is already final,
-                or would be `succeeded` without a Slurm job ID.
+                would be `succeeded` without a Slurm job ID, or (with `pending_for`)
+                is not pending, or not for long enough yet.
         """
         if status not in (*FINAL_ATTEMPT_STATUSES, "unknown"):
             raise ValueError(f"Unknown final attempt status {status!r}")
@@ -1275,6 +1282,7 @@ class ExecutionRegistry:
                 status in FINAL_ATTEMPT_STATUSES,
             ),
             slurm_job_id=slurm_job_id,
+            pending_for=pending_for,
         )
 
     def _transition(
@@ -1287,15 +1295,24 @@ class ExecutionRegistry:
         nodes: Iterable[str] = (),
         slurm_job_id: int | None = None,
         expected: str | None = None,
+        pending_for: timedelta | None = None,
     ) -> Attempt:
         with transaction(self.database, None, f"mark an execution attempt {status}") as cursor:
             current = cursor.execute(
-                "SELECT e.execution_id, a.status, a.slurm_job_id FROM execution_attempts a "
+                "SELECT e.execution_id, a.status, a.slurm_job_id, a.error_kind, "
+                "a.updated_at <= now() - %s::interval AS aged "
+                "FROM execution_attempts a "
                 "JOIN executions e USING (execution_id) WHERE a.id = %s FOR UPDATE",
-                (attempt_id,),
+                (pending_for or timedelta(0), attempt_id),
             ).fetchone()
             if current is None:
                 raise ExecutionNotFoundError("The execution attempt does not exist")
+            if pending_for is not None and not (
+                current["error_kind"] == "remote_outcome_pending" and current["aged"]
+            ):
+                raise InvalidTransitionError(
+                    "The attempt's outcome has not been pending for the full wait yet"
+                )
             if expected is not None and current["status"] != expected:
                 raise InvalidTransitionError(
                     f"The attempt is {current['status']}, no longer {expected}"

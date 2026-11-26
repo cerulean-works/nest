@@ -517,7 +517,9 @@ class ApplicationOutcomeTests(_Base):
 
     # Retry isolation -----------------------------------------------------------
 
-    def run_retry_while_first_rpc_is_paused(self, pause_in: str):
+    def run_retry_while_first_rpc_is_paused(
+        self, pause_in: str, *, refused_ok: bool = False, before_retry=None
+    ):
         """
         Pauses attempt A's Execute in `pause_in` (`wait_result`, before its download,
         or `read_outcome`, after it), settles A through GetJobStatus as another
@@ -548,10 +550,19 @@ class ApplicationOutcomeTests(_Base):
             [a] = self.attempts()
             self.assert_application_failure(a)
             self.flag.touch()
-            results["b"] = self.execute(self.flaky(), x_nest_idempotency_key="race")
-            resume.set()
-            thread.join(60)
-        return results
+            if before_retry is not None:
+                before_retry()
+            retry_error = None
+            try:
+                results["b"] = self.execute(self.flaky(), x_nest_idempotency_key="race")
+            except grpc.RpcError as exc:
+                if not refused_ok:
+                    raise
+                retry_error = cast(grpc.Call, exc)
+            finally:
+                resume.set()
+                thread.join(60)
+        return results, retry_error
 
     def assert_isolated(self, results):
         # A's client gets A's traceback, never B's result; B gets its own.
@@ -578,10 +589,10 @@ class ApplicationOutcomeTests(_Base):
         )
 
     def test_retry_never_touches_an_attempt_paused_before_its_download(self):
-        self.assert_isolated(self.run_retry_while_first_rpc_is_paused("wait_result"))
+        self.assert_isolated(self.run_retry_while_first_rpc_is_paused("wait_result")[0])
 
     def test_retry_never_touches_an_attempt_paused_before_its_outcome_read(self):
-        self.assert_isolated(self.run_retry_while_first_rpc_is_paused("read_outcome"))
+        self.assert_isolated(self.run_retry_while_first_rpc_is_paused("read_outcome")[0])
 
     # Missing, late and unreadable records ----------------------------------------
 
@@ -733,6 +744,207 @@ class ApplicationOutcomeTests(_Base):
             ("succeeded", None, 1),
         )
         self.assertEqual(attempt["output_ref"], f"{shared}/output.pkl")
+
+    def allow_legacy_workers(self) -> RegistryAdmission:
+        admission = RegistryAdmission(
+            self.db,
+            self.backend,
+            self.profile,
+            self.platform_id,
+            audit=self.audit,
+            legacy_workers="allow",
+        )
+        self.admission = admission
+        self.stub = self.serve(admission)
+        return admission
+
+    def deploy_current_worker(self):
+        shutil.copyfile(
+            Path(__file__).resolve().parent.parent / "scripts" / "worker.sbatch",
+            self.hpc.base / "project" / "scripts" / "worker.sbatch",
+        )
+
+    def test_legacy_retry_in_the_shared_directory_needs_a_new_key(self):
+        # A mixed rollout: a legacy script runs the current worker, which still
+        # writes an outcome record in the shared directory.
+        self.allow_legacy_workers()
+        self.deploy_legacy_worker()
+        first = self.execute(self.flaky(), x_nest_idempotency_key="legacy")
+        self.assertEqual(first["message"], "first try fails")
+        self.flag.touch()
+        error = self.refused(lambda: self.execute(self.flaky(), x_nest_idempotency_key="legacy"))
+        self.assertEqual(error.code(), grpc.StatusCode.FAILED_PRECONDITION)
+        self.assertEqual(
+            dict(error.trailing_metadata())["nest-error-kind"], "retry_needs_isolated_worker"
+        )
+        self.assertEqual(len(self.sbatch_calls()), 1)
+        failed, refused = self.attempts()
+        self.assert_application_failure(failed)
+        self.assertEqual(failed["worker_protocol"], 1)
+        self.assertEqual(
+            (refused["status"], refused["error_kind"], refused["worker_protocol"]),
+            ("failed", "retry_needs_isolated_worker", None),
+        )
+        # The first attempt's result in the shared directory is untouched.
+        shared = self.hpc.base / "jobs" / failed["execution_id"]
+        self.assertEqual(
+            cloudpickle.loads((shared / "output.pkl").read_bytes())["message"], "first try fails"
+        )
+        # A new key is a new execution, in its own directory.
+        self.assertEqual(self.execute(self.flaky(), x_nest_idempotency_key="legacy-2"), "ok")
+
+    def test_a_retry_after_an_unpinned_attempt_needs_an_isolated_worker(self):
+        # An attempt recorded before migration 0021 has no worker_protocol: it
+        # used the shared directory.
+        self.allow_legacy_workers()
+        self.deploy_legacy_worker()
+        self.execute(self.flaky(), x_nest_idempotency_key="old")
+        self.sql(
+            "ALTER TABLE execution_attempts DISABLE TRIGGER execution_attempts_worker_protocol"
+        )
+        self.sql("UPDATE execution_attempts SET worker_protocol = NULL")
+        self.sql("ALTER TABLE execution_attempts ENABLE TRIGGER execution_attempts_worker_protocol")
+        error = self.refused(lambda: self.execute(self.flaky(), x_nest_idempotency_key="old"))
+        self.assertEqual(
+            dict(error.trailing_metadata())["nest-error-kind"], "retry_needs_isolated_worker"
+        )
+        # An updated worker isolates the retry, so it may run.
+        self.deploy_current_worker()
+        self.flag.touch()
+        self.assertEqual(self.execute(self.flaky(), x_nest_idempotency_key="old"), "ok")
+
+    def test_legacy_attempt_paused_before_its_download_keeps_its_own_result(self):
+        self.legacy_attempt_paused_keeps_its_own_result("wait_result")
+
+    def test_legacy_attempt_paused_before_its_outcome_read_keeps_its_own_result(self):
+        self.legacy_attempt_paused_keeps_its_own_result("read_outcome")
+
+    def legacy_attempt_paused_keeps_its_own_result(self, pause_in):
+        self.allow_legacy_workers()
+        self.deploy_legacy_worker()
+        results, retry_error = self.run_retry_while_first_rpc_is_paused(pause_in, refused_ok=True)
+        # The legacy retry was refused before staging; A's client got A's traceback.
+        self.assertEqual(results["a"]["message"], "first try fails")
+        assert retry_error is not None
+        self.assertEqual(
+            dict(retry_error.trailing_metadata())["nest-error-kind"], "retry_needs_isolated_worker"
+        )
+        self.assertEqual(len(self.sbatch_calls()), 1)
+
+    def test_cross_version_retry_during_a_paused_download_is_isolated(self):
+        self.cross_version_retry_never_touches_the_legacy_attempt("wait_result")
+
+    def test_cross_version_retry_during_a_paused_outcome_read_is_isolated(self):
+        self.cross_version_retry_never_touches_the_legacy_attempt("read_outcome")
+
+    def cross_version_retry_never_touches_the_legacy_attempt(self, pause_in):
+        # A ran on a legacy script in the shared directory; the Platform is
+        # updated, and B runs isolated in attempts/2 while A is still being read.
+        self.allow_legacy_workers()
+        self.deploy_legacy_worker()
+        results, _ = self.run_retry_while_first_rpc_is_paused(
+            pause_in, before_retry=self.deploy_current_worker
+        )
+        self.assertEqual(results["a"]["message"], "first try fails")
+        self.assertEqual(results["b"], "ok")
+        a, b = self.attempts()
+        self.assertEqual((a["worker_protocol"], b["worker_protocol"]), (1, 2))
+        self.assert_application_failure(a)
+        self.assertEqual((b["status"], b["error_kind"]), ("succeeded", None))
+        shared = self.hpc.base / "jobs" / a["execution_id"]
+        self.assertEqual(a["output_ref"], f"{shared}/output.pkl")
+        self.assertEqual(b["output_ref"], f"{self.attempt_dir(a['execution_id'], 2)}/output.pkl")
+        self.assertEqual(
+            cloudpickle.loads((shared / "output.pkl").read_bytes())["message"], "first try fails"
+        )
+
+    def hidden_completed_attempt(self):
+        """A completed attempt nobody has settled, whose record is not visible yet."""
+        self.record_nothing_on_completion()
+        records = self.remove_outcome_after_the_job()
+        self.execute(self.train)
+        [attempt] = self.attempts()
+        self.assertEqual((attempt["status"], attempt["error_kind"]), ("submitted", None))
+        self.sql("UPDATE execution_attempts SET updated_at = now() - interval '2 hours'")
+        return attempt, records[-1]
+
+    def observe_during_the_sweeps_status_query(self, concurrent):
+        """Runs `concurrent` once, inside the sweep's Slurm status request."""
+        original = SlurmBackend.status
+        ran = []
+
+        def status(backend, job_id):
+            if not ran:
+                ran.append(True)
+                concurrent()
+            return original(backend, job_id)
+
+        return mock.patch.object(SlurmBackend, "status", autospec=True, side_effect=status)
+
+    def assert_still_pending(self):
+        [attempt] = self.attempts()
+        self.assertEqual(
+            (attempt["status"], attempt["slurm_state"], attempt["error_kind"]),
+            ("submitted", "COMPLETED", "remote_outcome_pending"),
+        )
+
+    def test_a_concurrent_status_query_restarts_the_missing_outcome_wait(self):
+        attempt, hidden = self.hidden_completed_attempt()
+        other = RegistryAdmission(
+            self.open_database(), self.backend, self.profile, self.platform_id
+        )
+        record = {"attempt_id": attempt["id"], "status": "submitted"}
+        with self.observe_during_the_sweeps_status_query(
+            lambda: other.observe(record, "COMPLETED")
+        ):
+            # Selected as idle for 2 hours, but marked pending during its query.
+            self.admission.settle(timedelta(hours=1))
+        self.assert_still_pending()
+        self.admission.settle(timedelta(hours=1))
+        self.assert_still_pending()
+        # The record appears within the wait: settled normally, never failed.
+        hidden.rename(hidden.with_name("outcome.json"))
+        self.admission.settle(timedelta(0))
+        self.assert_application_failure(self.attempts()[0])
+
+    def test_two_replicas_sweeping_wait_the_full_grace(self):
+        attempt, _ = self.hidden_completed_attempt()
+        replica = RegistryAdmission(
+            self.open_database(), self.backend, self.profile, self.platform_id
+        )
+        with self.observe_during_the_sweeps_status_query(
+            lambda: replica.settle(timedelta(hours=1))
+        ):
+            self.admission.settle(timedelta(hours=1))
+        self.assert_still_pending()
+        # After the full wait, either replica fails it.
+        self.sql("UPDATE execution_attempts SET updated_at = now() - interval '2 hours'")
+        replica.settle(timedelta(hours=1))
+        [attempt] = self.attempts()
+        self.assertEqual(
+            (attempt["status"], attempt["error_kind"]), ("failed", "remote_outcome_missing")
+        )
+
+    def test_failing_a_missing_outcome_is_a_locked_compare_and_set(self):
+        attempt, _ = self.hidden_completed_attempt()
+        # Not pending: refused.
+        with self.assertRaises(ExecutionRegistryError):
+            self.registry.finish_attempt(
+                attempt["id"],
+                "failed",
+                error_kind="remote_outcome_missing",
+                pending_for=timedelta(0),
+            )
+        self.assertTrue(self.registry.note_outcome_pending(attempt["id"], "pending"))
+        # Pending, but not for the whole wait: refused.
+        with self.assertRaises(ExecutionRegistryError):
+            self.registry.finish_attempt(
+                attempt["id"],
+                "failed",
+                error_kind="remote_outcome_missing",
+                pending_for=timedelta(hours=1),
+            )
+        self.assert_still_pending()
 
     def test_worker_protocol_is_pinned_once_before_submission(self):
         self.record_nothing_on_completion()
