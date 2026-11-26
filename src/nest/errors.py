@@ -25,6 +25,12 @@ IDEMPOTENCY_METADATA = "x-nest-idempotency-key"
 """Request-metadata key making a registry-backed submission idempotent for its owner
 and Project: a repeated request with the same key never submits twice."""
 
+EXECUTION_AUTHORITY_METADATA = "x-nest-execution-authority"
+"""Request-metadata key naming the execution authority a registry-backed submission
+asks for: `controller_owned` (Mode A, Controller SSH) or `user_owned` (Mode B, the
+User's own HPC account). Only a request: the server decides from its own policies,
+refuses an authority they do not permit, and never substitutes another."""
+
 EXECUTION_ID_METADATA = "nest-execution-id"
 """Trailing-metadata key carrying the Nest execution ID of a registry-backed submission."""
 

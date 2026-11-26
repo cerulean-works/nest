@@ -45,6 +45,18 @@ Usage:
     nest-db account native-default PLATFORM --project-id UUID --allow | --forbid
     (every change also takes --operator NAME --reason TEXT)
 
+    # Execution authority policies and HPC account bindings (see "HPC access"):
+    nest-db hpc-access show    PLATFORM [--project-id UUID]
+    nest-db hpc-access set-platform-policy PLATFORM --authorities LIST
+    nest-db hpc-access set-project-policy  PLATFORM --project-id UUID --authorities LIST
+    nest-db hpc-access bindings PLATFORM [--user-id UUID]
+    nest-db hpc-access attest  PLATFORM --user-id UUID --unix-user NAME
+                               --method operator_attestation|nchc_attestation
+                               --evidence-ref REF [--unix-uid N]
+    nest-db hpc-access revoke  BINDING_ID --revoked-reason CODE
+    (every change also takes --operator NAME --reason TEXT; LIST is
+    controller_owned, user_owned, both comma-separated, or none)
+
     # Durable Provider approvals (see "Onboard a Project"):
     nest-db provider list    [--provider PROVIDER] [--project-id UUID] [--status S]
     nest-db provider approve | revoke PROVIDER --project-id UUID
@@ -92,6 +104,7 @@ from .approvals import ProviderApprovalStore, parse_project_ids
 from .bootstrap import audit_events, bootstrap_state
 from .connection import Database, DatabaseError
 from .executions import Attempt, ExecutionRegistry, ExecutionRegistryError
+from .hpc_access import VERIFICATION_METHODS, HPCAccessError, HPCAccessStore, HPCBinding
 from .identity import IdentityStore, UserNotActiveError
 from .migrate import MigrationError, schema_status, upgrade, verify
 from .platforms import (
@@ -171,6 +184,7 @@ def _parser() -> argparse.ArgumentParser:
 
     _platform_parser(commands)
     _account_parser(commands)
+    _hpc_access_parser(commands)
     _execution_parser(commands)
     _provider_parser(commands)
     _project_parser(commands)
@@ -536,6 +550,167 @@ def _platform_parser(commands) -> None:
         grant = actions.add_parser(name, parents=[change], help=f"{verb} a Platform")
         grant.add_argument("platform", metavar="PLATFORM")
         grant.add_argument("--project-id", required=True, type=UUID, metavar="UUID")
+
+
+def _hpc_access_parser(commands) -> None:
+    access = commands.add_parser(
+        "hpc-access",
+        help="manage execution authority policies and verified HPC account bindings",
+        description=(
+            "Which execution authorities (controller_owned: Controller SSH; user_owned: "
+            "the User's own HPC account) a Platform and a Project on it permit, and the "
+            "per-User HPC account bindings. A binding is verified only by recording an "
+            "independent attestation; a User's typed username is never evidence. Nothing "
+            "here stores a password, OTP, SSH key or session. Every change is audited "
+            "with the operator name, the reason and the PostgreSQL role. PLATFORM is a "
+            "slug or ID."
+        ),
+    )
+    actions = access.add_subparsers(dest="action", required=True)
+    change = argparse.ArgumentParser(add_help=False)
+    change.add_argument(
+        "--operator", required=True, help="who is making the change, for the audit log"
+    )
+    change.add_argument("--reason", required=True, help="why, for the audit log")
+    show = actions.add_parser("show", help="show the authority policies in force")
+    show.add_argument("platform", metavar="PLATFORM")
+    show.add_argument("--project-id", type=UUID, metavar="UUID")
+    authorities = argparse.ArgumentParser(add_help=False)
+    authorities.add_argument(
+        "--authorities",
+        required=True,
+        metavar="LIST",
+        help="controller_owned, user_owned, both comma-separated, or none",
+    )
+    platform_policy = actions.add_parser(
+        "set-platform-policy",
+        parents=[change, authorities],
+        help="append the Platform's next authority policy version",
+    )
+    platform_policy.add_argument("platform", metavar="PLATFORM")
+    project_policy = actions.add_parser(
+        "set-project-policy",
+        parents=[change, authorities],
+        help="append a Project's next authority policy version on the Platform",
+    )
+    project_policy.add_argument("platform", metavar="PLATFORM")
+    project_policy.add_argument("--project-id", required=True, type=UUID, metavar="UUID")
+    listing = actions.add_parser("bindings", help="list HPC account binding versions")
+    listing.add_argument("platform", metavar="PLATFORM")
+    listing.add_argument("--user-id", type=UUID, metavar="UUID")
+    attest = actions.add_parser(
+        "attest",
+        parents=[change],
+        help="record an independent attestation as a User's verified binding",
+    )
+    attest.add_argument("platform", metavar="PLATFORM")
+    attest.add_argument("--user-id", required=True, type=UUID, metavar="UUID")
+    attest.add_argument("--unix-user", required=True, metavar="NAME")
+    attest.add_argument("--unix-uid", type=int, metavar="N")
+    attest.add_argument("--method", required=True, choices=VERIFICATION_METHODS)
+    attest.add_argument(
+        "--evidence-ref",
+        required=True,
+        metavar="REF",
+        help="reference to the attestation, such as a ticket ID; never the evidence itself",
+    )
+    revoke = actions.add_parser("revoke", parents=[change], help="revoke a current binding")
+    revoke.add_argument("binding_id", type=UUID, metavar="BINDING_ID")
+    revoke.add_argument(
+        "--revoked-reason", required=True, metavar="CODE", help="such as left_project"
+    )
+
+
+def _print_binding(binding: HPCBinding) -> None:
+    print(
+        f"binding {binding.id} user={binding.user_id} platform={binding.platform_id} "
+        f"version={binding.version} unix_user={binding.unix_user} "
+        f"uid={binding.unix_uid if binding.unix_uid is not None else '-'} "
+        f"status={binding.status} source={binding.claim_source}"
+        + (
+            f" method={binding.verification_method} evidence={binding.verification_evidence_ref}"
+            f" verified_by={json.dumps(binding.verified_by)}"
+            if binding.verified_at
+            else ""
+        )
+        + (f" revoked_reason={binding.revoked_reason}" if binding.revoked_reason else "")
+    )
+
+
+def _hpc_access(database: Database, args: argparse.Namespace) -> int:
+    """Runs one `nest-db hpc-access` action on an open, verified database."""
+    store = HPCAccessStore(database)
+    audit: dict[str, Any] = {
+        "operator": getattr(args, "operator", None),
+        "reason": getattr(args, "reason", None),
+    }
+
+    def authorities() -> list[str]:
+        raw = args.authorities.strip()
+        return [] if raw == "none" else [a for a in raw.split(",") if a.strip()]
+
+    try:
+        if args.action == "show":
+            platform = PlatformStore(database).get_platform(args.platform)
+            if platform is None:
+                raise PlatformNotFoundError("No such Platform")
+            for row in store.policy_history(platform.id):
+                scope = f"project={row['project_id']}" if row["project_id"] else "platform"
+                print(
+                    f"{scope} version={row['version']} "
+                    f"authorities={','.join(row['authorities']) or 'none'} "
+                    f"at={row['created_at'].isoformat()}"
+                )
+            if args.project_id is not None:
+                policy = store.effective_policy(args.project_id, platform.id)
+                print(
+                    f"in force for project={args.project_id}: "
+                    f"{','.join(policy.authorities) or 'none'} "
+                    f"(platform v{policy.platform_version}, project v{policy.project_version}; "
+                    "the Controller's NEST_EXECUTION_AUTHORITIES also applies)"
+                )
+        elif args.action == "set-platform-policy":
+            version = store.set_platform_policy(args.platform, authorities(), **audit)
+            print(f"Platform {args.platform} authority policy is now version {version}")
+        elif args.action == "set-project-policy":
+            version = store.set_project_policy(
+                args.project_id, args.platform, authorities(), **audit
+            )
+            print(
+                f"Project {args.project_id} authority policy on {args.platform} is now "
+                f"version {version}"
+            )
+        elif args.action == "bindings":
+            for binding in store.bindings(user_id=args.user_id, platform=args.platform):
+                _print_binding(binding)
+        elif args.action == "attest":
+            _print_binding(
+                store.attest(
+                    args.user_id,
+                    args.platform,
+                    args.unix_user,
+                    method=args.method,
+                    evidence_ref=args.evidence_ref,
+                    unix_uid=args.unix_uid,
+                    **audit,
+                )
+            )
+        else:
+            _print_binding(
+                store.revoke(
+                    args.binding_id,
+                    reason=args.revoked_reason,
+                    operator=audit["operator"],
+                    note=audit["reason"],
+                )
+            )
+        return 0
+    except (PlatformError, ProjectNotFoundError, HPCAccessError) as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 2
 
 
 def _account_parser(commands) -> None:
@@ -984,6 +1159,7 @@ def main(argv: list[str] | None = None) -> int:
         "audit",
         "platform",
         "account",
+        "hpc-access",
         "execution",
         "provider",
         "project",
@@ -1002,6 +1178,7 @@ def main(argv: list[str] | None = None) -> int:
                 "audit": _audit,
                 "platform": _platform,
                 "account": _account,
+                "hpc-access": _hpc_access,
                 "execution": _execution,
                 "provider": _provider,
                 "project": _project,

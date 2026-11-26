@@ -66,6 +66,7 @@ from .db import (
 )
 from .errors import (
     ERROR_KIND_METADATA,
+    EXECUTION_AUTHORITY_METADATA,
     EXECUTION_ID_METADATA,
     IDEMPOTENCY_METADATA,
     JOB_ID_METADATA,
@@ -445,16 +446,26 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
         raise AssertionError("context.abort raises")
 
     def _submission_metadata(self, context) -> dict:
-        """The Platform and idempotency key a registry-backed submission asks for."""
+        """
+        The Platform, idempotency key and execution authority a registry-backed
+        submission asks for. None of them is trusted: admission decides.
+        """
         key = _single_metadata(context, IDEMPOTENCY_METADATA)
         if key is not None and not re.fullmatch(r"[\x21-\x7e]{1,200}", key):
             context.abort(
                 grpc.StatusCode.INVALID_ARGUMENT,
                 f"{IDEMPOTENCY_METADATA} must be 1 to 200 printable ASCII characters",
             )
+        authority = _single_metadata(context, EXECUTION_AUTHORITY_METADATA)
+        if authority is not None and not re.fullmatch(r"[a-z_]{1,40}", authority):
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"{EXECUTION_AUTHORITY_METADATA} must be controller_owned or user_owned",
+            )
         return {
             "platform": _single_metadata(context, PLATFORM_METADATA),
             "idempotency_key": key,
+            "authority": authority,
         }
 
     def _execute_registry(self, request, context, principal, execution_id, attribution):
@@ -1321,9 +1332,16 @@ def build_admission(
     )
     if config.platform.ssh_mode == "B":
         logger.warning(
-            "Platform %r uses Mode B, which needs verified per-User HPC bindings that this "
-            "Controller does not have: every submission to it is refused",
+            "Platform %r uses legacy transport Mode B (Controller-managed key SSH), which "
+            "the Execution Registry does not route yet: every submission to it is refused",
             config.platform.id,
+        )
+    if "user_owned" in config.execution_authorities:
+        logger.warning(
+            "NEST_EXECUTION_AUTHORITIES permits user_owned, but this Controller has no "
+            "user-owned SSH session transport: such submissions are authorized against "
+            "the Platform and Project policies and verified HPC bindings, then refused; "
+            "they never fall back to the Controller's credentials"
         )
     return RegistryAdmission(
         database,
@@ -1338,6 +1356,7 @@ def build_admission(
             access.provider_id if config.provider_approvals == "environment" else None
         ),
         limits=config.limits,
+        authorities=config.execution_authorities,
     )
 
 
@@ -1393,6 +1412,7 @@ def record_start(config: ControllerConfig, database: Database | None) -> None:
             "email_enabled": config.email is not None,
             "google_sign_in": config.google is not None,
             "execution_registry": config.execution_registry,
+            "execution_authorities": ",".join(config.execution_authorities),
             "grpc_allowed_peers": len(config.rpc.allowed_peers),
             "grpc_trusted_proxies": len(config.rpc.trusted_proxies),
             "grpc_peer_rate": config.rpc.peer_rate,

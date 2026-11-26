@@ -91,6 +91,9 @@ OWNERS = {
     "executions": "0014_execution_registry",  # C01
     "execution_attempts": "0014_execution_registry",  # C01
     "project_default_platforms": "0015_project_platform_policy",  # Patch B06
+    "hpc_platform_authority_policies": "0019_hpc_access_policy",  # D01
+    "project_platform_authority_policies": "0019_hpc_access_policy",  # D01
+    "hpc_account_bindings": "0019_hpc_access_policy",  # D02
 }
 
 # A catalog of the schema objects in `public`: what two databases must share to have

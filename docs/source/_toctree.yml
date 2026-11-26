@@ -59,6 +59,8 @@ guide:
         title: Map Slurm accounts to Projects
       - local: execution-registry
         title: Admit submissions through the Execution Registry
+      - local: hpc-access
+        title: Authorize execution authority and HPC account bindings
       - local: admission-limits
         title: Admission limits for the trusted pilot (F02a)
       - local: platform-admin
