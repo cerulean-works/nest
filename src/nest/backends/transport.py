@@ -659,6 +659,13 @@ class LocalOpenSSHTransport(_OpenSSHTransport):
         self.login()
         return super().run(command, input)
 
+    def _process(
+        self, command: str, input: bytes | None = None
+    ) -> subprocess.CompletedProcess[bytes]:
+        # Never hand the user's terminal to the remote command, where it would read
+        # keystrokes typed while it runs; the prompts read /dev/tty, not stdin.
+        return super()._process(command, b"" if input is None else input)
+
     def run_bounded(self, command: str, limit: int) -> bytes:
         self.login()
         return super().run_bounded(command, limit)

@@ -482,6 +482,19 @@ class LocalSessionLifecycleTests(unittest.TestCase):
         self.assertTrue(kwargs["capture_output"])  # remote errors stay classifiable
         self.assertEqual(kwargs["timeout"], 7)
 
+    def test_remote_commands_never_read_the_users_terminal(self):
+        _, kwargs = self.calls_with(connected=True)[0]
+        self.assertEqual(kwargs["input"], b"")  # stdin is an empty pipe, not the terminal
+
+    def test_controller_ssh_stdin_is_unchanged(self):
+        transport = ControllerSSHTransport(_config())
+        with mock.patch(
+            "nest.backends.transport.subprocess.run",
+            return_value=mock.Mock(returncode=0, stdout=b"", stderr=b""),
+        ) as run:
+            transport.run("true")
+        self.assertIsNone(run.call_args.kwargs["input"])
+
     def test_an_open_connection_is_reused_without_logging_in(self):
         self.assertEqual([c for c, _ in self.calls_with(connected=True)], ["squeue --me"])
 
