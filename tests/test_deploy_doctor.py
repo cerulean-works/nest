@@ -45,19 +45,24 @@ def container(
     pid=0,
     exit_code=0,
     started=NEVER,
+    finished=NEVER,
     created="2026-11-26T08:00:00Z",
+    health=None,
 ):
+    state = {
+        "Status": status,
+        "Pid": pid,
+        "ExitCode": exit_code,
+        "StartedAt": started,
+        "FinishedAt": finished,
+    }
+    if health is not None:
+        state["Health"] = {"Status": health}
     return {
         "Id": uuid.uuid4().hex + uuid.uuid4().hex,
         "Name": "/" + name,
         "Created": created,
-        "State": {
-            "Status": status,
-            "Pid": pid,
-            "ExitCode": exit_code,
-            "StartedAt": started,
-            "FinishedAt": NEVER,
-        },
+        "State": state,
         "Config": {
             "Image": "nest-controller:local",
             "Labels": {
@@ -66,6 +71,14 @@ def container(
             },
         },
     }
+
+
+def doctor_now_iso(offset):
+    """A Docker timestamp `offset` seconds from now."""
+    import datetime
+
+    moment = datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=offset)
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def network(name, subnet, bridge=None):
@@ -198,7 +211,7 @@ class RecoverMigrateTests(unittest.TestCase):
     def test_dry_run_changes_nothing(self):
         done, stuck = incident_containers()
         fake = FakeDocker([done, stuck])
-        code, out = run(["recover-migrate"], fake)
+        code, out = run(["recover-migrate", "--settle", "0"], fake)
         self.assertEqual(code, 0)
         self.assertIn(f"would run: docker rm {stuck['Id'][:12]}", out)
         self.assertFalse([c for c in fake.calls if c[:2] == ["docker", "rm"]])
@@ -208,7 +221,7 @@ class RecoverMigrateTests(unittest.TestCase):
         done, stuck = incident_containers()
         running = container("nest-controller-1", "running", service="controller", pid=7)
         fake = FakeDocker([done, stuck, running])
-        code, out = run(["recover-migrate", "--apply"], fake)
+        code, out = run(["recover-migrate", "--apply", "--settle", "0"], fake)
         self.assertEqual(code, 0)
         removals = [c for c in fake.calls if c[:2] == ["docker", "rm"]]
         # Never forced and never with volumes.
@@ -223,7 +236,7 @@ class RecoverMigrateTests(unittest.TestCase):
             container("nest-migrate-1", "running", pid=9, started="2026-11-26T08:00:01Z"),
         ):
             fake = FakeDocker([state])
-            _, out = run(["recover-migrate", "--apply"], fake)
+            _, out = run(["recover-migrate", "--apply", "--settle", "0"], fake)
             self.assertIn("nothing to recover", out)
             self.assertFalse([c for c in fake.calls if c[:2] == ["docker", "rm"]])
 
@@ -242,25 +255,99 @@ class RecoverMigrateTests(unittest.TestCase):
                     )
             return original(argv)
 
-        _, out = run(["recover-migrate", "--apply"], started_meanwhile)
+        _, out = run(["recover-migrate", "--apply", "--settle", "0"], started_meanwhile)
         self.assertIn("changed since it was listed", out)
         self.assertIn(stuck["Id"], fake.containers)
 
+    def test_never_removes_a_container_waiting_for_postgres(self):
+        # A healthy deploy: Compose created migrate and waits for PostgreSQL's health
+        # check before starting it, however long that takes.
+        for health in ("starting", "unhealthy"):
+            with self.subTest(health):
+                waiting = container("nest-migrate-1", "created")
+                postgres = container(
+                    "nest-postgres-1", "running", service="postgres", pid=5, health=health
+                )
+                fake = FakeDocker([waiting, postgres])
+                code, out = run(["migrate-status"], fake)
+                self.assertEqual(code, 5, out)
+                self.assertIn("waiting-dependency", out)
+                self.assertIn(f"PostgreSQL is {health}", out)
+                self.assertNotIn("Recover with", out)
+                _, out = run(["recover-migrate", "--apply", "--settle", "0"], fake)
+                self.assertIn("nothing to recover", out)
+                self.assertFalse([c for c in fake.calls if c[:2] == ["docker", "rm"]])
+
+    def test_never_removes_a_recently_created_container(self):
+        young = container("nest-migrate-1", "created", created=doctor_now_iso(-30))
+        fake = FakeDocker([young])
+        code, out = run(["migrate-status"], fake)
+        self.assertEqual(code, 5)
+        self.assertIn("pending", out)
+        _, out = run(["recover-migrate", "--apply", "--settle", "0"], fake)
+        self.assertIn("nothing to recover", out)
+        self.assertFalse([c for c in fake.calls if c[:2] == ["docker", "rm"]])
+
+    def test_stuck_once_postgres_is_healthy_and_the_container_is_old(self):
+        _, stuck = incident_containers()
+        postgres = container(
+            "nest-postgres-1", "running", service="postgres", pid=5, health="healthy"
+        )
+        fake = FakeDocker([stuck, postgres])
+        code, out = run(["migrate-status"], fake)
+        self.assertEqual(code, 3, out)
+        self.assertIn("PostgreSQL is healthy", out)
+        code, _ = run(["recover-migrate", "--apply", "--settle", "0"], fake)
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [c for c in fake.calls if c[:2] == ["docker", "rm"]], [["docker", "rm", stuck["Id"]]]
+        )
+        self.assertIn(postgres["Id"], fake.containers)
+
+    def test_rechecks_after_settling_and_skips_a_container_postgres_released(self):
+        _, stuck = incident_containers()
+        postgres = container(
+            "nest-postgres-1", "running", service="postgres", pid=5, health="healthy"
+        )
+        fake = FakeDocker([stuck, postgres])
+        slept = []
+
+        def settle(seconds):
+            slept.append(seconds)
+            stuck["State"].update(Status="running", Pid=12, StartedAt="2026-11-26T09:00:00Z")
+
+        parsed = doctor.parser().parse_args(["recover-migrate", "--apply"])
+        out = io.StringIO()
+        with redirect_stdout(out):
+            doctor.recover_migrate(parsed, doctor.Docker(run=fake), sleep=settle)
+        self.assertEqual(slept, [doctor.DEFAULT_SETTLE])
+        self.assertIn("changed since it was listed", out.getvalue())
+        self.assertFalse([c for c in fake.calls if c[:2] == ["docker", "rm"]])
+
+
+# The wall clock the wait tests run at: the deploy (and the wait) starts here.
+DEPLOY_START = "2026-11-26T09:00:00Z"
+
 
 class WaitMigrateTests(unittest.TestCase):
-    def wait(self, fake, timeout=30.0, stuck_after=10.0):
+    def wait(self, fake, timeout=30.0, stuck_after=10.0, extra=()):
         now = [0.0]
+        start = doctor.parse_time(DEPLOY_START)
 
         def sleep(seconds):
             now[0] += seconds
 
         parsed = doctor.parser().parse_args(
-            ["wait-migrate", "--timeout", str(timeout), "--stuck-after", str(stuck_after)]
+            ["wait-migrate", "--timeout", str(timeout), "--stuck-after", str(stuck_after), *extra]
         )
         out = io.StringIO()
         with redirect_stdout(out):
             code = doctor.wait_migrate(
-                parsed, doctor.Docker(run=fake), clock=lambda: now[0], sleep=sleep
+                parsed,
+                doctor.Docker(run=fake),
+                clock=lambda: now[0],
+                sleep=sleep,
+                wall=lambda: start + now[0],
             )
         return code, now[0], out.getvalue()
 
@@ -272,9 +359,10 @@ class WaitMigrateTests(unittest.TestCase):
         self.assertIn("stuck:", out)
 
     def test_completed_failed_and_timeout(self):
-        done = container("nest-migrate-1", "exited", started="2026-11-26T08:00:01Z")
+        after = {"started": "2026-11-26T09:00:01Z", "finished": "2026-11-26T09:00:02.5Z"}
+        done = container("nest-migrate-1", "exited", **after)
         self.assertEqual(self.wait(FakeDocker([done]))[0], 0)
-        failed = container("nest-migrate-1", "exited", exit_code=1, started="2026-11-26T08:00:01Z")
+        failed = container("nest-migrate-1", "exited", exit_code=1, **after)
         self.assertEqual(self.wait(FakeDocker([failed]))[0], 4)
         running = container("nest-migrate-1", "running", pid=3, started="2026-11-26T08:00:01Z")
         code, elapsed, _ = self.wait(FakeDocker([running]), timeout=12)
@@ -282,6 +370,67 @@ class WaitMigrateTests(unittest.TestCase):
         self.assertGreaterEqual(elapsed, 12)
         code, _, _ = self.wait(FakeDocker([]), timeout=4)
         self.assertEqual(code, 5)
+
+    def test_a_previous_deploys_result_does_not_count(self):
+        before = {"started": "2026-11-25T10:00:01Z", "finished": "2026-11-25T10:00:02Z"}
+        for exit_code in (0, 1):
+            with self.subTest(exit_code=exit_code):
+                old = container("nest-migrate-1", "exited", exit_code=exit_code, **before)
+                code, elapsed, out = self.wait(FakeDocker([old]), timeout=8)
+                self.assertEqual(code, 5, out)
+                self.assertGreaterEqual(elapsed, 8)
+        # The same container started again by this deploy (Compose reuses an unchanged
+        # one) counts once it finishes after the deploy started.
+        old = container("nest-migrate-1", "exited", **before)
+        fake = FakeDocker([old])
+        original = fake.__call__
+        polls = []
+
+        def rerun(argv):
+            if (
+                list(argv[:2]) == ["docker", "ps"]
+                and "com.docker.compose.service=migrate" in argv[-1]
+            ):
+                polls.append(argv)
+                if len(polls) == 3:
+                    old["State"].update(
+                        StartedAt="2026-11-26T09:00:04Z", FinishedAt="2026-11-26T09:00:05Z"
+                    )
+            return original(argv)
+
+        code, _, out = self.wait(rerun, timeout=60)
+        self.assertEqual(code, 0, out)
+
+    def test_since_names_the_deploy_start(self):
+        result = {"started": "2026-11-26T08:59:30Z", "finished": "2026-11-26T08:59:40Z"}
+        done = container("nest-migrate-1", "exited", **result)
+        code, _, _ = self.wait(FakeDocker([done]), extra=("--since", "2026-11-26T08:59:00Z"))
+        self.assertEqual(code, 0)
+        code, _, _ = self.wait(FakeDocker([done]), timeout=4)
+        self.assertEqual(code, 5)
+        with self.assertRaises(ValueError):
+            self.wait(FakeDocker([done]), extra=("--since", "yesterday"))
+
+    def test_waiting_for_postgres_is_not_stuck(self):
+        waiting = container("nest-migrate-1", "created")
+        postgres = container(
+            "nest-postgres-1", "running", service="postgres", pid=5, health="starting"
+        )
+        code, _, out = self.wait(FakeDocker([waiting, postgres]), timeout=120, stuck_after=10)
+        self.assertEqual(code, 5, out)
+        self.assertNotIn("stuck", out)
+
+    def test_docker_timestamps(self):
+        self.assertIsNone(doctor.parse_time(NEVER))
+        self.assertIsNone(doctor.parse_time(""))
+        nanos = doctor.parse_time("2026-11-26T09:30:08.027740823Z")
+        self.assertAlmostEqual(
+            nanos, doctor.parse_time("2026-11-26T09:30:08Z") + 0.0277408, places=5
+        )
+        self.assertEqual(
+            doctor.parse_time("2026-11-26T10:30:08+01:00"),
+            doctor.parse_time("2026-11-26T09:30:08Z"),
+        )
 
 
 class PreflightTests(unittest.TestCase):
@@ -602,7 +751,7 @@ class RealDockerTests(unittest.TestCase):
     def doctor(self, *args):
         out = io.StringIO()
         with redirect_stdout(out):
-            code = doctor.main([*args, "--project", self.project])
+            code = doctor.main([*args, "--project", self.project, "--min-age", "0"])
         return code, out.getvalue()
 
     def test_detects_and_removes_only_the_never_started_container(self):
@@ -611,10 +760,10 @@ class RealDockerTests(unittest.TestCase):
         code, out = self.doctor("migrate-status")
         self.assertEqual(code, 3, out)
         self.assertIn("replacement prefix", out)
-        code, _ = self.doctor("recover-migrate")
+        code, _ = self.doctor("recover-migrate", "--settle", "0")
         self.assertEqual(code, 0)
         self.assertEqual(self.doctor("migrate-status")[0], 3)
-        code, out = self.doctor("recover-migrate", "--apply")
+        code, out = self.doctor("recover-migrate", "--apply", "--settle", "0")
         self.assertEqual(code, 0, out)
         remaining = subprocess.run(
             [

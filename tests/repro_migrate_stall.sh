@@ -26,6 +26,9 @@
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DOCTOR="python3 $ROOT/scripts/nest-deploy-doctor.py"
+# The fixture's stuck container is seconds old; in production the doctor waits
+# --min-age (300 s) before calling a never-started container stuck.
+AGE="--min-age 0"
 project=nest-stall-$$
 work=$(mktemp -d)
 squatter=$project-squatter
@@ -121,7 +124,7 @@ done
 [ -n "$stuck" ] || fail "could not interrupt a recreate in 60 attempts (not reproduced)"
 pass "2. interrupted recreate left: $stuck"
 
-report=$($DOCTOR migrate-status --project "$project")
+report=$($DOCTOR migrate-status --project "$project" $AGE)
 code=$?
 [ $code -eq 3 ] || { echo "$report"; fail "migrate-status exited $code, not 3 (stuck)"; }
 pass "2. migrate-status reports stuck-created (exit 3)"
@@ -130,13 +133,13 @@ timeout 30 docker compose -p "$project" -f "$work/compose.yaml" up -d >"$work/ha
 [ $? -eq 124 ] || { cat "$work/hang.log"; fail "the retry did not hang"; }
 pass "3. the retry waits on the never-started container (killed after 30 s)"
 
-report=$($DOCTOR recover-migrate --project "$project")
+report=$($DOCTOR recover-migrate --project "$project" $AGE --settle 2)
 grep -q "would run: docker rm" <<<"$report" || fail "dry run printed no command"
-$DOCTOR migrate-status --project "$project" >/dev/null
+$DOCTOR migrate-status --project "$project" $AGE >/dev/null
 code=$?
 [ $code -eq 3 ] || fail "the dry run changed something (migrate-status exited $code)"
 pass "4. recover-migrate without --apply changes nothing"
-$DOCTOR recover-migrate --project "$project" --apply >/dev/null || fail "recover-migrate --apply failed"
+$DOCTOR recover-migrate --project "$project" $AGE --settle 2 --apply >/dev/null || fail "recover-migrate --apply failed"
 compose up -d --wait --wait-timeout 60 >/dev/null 2>&1 || fail "the deploy after recovery failed"
 $DOCTOR migrate-status --project "$project" >/dev/null || fail "migrate did not complete after recovery"
 [ "$(docker inspect "$project-controller-1" --format '{{.State.Status}}')" = running ] || fail "the Controller is not running"

@@ -97,13 +97,16 @@ step on this page.
 
 ```bash
 python3 scripts/nest-deploy-doctor.py preflight      --project <appName> --env-file .env
-# Deploy in Dokploy, then:
+# Start this as you press Deploy in Dokploy (or pass --since <deploy start, RFC 3339>):
 python3 scripts/nest-deploy-doctor.py wait-migrate   --project <appName> --timeout 300
 python3 scripts/nest-deploy-doctor.py migrate-status --project <appName>
 ```
 
 Expected: every preflight line `PASS` (a `SKIP` only with the reason checked by
-hand), then `completed: <appName>-migrate-1` and exit 0. On exit 3, follow
+hand), then `completed: <appName>-migrate-1` and exit 0. That line counts only a
+migration that finished after the wait started. A timeout while `migrate-status`
+shows `waiting-dependency` means PostgreSQL is not healthy; check it, and do not
+recover `migrate`. On exit 3, follow
 [Recover a stuck migrate](deployment-recovery#recover-a-stuck-migrate). On exit 4,
 fix the cause from `--logs 40`. Then check that the private path still works, from
 a Tailnet client: `nest projects current` and one small remote call.

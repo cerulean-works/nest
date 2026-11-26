@@ -7,7 +7,7 @@ Run it on the Docker host as a user who may use the Docker CLI. It needs only Py
 
     python3 scripts/nest-deploy-doctor.py preflight      --project APP --env-file .env
     python3 scripts/nest-deploy-doctor.py migrate-status --project APP [--logs 40]
-    python3 scripts/nest-deploy-doctor.py wait-migrate   --project APP --timeout 300
+    python3 scripts/nest-deploy-doctor.py wait-migrate   --project APP --timeout 300 [--since T]
     python3 scripts/nest-deploy-doctor.py recover-migrate --project APP [--apply]
 
 `--project` is the Compose project name: Dokploy's application name (its `appName`,
@@ -27,18 +27,24 @@ preflight
 
 migrate-status
     Lists this project's `migrate` containers and classifies each: `completed`,
-    `failed` (non-zero exit), `running`, or `stuck-created` (created by Compose but
-    never started: PID 0, no start time, no logs). `--logs N` adds the last N log
-    lines (at most 200) of failed or running containers.
+    `failed` (non-zero exit), `running`, `waiting-dependency` (not started because
+    this project's PostgreSQL is not healthy yet: normal while it starts),
+    `pending` (created less than `--min-age` seconds ago), or `stuck-created`
+    (never started, PID 0, no start time, no logs, although PostgreSQL is healthy or
+    absent and the container is older than `--min-age`). `--logs N` adds the last N
+    log lines (at most 200) of failed or running containers.
 
 wait-migrate
-    Waits, bounded by `--timeout`, for the migration to finish. Exits 0 when it
-    completed, 4 when it failed, 3 when a container stays `stuck-created` for
-    `--stuck-after` seconds, 5 on timeout. It starts and stops nothing.
+    Waits, bounded by `--timeout`, for a migration that finishes after `--since`
+    (default: when the command starts, so start it as you press Deploy; a previous
+    deploy's finished container never counts). Exits 0 when it completed, 4 when it
+    failed, 3 when a container stays `stuck-created` for `--stuck-after` seconds,
+    5 on timeout. It starts and stops nothing.
 
 recover-migrate
-    For `stuck-created` containers only. Prints the exact `docker rm` it would run;
-    with `--apply` it runs it. `docker rm` without `-f` or `-v` removes only a
+    For `stuck-created` containers only, never one waiting for PostgreSQL or younger
+    than `--min-age`. It checks the state again after `--settle` seconds, prints the
+    exact `docker rm` it would run, and with `--apply` runs it. `docker rm` without `-f` or `-v` removes only a
     container that is not running and never touches a volume. The migration is not
     skipped: the next deploy creates a fresh `migrate` container, runs
     `nest-db upgrade` again, and the Controller still starts only after it succeeds.
@@ -46,14 +52,16 @@ recover-migrate
     waiting forever; deploy again afterwards.
 
 Exit codes: 0 ok, 1 a check failed, 2 usage or Docker error, 3 stuck, 4 migration
-failed, 5 timed out, 6 no migrate container found.
+failed, 5 still in progress or timed out, 6 no migrate container found.
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime
 import ipaddress
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -67,6 +75,11 @@ DEFAULT_EDGE_NETWORK = "dokploy-network"
 DEFAULT_TRAEFIK_CONTAINER = "dokploy-traefik"
 NEVER_STARTED = "0001-01-01T00:00:00Z"
 MAX_LOG_LINES = 200
+# Longer than compose.dokploy.yaml's PostgreSQL health window (start_period 30 s,
+# then up to 30 retries 5 s apart): a never-started migrate container younger than
+# this may still be about to start.
+DEFAULT_MIN_AGE = 300.0
+DEFAULT_SETTLE = 10.0
 
 # Settings read from the environment file. Only the network ones are printed.
 SETTINGS = (
@@ -529,11 +542,30 @@ def preflight(args, docker: Docker, environ: dict[str, str]) -> int:
     return 1 if any(c.status == "FAIL" for c in checks) else 0
 
 
+def parse_time(value: str) -> float | None:
+    """Seconds since the epoch for a Docker timestamp (RFC 3339, nanoseconds), or
+    `None` for an empty or never-set one."""
+    if not value or value.startswith("0001-01-01"):
+        return None
+    text = value.strip().replace("Z", "+00:00")
+    match = re.match(r"^(.*T\d{2}:\d{2}:\d{2})(\.\d+)?(.*)$", text)
+    if match:
+        # Python before 3.11 accepts only 3 or 6 fractional digits.
+        digits = (match.group(2) or ".")[1:]
+        fraction = "." + (digits + "000000")[:6] if digits else ""
+        text = match.group(1) + fraction + match.group(3)
+    moment = datetime.datetime.fromisoformat(text)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=datetime.timezone.utc)  # noqa: UP017 (Python 3.9+)
+    return moment.timestamp()
+
+
 @dataclass
 class MigrateState:
     id: str
     name: str
-    state: str  # completed, failed, running, stuck-created, other
+    # completed, failed, running, waiting-dependency, pending, stuck-created, other
+    state: str
     exit_code: int
     created: str
     started: str
@@ -549,8 +581,29 @@ class MigrateState:
             data.pop("logs")
         return data
 
+    def finished_after(self, moment: float) -> bool:
+        finished = parse_time(self.finished)
+        return finished is not None and finished >= moment
 
-def classify(container: dict) -> MigrateState:
+
+def dependency_health(docker: Docker, project: str) -> str | None:
+    """Health of this project's PostgreSQL (`migrate` waits for it to be healthy), or
+    `None` when the project has none (an external database)."""
+    found = sorted(docker.containers(project, "postgres"), key=lambda c: c.get("Created", ""))
+    if not found:
+        return None
+    state = found[-1].get("State") or {}
+    health = (state.get("Health") or {}).get("Status")
+    return health or state.get("Status") or "unknown"
+
+
+def classify(
+    container: dict,
+    *,
+    now: float | None = None,
+    dependency: str | None = None,
+    min_age: float = DEFAULT_MIN_AGE,
+) -> MigrateState:
     state = container.get("State") or {}
     status = state.get("Status", "")
     name = container.get("Name", "").lstrip("/")
@@ -559,11 +612,31 @@ def classify(container: dict) -> MigrateState:
     prefix = name.split("_", 1)[0]
     replacement = "_" in name and len(prefix) == 12 and all(c in "0123456789abcdef" for c in prefix)
     exit_code = int(state.get("ExitCode", 0) or 0)
+    created_at = parse_time(container.get("Created", ""))
+    age = None if created_at is None else (time.time() if now is None else now) - created_at
     if status == "created" and not state.get("Pid") and started in ("", NEVER_STARTED):
-        kind, detail = (
-            "stuck-created",
-            "created but never started (PID 0); Compose waits on it forever",
-        )
+        if dependency is not None and dependency != "healthy":
+            kind, detail = (
+                "waiting-dependency",
+                (
+                    f"not started yet: PostgreSQL is {dependency}, and Compose starts migrate "
+                    "once it is healthy; check the postgres container if this lasts"
+                ),
+            )
+        elif age is None or age < min_age:
+            kind, detail = (
+                "pending",
+                "created recently and not started yet; Compose normally starts it within seconds",
+            )
+        else:
+            kind, detail = (
+                "stuck-created",
+                (
+                    f"created {age:.0f} s ago but never started (PID 0) although "
+                    f"{'PostgreSQL is healthy' if dependency else 'it waits on nothing'}; "
+                    "Compose waits on it forever"
+                ),
+            )
     elif status == "exited" and exit_code == 0:
         kind, detail = "completed", "nest-db upgrade finished"
     elif status in ("exited", "dead"):
@@ -587,8 +660,12 @@ def classify(container: dict) -> MigrateState:
     )
 
 
-def migrate_states(docker: Docker, project: str) -> list[MigrateState]:
-    states = [classify(c) for c in docker.containers(project, "migrate")]
+def migrate_states(
+    docker: Docker, project: str, min_age: float = DEFAULT_MIN_AGE, now: float | None = None
+) -> list[MigrateState]:
+    containers = docker.containers(project, "migrate")
+    dependency = dependency_health(docker, project) if containers else None
+    states = [classify(c, now=now, dependency=dependency, min_age=min_age) for c in containers]
     return sorted(states, key=lambda s: s.created)
 
 
@@ -601,13 +678,13 @@ def verdict(states: list[MigrateState]) -> int:
     newest = states[-1]
     if newest.state == "failed":
         return 4
-    if newest.state == "running":
+    if newest.state in ("running", "waiting-dependency", "pending"):
         return 5
     return 0 if newest.state == "completed" else 1
 
 
 def migrate_status(args, docker: Docker) -> int:
-    states = migrate_states(docker, args.project)
+    states = migrate_states(docker, args.project, args.min_age)
     lines = min(max(args.logs, 0), MAX_LOG_LINES)
     for state in states:
         if lines and state.state in ("failed", "running"):
@@ -619,7 +696,7 @@ def migrate_status(args, docker: Docker) -> int:
         if not states:
             print(f"no migrate container in project {args.project} (is the migrate profile on?)")
         for state in states:
-            print(f"{state.state:<13} {state.name} ({state.id[:12]}): {state.detail}")
+            print(f"{state.state:<18} {state.name} ({state.id[:12]}): {state.detail}")
             for line in state.logs:
                 print(f"    | {line}")
     code = verdict(states)
@@ -630,11 +707,16 @@ def migrate_status(args, docker: Docker) -> int:
     return code
 
 
-def wait_migrate(args, docker: Docker, clock=time.monotonic, sleep=time.sleep) -> int:
+def wait_migrate(
+    args, docker: Docker, clock=time.monotonic, sleep=time.sleep, wall=time.time
+) -> int:
     start = clock()
+    since = parse_time(args.since) if args.since else wall()
+    if since is None:
+        raise ValueError(f"--since must be an RFC 3339 time, got {args.since!r}")
     stuck_since: dict[str, float] = {}
     while True:
-        states = migrate_states(docker, args.project)
+        states = migrate_states(docker, args.project, args.min_age, now=wall())
         now = clock()
         stuck = [s for s in states if s.state == "stuck-created"]
         for state in stuck:
@@ -644,36 +726,50 @@ def wait_migrate(args, docker: Docker, clock=time.monotonic, sleep=time.sleep) -
                 return 3
         if states and not stuck:
             newest = states[-1]
-            if newest.state == "completed":
+            # A previous deploy's container does not count: only one that finished
+            # after `since` is this deploy's migration.
+            if newest.finished_after(since) and newest.state == "completed":
                 print(f"completed: {newest.name}")
                 return 0
-            if newest.state == "failed":
+            if newest.finished_after(since) and newest.state == "failed":
                 print(
                     f"failed: {newest.name} exited {newest.exit_code}; see migrate-status --logs 40"
                 )
                 return 4
         if now - start >= args.timeout:
-            print(f"timed out after {args.timeout:.0f} s; see migrate-status")
+            print(
+                f"timed out after {args.timeout:.0f} s without a migration that finished "
+                "after --since; see migrate-status"
+            )
             return 5
         sleep(args.interval)
 
 
-def recover_migrate(args, docker: Docker) -> int:
-    states = migrate_states(docker, args.project)
+def recover_migrate(args, docker: Docker, sleep=time.sleep) -> int:
+    states = migrate_states(docker, args.project, args.min_age)
     stuck = [s for s in states if s.state == "stuck-created"]
     if not stuck:
-        print("nothing to recover: no migrate container is stuck in Created")
+        waiting = [s for s in states if s.state in ("waiting-dependency", "pending")]
+        if waiting:
+            print(
+                f"nothing to recover: {waiting[0].name} is {waiting[0].state}: {waiting[0].detail}"
+            )
+        else:
+            print("nothing to recover: no migrate container is stuck in Created")
         return verdict(states) if states else 6
+    # Give Compose time to start it if PostgreSQL has only just become healthy.
+    sleep(args.settle)
+    dependency = dependency_health(docker, args.project)
     for state in stuck:
         # Re-read just before acting: the container must still be the same,
-        # never-started migrate container of this project.
+        # never-started migrate container of this project, still stuck.
         fresh = docker.container(state.id)
         labels = ((fresh or {}).get("Config") or {}).get("Labels") or {}
         if (
             fresh is None
             or labels.get("com.docker.compose.project") != args.project
             or labels.get("com.docker.compose.service") != "migrate"
-            or classify(fresh).state != "stuck-created"
+            or classify(fresh, dependency=dependency, min_age=args.min_age).state != "stuck-created"
         ):
             print(f"skipped {state.name}: it changed since it was listed")
             continue
@@ -703,6 +799,13 @@ def parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--project", default="nest", help="Compose project name (Dokploy appName)")
     common.add_argument("--json", action="store_true", help="one JSON object per line")
+    age = argparse.ArgumentParser(add_help=False)
+    age.add_argument(
+        "--min-age",
+        type=float,
+        default=DEFAULT_MIN_AGE,
+        help=f"seconds before a never-started container may be called stuck ({DEFAULT_MIN_AGE:.0f})",
+    )
     commands = top.add_subparsers(dest="command", required=True)
     check = commands.add_parser(
         "preflight", parents=[common], help="check networks and gateway settings"
@@ -710,19 +813,26 @@ def parser() -> argparse.ArgumentParser:
     check.add_argument("--env-file", help="the deployment's .env (read literally)")
     check.add_argument("--traefik-container", default=DEFAULT_TRAEFIK_CONTAINER)
     status = commands.add_parser(
-        "migrate-status", parents=[common], help="classify migrate containers"
+        "migrate-status", parents=[common, age], help="classify migrate containers"
     )
     status.add_argument(
         "--logs", type=int, default=0, metavar="N", help=f"last N log lines (max {MAX_LOG_LINES})"
     )
     wait = commands.add_parser(
-        "wait-migrate", parents=[common], help="bounded wait for the migration"
+        "wait-migrate", parents=[common, age], help="bounded wait for the migration"
     )
     wait.add_argument("--timeout", type=float, default=300.0)
+    wait.add_argument(
+        "--since",
+        help="RFC 3339 time the deploy started (default: now); older results are ignored",
+    )
     wait.add_argument("--stuck-after", type=float, default=60.0)
     wait.add_argument("--interval", type=float, default=2.0)
     recover = commands.add_parser(
-        "recover-migrate", parents=[common], help="remove a never-started migrate container"
+        "recover-migrate", parents=[common, age], help="remove a never-started migrate container"
+    )
+    recover.add_argument(
+        "--settle", type=float, default=DEFAULT_SETTLE, help="seconds to re-check before acting"
     )
     recover.add_argument("--apply", action="store_true", help="run the removal (default: print it)")
     return top

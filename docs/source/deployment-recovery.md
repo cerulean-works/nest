@@ -102,12 +102,17 @@ this page bypasses that. Compose YAML cannot put a timeout on its own `depends_o
 wait, and Dokploy runs Compose itself, so the doctor is the bounded check:
 
 ```bash
+# Start it as you press Deploy, or name the deploy's start time:
 python3 scripts/nest-deploy-doctor.py wait-migrate --project <appName> --timeout 300
+python3 scripts/nest-deploy-doctor.py wait-migrate --project <appName> --since 2026-11-26T09:00:00Z
 ```
 
-It exits 0 when the migration finished, 4 when it failed, 3 when a container
-stays stuck in Created for `--stuck-after` seconds (default 60), and 5 on timeout.
-It starts and stops nothing. On a plain Docker host, without Dokploy,
+It counts only a migration that finished after `--since`, which defaults to when
+the command starts. The previous deploy's finished `migrate` container is still
+there at the start of a deploy, and it never counts as this deploy's result. The
+command exits 0 when this deploy's migration finished and 4 when it failed. It
+exits 3 when a container has been `stuck-created` (below) for `--stuck-after`
+seconds (default 60), and 5 on timeout. It starts and stops nothing. On a plain Docker host, without Dokploy,
 `docker compose -p <appName> -f compose.dokploy.yaml up -d --wait --wait-timeout 300`
 gives the same bound, but the deploy itself fails rather than waits.
 
@@ -119,7 +124,13 @@ failed or running container, capped at 200; `nest-db` never logs credentials.
 | `completed` | `nest-db upgrade` exited 0 | Nothing |
 | `failed` | It exited non-zero; the Controller stays down (fails closed) | Read `--logs 40`, fix the cause (database reachability, password, TLS, a schema from a newer Nest; see [Troubleshooting](database#troubleshooting)), then deploy again. Never reset the database or start the Controller by hand. |
 | `running` | The upgrade is still running | Wait; a long upgrade on a large database is normal. Check PostgreSQL if it does not finish. |
-| `stuck-created` | Created by Compose but never started (PID 0, no start time, no logs); `replacement prefix` when the name carries Compose's temporary prefix | Recover as below |
+| `waiting-dependency` | Created but not started yet, because this project's PostgreSQL is not healthy. Compose creates `migrate` first and starts it only once PostgreSQL's health check passes, which can take minutes on a first start or a slow volume. | Wait. If it lasts, check the `postgres` container's health and logs. Never remove the `migrate` container. |
+| `pending` | Created less than `--min-age` seconds ago (default 300, longer than PostgreSQL's health window) and not started yet | Wait |
+| `stuck-created` | Created at least `--min-age` seconds ago and never started (PID 0, no start time, no logs), although PostgreSQL is healthy (or the project has none). `replacement prefix` when the name carries Compose's temporary prefix. | Recover as below |
+
+`migrate-status` exits 0 for `completed`, 4 for `failed`, 3 for `stuck-created`,
+and 5 while the migration is still in progress (`running`, `waiting-dependency`,
+`pending`).
 
 ### Recover a stuck `migrate`
 
@@ -128,9 +139,13 @@ python3 scripts/nest-deploy-doctor.py recover-migrate --project <appName>       
 python3 scripts/nest-deploy-doctor.py recover-migrate --project <appName> --apply  # runs it
 ```
 
-It acts only on containers that carry this project's label and the `migrate`
-service label and are still in Created and never started. It reads each one again
-right before acting, and runs plain `docker rm <id>` without `-f` or `-v`, so it
+It acts only on `stuck-created` containers: they carry this project's label and
+the `migrate` service label, have been in Created without ever starting for at
+least `--min-age` seconds, and PostgreSQL, when the project has one, is healthy.
+It never touches a container that is `waiting-dependency` or `pending`. It waits
+`--settle` seconds (default 10), so that Compose can start a container whose
+PostgreSQL has only just become healthy. Then it reads PostgreSQL's health and
+each container again right before acting, and runs plain `docker rm <id>` without `-f` or `-v`, so it
 cannot remove a running container or any volume. If a Dokploy deploy is still
 waiting on that container, the deploy fails at once instead of hanging. Then
 press **Deploy** again: Compose creates a fresh `migrate`, runs
@@ -165,7 +180,7 @@ and a fresh deploy: the migration then always runs with the current configuratio
 
 | Test | Kind | Covers |
 | --- | --- | --- |
-| `tests/test_deploy_doctor.py` | CI (unit) | Each `migrate` state, including the incident's container pair; bounded logs; project scoping; dry run; `--apply` removes only a never-started container, with plain `docker rm`, and skips one that started in the meantime; the `wait-migrate` bounds; every preflight check with passing and failing settings; literal `.env` reading with no secret printed; the defaults match `compose.dokploy.yaml`; Traefik file selection |
+| `tests/test_deploy_doctor.py` | CI (unit) | Each `migrate` state, including the incident's container pair; a container waiting for a `starting` or `unhealthy` PostgreSQL, or created recently, is never stuck and never removed; a previous deploy's result never satisfies `wait-migrate`; bounded logs; project scoping; dry run; `--apply` removes only a never-started container, with plain `docker rm`, and skips one that started in the meantime; the `wait-migrate` bounds; every preflight check with passing and failing settings; literal `.env` reading with no secret printed; the defaults match `compose.dokploy.yaml`; Traefik file selection |
 | `tests/test_deploy_doctor.py::RealDockerTests` | CI when a Docker daemon is present | A real never-started container with Compose labels is detected and removed; another container of the project is kept |
 | `tests/repro_migrate_stall.sh` | Manual (Docker) | The failed network create, the interrupted recreate, the stall, the bounded wait and the recovery, with named volumes kept |
 | `tests/smoke_compose_env.sh` | CI | Repeated `migrate` runs from an environment-only `.env`, restart and recreation keep data and the Tailscale identity |
