@@ -408,10 +408,11 @@ class ExchangeTests(_Base):
         with self.assertRaises(psycopg.errors.IntegrityConstraintViolation):
             self.sql("DELETE FROM workload_token_uses WHERE jti = 'inside-margin'")
 
-    def hold_principal_lock(self, seconds: float) -> threading.Thread:
-        """Holds the principal's row lock from another connection for `seconds`, so
-        an exchange started meanwhile waits for it."""
-        held = threading.Event()
+    def hold_principal_lock(self) -> threading.Event:
+        """Holds the principal's row lock from another connection until the returned
+        event is set, so an exchange started meanwhile waits for it. Released and
+        joined at cleanup even if the test fails."""
+        held, release = threading.Event(), threading.Event()
 
         def hold():
             with connect(self.url) as conn, conn.transaction():
@@ -420,40 +421,99 @@ class ExchangeTests(_Base):
                     (self.principal.id,),
                 )
                 held.set()
-                time.sleep(seconds)
+                release.wait(60)
 
-        thread = threading.Thread(target=hold)
+        thread = threading.Thread(target=hold, daemon=True)
         thread.start()
-        self.assertTrue(held.wait(10))
-        return thread
+        self.addCleanup(thread.join, 30)
+        self.addCleanup(release.set)
+        self.assertTrue(held.wait(10), "the lock holder never took the lock")
+        return release
+
+    def in_background(self, call) -> tuple[threading.Thread, dict[str, Any]]:
+        """Runs `call` in a thread; its result or exception lands in the dict."""
+        outcome: dict[str, Any] = {}
+
+        def run():
+            try:
+                outcome["result"] = call()
+            except Exception as exc:  # noqa: BLE001 - reported by the test
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 30)
+        return thread, outcome
+
+    def wait_until_blocked(self, query_prefix: str) -> None:
+        """Waits until a backend running a query starting with `query_prefix` is
+        waiting on a lock, so the test knows the exchange is blocked there."""
+        for _ in range(400):
+            [(waiting,)] = self.sql(
+                "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
+                "AND query LIKE %s",
+                query_prefix + "%",
+            )
+            if waiting:
+                return
+            time.sleep(0.025)
+        self.fail(f"no backend ever waited on a lock in {query_prefix!r}")
+
+    @staticmethod
+    def sleep_past(deadline: datetime) -> None:
+        time.sleep(max(0.0, (deadline - datetime.now(UTC)).total_seconds()) + 0.5)
 
     def test_a_token_whose_deadline_passes_during_a_lock_wait_is_refused(self):
-        # Hold the lock first, then mint a token whose exp was 55 seconds ago: still
-        # inside the verifier's skew, so it verifies even on a slow runner, but its
-        # acceptance deadline (exp + 60 s) passes while the exchange waits 7 s.
-        holder = self.hold_principal_lock(7.0)
+        # A token whose exp was 50 seconds ago: inside the verifier's 60 s skew, so
+        # it verifies, with its acceptance deadline (exp + 60 s) 10 seconds away.
         now = int(time.time())
-        token = self.issuer.mint(exp=now - 55, iat=now - 300, nbf=now - 300)
-        try:
-            self.assertEqual(self.refused(token), "invalid_token")
-        finally:
-            holder.join()
+        token = self.issuer.mint(exp=now - 50, iat=now - 300, nbf=now - 300)
+        deadline = datetime.fromtimestamp(now - 50 + 60, UTC)
+        verified = threading.Event()
+        verify = self.exchanger.verifier.verify
+
+        def verify_and_signal(raw):
+            claims = verify(raw)  # raises, and the test fails, if refused here
+            verified.set()
+            return claims
+
+        release = self.hold_principal_lock()
+        with unittest.mock.patch.object(self.exchanger.verifier, "verify", verify_and_signal):
+            thread, outcome = self.in_background(
+                lambda: self.exchanger.exchange(token, str(self.principal.id))
+            )
+            # 1. The token passed verification, before its deadline.
+            self.assertTrue(verified.wait(10), "the token was not verified")
+            self.assertLess(datetime.now(UTC), deadline)
+            # 2. The exchange is blocked on the principal's row lock.
+            self.wait_until_blocked("SELECT id, name, description, status")
+            # 3. Only once the deadline has passed is the lock released.
+            self.sleep_past(deadline)
+            release.set()
+            thread.join(30)
+        error = outcome.get("error")
+        self.assertIsInstance(error, WorkloadExchangeError, outcome)
+        assert isinstance(error, WorkloadExchangeError)
+        self.assertEqual(error.reason, "invalid_token")
         self.assertEqual(self.sql("SELECT count(*) FROM workload_token_uses"), [(0,)])
         self.assertEqual(self.sql("SELECT count(*) FROM service_sessions"), [(0,)])
+        # Refused by the post-lock check, not the verifier: the refusal is audited.
         [denied] = [e for e in self.events("workload.exchange") if e.reason == "expired"]
         self.assertEqual(denied.outcome, "denied")
 
     def test_issuance_uses_the_clock_after_the_lock_wait(self):
-        holder = self.hold_principal_lock(2.0)
+        release = self.hold_principal_lock()
         started = datetime.now(UTC)
-        try:
-            issued = self.exchange()
-        finally:
-            holder.join()
-        session = issued.session
+        thread, outcome = self.in_background(self.exchange)
+        self.wait_until_blocked("SELECT id, name, description, status")
+        time.sleep(2.0)
+        release.set()
+        thread.join(30)
+        self.assertNotIn("error", outcome)
+        session = outcome["result"].session
         # Created when it was issued, not when its transaction began, and its
         # lifetime counts from then.
-        self.assertGreaterEqual(session.created_at, started + timedelta(seconds=1.5))
+        self.assertGreaterEqual(session.created_at, started + timedelta(seconds=2))
         self.assertEqual(session.expires_at - session.created_at, timedelta(seconds=600))
         [(used_at,)] = self.sql(
             "SELECT used_at FROM workload_token_uses WHERE jti = %s", session.jti
@@ -461,7 +521,7 @@ class ExchangeTests(_Base):
         # The use is recorded just before the session is issued, after the wait.
         self.assertLessEqual(used_at, session.created_at)
         self.assertLess(session.created_at - used_at, timedelta(seconds=1))
-        self.assertGreaterEqual(used_at, started + timedelta(seconds=1.5))
+        self.assertGreaterEqual(used_at, started + timedelta(seconds=2))
 
     def test_a_deadline_passing_while_the_replay_key_insert_waits_rolls_everything_back(self):
         """A writer that takes no advisory lock holds the same (issuer, jti)
@@ -481,8 +541,7 @@ class ExchangeTests(_Base):
             workflows=[WORKFLOW],
             **OPS,
         )
-        holding = threading.Event()
-        release = threading.Event()
+        holding, release = threading.Event(), threading.Event()
 
         def writer():
             with connect(self.url) as conn, conn.transaction(force_rollback=True):
@@ -493,15 +552,14 @@ class ExchangeTests(_Base):
                     (issuer, other.id, other_policy.id),
                 )
                 holding.set()
-                release.wait(20)
+                release.wait(60)
 
-        thread = threading.Thread(target=writer)
-        thread.start()
-        self.assertTrue(holding.wait(10))
-        result: dict[str, object] = {}
-        # Far enough ahead that a slow runner still reaches the unique-index wait
-        # before it; the writer is released only once it has passed.
-        deadline = datetime.now(UTC) + timedelta(seconds=5)
+        writer_thread = threading.Thread(target=writer, daemon=True)
+        writer_thread.start()
+        self.addCleanup(writer_thread.join, 30)
+        self.addCleanup(release.set)
+        self.assertTrue(holding.wait(10), "the writer never inserted")
+        deadline = datetime.now(UTC) + timedelta(seconds=10)
 
         def exchange():
             try:
@@ -515,28 +573,21 @@ class ExchangeTests(_Base):
                     ttl_seconds=600,
                     provenance={},
                 )
-                result["outcome"] = "issued"
+                return "issued"
             except ExchangeRefusedError as exc:
-                result["outcome"] = exc.reason
+                return exc.reason
 
-        exchanger = threading.Thread(target=exchange)
-        exchanger.start()
-        # Wait until the exchange is blocked on the unique index, then past its
-        # deadline, then let the writer roll back.
-        for _ in range(200):
-            waiting = self.sql(
-                "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
-                "AND query LIKE 'INSERT INTO workload_token_uses%%'"
-            )
-            if waiting[0][0]:
-                break
-            time.sleep(0.05)
-        self.assertEqual(waiting[0][0], 1, "the exchange should be waiting on the index")
-        time.sleep(max(0.0, (deadline - datetime.now(UTC)).total_seconds()) + 0.5)
+        thread, outcome = self.in_background(exchange)
+        # The exchange got past every pre-insert check before its deadline and is
+        # now blocked on the unique index; only after the deadline does the writer
+        # roll back.
+        self.wait_until_blocked("INSERT INTO workload_token_uses")
+        self.assertLess(datetime.now(UTC), deadline)
+        self.sleep_past(deadline)
         release.set()
-        thread.join()
-        exchanger.join(20)
-        self.assertEqual(result.get("outcome"), "expired")
+        writer_thread.join(30)
+        thread.join(30)
+        self.assertEqual(outcome.get("result"), "expired", outcome)
         self.assertEqual(self.sql("SELECT count(*) FROM workload_token_uses"), [(0,)])
         self.assertEqual(self.sql("SELECT count(*) FROM service_sessions"), [(0,)])
 
