@@ -77,6 +77,8 @@ guide:
         title: Run the public gRPC gateway pilot (H08)
       - local: hosted-rollout
         title: Hosted gRPC rollout runbook and evidence (H09)
+      - local: ssh-relay-feasibility
+        title: Public SSH egress feasibility and relay contract (D03)
   - title: Contributing
     sections:
       - local: developing
