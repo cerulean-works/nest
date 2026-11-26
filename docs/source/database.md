@@ -37,6 +37,7 @@ The database is **externally managed** and **opt-in**:
 | `hpc_platforms`, `hpc_login_nodes`, `hpc_platform_project_grants` | The HPC Platform Catalog: each Platform's immutable UUID and slug, its approved login nodes, and the Projects granted each Platform. See [Register HPC Platforms and login nodes](platforms). |
 | `slurm_accounts`, `project_platform_accounts`, `project_platform_account_policies` | The Slurm Account Registry: accounts scoped to one Platform, and the accounts each Project may charge on each granted Platform. See [Map Slurm accounts to Projects](slurm-accounts). |
 | `project_default_platforms` | Each Project's optional default Platform, one of its grants. See [Project eligibility and default Platform](platforms#project-eligibility-and-default-platform). |
+| `hpc_platform_authority_policies`, `project_platform_authority_policies`, `hpc_account_bindings` | Versioned execution authority policies of each Platform and of each Project on a Platform, and each User's per-Platform HPC account binding versions with their verification and revocation state. No credential. See [Authorize execution authority and HPC account bindings](hpc-access). |
 | `executions`, `execution_attempts`, `execution_attempt_options`, `execution_attempt_nodes` | The Platform-aware execution registry: each logical execution with its owner and Project, and each submission attempt with its Platform, login-node snapshot, HPC identity, Slurm account, resolved options and allocated nodes. See [Execution registry](#execution-registry). |
 | `schema_migrations` | The applied schema versions and their checksums (see [Migrations](#migrations)). |
 
@@ -427,7 +428,8 @@ and a database upgraded release by release end with the same schema.
 | 0014 | `execution_registry` | Execution registry: `executions`, `execution_attempts` and their options and nodes |
 | 0015 | `project_platform_policy` | `project_default_platforms`; immutable Project and Organization IDs |
 | 0016 | `platform_role_boundaries` | Platform roles can only be granted to an active User |
-| 0019 | `service_principals` | **B09 CI workload identity:** `service_principals`, `workload_trust_policies`, `service_principal_grants`, `workload_token_uses`, `service_sessions` |
+| 0019 | `hpc_access_policy` | **D01/D02:** `hpc_platform_authority_policies`, `project_platform_authority_policies`, `hpc_account_bindings`; each new attempt pins `execution_authority` and its policy versions |
+| 0020 | `service_principals` | **B09 CI workload identity:** `service_principals`, `workload_trust_policies`, `service_principal_grants`, `workload_token_uses`, `service_sessions` |
 
 D07 (0012) owns Platform identity: the Platform UUID and slug, its login nodes and
 its Project grants. D08 (0013) owns Slurm accounts, which reference D07's Platform,

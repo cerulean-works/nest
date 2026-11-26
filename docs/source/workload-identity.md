@@ -178,7 +178,7 @@ repository of their own, so such tokens must not be able to fill the database.
 
 ## Upgrade and rollback
 
-`nest-db upgrade` applies `0019_service_principals`. It only adds tables, changes
+`nest-db upgrade` applies `0020_service_principals`. It only adds tables, changes
 no existing row, and creates no principal, so nothing changes until an operator
 creates one and sets `NEST_WORKLOAD_OIDC_AUDIENCE`.
 

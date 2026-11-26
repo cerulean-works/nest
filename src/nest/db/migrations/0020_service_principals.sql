@@ -1,4 +1,4 @@
--- 0019: service principals and CI workload identity (B09).
+-- 0020: service principals and CI workload identity (B09).
 --
 -- Applied migrations are immutable: never edit this file. Change the schema by
 -- adding the next numbered file (see "Database migrations" in the docs).

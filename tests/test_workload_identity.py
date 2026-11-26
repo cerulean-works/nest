@@ -630,12 +630,12 @@ class SchemaTests(_Base):
         self.assertNotIn(grant.id, {g.id for g in self.store.effective_grants(self.principal.id)})
 
     def test_migration_keeps_human_sessions_and_needs_no_service_rows(self):
-        """Upgrading a database at 0018 changes nothing a User relies on."""
+        """Upgrading a database at 0019 changes nothing a User relies on."""
         url = self.database()
         migrations = load_migrations()
-        at_0018 = [m for m in migrations if m.version <= 18]
+        at_0019 = [m for m in migrations if m.version <= 19]
         with connect(url) as conn:
-            upgrade(conn, migrations=at_0018)
+            upgrade(conn, migrations=at_0019)
         db = Database(load_database_config({"NEST_DATABASE_URL": url}))
         db.open()
         self.addCleanup(db.close)
@@ -654,7 +654,7 @@ class SchemaTests(_Base):
         )
         with connect(url) as conn:
             applied = upgrade(conn)
-        self.assertEqual([m.label for m in applied], ["0019_service_principals"])
+        self.assertEqual([m.label for m in applied], ["0020_service_principals"])
         grant = SessionStore(db).authenticate(hash_token(access), kind="cli")
         assert grant is not None
         self.assertEqual(grant.session.user_id, user)

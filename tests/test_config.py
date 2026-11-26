@@ -417,7 +417,7 @@ class ModeSeparationTests(unittest.TestCase):
         files = Files(self)
         backend = build_backend(load_controller_config(managed(files)))
         assert backend is not None
-        argv = backend._ssh_argv()
+        argv = _controller_ssh(backend).ssh_argv()
         self.assertEqual(argv[:3], ["ssh", "-F", "none"])
         options = [argv[i + 1] for i, a in enumerate(argv) if a == "-o"]
         self.assertIn("StrictHostKeyChecking=yes", options)
@@ -432,7 +432,7 @@ class ModeSeparationTests(unittest.TestCase):
     def test_mode_a_command_line_is_unchanged(self):
         backend = build_backend(load_controller_config(LEGACY))
         assert backend is not None
-        self.assertEqual(backend._ssh_argv(), ["ssh", "-o", "BatchMode=yes", "hpc"])
+        self.assertEqual(_controller_ssh(backend).ssh_argv(), ["ssh", "-o", "BatchMode=yes", "hpc"])
 
     def test_backend_profile_settings_reach_slurm(self):
         files = Files(self)
@@ -664,7 +664,7 @@ class PlatformTests(unittest.TestCase):
         self.assertEqual(without, with_tailscale)
         backend = build_backend(without)
         assert backend is not None
-        argv = backend._ssh_argv()
+        argv = _controller_ssh(backend).ssh_argv()
         self.assertEqual(argv[:3], ["ssh", "-F", "none"])
         self.assertEqual(argv[-5:], ["-p", "22", "-l", "svc-lab", "lab-login.example.edu"])
         self.assertFalse(any("proxy" in a.lower() or "tailscale" in a for a in argv))
@@ -886,3 +886,11 @@ class TLSTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _controller_ssh(backend):
+    """The backend's Controller-owned SSH transport (trusted Mode A)."""
+    from nest.backends.transport import ControllerSSHTransport
+
+    assert isinstance(backend.transport, ControllerSSHTransport)
+    return backend.transport

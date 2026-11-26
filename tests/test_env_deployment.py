@@ -553,7 +553,7 @@ class ChildEnvironmentTests(unittest.TestCase):
     def test_ssh_processes_get_the_reduced_environment(self):
         backend = SlurmBackend(SlurmConfig(ssh_host="hpc", account="physics", ssh_mode="A"))
         with mock.patch.dict(os.environ, self.ENV), mock.patch("subprocess.run") as run:
-            backend._ssh_process("true")
+            _controller_ssh(backend)._process("true")
         env = run.call_args.kwargs["env"]
         self.assertNotIn(SECRET_MARKER, " ".join(env.values()))
         self.assertEqual(env["HOME"], "/home/nest")
@@ -696,3 +696,11 @@ class InlineDatabaseCATests(PostgresTLSTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _controller_ssh(backend):
+    """The backend's Controller-owned SSH transport (trusted Mode A)."""
+    from nest.backends.transport import ControllerSSHTransport
+
+    assert isinstance(backend.transport, ControllerSSHTransport)
+    return backend.transport

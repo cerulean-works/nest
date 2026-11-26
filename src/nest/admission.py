@@ -7,7 +7,10 @@ registry-backed Controller (`NEST_EXECUTION_REGISTRY=required`) takes, for both
 
 1. selects the Platform with [`authz.PlatformCatalog.select_platform`] for the
    authenticated caller and the immutable Project (an ineligible Platform is
-   refused, never replaced), and checks that this Controller serves it;
+   refused, never replaced), checks that this Controller serves it, and resolves
+   the execution authority (D01) with [`authz.AuthorityResolver`] from the
+   deployment, Platform and Project policies and, for `user_owned`, the caller's
+   verified HPC binding (D02), before any login node is selected;
 2. lets the server choose an approved login node for the Platform's transport mode
    ([`authz.PlatformCatalog.select_login_node`]);
 3. takes the HPC identity from the server's own records (an
@@ -27,11 +30,18 @@ have run but no job ID arrived (it is never resubmitted; see
 [`db.ExecutionRegistry.reconcile`]), and `running`, `succeeded`, `failed` or
 `cancelled` as Slurm reports it.
 
-Mode B: Nest has no verified per-User HPC binding or per-User transport yet. The
-default [`admission.ControllerIdentitySource`] therefore refuses every Mode B
-submission (`hpc_binding_unavailable`), and even a verified binding is refused at
-the transport step (`mode_b_transport_unavailable`): the Controller's own SSH
-credentials are never used for a User's Mode B job.
+Execution authority (D01): a `user_owned` (Mode B, User SSH Proxy) submission
+that the policies permit and whose caller has a verified binding is still refused
+(`user_owned_transport_unavailable`): this Controller has no user-owned SSH
+session transport yet (D03/D05). It never runs such a job with its own
+credentials, and never falls back to `controller_owned`. Every admitted attempt
+pins its authority and the policy versions it was admitted under.
+
+Legacy transport Mode B (`NEST_SLURM_SSH_MODE=B`, the Controller's managed-key
+SSH) keeps its meaning and is not reinterpreted as a User's session: the default
+[`admission.ControllerIdentitySource`] still refuses it
+(`hpc_binding_unavailable`), and even a verified identity is refused at the
+transport step (`mode_b_transport_unavailable`), until D09 routes it.
 
 Admission limits (F02a): with [`config.AdmissionLimits`], step 5 also rechecks the
 submitter's session and membership and reserves the attempt's CPUs, GPUs and
@@ -50,7 +60,7 @@ from __future__ import annotations
 import hashlib
 import threading
 import time
-from collections.abc import Generator, Mapping
+from collections.abc import Collection, Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -62,6 +72,7 @@ import grpc
 from ._logging import get_logger
 from .audit import AuditLog
 from .authz.accounts import AccountResolution, AccountResolutionError, AccountResolver, HPCIdentity
+from .authz.hpc_access import AuthorityRefusedError, AuthorityResolver
 from .authz.platforms import PlatformCatalog, PlatformResolutionError, PlatformSelection
 from .authz.policy import Principal
 from .backends.slurm import (
@@ -78,6 +89,8 @@ from .db.executions import (
     AdmissionLimitError,
     Attempt,
     AttemptInFlightError,
+    AuthorityNotPermittedError,
+    BindingNotVerifiedError,
     Execution,
     ExecutionClosedError,
     ExecutionRegistry,
@@ -231,6 +244,8 @@ class SubmissionRequest:
         source_digest (`str | None`): Digest of the serialized call (`Execute`).
         environment_digest (`str | None`): Digest of the environment files.
         idempotency_key (`str | None`): `x-nest-idempotency-key`.
+        authority (`str | None`): Execution authority asked for
+            (`x-nest-execution-authority`); only a request, never a grant.
     """
 
     kind: str
@@ -246,6 +261,7 @@ class SubmissionRequest:
     source_digest: str | None = None
     environment_digest: str | None = None
     idempotency_key: str | None = None
+    authority: str | None = None
 
     def requested_options(self) -> dict[str, Any]:
         """The options as requested, before any default; part of the request digest."""
@@ -260,6 +276,8 @@ class SubmissionRequest:
             options["source_digest"] = self.source_digest
         if self.environment_digest is not None:
             options["environment_digest"] = self.environment_digest
+        if self.authority is not None:
+            options["execution_authority"] = self.authority
         return options
 
 
@@ -395,6 +413,9 @@ class RegistryAdmission:
         provider_revocations (`str`, *optional*): With environment-mode approvals
             (`NEST_PROVIDER_APPROVALS=environment`), the Provider whose recorded
             revocations are checked again in that transaction, for the same reason.
+        authorities (`Collection[str]`, *optional*): The execution authorities this
+            deployment permits (`NEST_EXECUTION_AUTHORITIES`); only
+            `controller_owned` by default.
     """
 
     def __init__(
@@ -409,6 +430,7 @@ class RegistryAdmission:
         provider_approval: str | None = None,
         provider_revocations: str | None = None,
         limits: AdmissionLimits | None = None,
+        authorities: Collection[str] = ("controller_owned",),
     ):
         self.registry = ExecutionRegistry(database)
         self.limits = limits
@@ -424,6 +446,7 @@ class RegistryAdmission:
         self.audit = audit or AuditLog(database)
         self.catalog = PlatformCatalog(database, self.audit)
         self.accounts = AccountResolver(database, self.audit)
+        self.authority = AuthorityResolver(database, authorities, self.audit)
         self.backend = backend
         self.profile = profile
         self.platform_id = platform_id
@@ -511,6 +534,30 @@ class RegistryAdmission:
                 f"This Controller does not submit to Platform {platform.slug!r}; it was "
                 f"selected ({selection.origin}) but no other Platform is used instead",
             )
+        # D01: authorized before any login node, relay or staging is touched.
+        try:
+            decision = self.authority.resolve(principal, project_id, platform.id, request.authority)
+        except AuthorityRefusedError as exc:
+            raise AdmissionRefusedError(
+                exc.reason,
+                str(exc),
+                (
+                    grpc.StatusCode.INVALID_ARGUMENT
+                    if exc.reason == "invalid_authority"
+                    else grpc.StatusCode.PERMISSION_DENIED
+                ),
+                {"execution_authority": exc.authority},
+            ) from None
+        if decision.authority == "user_owned":
+            # Verified and permitted, but there is no user-owned session transport
+            # yet. Never the Controller's credentials, never controller_owned.
+            raise AdmissionRefusedError(
+                "user_owned_transport_unavailable",
+                f"Running on {platform.slug!r} under your own HPC account is authorized, but "
+                "this Controller has no user-owned SSH session transport yet; nothing was "
+                "submitted, and the Controller's own credentials are never used instead",
+                details=decision.details(),
+            )
         mode = self.profile.ssh_mode
         try:
             endpoint = self.catalog.select_login_node(
@@ -540,6 +587,13 @@ class RegistryAdmission:
                 "invalid_account", str(exc), grpc.StatusCode.INVALID_ARGUMENT
             ) from None
         backend = self._transport(endpoint)
+        if trusted.identity.kind != "controller" or trusted.principal.binding_id is not None:
+            # controller_owned runs as the Controller's own identity, never a User's.
+            raise AdmissionRefusedError(
+                "identity_not_allowed",
+                "A controller_owned submission runs only as the Controller's own HPC identity",
+                grpc.StatusCode.PERMISSION_DENIED,
+            )
         if resolution.account_name is None:
             # Only Mode B resolves to the native default, and Mode B has no transport.
             raise AdmissionRefusedError(
@@ -593,7 +647,16 @@ class RegistryAdmission:
                 submitter=Submitter(principal.user_id, principal.session_id),
                 reservation=reservation if self.limits is not None else None,
                 limits=self.limits,
+                authority=decision.pin(),
             )
+        except AuthorityNotPermittedError as exc:
+            raise AdmissionRefusedError(
+                "authority_policy_changed", str(exc), grpc.StatusCode.PERMISSION_DENIED
+            ) from None
+        except BindingNotVerifiedError as exc:
+            raise AdmissionRefusedError(
+                "hpc_binding_revoked", str(exc), grpc.StatusCode.PERMISSION_DENIED
+            ) from None
         except AdmissionLimitError as exc:
             raise _limit_refusal(exc) from None
         except SubmitterNotAuthorizedError as exc:
@@ -628,6 +691,7 @@ class RegistryAdmission:
             "platform_origin": selection.origin,
             "login_node_id": endpoint.node_id,
             "mode": mode,
+            **decision.details(),
             "account": resolution.account_name,
             "account_origin": resolution.origin,
             "cpu": reservation.cpu,

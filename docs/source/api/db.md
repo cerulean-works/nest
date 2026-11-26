@@ -198,6 +198,34 @@ registry.record_submission(attempt.id, slurm_job_id)
 
 [[autodoc]] db.ExecutionClosedError
 
+### Execution authority and HPC account bindings (D01, D02)
+
+See [Authorize execution authority and HPC account bindings](../hpc-access).
+
+[[autodoc]] db.HPCAccessStore
+
+[[autodoc]] db.AuthorityPolicy
+
+[[autodoc]] db.AuthorityPin
+
+[[autodoc]] db.HPCBinding
+
+[[autodoc]] db.normalize_authorities
+
+[[autodoc]] db.normalize_unix_user
+
+[[autodoc]] db.HPCAccessError
+
+[[autodoc]] db.BindingNotFoundError
+
+[[autodoc]] db.BindingConflictError
+
+[[autodoc]] db.BindingStateError
+
+[[autodoc]] db.AuthorityNotPermittedError
+
+[[autodoc]] db.BindingNotVerifiedError
+
 ### Admission reservations (F02a)
 
 [[autodoc]] db.Reservation

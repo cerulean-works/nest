@@ -146,6 +146,27 @@ chosen.origin  # "explicit", "project_default", "mode_b_user_default", ...
 
 [[autodoc]] authz.AccountResolutionError
 
+## Execution authority (D01, D02)
+
+See [Authorize execution authority and HPC account bindings](../hpc-access).
+
+```python
+from nest.authz import AuthorityRefusedError, AuthorityResolver
+
+resolver = AuthorityResolver(database, deployment=config.execution_authorities)
+try:
+    decision = resolver.resolve(principal, project_id, platform_id, requested="user_owned")
+except AuthorityRefusedError as exc:
+    exc.reason  # "authority_not_permitted", "hpc_binding_unverified", ...
+decision.pin()  # what the execution attempt records
+```
+
+[[autodoc]] authz.AuthorityResolver
+
+[[autodoc]] authz.AuthorityDecision
+
+[[autodoc]] authz.AuthorityRefusedError
+
 ## Platform administration
 
 See [Use the privileged management API](../privileged-api).
