@@ -116,7 +116,8 @@ def check_observed_at(
                 raise ValueError(f"keyscan_host_mismatch: {text} is not an address literal")
             if address not in allowed or key_port != port:
                 raise ValueError(f"keyscan_host_mismatch: {text}:{key_port} was not validated")
-            observed.add(f"{address}:{key_port}")
+            shown = f"[{address}]" if address.version == 6 else str(address)
+            observed.add(f"{shown}:{key_port}")
     return sorted(observed)
 
 
