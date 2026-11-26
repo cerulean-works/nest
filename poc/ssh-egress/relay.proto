@@ -1,0 +1,59 @@
+// DRAFT contract for the D03 restricted opaque SSH relay. Not compiled, not served,
+// not part of nest.proto. It changes only after the open decisions in
+// docs/source/ssh-relay-feasibility.md are settled and D01/D02/B07/D07 have landed.
+//
+// Invariants a real service must keep (tests/test_ssh_egress_poc.py checks the
+// first two against this file):
+//   * No message carries a destination host, port, address or URL. The Controller
+//     picks the login node from its server-side allowlist for `platform_id`.
+//   * Data frames are opaque SSH ciphertext. The Controller never parses, decrypts,
+//     logs or stores them, and never sees passwords, OTPs or session keys.
+//   * Authentication is the caller's Nest session in call metadata (never in a
+//     frame or process argument) over TLS; authorization (D01 mode policy, B07 RBAC)
+//     completes before any DNS lookup or socket. No fallback to Mode A.
+//   * Errors end the call with a gRPC status and a stable `nest-relay-reason`
+//     trailer (see Outcome in poc/ssh-egress/relay_contract.py).
+
+syntax = "proto3";
+
+package nest.relay.v1alpha;
+
+service SshRelay {
+  // One call per OpenSSH connection. The first ClientFrame must be `open`; the
+  // first ServerFrame is `opened` once the Controller's TCP connection exists.
+  rpc Open(stream ClientFrame) returns (stream ServerFrame);
+}
+
+message ClientFrame {
+  oneof frame {
+    OpenRelay open = 1;
+    // At most the advertised max_frame_bytes. Backpressure is gRPC flow control.
+    bytes data = 2;
+    // The local OpenSSH closed its write side: the Controller sends TCP FIN.
+    HalfClose half_close = 3;
+  }
+}
+
+message OpenRelay {
+  string platform_id = 1;  // immutable Platform UUID
+  string project_id = 2;   // Project UUID the session acts for
+  string attempt_id = 3;   // execution attempt registered before sbatch; optional
+}
+
+message ServerFrame {
+  oneof frame {
+    RelayOpened opened = 1;
+    bytes data = 2;
+    // The login node closed its write side.
+    HalfClose half_close = 3;
+  }
+}
+
+message RelayOpened {
+  string relay_id = 1;          // audit correlation ID
+  uint32 max_frame_bytes = 2;
+  uint32 idle_timeout_seconds = 3;
+  uint32 max_duration_seconds = 4;
+}
+
+message HalfClose {}
