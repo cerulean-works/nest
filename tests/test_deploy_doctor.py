@@ -22,6 +22,11 @@ ROOT = Path(__file__).resolve().parents[1]
 DOCTOR = ROOT / "scripts" / "nest-deploy-doctor.py"
 RENDER = ROOT / "deploy" / "public-grpc" / "traefik" / "render.sh"
 
+# Inside the Controller image only tests/ is present (and sometimes scripts/).
+if not DOCTOR.is_file():
+    raise unittest.SkipTest("requires the repository's scripts/")
+CHECKOUT = (ROOT / "compose.dokploy.yaml").is_file() and RENDER.is_file()
+
 spec = importlib.util.spec_from_file_location("nest_deploy_doctor", DOCTOR)
 assert spec is not None and spec.loader is not None
 doctor = importlib.util.module_from_spec(spec)
@@ -481,6 +486,7 @@ class PreflightTests(unittest.TestCase):
         self.assertNotIn("s3cret", out)
         self.assertNotIn("tskey", out)
 
+    @unittest.skipUnless(CHECKOUT, "requires the repository checkout")
     def test_defaults_match_compose_dokploy(self):
         compose = (ROOT / "compose.dokploy.yaml").read_text()
         self.assertIn(f"${{NEST_GRPC_ORIGIN_SUBNET:-{doctor.DEFAULT_ORIGIN_SUBNET}}}", compose)
@@ -488,6 +494,7 @@ class PreflightTests(unittest.TestCase):
         self.assertIn(f"${{NEST_GRPC_EDGE_NETWORK:-{doctor.DEFAULT_EDGE_NETWORK}}}", compose)
 
 
+@unittest.skipUnless(CHECKOUT, "requires the repository checkout")
 class TraefikRenderTests(unittest.TestCase):
     def render(self, *args):
         return subprocess.run(
