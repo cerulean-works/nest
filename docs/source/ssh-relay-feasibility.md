@@ -158,8 +158,8 @@ carrying real user sessions, or opening Controller firewall rules.
 - The relay never supplies, learns or vouches for a host key. A key the relay or
   the probe observes is an observation over the same path that might be attacked.
 - OpenSSH runs with strict host-key checking against an application-owned known
-  hosts file. Never use `StrictHostKeyChecking=no`, `UserKnownHostsFile=/dev/null`
-  or trust on first use. Unknown or mismatched keys fail closed.
+  hosts file. Never turn strict checking off, never use `/dev/null` as the
+  host-key database, and never trust on first use. Unknown or mismatched keys fail closed.
 - Rotation (announcing a new key ahead of time and overlapping old and new pins)
   is an [open decision](#unresolved-decisions).
 
