@@ -369,3 +369,19 @@ and makes every redemption transactional; interfaces go through
 [[autodoc]] db.EmailMismatchError
 
 [[autodoc]] db.AlreadyInvitedError
+
+## Service principals
+
+[[autodoc]] db.ServicePrincipalStore
+
+[[autodoc]] db.ServicePrincipal
+
+[[autodoc]] db.TrustPolicy
+
+[[autodoc]] db.ServiceGrant
+
+[[autodoc]] db.ServiceSession
+
+[[autodoc]] db.ExchangeRefusedError
+
+[[autodoc]] db.ServicePrincipalError

@@ -52,6 +52,8 @@ except ConfigError as error:
 
 [[autodoc]] config.GoogleAuthConfig
 
+[[autodoc]] config.WorkloadIdentityConfig
+
 [[autodoc]] config.SessionPolicy
 
 [[autodoc]] config.ClientConfig

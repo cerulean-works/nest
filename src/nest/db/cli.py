@@ -73,6 +73,17 @@ Usage:
     nest-db execution reconcile ATTEMPT_ID --slurm-job-id N | --not-submitted
                               --operator NAME --reason EVIDENCE
 
+    # CI service principals (see "CI workload identity"):
+    nest-db service-principal list | show PRINCIPAL | create NAME
+    nest-db service-principal trust PRINCIPAL --audience AUD --repository OWNER/NAME
+                              --repository-id N --repository-owner-id N
+                              --ref REF --workflow PATH [--environment NAME]
+    nest-db service-principal grant PRINCIPAL --project-id UUID --capabilities CAP,CAP
+                              [--platform PLATFORM]
+    nest-db service-principal revoke PRINCIPAL | revoke-policy ID | revoke-grant ID
+                              | revoke-session ID | prune
+    (every change also takes --operator NAME --reason TEXT)
+
     # The security audit log (see "Security audit log"):
     nest-db audit list   [--user-id UUID] [--project-id UUID] [--event NAME] [--limit N]
     nest-db audit verify # seal new records, then check the hash chain
@@ -98,6 +109,7 @@ from .._logging import configure_logging
 from ..audit import AuditLog
 from ..config import ConfigError, load_database_config
 from ..errors import DatabaseUnavailableError
+from . import service_cli
 from ._transaction import audit_context, transaction
 from .accounts import ProjectAccountLink, SlurmAccount, SlurmAccountStore
 from .approvals import ProviderApprovalStore, parse_project_ids
@@ -188,6 +200,7 @@ def _parser() -> argparse.ArgumentParser:
     _execution_parser(commands)
     _provider_parser(commands)
     _project_parser(commands)
+    service_cli.add_parser(commands, _change_parent())
 
     security = commands.add_parser(
         "audit",
@@ -1163,6 +1176,7 @@ def main(argv: list[str] | None = None) -> int:
         "execution",
         "provider",
         "project",
+        "service-principal",
     ):
         try:
             database.open()
@@ -1182,6 +1196,7 @@ def main(argv: list[str] | None = None) -> int:
                 "execution": _execution,
                 "provider": _provider,
                 "project": _project,
+                "service-principal": service_cli.run,
             }[args.command]
             return action(database, args)
         except MigrationError as exc:

@@ -429,6 +429,7 @@ and a database upgraded release by release end with the same schema.
 | 0015 | `project_platform_policy` | `project_default_platforms`; immutable Project and Organization IDs |
 | 0016 | `platform_role_boundaries` | Platform roles can only be granted to an active User |
 | 0019 | `hpc_access_policy` | **D01/D02:** `hpc_platform_authority_policies`, `project_platform_authority_policies`, `hpc_account_bindings`; each new attempt pins `execution_authority` and its policy versions |
+| 0020 | `service_principals` | **B09 CI workload identity:** `service_principals`, `workload_trust_policies`, `service_principal_grants`, `workload_token_uses`, `service_sessions` |
 
 D07 (0012) owns Platform identity: the Platform UUID and slug, its login nodes and
 its Project grants. D08 (0013) owns Slurm accounts, which reference D07's Platform,

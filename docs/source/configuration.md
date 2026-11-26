@@ -455,6 +455,21 @@ the checks applied to each sign-in.
 | `NEST_AUTH_REFRESH_TTL` | `86400` | Seconds a refresh session stays usable without being refreshed. Each refresh rotates it and starts this period again. At least `NEST_AUTH_ACCESS_TOKEN_TTL`. |
 | `NEST_AUTH_SESSION_MAX_LIFETIME` | `604800` | Seconds after sign-in when the session ends however often it is refreshed; the User then signs in again. At least `NEST_AUTH_REFRESH_TTL`, at most 7776000 (90 days). |
 
+### CI workload identity
+
+The exchange of GitHub Actions OIDC tokens for short-lived service sessions is
+opt-in and enabled by `NEST_WORKLOAD_OIDC_AUDIENCE`. It's served by the auth
+listener, so it needs Google sign-in, plus `NEST_DATABASE_URL` and
+`NEST_CONTROLLER_AUTH=session`. Which repositories, refs, workflows and
+environments are trusted is set per service principal in the database, never here.
+Service principals get no Controller HPC authority. See
+[Authenticate CI workloads with GitHub Actions OIDC](workload-identity).
+
+| Variable | Default | Behavior |
+| --- | --- | --- |
+| `NEST_WORKLOAD_OIDC_AUDIENCE` | Unset (disabled) | The exact `aud` a workload token must carry, and every trust policy must name, such as `https://auth.nest.example.org/workload`. 1 to 255 printable ASCII characters. Choose one unique to this deployment. |
+| `NEST_WORKLOAD_TOKEN_TTL` | `600` | Seconds a service session is accepted. 60 to 3600. Never refreshed: the job exchanges a new OIDC token instead. |
+
 ### Console connection profiles
 
 The Management Console's **Connect to Project** page (see

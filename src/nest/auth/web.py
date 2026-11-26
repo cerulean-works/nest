@@ -32,6 +32,13 @@ It serves these routes and nothing else:
 - `/api/admin` and below serve the privileged management API, for active
   `platform_admin`s only (see [`authz.AdminService`] and *Privileged management
   API*).
+- `POST /auth/workload/token` exchanges a CI workload identity token (a GitHub
+  Actions OIDC token) for a short-lived service session, `GET
+  /auth/workload/session` describes one and `POST /auth/workload/logout` ends it
+  (see [`auth.WorkloadExchange`]). Served only with `NEST_WORKLOAD_OIDC_AUDIENCE`.
+- `GET /api/workload/projects[/<id>]` is the only API a service session may call:
+  the Projects it was granted, with its capabilities (see
+  [`authz.ServiceAccess`]). Every other API answers a service session `403`.
 - `/api/invitations` and below serve the signed-in User's own invitations, and
   `GET`/`POST /invitations/accept` is the browser page that reviews and accepts an
   invitation link (see *Invite people to a Project*).
@@ -80,6 +87,12 @@ from ..authz import (
     ProjectPlatforms,
     ProjectService,
     ProviderPolicy,
+)
+from ..authz.workload import (
+    ServiceAccess,
+    ServiceCaller,
+    ServiceDeniedError,
+    is_service_token,
 )
 from ..config import (
     ADMIN_API_PATH,
@@ -146,6 +159,7 @@ from .console import (
     console_page,
 )
 from .google import SIGN_IN_TTL, GoogleSignIn, SignInError
+from .workload import WorkloadExchange, WorkloadExchangeError
 
 if TYPE_CHECKING:
     from ..mail import EmailService
@@ -197,6 +211,18 @@ CLI_LOGOUT_PATH = AUTH_CLI_PREFIX + "logout"
 CLI_API_PATHS = (CLI_START_PATH, CLI_TOKEN_PATH, CLI_REFRESH_PATH, CLI_LOGOUT_PATH)
 """The CLI's JSON `POST` routes."""
 
+WORKLOAD_TOKEN_PATH = "/auth/workload/token"
+"""Route that exchanges a CI workload identity token for a service session."""
+
+WORKLOAD_SESSION_PATH = "/auth/workload/session"
+"""Route that describes the service session of a bearer service token."""
+
+WORKLOAD_LOGOUT_PATH = "/auth/workload/logout"
+"""Route that revokes the service session of a bearer service token."""
+
+WORKLOAD_API_PATH = "/api/workload"
+"""The API service sessions may call: their granted Projects."""
+
 CLI_RETURN_COOKIE = "nest_cli_approval"
 """Cookie holding the user code of a CLI approval that sent the browser to sign in
 first, so the callback returns to that approval."""
@@ -211,6 +237,9 @@ callback returns to the Console."""
 
 MAX_BODY_BYTES = 4096
 """Largest request body accepted."""
+
+WORKLOAD_MAX_BODY_BYTES = 16384
+"""Largest workload token exchange body accepted: a workload token plus its JSON."""
 
 _SECURITY_HEADERS = {
     "Cache-Control": "no-store",
@@ -435,6 +464,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._dispatch(self._cli_approve_page)
         elif path == CLI_SESSION_PATH:
             self._dispatch(self._cli_describe)
+        elif path == WORKLOAD_SESSION_PATH:
+            self._dispatch(self._workload_describe)
+        elif path in (WORKLOAD_TOKEN_PATH, WORKLOAD_LOGOUT_PATH):
+            self._dispatch(lambda: self._not_allowed("POST"))
         elif path == INVITATION_PAGE_PATH:
             self._dispatch(self._invitation_page)
         elif _is_console(path):
@@ -454,6 +487,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._dispatch(lambda: self._same_origin() and self._logout())
         elif path in CLI_API_PATHS:
             self._dispatch(lambda: self._cli_api(path))
+        elif path in (WORKLOAD_TOKEN_PATH, WORKLOAD_LOGOUT_PATH):
+            self._dispatch(lambda: self._workload_api(path))
         elif path == CLI_APPROVE_PATH:
             self._dispatch(lambda: self._same_origin(require_origin=True) and self._cli_decide())
         elif path == INVITATION_PAGE_PATH:
@@ -467,7 +502,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         path = urlsplit(self.path).path
-        if path in (REFRESH_PATH, LOGOUT_PATH) or path in CLI_API_PATHS:
+        if path in (REFRESH_PATH, LOGOUT_PATH, WORKLOAD_TOKEN_PATH, WORKLOAD_LOGOUT_PATH) or (
+            path in CLI_API_PATHS
+        ):
             allow = "POST"
         elif path in (CLI_APPROVE_PATH, INVITATION_PAGE_PATH) or _is_api(path):
             allow = "GET, POST"
@@ -887,11 +924,11 @@ class _Handler(BaseHTTPRequestHandler):
                 "The command line was not signed in. You can close this page.",
             )
 
-    def _read_body(self) -> bytes | None:
+    def _read_body(self, limit: int = MAX_BODY_BYTES) -> bytes | None:
         """The request body, or `None` (after answering) when it is too large."""
         raw = self.headers.get("Content-Length") or "0"
         length = int(raw) if raw.isdecimal() else -1
-        if not 0 <= length <= MAX_BODY_BYTES:
+        if not 0 <= length <= limit:
             self.close_connection = True
             self._fail(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Too large", "Request too large.")
             return None
@@ -1184,12 +1221,172 @@ class _Handler(BaseHTTPRequestHandler):
             ),
         )
 
-    def _bearer_grant(self) -> AccessGrant | None:
+    def _bearer_token(self) -> str | None:
         header = self.headers.get("Authorization") or ""
         scheme, _, token = header.partition(" ")
         if scheme.lower() != "bearer" or not token.strip():
             return None
-        return self.app.sessions.authenticate(hash_token(token.strip()), kind="cli")
+        return token.strip()
+
+    def _bearer_grant(self) -> AccessGrant | None:
+        token = self._bearer_token()
+        if token is None or is_service_token(token):
+            return None
+        return self.app.sessions.authenticate(hash_token(token), kind="cli")
+
+    # CI workload identity ----------------------------------------------------
+
+    def _service_caller(self) -> ServiceCaller | None:
+        token = self._bearer_token()
+        if token is None or self.app.service_access is None:
+            return None
+        return self.app.service_access.authenticate(token)
+
+    def _workload_api(self, path: str):
+        """
+        `POST /auth/workload/token` and `/auth/workload/logout`. Like the CLI's JSON
+        routes, they read no cookies and refuse anything a browser sends.
+        """
+        exchange = self.app.workload
+        if exchange is None:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        if self.headers.get("Origin") is not None or self.headers.get("Sec-Fetch-Site"):
+            logger.warning("Workload request refused reason=browser_origin")
+            self._json(HTTPStatus.FORBIDDEN, {"error": "cross_origin"})
+            return
+        if path == WORKLOAD_LOGOUT_PATH:
+            caller = self._service_caller()
+            if caller is not None:
+                exchange.store.revoke_session(caller.session_id, reason="logout")
+                logger.info("Service session ended session_id=%s", caller.session_id)
+            self._json(HTTPStatus.OK, {"signed_out": caller is not None})
+            return
+        content_type = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if content_type != "application/json":
+            self._json(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, {"error": "invalid_request"})
+            return
+        # A workload token is larger than the default body limit allows.
+        body = self._read_body(limit=WORKLOAD_MAX_BODY_BYTES)
+        if body is None:
+            return
+        try:
+            payload = json.loads(body or b"{}")
+        except ValueError:
+            payload = None
+        if not isinstance(payload, dict):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        try:
+            issued = exchange.exchange(payload.get("token"), payload.get("service_principal_id"))
+        except WorkloadExchangeError as exc:
+            self._json(exc.status, {"error": exc.reason})
+            return
+        session = issued.session
+        self._json(
+            HTTPStatus.OK,
+            {
+                "access_token": issued.token,
+                "token_type": "Bearer",
+                **self._service_session_payload(
+                    session.service_principal_id, session.id, session.expires_at
+                ),
+            },
+        )
+
+    def _service_session_payload(
+        self, principal_id: UUID, session_id: UUID, expires_at: datetime
+    ) -> dict[str, object]:
+        return {
+            "principal_type": "service",
+            "service_principal_id": str(principal_id),
+            "session_id": str(session_id),
+            "expires_in": expires_in(expires_at, datetime.now(UTC)),
+            "expires_at": expires_at.isoformat(),
+        }
+
+    def _workload_describe(self):
+        caller = self._service_caller() if self.app.workload is not None else None
+        if caller is None:
+            self._json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "unauthenticated"},
+                headers={"WWW-Authenticate": 'Bearer realm="nest"'},
+            )
+            return
+        self._json(
+            HTTPStatus.OK,
+            self._service_session_payload(
+                caller.service_principal_id, caller.session_id, caller.expires_at
+            ),
+        )
+
+    def _service_api(self, method: str, path: str, token: str):
+        """
+        An API request with a service token. Only `GET /api/workload/projects` and
+        `/api/workload/projects/<id>` are served; every other route is refused, so
+        no User API (Projects, invitations, the Console, administration) ever
+        accepts a service principal.
+        """
+        access = self.app.service_access
+        caller = access.authenticate(token) if access is not None else None
+        if access is None or caller is None:
+            self._json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "unauthenticated"},
+                headers={"WWW-Authenticate": 'Bearer realm="nest"'},
+            )
+            return
+        parts = [p for p in path.removeprefix(WORKLOAD_API_PATH).split("/") if p]
+        if not path.startswith(WORKLOAD_API_PATH + "/") or not parts or parts[0] != "projects":
+            access.record(
+                caller,
+                "service.api",
+                "denied",
+                reason="service_principal",
+                details={"method": method},
+            )
+            self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden", "reason": "service_principal"})
+            return
+        if len(parts) > 2:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        if method != "GET":
+            self._not_allowed("GET")
+            return
+        grants = access.grants(caller)
+        if len(parts) == 1:
+            # Grants in force now, read once; a Project is listed only with project.read.
+            readable = dict.fromkeys(
+                g.project_id for g in grants if "project.read" in g.capabilities
+            )
+            listed = [
+                _service_project_json(
+                    pid,
+                    self.app.projects.store.get_project(pid),
+                    [g for g in grants if g.project_id == pid],
+                )
+                for pid in readable
+            ]
+            access.record(caller, "project.list", "succeeded", details={"projects": len(listed)})
+            self._json(HTTPStatus.OK, {"projects": listed})
+            return
+        project_id = _parse_uuid(parts[1])
+        if project_id is None:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        try:
+            access.require(caller, "project.read", project_id)
+        except ServiceDeniedError:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        project = self.app.projects.store.get_project(project_id)
+        if project is None:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        items = [g for g in grants if g.project_id == project_id]
+        access.record(caller, "project.read", "succeeded", project_id=project_id)
+        self._json(HTTPStatus.OK, _service_project_json(project_id, project, items))
 
     def _cli_logout(self, payload: dict):
         session_id = None
@@ -1231,6 +1428,21 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _api(self, method: str, path: str):
         """Authenticates, parses and routes a Projects API request."""
+        token = self._bearer_token()
+        if token is not None and is_service_token(token):
+            self._service_api(method, path, token)
+            return
+        if path == WORKLOAD_API_PATH or path.startswith(WORKLOAD_API_PATH + "/"):
+            # Only service sessions call it; a User's session is refused as such.
+            if self._principal() is None:
+                self._json(
+                    HTTPStatus.UNAUTHORIZED,
+                    {"error": "unauthenticated"},
+                    headers={"WWW-Authenticate": 'Bearer realm="nest"'},
+                )
+            else:
+                self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden", "reason": "service_only"})
+            return
         principal = self._principal()
         if principal is None:
             self._json(
@@ -1710,10 +1922,29 @@ _UNAVAILABLE = {
 """What the invitation page says for each [`db.InvitationUnavailableError`] reason."""
 
 
+def _service_project_json(project_id: UUID, project: Project | None, grants: list) -> dict:
+    """A granted Project as a service principal sees it: no members, no roles."""
+    return {
+        "id": str(project_id),
+        "name": project.name if project else None,
+        "grants": [
+            {
+                "id": grant.id,
+                "platform_id": _id(grant.platform_id),
+                "capabilities": list(grant.capabilities),
+            }
+            for grant in grants
+        ],
+        # Execution capabilities are recorded, never exercised: see ServiceAccess.
+        "hpc_authority": False,
+    }
+
+
 def _is_api(path: str) -> bool:
     return any(
         path == root or path.startswith(root + "/")
         for root in (
+            WORKLOAD_API_PATH,
             CONNECT_API_PATH,
             PROJECTS_API_PATH,
             INVITATIONS_API_PATH,
@@ -1976,6 +2207,9 @@ class AuthHTTPServer(ThreadingHTTPServer):
         eligibility ([`authz.ExecutionAccess`], *optional*): The Controller's
             execution access check, which the Console's `/api/connect` asks which
             Projects may run here and why not. Without it, eligibility is not reported.
+        workload ([`auth.WorkloadExchange`], *optional*): The CI workload token
+            exchange. Without it, `/auth/workload/token` is not found and no service
+            token is accepted.
     """
 
     daemon_threads = True
@@ -1995,9 +2229,14 @@ class AuthHTTPServer(ThreadingHTTPServer):
         admin: AdminService | None = None,
         provider_policy: ProviderPolicy | None = None,
         eligibility: ExecutionAccess | None = None,
+        workload: WorkloadExchange | None = None,
     ):
         self.sign_in = sign_in
         self.eligibility = eligibility
+        self.workload = workload
+        self.service_access = (
+            ServiceAccess(sign_in.database, workload.audit) if workload is not None else None
+        )
         self.cli = cli or CLISignIn(sign_in.database, sign_in.sessions)
         config = sign_in.config
         self.callback_path = urlsplit(config.redirect_url).path
@@ -2070,6 +2309,7 @@ def start_auth_service(
     email: EmailService | None = None,
     provider_policy: ProviderPolicy | None = None,
     eligibility: ExecutionAccess | None = None,
+    workload: WorkloadExchange | None = None,
 ) -> AuthService:
     """
     Starts the auth listener when Google sign-in is configured.
@@ -2091,6 +2331,8 @@ def start_auth_service(
             Provider approval source, reported by the privileged management API.
         eligibility ([`authz.ExecutionAccess`], *optional*): The Controller's
             execution access check, for the Console's Project eligibility.
+        workload ([`auth.WorkloadExchange`], *optional*): The CI workload token
+            exchange (`NEST_WORKLOAD_OIDC_AUDIENCE`).
 
     Raises:
         `OSError`: If `NEST_AUTH_HTTP_BIND` cannot be bound.
@@ -2108,6 +2350,7 @@ def start_auth_service(
         email=email,
         provider_policy=provider_policy,
         eligibility=eligibility,
+        workload=workload,
     )
     thread = threading.Thread(target=server.serve_forever, name="nest-auth-http", daemon=True)
     thread.start()

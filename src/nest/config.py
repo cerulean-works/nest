@@ -362,6 +362,17 @@ GOOGLE_SETTINGS = (
 """Google sign-in settings, read by [`config.load_controller_config`] when any of the
 `NEST_GOOGLE_*` settings is set."""
 
+WORKLOAD_SETTINGS = ("NEST_WORKLOAD_OIDC_AUDIENCE", "NEST_WORKLOAD_TOKEN_TTL")
+"""CI workload identity settings (B09), read by [`config.load_controller_config`].
+`NEST_WORKLOAD_OIDC_AUDIENCE` enables the exchange; it needs Google sign-in (the
+auth listener), the database and `NEST_CONTROLLER_AUTH=session`."""
+
+DEFAULT_WORKLOAD_TOKEN_TTL = 600.0
+"""Seconds a service session lasts by default: ten minutes."""
+
+MAX_WORKLOAD_TOKEN_TTL = 3600.0
+"""Longest service session `NEST_WORKLOAD_TOKEN_TTL` may set: an hour."""
+
 BOOTSTRAP_SETTINGS = ("NEST_BOOTSTRAP_ADMIN_GOOGLE_EMAIL",)
 """The one-time platform administrator bootstrap, read by
 [`config.load_controller_config`]. Needs `NEST_DATABASE_URL`."""
@@ -897,6 +908,33 @@ class GoogleAuthConfig:
         }
 
 
+@dataclass(frozen=True)
+class WorkloadIdentityConfig:
+    """
+    CI workload identity (B09). Present only when `NEST_WORKLOAD_OIDC_AUDIENCE` is set.
+
+    The auth listener then exchanges a GitHub Actions OIDC token for a short-lived
+    service session, when the token matches a service principal's trust policy
+    (see *CI workload identity*). Which repositories, refs, workflows and
+    environments are trusted is the operator's, in the database; nothing here
+    widens it.
+
+    Attributes:
+        audience (`str`): `NEST_WORKLOAD_OIDC_AUDIENCE`: the exact `aud` a workload
+            token must carry, and every trust policy must name. Choose one unique to
+            this deployment, such as its auth URL.
+        token_ttl (`float`): `NEST_WORKLOAD_TOKEN_TTL`: seconds a service session
+            lasts, 60 to 3600. It is never refreshed.
+    """
+
+    audience: str
+    token_ttl: float = DEFAULT_WORKLOAD_TOKEN_TTL
+
+    def summary(self) -> dict[str, object]:
+        """Returns a log-safe description; nothing here is secret."""
+        return {"audience": self.audience, "token_ttl": self.token_ttl}
+
+
 DEFAULT_GRPC_MAX_WORKERS = 4
 DEFAULT_GRPC_MAX_CONCURRENT_RPCS = 32
 DEFAULT_GRPC_MAX_MESSAGE_BYTES = 4 * 1024 * 1024
@@ -1113,6 +1151,8 @@ class ControllerConfig:
             `NEST_EMAIL_ENABLED` is not `true`.
         google (`GoogleAuthConfig | None`): Google sign-in settings, or `None` when
             `NEST_GOOGLE_CLIENT_ID` is unset.
+        workload (`WorkloadIdentityConfig | None`): CI workload identity settings,
+            or `None` when `NEST_WORKLOAD_OIDC_AUDIENCE` is unset.
         bootstrap_admin_email (`str | None`): `NEST_BOOTSTRAP_ADMIN_GOOGLE_EMAIL`,
             trimmed and lowercased: the Google account that becomes the first
             `platform_admin` at its first verified sign-in. Has no effect once the
@@ -1169,6 +1209,7 @@ class ControllerConfig:
     database: DatabaseConfig | None = None
     email: EmailConfig | None = None
     google: GoogleAuthConfig | None = None
+    workload: WorkloadIdentityConfig | None = None
     bootstrap_admin_email: str | None = None
     auth: str = "none"
     allow_plaintext: bool = False
@@ -1240,6 +1281,7 @@ class ControllerConfig:
             "database": self.database.summary() if self.database else None,
             "email": self.email.summary() if self.email else None,
             "google": self.google.summary() if self.google else None,
+            "workload": self.workload.summary() if self.workload else None,
             # The address is personal data, so only whether it is set is logged.
             "bootstrap_admin_configured": self.bootstrap_admin_email is not None,
             "auth": self.auth,
@@ -2330,6 +2372,7 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
     google = _google(reader, database)
     bootstrap_admin_email = _bootstrap_admin_email(reader, database)
     auth, allow_plaintext, allowed_projects = _controller_auth(reader, database, bind, tls)
+    workload = _workload(reader, database, google, auth)
     provider_approvals = _provider_approvals(reader, auth)
     execution_registry = _execution_registry(
         reader, auth, platforms.get(default_platform) if default_platform else None
@@ -2370,6 +2413,7 @@ def load_controller_config(environ: Mapping[str, str] | None = None) -> Controll
         database=database,
         email=email,
         google=google,
+        workload=workload,
         bootstrap_admin_email=bootstrap_admin_email,
         auth=auth,
         allow_plaintext=allow_plaintext,
@@ -2624,6 +2668,47 @@ def _controller_auth(
             reader.fail("NEST_PROVIDER_ALLOWED_PROJECTS needs NEST_CONTROLLER_AUTH=session")
         allow_plaintext = False
     return auth, allow_plaintext, frozenset(projects)
+
+
+def _workload(
+    reader: _Reader,
+    database: DatabaseConfig | None,
+    google: GoogleAuthConfig | None,
+    auth: str,
+) -> WorkloadIdentityConfig | None:
+    """
+    Reads `NEST_WORKLOAD_OIDC_AUDIENCE` and `NEST_WORKLOAD_TOKEN_TTL` (B09).
+
+    The exchange is served by the auth listener, stores principals and sessions in
+    the database, and is meaningless without session authentication, so each is
+    required rather than silently leaving the exchange off.
+    """
+    audience = reader.get("NEST_WORKLOAD_OIDC_AUDIENCE")
+    if audience is None:
+        if reader.get("NEST_WORKLOAD_TOKEN_TTL"):
+            reader.fail("NEST_WORKLOAD_TOKEN_TTL needs NEST_WORKLOAD_OIDC_AUDIENCE")
+        return None
+    before = len(reader.problems)
+    if not re.fullmatch(r"[\x21-\x7e]{1,255}", audience):
+        reader.fail("NEST_WORKLOAD_OIDC_AUDIENCE must be 1 to 255 printable ASCII characters")
+    ttl = reader.seconds("NEST_WORKLOAD_TOKEN_TTL", DEFAULT_WORKLOAD_TOKEN_TTL)
+    if not 60 <= ttl <= MAX_WORKLOAD_TOKEN_TTL:
+        reader.fail(f"NEST_WORKLOAD_TOKEN_TTL must be between 60 and 3600 seconds, got {ttl:g}")
+    if database is None and reader.get("NEST_DATABASE_URL") is None:
+        reader.fail(
+            "NEST_WORKLOAD_OIDC_AUDIENCE needs NEST_DATABASE_URL: service principals and "
+            "their sessions are stored in the database"
+        )
+    if google is None and reader.get("NEST_GOOGLE_CLIENT_ID") is None:
+        reader.fail(
+            "NEST_WORKLOAD_OIDC_AUDIENCE needs NEST_GOOGLE_CLIENT_ID: the token exchange is "
+            "served by the auth listener"
+        )
+    if auth != "session":
+        reader.fail("NEST_WORKLOAD_OIDC_AUDIENCE needs NEST_CONTROLLER_AUTH=session")
+    if len(reader.problems) > before:
+        return None
+    return WorkloadIdentityConfig(audience=audience, token_ttl=ttl)
 
 
 def _provider_approvals(reader: _Reader, auth: str) -> str:
