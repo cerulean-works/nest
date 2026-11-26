@@ -260,8 +260,9 @@ def run(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, resolver
             file_keys = parse_keyscan(args.keyscan_file.read_text())
             check_observed_at(file_keys, addresses, port)
         except (OSError, ValueError) as error:
+            # The whole file is rejected and reported once; no per-address records.
             report("host_key", False, source="operator_file", detail=str(error))
-            file_keys = []
+            file_keys = None
 
     # Every validated address is tested on its own; nothing is aggregated across them.
     for target in addresses:
@@ -282,7 +283,7 @@ def run(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, resolver
                 )
                 continue
             report_host_key(report, keys, target, port, pins, source="probe_keyscan")
-        elif file_keys:
+        elif file_keys is not None:
             report_host_key(
                 report, keys_at(file_keys, target, port), target, port, pins, source="operator_file"
             )

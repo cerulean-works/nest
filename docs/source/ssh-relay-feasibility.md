@@ -109,7 +109,10 @@ probe directory, read-only, and pass no environment, secrets or other volumes.
 Nothing is changed in the Controller container.
 
 ```bash
-CID=$(docker ps -q --filter label=com.docker.compose.service=controller)
+PROJECT=<compose-project>   # this deployment's Compose project (Dokploy app name)
+CID=$(docker ps -q --filter "label=com.docker.compose.project=$PROJECT" \
+  --filter label=com.docker.compose.service=controller)
+[ "$(printf '%s\n' "$CID" | grep -c .)" -eq 1 ] || { echo "need exactly one Controller"; exit 1; }
 IMAGE=$(docker inspect -f '{{.Image}}' "$CID")
 docker run --rm --network "container:$CID" --user 65534:65534 --read-only \
   --cap-drop ALL --security-opt no-new-privileges --entrypoint python3 \
@@ -141,7 +144,8 @@ for each approved IPv6 address) on the host. Neither may name `tailscale0`, a
 WireGuard or VPN interface, or an exit node.
 
 **Record the revision and place.** With the probe output, save
-`git rev-parse HEAD` of the checkout you ran from, `$CID` and `$IMAGE` (Docker), and
+`git rev-parse HEAD` of the checkout you ran from, `$PROJECT`, `$CID` and `$IMAGE`
+(Docker), and
 the route output. These go with the approval record.
 
 **Public source address.** The probe sees only its local address (a bridge

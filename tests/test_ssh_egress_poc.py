@@ -480,6 +480,22 @@ class EgressProbeTests(unittest.TestCase):
             "no built-in --keyscan against every tested address", summary["acceptance_blockers"]
         )
 
+    def test_empty_keyscan_file_still_fails_each_address(self):
+        for content in ("", "# only a comment\n"):
+            with self.subTest(content=content):
+                with FixtureServer() as fixture, tempfile.TemporaryDirectory() as tmp:
+                    scan = Path(tmp) / "scan.txt"
+                    scan.write_text(content)
+                    code, records = probe(
+                        "--host", "127.0.0.1", "--port", str(fixture.port),
+                        "--allowed-port", str(fixture.port), "--fixture",
+                        "--pin", PIN, "--keyscan-file", str(scan),
+                    )  # fmt: skip
+                key = {r.get("check"): r for r in records}["host_key"]
+                self.assertEqual(code, 1)
+                self.assertFalse(key["ok"])
+                self.assertEqual(key["detail"], "no key observed at this address")
+
     def test_summary_records_where_it_ran(self):
         with FixtureServer() as fixture:
             code, records = probe(
