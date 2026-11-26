@@ -17,6 +17,7 @@ import unittest
 import uuid
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCTOR = ROOT / "scripts" / "nest-deploy-doctor.py"
@@ -93,8 +94,10 @@ def network(name, subnet, bridge=None):
 class FakeDocker:
     """Answers the docker commands the doctor runs, and records them."""
 
-    def __init__(self, containers=(), networks=(), routes=None, traefik=None):
+    def __init__(self, containers=(), networks=(), routes=None, traefik=None, logs=None):
         self.containers = {c["Id"]: c for c in containers}
+        # Container ID -> its full log text, or None when Docker cannot read it.
+        self.logs = logs or {}
         self.networks = list(networks)
         self.routes = routes
         self.traefik = traefik
@@ -128,6 +131,12 @@ class FakeDocker:
                 return R(1, "", "Error: No such container")
             return R(0, json.dumps(found))
         if argv[:2] == ["docker", "logs"]:
+            target = argv[-1]
+            if target in self.logs:
+                text = self.logs[target]
+                if text is None:
+                    return R(1, "", "Error response from daemon: can not get logs")
+                return R(0, text, "")
             return R(0, "line 1\nline 2\nline 3\n")
         if argv[:2] == ["docker", "rm"]:
             target = self.containers.get(argv[-1])
@@ -625,8 +634,8 @@ class PreflightTests(unittest.TestCase):
                 "NEST_TAILSCALE_AUTHKEY=tskey-should-not-print\n"
             )
         values = doctor.read_env_file(handle.name)
-        self.assertEqual(values["NEST_GRPC_ORIGIN_SUBNET"], "10.253.250.0/28")
-        self.assertEqual(values["NEST_GRPC_GATEWAY_ADDRESS"], "10.253.250.2")
+        self.assertEqual(values["NEST_GRPC_ORIGIN_SUBNET"], ("10.253.250.0/28", False))
+        self.assertEqual(values["NEST_GRPC_GATEWAY_ADDRESS"], ("10.253.250.2", False))
         self.assertNotIn("NEST_DATABASE_PASSWORD", values)
         fake = FakeDocker()
         code, out = run(["preflight", "--env-file", handle.name], fake)
@@ -641,6 +650,274 @@ class PreflightTests(unittest.TestCase):
         self.assertIn(f"${{NEST_GRPC_ORIGIN_SUBNET:-{doctor.DEFAULT_ORIGIN_SUBNET}}}", compose)
         self.assertIn(f"${{NEST_GRPC_GATEWAY_ADDRESS:-{doctor.DEFAULT_GATEWAY_ADDRESS}}}", compose)
         self.assertIn(f"${{NEST_GRPC_EDGE_NETWORK:-{doctor.DEFAULT_EDGE_NETWORK}}}", compose)
+
+
+class SettingsPrecedenceTests(unittest.TestCase):
+    """Preflight checks what `docker compose --env-file .env` would use."""
+
+    def env_file(self, text):
+        with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as handle:
+            handle.write(text)
+        self.addCleanup(Path(handle.name).unlink)
+        return handle.name
+
+    def preflight(self, environ, text, networks=(), traefik=None):
+        path = self.env_file(text)
+        fake = FakeDocker(networks=networks, traefik=traefik)
+        code, out = run(["preflight", "--env-file", path], fake, environ)
+        return code, out
+
+    SAFE = "NEST_GRPC_ORIGIN_SUBNET='10.253.250.0/28'\nNEST_GRPC_GATEWAY_ADDRESS='10.253.250.2'\n"
+
+    def test_the_shell_environment_wins_over_the_env_file(self):
+        squatter = [network("app_x", "172.31.0.0/16")]
+        code, out = self.preflight({}, self.SAFE, networks=squatter)
+        self.assertEqual(code, 0, out)
+        # The invoking shell exports the colliding default: Compose would use it.
+        shell = {
+            "NEST_GRPC_ORIGIN_SUBNET": "172.31.250.0/28",
+            "NEST_GRPC_GATEWAY_ADDRESS": "172.31.250.2",
+        }
+        code, out = self.preflight(shell, self.SAFE, networks=squatter)
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL origin_subnet_free: 172.31.250.0/28 overlaps", out)
+        self.assertIn("WARN settings: the shell environment overrides", out)
+        self.assertIn("NEST_GRPC_ORIGIN_SUBNET, NEST_GRPC_GATEWAY_ADDRESS", out)
+
+    def test_an_empty_shell_value_overrides_the_file_and_takes_the_default(self):
+        squatter = [network("app_x", "172.31.0.0/16")]
+        shell = {"NEST_GRPC_ORIGIN_SUBNET": "", "NEST_GRPC_GATEWAY_ADDRESS": ""}
+        code, out = self.preflight(shell, self.SAFE, networks=squatter)
+        self.assertEqual(code, 1, out)
+        self.assertIn("PASS origin_subnet: 172.31.250.0/28", out)
+
+    def test_empty_and_unset_file_values_take_the_compose_default(self):
+        code, out = self.preflight({}, "NEST_GRPC_ORIGIN_SUBNET=''\n")
+        self.assertIn("PASS origin_subnet: 172.31.250.0/28", out)
+        self.assertIn("PASS gateway_address: 172.31.250.2 in 172.31.250.0/28", out)
+        self.assertEqual(code, 0, out)
+
+    def test_interpolated_values_are_refused_not_guessed(self):
+        for line in (
+            "NEST_GRPC_ORIGIN_SUBNET=${SUBNET}\n",
+            'NEST_GRPC_ORIGIN_SUBNET="$SUBNET"\n',
+            "NEST_GRPC_TRUSTED_PROXIES=${GATEWAY:-10.0.0.2}/32\n",
+        ):
+            with self.subTest(line):
+                code, out = self.preflight({}, line)
+                self.assertEqual(code, 1, out)
+                self.assertIn("FAIL settings:", out)
+                self.assertIn("interpolates", out)
+        # Single quotes are literal for Compose too: checked as written (and invalid).
+        code, out = self.preflight({}, "NEST_GRPC_ORIGIN_SUBNET='$SUBNET'\n")
+        self.assertNotIn("FAIL settings:", out)
+        self.assertIn("FAIL origin_subnet:", out)
+
+    def test_the_shell_decides_the_profiles_and_the_gateway_checks(self):
+        text = self.SAFE + (
+            "COMPOSE_PROFILES='local-db,migrate'\n"
+            "NEST_PUBLIC_PILOT='true'\n"
+            "NEST_GRPC_TRUSTED_PROXIES='10.253.250.2/32'\n"
+            "NEST_GRPC_ALLOWED_PEERS='10.253.250.0/28,172.18.0.0/16'\n"
+            "NEST_GRPC_EDGE_PROXY='10.0.1.7/32'\n"
+        )
+        traefik = {
+            "Config": {"Image": "traefik:v3.3.7"},
+            "NetworkSettings": {"Networks": {"dokploy-network": {"IPAddress": "10.0.1.7"}}},
+        }
+        nets = [network("nest_tailnet", "172.18.0.0/16")]
+        code, out = self.preflight({}, text, networks=nets, traefik=traefik)
+        self.assertIn("SKIP public_grpc", out)
+        shell = {
+            "COMPOSE_PROFILES": "local-db,migrate,public-grpc",
+            "NEST_GRPC_EDGE_PROXY": "10.0.1.9/32",
+        }
+        code, out = self.preflight(shell, text, networks=nets, traefik=traefik)
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL edge_proxy: NEST_GRPC_EDGE_PROXY is 10.0.1.9/32", out)
+        self.assertIn("PASS trusted_proxies", out)
+
+
+SYNTHETIC_TOKEN = "nest-synthetic-" + "0123456789abcdef" * 2
+
+
+class LogLeakCheckTests(unittest.TestCase):
+    def services(self):
+        gateway = container("nest-grpc-gateway-1", "running", service="grpc-gateway", pid=4)
+        controller = container("nest-controller-1", "running", service="controller", pid=5)
+        other = container(
+            "other-controller-1", "running", project="other", service="controller", pid=6
+        )
+        return gateway, controller, other
+
+    def check(self, fake, argv=(), secret=SYNTHETIC_TOKEN + "\n"):
+        parsed = doctor.parser().parse_args(["log-leak-check", *argv])
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), mock.patch.object(sys, "stderr", err):
+            try:
+                code = doctor.log_leak_check(
+                    parsed, doctor.Docker(run=fake), stdin=io.StringIO(secret)
+                )
+            except doctor.DockerError as error:
+                print(f"nest-deploy-doctor: {error}", file=sys.stderr)
+                code = 2
+        return code, out.getvalue() + err.getvalue()
+
+    def test_a_leak_is_counted_and_the_value_never_printed(self):
+        gateway, controller, other = self.services()
+        logs = {
+            gateway[
+                "Id"
+            ]: f"GET /nest.ExecutionService/Execute authorization: Bearer {SYNTHETIC_TOKEN}\n",
+            controller["Id"]: "started\n",
+            other["Id"]: SYNTHETIC_TOKEN,
+        }
+        fake = FakeDocker([gateway, controller, other], logs=logs)
+        code, out = self.check(fake)
+        self.assertEqual(code, 1)
+        self.assertIn("LEAK nest-grpc-gateway-1: 1 occurrence(s)", out)
+        self.assertIn("PASS nest-controller-1: 0 occurrence(s)", out)
+        self.assertNotIn("other-controller-1", out)
+        self.assertNotIn(SYNTHETIC_TOKEN, out)
+        self.assertNotIn(SYNTHETIC_TOKEN[:20], out)
+        # The value is never part of a Docker command line.
+        self.assertFalse([c for c in fake.calls if any(SYNTHETIC_TOKEN in a for a in c)])
+
+    def test_several_values_from_stdin_are_all_searched(self):
+        gateway, controller, _ = self.services()
+        refresh = "nest-synthetic-refresh-" + "f" * 32
+        fake = FakeDocker(
+            [gateway, controller], logs={gateway["Id"]: "ok", controller["Id"]: f"x {refresh} y"}
+        )
+        code, out = self.check(fake, secret=f"{SYNTHETIC_TOKEN}\n{refresh}\n")
+        self.assertEqual(code, 1)
+        self.assertIn("LEAK nest-controller-1: 1 occurrence(s)", out)
+        self.assertNotIn(refresh, out)
+        # One short value refuses the whole run, before any log is read.
+        code, out = self.check(FakeDocker([gateway]), secret=f"{SYNTHETIC_TOKEN}\nshort\n")
+        self.assertEqual(code, 2)
+
+    def test_clean_logs_pass(self):
+        gateway, controller, _ = self.services()
+        fake = FakeDocker(
+            [gateway, controller], logs={gateway["Id"]: "ok\n", controller["Id"]: "ok\n"}
+        )
+        code, out = self.check(fake, ["--since", "2026-11-26T09:00:00Z"])
+        self.assertEqual(code, 0, out)
+        logs = [c for c in fake.calls if c[:2] == ["docker", "logs"]]
+        self.assertTrue(all(c[2:4] == ["--since", "2026-11-26T09:00:00Z"] for c in logs))
+
+    def test_an_unreadable_log_never_passes(self):
+        gateway, controller, _ = self.services()
+        fake = FakeDocker(
+            [gateway, controller], logs={gateway["Id"]: None, controller["Id"]: "ok\n"}
+        )
+        code, out = self.check(fake)
+        self.assertEqual(code, 2, out)
+        self.assertIn("could not read the logs", out)
+
+    def test_a_missing_service_or_project_never_passes(self):
+        _, controller, _ = self.services()
+        code, out = self.check(FakeDocker([controller]), ["--service", "grpc-gateway"])
+        self.assertEqual(code, 2)
+        self.assertIn("no container for grpc-gateway", out)
+        code, _ = self.check(FakeDocker([]))
+        self.assertEqual(code, 2)
+
+    def test_service_selection(self):
+        gateway, controller, _ = self.services()
+        fake = FakeDocker(
+            [gateway, controller], logs={gateway["Id"]: "ok", controller["Id"]: SYNTHETIC_TOKEN}
+        )
+        code, out = self.check(fake, ["--service", "grpc-gateway"])
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("nest-controller-1", out)
+
+    def test_short_or_missing_values_are_refused(self):
+        gateway, controller, _ = self.services()
+        fake = FakeDocker([gateway, controller])
+        for secret in ("", "short\n"):
+            code, out = self.check(fake, secret=secret)
+            self.assertEqual(code, 2)
+            self.assertIn("nothing was searched", out)
+        self.assertFalse([c for c in fake.calls if c[:2] == ["docker", "logs"]])
+
+    def test_a_synthetic_canary_needs_no_secret(self):
+        gateway, controller, _ = self.services()
+        fake = FakeDocker(
+            [gateway, controller], logs={gateway["Id"]: "nest-canary-42", controller["Id"]: ""}
+        )
+        code, out = self.check(fake, ["--canary", "nest-canary-42"], secret="")
+        self.assertEqual(code, 1)
+        self.assertIn("LEAK nest-grpc-gateway-1", out)
+
+    def test_the_value_is_typed_without_echo_on_a_terminal(self):
+        class Terminal(io.StringIO):
+            def isatty(self):
+                return True
+
+        prompts = []
+
+        def prompt(text):
+            prompts.append(text)
+            return SYNTHETIC_TOKEN
+
+        self.assertEqual(doctor.read_secret(Terminal(), prompt), [SYNTHETIC_TOKEN])
+        self.assertEqual(len(prompts), 1)
+        self.assertNotIn(SYNTHETIC_TOKEN, prompts[0])
+        self.assertNotIn("--token", " ".join(doctor.parser().format_help().split()))
+
+
+@unittest.skipUnless(CHECKOUT, "requires the repository checkout")
+class RunbookCommandTests(unittest.TestCase):
+    """Every Compose command in the operator docs targets compose.dokploy.yaml, and
+    every service they name exists there."""
+
+    DOCS = ("hosted-rollout.md", "public-grpc-gateway.md", "deployment-recovery.md", "dokploy.md")
+
+    def services(self):
+        compose = (ROOT / "compose.dokploy.yaml").read_text()
+        block = compose.split("\nservices:\n", 1)[1].split("\nnetworks:\n", 1)[0]
+        return set(re.findall(r"^  ([a-z][a-z0-9-]*):$", block, re.MULTILINE))
+
+    def commands(self):
+        for name in self.DOCS:
+            text = (ROOT / "docs" / "source" / name).read_text()
+            for block in re.findall(r"```(?:bash|sh)\n(.*?)```", text, re.DOTALL):
+                for line in block.replace("\\\n", " ").splitlines():
+                    yield name, line.strip()
+
+    def test_compose_commands_name_the_dokploy_file(self):
+        for name, line in self.commands():
+            if "docker compose" not in line or line.startswith("#"):
+                continue
+            command = line.split("#", 1)[0]
+            if re.search(r"docker compose (ls|version)\b", command):
+                continue
+            with self.subTest(doc=name, line=line):
+                self.assertRegex(command, r"-f \S*compose\.dokploy\.yaml\b")
+
+    def test_named_services_exist(self):
+        services = self.services()
+        seen = 0
+        for name, line in self.commands():
+            match = re.search(
+                r"(?:^|\s|\()dc\s+(?:logs|exec|restart|up -d --force-recreate)\s+((?:-[\w-]+\s+\S+\s+)*)([a-z][a-z0-9-]*)",
+                line,
+            )
+            if match:
+                seen += 1
+                with self.subTest(doc=name, line=line):
+                    self.assertIn(match.group(2), services)
+        self.assertGreater(seen, 3)
+
+    def test_the_helper_is_the_dokploy_invocation(self):
+        text = (ROOT / "docs" / "source" / "hosted-rollout.md").read_text()
+        self.assertIn(
+            'dc() { docker compose -p "$APP" --project-directory "$CODE" -f "$CODE/compose.dokploy.yaml" --env-file "$CODE/.env" "$@"; }',
+            text,
+        )
+        self.assertNotRegex(text, r"docker compose -p <appName> (logs|exec|restart)")
 
 
 @unittest.skipUnless(CHECKOUT, "requires the repository checkout")

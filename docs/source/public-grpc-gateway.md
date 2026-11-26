@@ -146,7 +146,8 @@ performs them.
    closed on an overlapping subnet or route, a trusted proxy other than the
    gateway's /32, allowed peers missing the gateway or the actual Tailnet bridge,
    and an edge address that is not the running Traefik's. Then redeploy. Check
-   `docker compose logs grpc-gateway` for `rendered for grpc.staging.<domain>`, and
+   `dc logs grpc-gateway` (`dc` is the Dokploy invocation of the
+   [rollout runbook](hosted-rollout#runbook)) for `rendered for grpc.staging.<domain>`, and
    `python3 scripts/nest-deploy-doctor.py migrate-status --project <appName>`. If
    the deploy hangs on `migrate`, see
    [Recover a stuck migrate](deployment-recovery#recover-a-stuck-migrate).
@@ -197,11 +198,17 @@ the `sdk_target` check: the SDK must name the same address over TLS with the sam
 roots as `--ca-file` (or system roots). If it names another Controller, such as
 your Tailnet one, the run fails before any session is read or any job is
 submitted; the script never redirects a session to the address you give it.
-Finally:
+Finally, check that no credential reached any log, with a synthetic canary and the
+real pilot session's tokens, as the rollout runbook's R5 describes (*No credential
+in any log*):
 
 ```bash
-docker compose logs grpc-gateway | grep -cF "<a staging session token>"   # must print 0
+python3 scripts/nest-deploy-doctor.py log-leak-check --project <appName> --canary <canary>
 ```
+
+The real tokens are piped in on standard input, never typed into a command. Never
+`grep` a log for a pasted token: that leaves it in the shell history and the
+process list.
 
 ### Evidence
 

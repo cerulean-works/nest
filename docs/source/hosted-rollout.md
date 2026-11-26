@@ -77,14 +77,30 @@ Status:          live passed | failed (<what>) | blocked (<what>)
 ## Runbook
 
 Run each step on **staging** first: name `grpc.staging.<domain>` and the Let's
-Encrypt **staging** directory. `<appName>` is the Dokploy application's Compose
-project name. Commands on the Dokploy host run from its checkout
-(`/etc/dokploy/compose/<appName>/code`).
+Encrypt **staging** directory.
+
+On the Dokploy host, start every session with the same invocation Dokploy uses:
+its project name (the application's `appName`, from `docker compose ls`), its
+checkout, `compose.dokploy.yaml` (not the repository's `compose.yaml`) and the
+`.env` Dokploy wrote, which also sets `COMPOSE_PROFILES`. Every `dc` command
+below goes through this helper:
+
+```bash
+APP=<appName>
+CODE=/etc/dokploy/compose/$APP/code
+cd "$CODE"
+dc() { docker compose -p "$APP" --project-directory "$CODE" -f "$CODE/compose.dokploy.yaml" --env-file "$CODE/.env" "$@"; }
+dc config --services   # names only; lists grpc-gateway and grpc-certificates once their profiles are on
+```
+
+Run it from a clean shell. Variables exported in the shell override `.env` for
+`docker compose` and for `nest-deploy-doctor.py preflight`, which warns when one
+does. Never run plain `dc config`: it prints every secret in `.env`.
 
 ### R0. Revision and rollback point
 
 ```bash
-git -C /etc/dokploy/compose/<appName>/code rev-parse --short HEAD
+git -C "$CODE" rev-parse --short HEAD
 docker compose ls
 docker image ls --digests | grep -E 'nest-controller|envoy|lego|traefik'
 ```
@@ -96,10 +112,10 @@ step on this page.
 ### R1. Deployment preflight and migration (A1 to A4)
 
 ```bash
-python3 scripts/nest-deploy-doctor.py preflight      --project <appName> --env-file .env
+python3 scripts/nest-deploy-doctor.py preflight      --project "$APP" --env-file "$CODE/.env"
 # Start this as you press Deploy in Dokploy (or pass --since <deploy start, RFC 3339>):
-python3 scripts/nest-deploy-doctor.py wait-migrate   --project <appName> --timeout 300
-python3 scripts/nest-deploy-doctor.py migrate-status --project <appName>
+python3 scripts/nest-deploy-doctor.py wait-migrate   --project "$APP" --timeout 300
+python3 scripts/nest-deploy-doctor.py migrate-status --project "$APP"
 ```
 
 Expected: every preflight line `PASS` (a `SKIP` only with the reason checked by
@@ -134,8 +150,8 @@ curl -sS -o /dev/null -w '%{http_code}\n' https://auth.nest.cerulean.works/conso
 ### R3. Certificate (B2)
 
 ```bash
-docker compose -p <appName> logs grpc-certificates | tail -n 20
-docker compose -p <appName> logs grpc-gateway | grep -i -E 'secret|certificate' | tail -n 5
+dc logs grpc-certificates | tail -n 20
+dc logs grpc-gateway | grep -i -E 'secret|certificate' | tail -n 5
 ```
 
 Expected: lego reports a certificate for the staging name from the staging CA
@@ -144,10 +160,10 @@ loading it. To exercise renewal in staging without waiting 60 days, run one rene
 by hand in the `grpc-certificates` container. It uses the same state and token:
 
 ```bash
-docker compose -p <appName> exec grpc-certificates sh -c \
+dc exec grpc-certificates sh -c \
   'CLOUDFLARE_DNS_API_TOKEN_FILE=/run/secrets/cloudflare_dns_api_token /lego --accept-tos --email "$NEST_GRPC_ACME_EMAIL" --server "${NEST_GRPC_ACME_SERVER:-https://acme-staging-v02.api.letsencrypt.org/directory}" \
    --path /var/lib/lego --dns cloudflare --domains "$NEST_GRPC_PUBLIC_HOST" renew --days 90'
-docker compose -p <appName> restart grpc-certificates   # its loop installs the renewed pair
+dc restart grpc-certificates   # its loop installs the renewed pair
 ```
 
 Envoy must load the new pair without a restart of `grpc-gateway`, and
@@ -193,9 +209,73 @@ pilot Project; `execute` returns the expected result; the example prints `42`
 twice. Then on the host:
 
 ```bash
-docker compose -p <appName> logs grpc-gateway | grep -cF "<a staging access token>"   # 0
-docker compose -p <appName> exec controller nest-db audit list --limit 5              # client_address is the outside client's public address
+dc exec controller nest-db audit list --limit 5   # client_address is the outside client's public address
 ```
+
+**No credential in any log (B4).** Never put a real token in a command, a shell
+variable, a file or an issue: `grep "<token>"` would leave it in shell history and
+in the process list. `nest-deploy-doctor.py log-leak-check` reads the values from
+standard input (or prompts without echo), searches every container log of the
+project in memory, and prints only a count per container. It exits 0 when nothing
+matches, 1 when something does, and 2 when any log could not be read. A failed
+read never counts as clean.
+
+1. A synthetic canary first. It is not a credential, so it may appear in commands.
+   From the outside client, send it as a bearer token. The gateway must answer
+   `UNAUTHENTICATED`:
+
+   ```bash
+   canary=nest-canary-$(python3 -c 'import secrets; print(secrets.token_hex(12))')
+   uv run python - "$canary" <<'PY'
+   import sys, grpc
+   from nest.proto import execution_pb2, execution_pb2_grpc
+   roots = open("letsencrypt-staging-roots.pem", "rb").read()
+   channel = grpc.secure_channel("grpc.staging.<domain>:443", grpc.ssl_channel_credentials(roots))
+   stub = execution_pb2_grpc.ExecutionServiceStub(channel)
+   try:
+       stub.ListEligibleProjects(execution_pb2.ListEligibleProjectsRequest(), timeout=10,
+                                 metadata=[("authorization", "Bearer " + sys.argv[1])])
+   except grpc.RpcError as error:
+       print(error.code().name)   # UNAUTHENTICATED
+   PY
+   echo "$canary"   # give this to the host check below
+   ```
+
+   ```bash
+   # host: 0 occurrences everywhere, exit 0
+   python3 scripts/nest-deploy-doctor.py log-leak-check --project "$APP" --canary <canary>
+   ```
+
+2. The real pilot session used in R5. Pipe its tokens from the client's credential
+   store straight into the host check over SSH. They are never printed, and never
+   appear in an argument, the shell history or a file:
+
+   ```bash
+   # client: the stored session's access and refresh tokens, one per line, to the host's stdin
+   uv run python -c 'import sys
+   from nest.config import load_cli_auth_config
+   from nest.login import CredentialStore
+   config = load_cli_auth_config()
+   session = CredentialStore(config.credentials_file).load(config.url)
+   sys.stdout.write(session.access_token + "\n" + session.refresh_token + "\n")' \
+     | ssh <dokploy-host> 'cd /etc/dokploy/compose/<appName>/code && python3 scripts/nest-deploy-doctor.py log-leak-check --project <appName>'
+   ```
+
+   Expected: a `PASS <container>: 0 occurrence(s)` line for every container of the
+   project, and exit 0. Tokens from an earlier refresh of the same session are not
+   covered, so run R5 with a fresh `nest login`, and this check right after it.
+
+If the check reports `LEAK`:
+
+- Do not open, copy or attach the logs. Record only the gate, the container name
+  and the count.
+- End the session at once: `nest logout` on the client, and on the host
+  `dc exec controller nest-db sessions revoke` for that User (see
+  [Revoke sessions](authentication#revoke-sessions)).
+- Stop public traffic ([Roll back](public-grpc-gateway#roll-back), step 1). Then
+  discard the affected container's log by recreating it:
+  `dc up -d --force-recreate <service>`. With the `json-file` driver that removes
+  its log file. Mark B4 failed until the cause is fixed and the check passes.
 
 Also cover the selection cases with one pilot account each: a saved choice
 (`nest projects use`), an explicit `NEST_PROJECT_ID`, several eligible Projects
@@ -216,7 +296,7 @@ the real client address, never the forged one. Then check that nothing reached
 Slurm:
 
 ```bash
-docker compose -p <appName> exec controller nest-db audit list --limit 20
+dc exec controller nest-db audit list --limit 20
 # on the login node, as the service account: no job from these attempts
 squeue -u <service account> --start; sacct -u <service account> -S <start time> -n -X -o JobID,JobName,State
 ```

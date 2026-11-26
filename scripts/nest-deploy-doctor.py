@@ -9,6 +9,7 @@ Run it on the Docker host as a user who may use the Docker CLI. It needs only Py
     python3 scripts/nest-deploy-doctor.py migrate-status --project APP [--logs 40]
     python3 scripts/nest-deploy-doctor.py wait-migrate   --project APP --timeout 300 [--since T]
     python3 scripts/nest-deploy-doctor.py recover-migrate --project APP [--apply]
+    python3 scripts/nest-deploy-doctor.py log-leak-check --project APP < token-file
 
 `--project` is the Compose project name: Dokploy's application name (its `appName`,
 shown by `docker compose ls`), or `nest` for a plain `docker compose` run of the
@@ -50,6 +51,14 @@ recover-migrate
     `nest-db upgrade` again, and the Controller still starts only after it succeeds.
     A deploy that is still waiting on the removed container fails at once instead of
     waiting forever; deploy again afterwards.
+
+log-leak-check
+    Counts how often secret values occur in the logs of this project's containers (all
+    of them, or each `--service`), in memory. A value is typed without echo, or read one
+    per line from standard input, never from the command line, and is never printed.
+    `--canary` searches for a synthetic non-secret marker instead. Exits 1 if it
+    occurs anywhere, and 2 if any log cannot be read or a service has no container,
+    so a read failure never passes.
 
 Exit codes: 0 ok, 1 a check failed, 2 usage or Docker error, 3 stuck, 4 migration
 failed, 5 still in progress or timed out, 6 no migrate container found.
@@ -175,13 +184,42 @@ class Docker:
         result = self.run(["docker", "logs", "--tail", str(lines), container_id])
         return (result.stdout + result.stderr).rstrip()
 
+    def project_containers(self, project: str) -> list[dict]:
+        ids = self._ok(
+            [
+                "docker",
+                "ps",
+                "--all",
+                "--quiet",
+                "--no-trunc",
+                "--filter",
+                f"label=com.docker.compose.project={project}",
+            ]
+        ).split()
+        if not ids:
+            return []
+        return json.loads(self._ok(["docker", "container", "inspect", *ids]))
+
+    def full_logs(self, container_id: str, since: str | None) -> str:
+        """Every log line of a container, both streams; raises when Docker cannot
+        read them (so a read failure never looks like a clean result)."""
+        argv = ["docker", "logs"]
+        if since:
+            argv += ["--since", since]
+        result = self.run([*argv, container_id])
+        if result.returncode != 0:
+            raise DockerError(f"could not read the logs of {container_id[:12]}")
+        return result.stdout + result.stderr
+
     def remove(self, container_id: str) -> None:
         self._ok(["docker", "rm", container_id])
 
 
-def read_env_file(path: str | None) -> dict[str, str]:
-    """Reads KEY=VALUE lines literally: no expansion, one pair of quotes removed."""
-    values: dict[str, str] = {}
+def read_env_file(path: str | None) -> dict[str, tuple[str, bool]]:
+    """Reads the KEY=VALUE lines of the settings this tool checks, without expanding
+    anything: one pair of quotes removed. Each value comes with whether Compose would
+    interpolate it (a `$` outside single quotes), which this tool does not evaluate."""
+    values: dict[str, tuple[str, bool]] = {}
     if not path:
         return values
     with open(path, encoding="utf-8") as handle:
@@ -194,19 +232,59 @@ def read_env_file(path: str | None) -> dict[str, str]:
             if key.startswith("export "):
                 key = key[len("export ") :].strip()
             value = value.strip()
+            literal = False
             if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                literal = value[0] == "'"
                 value = value[1:-1]
             elif " #" in value:
                 value = value.split(" #", 1)[0].rstrip()
             if key in SETTINGS:
-                values[key] = value
+                values[key] = (value, "$" in value and not literal)
     return values
 
 
-def settings(env_file: str | None, environ: dict[str, str]) -> dict[str, str]:
-    values = {key: environ[key] for key in SETTINGS if environ.get(key, "").strip()}
-    values.update({k: v for k, v in read_env_file(env_file).items() if v.strip()})
-    return values
+def settings(env_file: str | None, environ: dict[str, str]) -> tuple[dict[str, str], list[Check]]:
+    """The values Compose would use for the checked settings, with Compose's
+    precedence: a variable set in the invoking shell's environment wins over the
+    `.env` file, even when it is empty. An empty or unset value then takes the
+    file's default, as `${NAME:-default}` does. A `.env` value that Compose would
+    interpolate is refused, not guessed."""
+    from_file = read_env_file(env_file)
+    values: dict[str, str] = {}
+    checks: list[Check] = []
+    overridden = []
+    for key in SETTINGS:
+        if key in environ:
+            value = environ[key]
+            if key in from_file and from_file[key][0] != value:
+                overridden.append(key)
+        elif key in from_file:
+            value, interpolated = from_file[key]
+            if interpolated:
+                checks.append(
+                    Check(
+                        "settings",
+                        "FAIL",
+                        f"{key} in {env_file} contains `$`, which Compose interpolates and "
+                        "this tool does not; write the literal value in single quotes",
+                    )
+                )
+                continue
+        else:
+            continue
+        if value.strip():
+            values[key] = value.strip()
+    if overridden:
+        checks.append(
+            Check(
+                "settings",
+                "WARN",
+                f"the shell environment overrides {env_file or '.env'} for "
+                f"{', '.join(overridden)}, as it does for `docker compose`; checked the "
+                "shell's values. Dokploy deploys from .env alone: unset them to check that.",
+            )
+        )
+    return values, checks
 
 
 def _cidrs(value: str) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
@@ -528,10 +606,10 @@ def host_routes(run: Runner) -> list[dict] | None:
 
 
 def preflight(args, docker: Docker, environ: dict[str, str]) -> int:
-    values = settings(args.env_file, environ)
+    values, checks = settings(args.env_file, environ)
     profiles = {p.strip() for p in values.get("COMPOSE_PROFILES", "").split(",") if p.strip()}
     networks = docker.networks()
-    checks = check_origin(values, args.project, networks, host_routes(docker.run))
+    checks += check_origin(values, args.project, networks, host_routes(docker.run))
     if "public-grpc" in profiles:
         checks += check_gateway(values, args.project, networks, docker, args.traefik_container)
     else:
@@ -789,6 +867,71 @@ def recover_migrate(args, docker: Docker, sleep=time.sleep) -> int:
     return 0
 
 
+MIN_SECRET_LENGTH = 16
+
+
+def read_secret(stdin=None, prompt=None) -> list[str]:
+    """The values to look for: one typed without echo on a terminal, or one per line
+    of standard input (for example piped over SSH from the client's credential store).
+    Never a command-line argument."""
+    import getpass
+
+    stream = stdin or sys.stdin
+    if stream.isatty():
+        values = [(prompt or getpass.getpass)("Value to look for (not echoed): ")]
+    else:
+        values = stream.read().splitlines()
+    return [v.strip() for v in values if v.strip()]
+
+
+def log_leak_check(args, docker: Docker, stdin=None, prompt=None) -> int:
+    if args.canary:
+        needles = [args.canary]
+    else:
+        needles = read_secret(stdin, prompt)
+        if not needles or any(len(n) < MIN_SECRET_LENGTH for n in needles):
+            print(
+                f"nest-deploy-doctor: give each full value (at least {MIN_SECRET_LENGTH} "
+                "characters) on its own line of standard input; nothing was searched",
+                file=sys.stderr,
+            )
+            return 2
+    containers = docker.project_containers(args.project)
+    wanted = set(args.service or [])
+    selected = [
+        c
+        for c in containers
+        if not wanted
+        or ((c.get("Config") or {}).get("Labels") or {}).get("com.docker.compose.service") in wanted
+    ]
+    found_services = {
+        ((c.get("Config") or {}).get("Labels") or {}).get("com.docker.compose.service")
+        for c in selected
+    }
+    if not selected or (wanted - found_services):
+        missing = ", ".join(sorted(wanted - found_services)) or "any service"
+        print(
+            f"nest-deploy-doctor: no container for {missing} in project {args.project}",
+            file=sys.stderr,
+        )
+        return 2
+    leaked = 0
+    for container in sorted(selected, key=lambda c: c.get("Name", "")):
+        name = container.get("Name", "").lstrip("/")
+        # Read failures raise DockerError (exit 2): an unreadable log is never "clean".
+        text = docker.full_logs(container["Id"], args.since)
+        count = sum(text.count(needle) for needle in needles)
+        leaked += count
+        print(f"{'LEAK' if count else 'PASS'} {name}: {count} occurrence(s)")
+    if leaked:
+        print(
+            "The value appears in these logs. Do not copy or share them. Revoke the session "
+            "(docs/source/hosted-rollout.md, R5), then follow the leak steps there."
+        )
+        return 1
+    return 0
+
+
 def emit(checks: list[Check], as_json: bool) -> None:
     for check in checks:
         print(json.dumps(check.__dict__) if as_json else check.line())
@@ -835,6 +978,20 @@ def parser() -> argparse.ArgumentParser:
         "--settle", type=float, default=DEFAULT_SETTLE, help="seconds to re-check before acting"
     )
     recover.add_argument("--apply", action="store_true", help="run the removal (default: print it)")
+    leak = commands.add_parser(
+        "log-leak-check",
+        parents=[common],
+        help="count a token (read from stdin, never argv) in this project's container logs",
+    )
+    leak.add_argument(
+        "--service",
+        action="append",
+        help="only this Compose service (repeatable); default: every container of the project",
+    )
+    leak.add_argument("--since", help="only logs since this time (docker logs --since)")
+    leak.add_argument(
+        "--canary", help="a synthetic, non-secret marker to look for instead of a real token"
+    )
     return top
 
 
@@ -850,6 +1007,8 @@ def main(argv: Sequence[str] | None = None, docker: Docker | None = None, enviro
             return migrate_status(args, docker)
         if args.command == "wait-migrate":
             return wait_migrate(args, docker)
+        if args.command == "log-leak-check":
+            return log_leak_check(args, docker)
         return recover_migrate(args, docker)
     except (DockerError, OSError, ValueError) as error:
         print(f"nest-deploy-doctor: {error}", file=sys.stderr)

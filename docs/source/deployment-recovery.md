@@ -62,8 +62,16 @@ Run `preflight` before any deploy that creates or changes `grpc-origin`, such as
 the first deploy of this release, a new `NEST_GRPC_ORIGIN_SUBNET`, or enabling
 `public-grpc`. It exits 1 if any check fails:
 
+It reads the values the way `docker compose --env-file .env` resolves them. A
+variable exported in the invoking shell wins over `.env`, even when it is empty.
+An empty or unset value takes the Compose file's default, as `${NAME:-default}`
+does. A `.env` value that Compose would interpolate (a `$` outside single quotes)
+is refused rather than guessed. Run it from a clean shell: Dokploy deploys from
+`.env` alone, and the doctor warns (`WARN settings`) when the shell overrides it.
+
 | Check | Fails when |
 | --- | --- |
+| `settings` | A `.env` value it checks uses `$` interpolation (FAIL), or the shell environment overrides `.env` (WARN) |
 | `origin_subnet` | `NEST_GRPC_ORIGIN_SUBNET` is not an IPv4 network (host bits set count too), or is not a /16 to /29 |
 | `gateway_address` | `NEST_GRPC_GATEWAY_ADDRESS` is outside the subnet, or is its network, broadcast or first host (Docker gives the first host to the bridge) |
 | `origin_subnet_free` | Another Docker network overlaps the subnet; it is named with its subnet. This project's own `grpc-origin` with the same subnet is fine. If the subnet differs, you get a warning: Compose will recreate the network and restart the Controller. |
@@ -180,7 +188,7 @@ and a fresh deploy: the migration then always runs with the current configuratio
 
 | Test | Kind | Covers |
 | --- | --- | --- |
-| `tests/test_deploy_doctor.py` | CI (unit) | Each `migrate` state, including the incident's container pair; a container waiting for a `starting` or `unhealthy` PostgreSQL, or created recently, is never stuck and never removed; a previous deploy's result never satisfies `wait-migrate`; bounded logs; project scoping; dry run; `--apply` removes only a never-started container, with plain `docker rm`, and skips one that started in the meantime; the `wait-migrate` bounds; every preflight check with passing and failing settings; literal `.env` reading with no secret printed; the defaults match `compose.dokploy.yaml`; Traefik file selection |
+| `tests/test_deploy_doctor.py` | CI (unit) | Shell-over-`.env` precedence, empty overrides and defaults, refused interpolation, and shell-chosen profiles; `log-leak-check` with a synthetic token (found, clean, unreadable log, missing service, values only on stdin and never printed); every Compose command in the operator docs names `compose.dokploy.yaml` and an existing service; each `migrate` state, including the incident's container pair; a container waiting for a `starting` or `unhealthy` PostgreSQL, or created recently, is never stuck and never removed; a previous deploy's result never satisfies `wait-migrate`; bounded logs; project scoping; dry run; `--apply` removes only a never-started container, with plain `docker rm`, and skips one that started in the meantime; the `wait-migrate` bounds; every preflight check with passing and failing settings; literal `.env` reading with no secret printed; the defaults match `compose.dokploy.yaml`; Traefik file selection |
 | `tests/test_deploy_doctor.py::RealDockerTests` | CI when a Docker daemon is present | A real never-started container with Compose labels is detected and removed; another container of the project is kept |
 | `tests/repro_migrate_stall.sh` | Manual (Docker) | The failed network create, the interrupted recreate, the stall, the bounded wait and the recovery, with named volumes kept |
 | `tests/smoke_compose_env.sh` | CI | Repeated `migrate` runs from an environment-only `.env`, restart and recreation keep data and the Tailscale identity |
