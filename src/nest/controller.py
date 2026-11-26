@@ -714,8 +714,9 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
     def _finish_completed(self, backend: SlurmBackend, record: int, job_dir: str) -> None:
         """
         Legacy `jobs` record of a completed worker, settled like the registry's
-        (see [`admission.completion`]). When the outcome record cannot be read, the
-        record stays `submitted` rather than claim a success.
+        (see [`admission.completion`]). The legacy path has no settle sweep, so when
+        the outcome record cannot be read the record becomes `unknown`
+        (`remote_outcome_unreadable`) rather than claim a success or look in flight.
         """
         assert self.jobs is not None
         try:
@@ -724,6 +725,15 @@ class ExecutionService(execution_pb2_grpc.ExecutionServiceServicer):
             remote = exc
         except InfrastructureError as exc:
             logger.warning("Outcome record unreadable record=%s kind=%s", record, exc.kind)
+            self.jobs.finish(
+                record,
+                "unknown",
+                error_kind="remote_outcome_unreadable",
+                error_message=(
+                    f"The job completed, but its outcome record could not be read ({exc.kind}); "
+                    "the result was returned to the caller"
+                ),
+            )
             return
         status, error_kind, message = completion(remote)
         self.jobs.finish(record, status, error_kind=error_kind, error_message=message)

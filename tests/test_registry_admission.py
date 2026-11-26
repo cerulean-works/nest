@@ -557,6 +557,20 @@ class ApplicationOutcomeTests(_Base):
         self.assertEqual((job["status"], job["error_kind"]), ("failed", "remote_application_error"))
         self.assertNotIn("device-side", job["error_message"])
 
+    def test_legacy_jobs_mark_an_unreadable_outcome_unknown(self):
+        self.hpc.drop_ssh("nest-outcome")
+        stub = self.serve(None)
+        response = stub.Execute(
+            execution_pb2.ExecuteRequest(payload=cloudpickle.dumps((self.train, (), {}))),
+            timeout=60,
+            metadata=self.metadata(),
+        )
+        self.assertEqual(cloudpickle.loads(response.result)["type"], "builtins.RuntimeError")
+        [job] = self.sql("SELECT status, error_kind FROM jobs")
+        self.assertEqual(
+            (job["status"], job["error_kind"]), ("unknown", "remote_outcome_unreadable")
+        )
+
 
 class DatabaseFailureTests(_Base):
     def test_failed_registration_or_attempt_commit_submits_nothing(self):

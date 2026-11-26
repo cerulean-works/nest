@@ -142,8 +142,9 @@ runs, so a stale record is never read as the new attempt's. Batch jobs
 (`SubmitJob`) have no outcome record: `COMPLETED` is a success.
 
 The legacy path (`NEST_EXECUTION_REGISTRY=legacy`) records the same outcome in
-`jobs`: `failed` with `remote_application_error`, or left `submitted` when the
-record cannot be read.
+`jobs`: `failed` with `remote_application_error`. It has no settle sweep, so a
+record that cannot be read makes the row `unknown` (`remote_outcome_unreadable`),
+never `succeeded`, and distinct from a job still in flight.
 
 ## Reconcile an unknown attempt
 

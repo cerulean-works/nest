@@ -44,7 +44,8 @@ RAISED = "raised"
 _MAX_ERROR_TYPE = 256
 # A module path and qualified name, such as `torch.cuda.OutOfMemoryError` or
 # `__main__.train.<locals>.Boom`.
-_ERROR_TYPE = re.compile(r"[A-Za-z_][\w.<>-]{0,255}")
+# ASCII only, so a name of the maximum length always fits in `MAX_OUTCOME_BYTES`.
+_ERROR_TYPE = re.compile(r"[A-Za-z_][\w.<>-]{0,255}", re.ASCII)
 
 
 class InvalidOutcomeError(ValueError):
@@ -97,10 +98,14 @@ def write(job_dir: Path | str, status: str, error_type: str | None = None) -> No
     if status == RAISED:
         name = (error_type or "")[:_MAX_ERROR_TYPE]
         record["error_type"] = name if _ERROR_TYPE.fullmatch(name) else "unknown"
+    data = json.dumps(record, separators=(",", ":"))
+    if len(data.encode()) > MAX_OUTCOME_BYTES:  # never larger than parse() accepts
+        record["error_type"] = "unknown"
+        data = json.dumps(record, separators=(",", ":"))
     path = _path(job_dir)
     partial = path.with_name(f".{OUTCOME_FILE}.{os.getpid()}.tmp")
     with partial.open("w", encoding="utf-8") as f:
-        json.dump(record, f, separators=(",", ":"))
+        f.write(data)
         f.flush()
         os.fsync(f.fileno())
     os.replace(partial, path)

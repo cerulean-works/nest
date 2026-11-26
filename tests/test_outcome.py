@@ -44,6 +44,19 @@ def test_write_never_records_an_unsafe_type_name(tmp_path):
     assert parsed.error_type == "__main__.train.<locals>.Boom"
 
 
+@pytest.mark.parametrize(
+    "name",
+    ["mod." + "é" * 200, "x" * 1000, "a." + "Ω" * 300, "pkg." + "A" * 251],
+)
+def test_written_records_always_parse(tmp_path, name):
+    outcome.write(tmp_path, outcome.RAISED, name)
+    data = (tmp_path / "outcome.json").read_bytes()
+    assert len(data) <= outcome.MAX_OUTCOME_BYTES
+    parsed = outcome.parse(data)
+    assert parsed.raised
+    assert parsed.error_type in ("unknown", name[:256])
+
+
 def test_clear_removes_a_stale_record(tmp_path):
     outcome.clear(tmp_path)  # nothing there: fine
     outcome.write(tmp_path, outcome.RETURNED)
