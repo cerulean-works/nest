@@ -2756,7 +2756,7 @@ def load_client_config(environ: Mapping[str, str] | None = None) -> ClientConfig
 
     The Controller is chosen in this order:
 
-    1. `NEST_PROFILE=hosted`: the hosted connection profile ([`config.HOSTED_PROFILE`]),
+    1. `NEST_PROFILE=hosted`: the hosted connection profile ([`config.HostedProfile`]),
        verified TLS to [`config.HOSTED_GRPC_ADDRESS`] with the hosted session. It
        cannot be combined with `NEST_CONTROLLER_ADDRESS`, `NEST_CONTROLLER_TLS`,
        `NEST_CONTROLLER_TLS_CA_FILE` or another `NEST_AUTH_URL`.
@@ -2925,7 +2925,7 @@ def default_preferences_file(environ: Mapping[str, str] | None = None) -> str:
 
 def is_hosted_gateway(address: str) -> bool:
     """Whether `address` (`host:port`) names the hosted public gateway of
-    [`config.HOSTED_PROFILE`]."""
+    [`config.HostedProfile`]."""
     return _same_address(address, HOSTED_PROFILE.address)
 
 
@@ -2974,7 +2974,7 @@ def _require_hosted_session_binding(reader: _Reader, address: str, tls: bool) ->
 def is_hosted_controller(address: str) -> bool:
     """Whether `address` (`host:port`) names a Cerulean-hosted Controller: the
     Tailnet [`config.HOSTED_CONTROLLER_ADDRESS`] or the public gateway of
-    [`config.HOSTED_PROFILE`]. Only those receive the hosted session."""
+    [`config.HostedProfile`]. Only those receive the hosted session."""
     return _same_address(address, HOSTED_CONTROLLER_ADDRESS) or is_hosted_gateway(address)
 
 
