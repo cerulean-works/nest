@@ -34,13 +34,29 @@ A failed migration stops the deployment before the Controller starts.
    resolves it. Compose must support secrets read from environment variables
    (`secrets.<name>.environment`, Compose v2.23 and later).
 2. Enable **Isolated Deployments**. Add no host ports. Add a Domain only for the
-   Google sign-in listener (step 5).
+   Google sign-in listener (step 6).
 3. Paste the variables below into **Environment**. Dokploy writes them to the
    `.env` file next to the Compose file, and Compose passes only the variables
    each service lists. Unlisted variables reach no container.
-4. Deploy. Check the logs of `migrate` and `controller`, then run the checks in
-   [Verify](#verify).
-5. For Google sign-in, add a Dokploy **Domain** for the `controller` service on
+4. Before the first deploy of this file, and whenever you change
+   `NEST_GRPC_ORIGIN_SUBNET`, run the read-only preflight on the Dokploy host. The
+   Controller always joins the internal `grpc-origin` network. Its default subnet
+   (`172.31.250.0/28`) can overlap a network that already exists, and then the
+   deploy fails at network creation:
+
+   ```bash
+   python3 scripts/nest-deploy-doctor.py preflight --project <appName> --env-file .env
+   ```
+
+   On a failure, set `NEST_GRPC_ORIGIN_SUBNET` and `NEST_GRPC_GATEWAY_ADDRESS` as
+   [Preflight and recover a Dokploy deployment](deployment-recovery#before-a-deploy-preflight)
+   describes.
+5. Deploy. Check the logs of `migrate` and `controller`, then run the checks in
+   [Verify](#verify). If the deploy waits on `migrate` and does not finish, run
+   `python3 scripts/nest-deploy-doctor.py migrate-status --project <appName>` and
+   follow [Recover a stuck migrate](deployment-recovery#recover-a-stuck-migrate).
+   Never remove the `migrate` profile to get past a failure.
+6. For Google sign-in, add a Dokploy **Domain** for the `controller` service on
    container port `8080` with HTTPS, and register
    `https://<that domain>/auth/google/callback` with the OAuth client. gRPC is never
    routed through Traefik; it stays on the Tailnet.
@@ -245,6 +261,12 @@ python -m nest.healthcheck
 # sidecar: enrolled with the expected tag and Serve mapping
 tailscale status --json | head -n 20
 tailscale serve status --json
+```
+
+```bash
+# host: the migration finished, nothing is stuck, the network settings are consistent
+python3 scripts/nest-deploy-doctor.py migrate-status --project <appName>
+python3 scripts/nest-deploy-doctor.py preflight --project <appName> --env-file .env
 ```
 
 Then follow *Start, migrate state, and verify* in

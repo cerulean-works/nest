@@ -3,25 +3,41 @@
 This guide takes you from a fresh environment to a function running on the
 Cerulean-hosted, authenticated (M1) Controller. Each step says whether **you** do
 it or whether it is an **operator** step that you ask the person running the
-Controller for. In short:
+Controller for.
+
+There are two ways to reach the hosted Controller:
+
+| Path | Status | Needs on your machine |
+| --- | --- | --- |
+| **Private**, over the Controller's Tailnet | Available; verified end to end | Tailscale, joined to the Tailnet or with an accepted node share |
+| **Hosted**, over the public gRPC gateway (`grpc.nest.cerulean.works:443`, verified TLS) | Invited pilot only, until H09 approves it ([status](hosted-rollout)) | Nothing but Nest. No Tailscale and no VPN. |
+
+In short, on the private path:
 
 ```bash
 uv add "nest @ git+https://github.com/cerulean-works/nest@main"
 export NEST_AUTH_URL="https://auth.nest.cerulean.works"
 export NEST_CONTROLLER_ADDRESS="nest-controller.tail8e5ba1.ts.net:50051"
 export NEST_CONTROLLER_TLS=false                     # plaintext gRPC inside the encrypted Tailnet
-export NEST_PROJECT_ID="<project-id>"
 uv run nest login
+uv run nest projects current                         # the Project your calls will run in
 uv run python main.py
 ```
 
-All four settings are explicit. `nest-controller.tail8e5ba1.ts.net:50051` is the
-Controller's Tailscale MagicDNS name, the address verified end to end for the
-hosted deployment. Because it is not the address the SDK recognizes as the hosted
-Controller, `.remote()` sends your hosted session only when `NEST_AUTH_URL` names
-the hosted sign-in (see [step 2](#2-point-the-sdk-at-the-controller)). Running a
-function also needs Tailnet access, a Project and the operator's approval of that
-Project; the steps below explain each. For a self-hosted Nest, see
+On the hosted path, once the operator has told you the public endpoint is open to
+you:
+
+```bash
+uv add "nest @ git+https://github.com/cerulean-works/nest@main"
+export NEST_PROFILE=hosted                           # opt in; not needed after H09
+uv run nest login
+uv run nest projects current
+uv run python main.py
+```
+
+You do not need `NEST_PROJECT_ID` when you may run in only one Project: the SDK
+uses that one. Running a function also needs a Project and the operator's
+approval of it; the steps below explain each. For a self-hosted Nest, see
 [Use a self-hosted Nest](#use-a-self-hosted-nest).
 
 To try Nest on one machine without a cluster, a sign-in or a Project, use the
@@ -32,16 +48,16 @@ To try Nest on one machine without a cluster, a sign-in or a Project, use the
 | You need | From |
 | --- | --- |
 | Python 3.14 and Nest in a uv project | [Install Nest](installation) |
-| Access to the Controller's Tailnet, or an accepted share of the Controller node | The operator |
+| Private path: access to the Controller's Tailnet, or an accepted share of the Controller node. Hosted path: the operator's word that the public endpoint is open to you | The operator |
 | A Google account | You |
 | A Project, and the operator's approval of it | You and the operator (steps 4 and 5) |
 
-| Hosted value | Setting |
-| --- | --- |
-| Controller (Tailscale MagicDNS) | `NEST_CONTROLLER_ADDRESS=nest-controller.tail8e5ba1.ts.net:50051` |
-| Transport | `NEST_CONTROLLER_TLS=false`, only because the authorized Tailnet encrypts and access-controls the connection |
-| Sign-in | `NEST_AUTH_URL=https://auth.nest.cerulean.works` |
-| Project | `NEST_PROJECT_ID=<project-id>`, a UUID, or unset to [choose one](project-selection) |
+| Setting | Private path | Hosted path |
+| --- | --- | --- |
+| Controller | `NEST_CONTROLLER_ADDRESS=nest-controller.tail8e5ba1.ts.net:50051` (Tailscale MagicDNS) | `NEST_PROFILE=hosted` (`grpc.nest.cerulean.works:443`) |
+| Transport | `NEST_CONTROLLER_TLS=false`, only because the authorized Tailnet encrypts and access-controls the connection | Verified TLS with the system's public roots; nothing to set |
+| Sign-in | `NEST_AUTH_URL=https://auth.nest.cerulean.works` | Fixed by the profile |
+| Project | Unset to [choose one](project-selection), or `NEST_PROJECT_ID=<project-id>` (a UUID) | The same |
 
 `nest.cerulean.works:50051` has **not** been verified end to end in this
 deployment; do not use it for gRPC. Examples below use `<project-id>` as a
@@ -50,7 +66,11 @@ an issue.
 
 ## 1. Connect to the Controller's network
 
-The shared Controller is reachable only through Tailscale. Connect a user-owned
+**Hosted path:** skip this step. The public gateway needs no Tailscale, but only
+once the operator has opened it to you. Until then, a call fails to connect, and
+nothing runs.
+
+**Private path:** the shared Controller is reachable only through Tailscale. Connect a user-owned
 device to the authorized Tailnet, or accept the Controller node share the operator
 sent you (see [Share a Controller over Tailscale](tailscale-shared)). Tagged
 devices cannot use shares.
@@ -72,6 +92,19 @@ use, decides whether you may connect.
 
 ## 2. Point the SDK at the Controller
 
+**Hosted path:**
+
+```bash
+export NEST_PROFILE=hosted
+```
+
+The profile fixes the address, verified TLS and the sign-in origin, and refuses to
+be mixed with `NEST_CONTROLLER_ADDRESS`, `NEST_CONTROLLER_TLS` or
+`NEST_CONTROLLER_TLS_CA_FILE`. See
+[Connect to Cerulean-hosted Nest](hosted-connection).
+
+**Private path:**
+
 ```bash
 export NEST_AUTH_URL="https://auth.nest.cerulean.works"
 export NEST_CONTROLLER_ADDRESS="nest-controller.tail8e5ba1.ts.net:50051"
@@ -89,13 +122,13 @@ Tailnet; never set it for a Controller reached over the public Internet. See
 
 `NEST_AUTH_URL` is required with this address. The SDK's built-in hosted
 sign-in default applies only when `NEST_CONTROLLER_ADDRESS` is exactly
-`nest.cerulean.works:50051` (`nest.config.HOSTED_CONTROLLER_ADDRESS`); for any other
-address, including the MagicDNS name, `.remote()` sends a session only from the
-origin `NEST_AUTH_URL` names. Without it, calls fail with
+`nest.cerulean.works:50051` (`nest.config.HOSTED_CONTROLLER_ADDRESS`). For the
+MagicDNS name, `.remote()` sends the hosted session only when `NEST_AUTH_URL`
+names the hosted sign-in. The name is one of `nest.config.HOSTED_CONTROLLER_ALIASES`,
+so the SDK does not ask you to confirm it with `NEST_HOSTED_SESSION_ADDRESS`.
+Without `NEST_AUTH_URL`, calls fail with
 `AuthenticationRequiredError` (*requires a Nest session*) even after a
-successful `nest login`. Recognizing the MagicDNS name as the hosted Controller
-would be a product change, tracked separately (G03/G02a); this guide does not
-assume it.
+successful `nest login`.
 
 For a Controller with its own TLS certificate, set `NEST_CONTROLLER_TLS=true`
 and, for a private CA, `NEST_CONTROLLER_TLS_CA_FILE=/path/to/ca.pem`. See
@@ -136,9 +169,9 @@ Signed in: https://auth.nest.cerulean.works
 
 The session is stored in `~/.config/nest/credentials.json` (mode `0600`), apart
 from sessions of any other Nest, and refreshed automatically for up to 7 days.
-`.remote()` sends it with every call to the Controller named by
-`NEST_CONTROLLER_ADDRESS` while `NEST_AUTH_URL` names the hosted sign-in, and to
-no Controller otherwise. It is a Nest session only: it is never
+`.remote()` sends it with every call to the hosted Controller: the public gateway
+under `NEST_PROFILE=hosted`, or the Tailnet address while `NEST_AUTH_URL` names
+the hosted sign-in. It goes to no other Controller. It is a Nest session only: it is never
 sent to an HPC login node and is not an NCHC password or one-time code. See
 [Sign in from the command line](cli-login).
 
@@ -172,31 +205,48 @@ the Project audit history (see
 [Create a Project for a User](project-onboarding#create-a-project-for-a-user)).
 As Owner you then invite the rest of your group.
 
-**Find and select your Project.** Open the [Management Console](console) at
-`https://auth.nest.cerulean.works/console`: its *Connect* page lists your Projects,
-says whether each can run on the Controller and what is still missing, and shows
-the commands below with your Project's ID filled in. From the command line:
+**Find your Projects.** In the browser, the
+[Management Console](console) at `https://auth.nest.cerulean.works/console` lists
+every Project you belong to under *Your Projects*, with its ID on its page. That
+is the ID to send the operator in step 5. Its *Connect* page says whether each
+Project can run on the Controller and what is still missing, and shows the
+commands below with your Project's ID filled in.
+
+**Choose the Project your calls run in** with the CLI, using the same settings as
+the SDK (step 2). These show only Projects you may run in now: your role allows
+submitting, and the operator has approved the Project and granted it a Platform
+(step 5):
 
 ```bash
-uv run nest projects list      # the Projects you may run in here
+uv run nest projects list      # Projects you may run in here; * marks the saved one
+uv run nest projects current   # what the next call would use, and why
 uv run nest projects select    # choose one by name and save it
-uv run nest projects current   # what the next call uses, and why
 ```
 
-With exactly one eligible Project you need none of this: the SDK uses it. In
-scripts and CI, set the Project explicitly instead:
-
-```bash
-export NEST_PROJECT_ID="<project-id>"
+```text
+3f0c...e1a2 (only eligible)
 ```
 
-`NEST_PROJECT_ID` always wins. Against a current Controller you may also leave it
-unset: the SDK then uses your saved choice or your only eligible Project, or asks
-on a terminal, and the Controller authorizes the Project on every call (see
-[Choose the Project your calls run in](project-selection)). A Controller from
-before Project selection refuses a call without it with *Name the Project to run
-in with NEST_PROJECT_ID*, and nothing runs. A value that is not a UUID is rejected
-by the SDK before any call (*NEST_PROJECT_ID must be a Project ID (a UUID)*).
+- **One eligible Project:** nothing to do. The SDK uses it, and `current` says
+  `only eligible`.
+- **Several:** the first call on a terminal asks you and saves your answer. To
+  choose ahead of time, run `uv run nest projects select` (or
+  `uv run nest projects use <ID>`), and
+  `uv run nest projects forget` to undo it.
+- **None:** `list` says so. Ask for an invitation (above), or for the operator's
+  approval (step 5). A call fails with `ProjectSelectionError` (`none_eligible`),
+  and nothing runs.
+- **Scripts, CI, batch jobs and notebooks** never prompt. With several Projects,
+  set `export NEST_PROJECT_ID="<project-id>"`. It always wins, and the Controller
+  still authorizes it on every call. A value that is not a UUID is rejected before
+  any call (*NEST_PROJECT_ID must be a Project ID (a UUID)*).
+
+A saved choice applies only to the same account, sign-in and Controller. If your
+membership or the approval is revoked, the call is refused, nothing runs, and the
+saved choice is forgotten. See
+[Choose the Project your calls run in](project-selection). A Controller from
+before Project selection refuses a call without `NEST_PROJECT_ID` with *Name the
+Project to run in with NEST_PROJECT_ID*.
 
 ## 5. Ask the operator to approve the Project
 
@@ -217,17 +267,19 @@ with `NEST_PROVIDER_ALLOWED_PROJECTS` only after the operator redeploys. See
 the Slurm account your group should be charged to. Never send them your Nest
 session file or tokens.
 
-Check that a Platform is granted:
+Check that a Platform is granted, with the ID from the Console:
 
 ```bash
-uv run nest platforms default --project-id "$NEST_PROJECT_ID"
+uv run nest platforms default --project-id <project-id>
 ```
 
 ```text
 nano4 (only_eligible)
 ```
 
-`No HPC Platform is granted to this Project.` means step 2 is still pending.
+`No HPC Platform is granted to this Project.` means operator step 2 is still
+pending. Once all three are done, `uv run nest projects current` names the
+Project.
 
 ## 6. Run a function
 
@@ -252,6 +304,10 @@ Run it:
 ```bash
 uv run python main.py
 ```
+
+The same program, with its dependency declared inline, is
+`examples/hosted_remote.py`. `uv run examples/hosted_remote.py` runs it without a
+project of your own.
 
 - `.local()` (and calling `compute(21)` directly) runs the function in your own
   Python process.
@@ -283,8 +339,8 @@ operator gives you these values (see [Onboard a Project](project-onboarding)):
 export NEST_AUTH_URL="https://nest.example.com"   # or: nest login --url https://nest.example.com
 export NEST_CONTROLLER_ADDRESS="controller.example.com:50051"
 export NEST_CONTROLLER_TLS=true                   # or false only on a trusted private network
-export NEST_PROJECT_ID="<project-id>"
 uv run nest login
+uv run nest projects current                      # or set NEST_PROJECT_ID for scripts and CI
 ```
 
 With `NEST_AUTH_URL` set, `nest login`, `nest auth status`, `nest logout` and
@@ -307,7 +363,7 @@ uv run python -m nest.controller
 
 ```bash
 # terminal 2: unset the shared Controller's settings first
-unset NEST_CONTROLLER_ADDRESS NEST_CONTROLLER_TLS NEST_AUTH_URL NEST_PROJECT_ID
+unset NEST_PROFILE NEST_CONTROLLER_ADDRESS NEST_CONTROLLER_TLS NEST_AUTH_URL NEST_PROJECT_ID
 uv run python main.py
 ```
 

@@ -1,0 +1,35 @@
+# Dokploy Traefik v3.5 and later: pass the public gRPC name through to the Nest
+# gateway (H08), with PROXY protocol v2 set on a TCP serversTransport.
+#
+# Traefik v3.5 deprecated `proxyProtocol` on a TCP loadBalancer (nest-grpc.yml still
+# works there, with a deprecation warning) in favour of this form. Traefik v3.4 and
+# earlier reject this file ("field not found, node: proxyProtocol") and route nothing
+# for the name, so a mismatch fails closed. Pick the file with
+# `python3 scripts/nest-deploy-doctor.py preflight`, or render it with
+# deploy/public-grpc/traefik/render.sh, which also sets the name.
+#
+# Copy to /etc/dokploy/traefik/dynamic/nest-grpc.yml on the Dokploy host. Deleting
+# the file is the rollback. Replace grpc.nest.cerulean.works with the staging name
+# for a staging run.
+tcp:
+  routers:
+    nest-grpc:
+      entryPoints:
+        - websecure
+      rule: HostSNI(`grpc.nest.cerulean.works`)
+      service: nest-grpc-gateway
+      tls:
+        passthrough: true
+  services:
+    nest-grpc-gateway:
+      loadBalancer:
+        servers:
+          # The gateway's alias on dokploy-network (compose.dokploy.yaml, profile
+          # public-grpc). Its port is never published on the host.
+          - address: nest-grpc-gateway:8443
+        serversTransport: nest-grpc-proxy-v2
+  serversTransports:
+    nest-grpc-proxy-v2:
+      # Envoy requires PROXY protocol v2 and refuses connections without it.
+      proxyProtocol:
+        version: 2

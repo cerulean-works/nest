@@ -12,7 +12,12 @@ It needs no VPN or Tailnet.
 > before. Pilot users opt in with `NEST_PROFILE=hosted` once the operator has
 > announced the [gateway pilot](public-grpc-gateway). Activation is a single,
 > reviewed change of `nest.config.HOSTED_PROFILE_DEFAULT`, and turning it back off
-> is the rollback.
+> is the rollback. The gates, and their current status, are in the
+> [rollout runbook](hosted-rollout).
+>
+> Without the Tailnet, you need only the public endpoint to be open to you. Until
+> the operator opens it, the [private path](quickstart) over the Tailnet is the
+> way to reach the hosted Controller.
 
 ## The flow
 
@@ -94,5 +99,6 @@ port is a custom Controller and gets nothing.
 - [x] Installation, first-call sign-in, Project selection and execution without
   any `NEST_` setting, tested with the default switched on in the test only.
 - [x] The hosted default stays inactive (`HOSTED_PROFILE_DEFAULT = False`) until H09.
-- [ ] Staged validation against the live pilot gateway (part of the
-  [H08 checklist](public-grpc-gateway#evidence)), then H09.
+- [ ] Staged validation against the live pilot gateway from an outside client
+  without Tailscale (gates C1 and C2 of the
+  [rollout runbook](hosted-rollout#evidence-matrix), run R5), then H09.
