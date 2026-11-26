@@ -18,7 +18,7 @@ import uuid
 from concurrent import futures
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 from unittest import mock
 
 import cloudpickle
@@ -339,9 +339,9 @@ class BindingTests(_Database):
         mine = attest(self.access, self.alice, self.nano4.id, "alice02", unix_uid=40123)
         self.assertEqual((mine.version, mine.unix_uid), (2, 40123))
         # A claim verified in place is checked too.
-        self.access.revoke(
-            self.access.current_binding(carol, self.nano4.id).id, reason="x", operator="o"
-        )  # type: ignore[union-attr]
+        carol_first = self.access.current_binding(carol, self.nano4.id)
+        assert carol_first is not None
+        self.access.revoke(carol_first.id, reason="withdrawn", operator="ops")
         self.access.claim(carol, self.nano4.id, "carol02")
         with self.assertRaises(BindingConflictError):
             attest(self.access, carol, self.nano4.id, "carol02", unix_uid=40123)
@@ -922,7 +922,9 @@ class LegacyPathTests(_AdmissionBase):
             stub.Execute(
                 request, timeout=30, metadata=[("x-nest-execution-authority", "user_owned")]
             )
-        self.assertEqual(caught.exception.code(), grpc.StatusCode.PERMISSION_DENIED)  # type: ignore[attr-defined]
+        self.assertEqual(
+            cast(grpc.Call, caught.exception).code(), grpc.StatusCode.PERMISSION_DENIED
+        )
         response = stub.Execute(request, timeout=30)
         self.assertEqual(cloudpickle.loads(response.result), 5)
 
