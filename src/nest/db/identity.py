@@ -206,6 +206,19 @@ class IdentityStore:
             ).fetchone()
         return User(**row) if row else None
 
+    def display_names(self, user_ids: list[UUID]) -> dict[UUID, str | None]:
+        """
+        The display names of `user_ids`, in one query, for showing members by name.
+        Unknown IDs are absent. Callers must already be allowed to see these Users.
+        """
+        if not user_ids:
+            return {}
+        with transaction(self.database, None, "read display names") as cursor:
+            rows = cursor.execute(
+                "SELECT id, display_name FROM users WHERE id = ANY(%s)", (list(user_ids),)
+            ).fetchall()
+        return {row["id"]: row["display_name"] for row in rows}
+
     def link_identity(
         self,
         user_id: UUID | str,

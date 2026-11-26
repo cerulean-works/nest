@@ -172,29 +172,19 @@ the Project audit history (see
 [Create a Project for a User](project-onboarding#create-a-project-for-a-user)).
 As Owner you then invite the rest of your group.
 
-**Find the ID** of the Projects you belong to with your CLI session:
-
-```python
-# list_projects.py
-import json
-import urllib.request
-
-from nest.login import ensure_session
-
-session = ensure_session()  # the origin NEST_AUTH_URL names (hosted by default)
-request = urllib.request.Request(
-    session.auth_url + "/api/projects",
-    headers={"Authorization": f"Bearer {session.access_token}"},
-)
-with urllib.request.urlopen(request) as response:
-    print(json.dumps(json.load(response), indent=2))
-```
+**Find and select your Project.** Open the [Management Console](console) at
+`https://auth.nest.cerulean.works/console`: its *Connect* page lists your Projects,
+says whether each can run on the Controller and what is still missing, and shows
+the commands below with your Project's ID filled in. From the command line:
 
 ```bash
-uv run python list_projects.py
+uv run nest projects list      # the Projects you may run in here
+uv run nest projects select    # choose one by name and save it
+uv run nest projects current   # what the next call uses, and why
 ```
 
-Then select the Project for your calls:
+With exactly one eligible Project you need none of this: the SDK uses it. In
+scripts and CI, set the Project explicitly instead:
 
 ```bash
 export NEST_PROJECT_ID="<project-id>"

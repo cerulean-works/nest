@@ -67,6 +67,7 @@ from ..audit import audit_interface
 from ..authz import (
     AccessDeniedError,
     AdminService,
+    ExecutionAccess,
     InvitationService,
     Organization,
     OrganizationMembership,
@@ -85,12 +86,14 @@ from ..config import (
     AUTH_CLI_PREFIX,
     AUTH_SESSION_PATHS,
     CLI_SCOPES,
+    CONNECT_API_PATH,
     CONSOLE_PATH,
     INVITATION_PAGE_PATH,
     INVITATIONS_API_PATH,
     ORGANIZATIONS_API_PATH,
     PLATFORMS_API_PATH,
     PROJECTS_API_PATH,
+    ConsoleConnectConfig,
     GoogleAuthConfig,
 )
 from ..db import (
@@ -134,7 +137,14 @@ from .cli import (
     format_user_code,
     normalize_user_code,
 )
-from .console import CONSOLE_HEADERS, CONSOLE_INDEX_PATHS, console_asset, console_page
+from .console import (
+    CONSOLE_HEADERS,
+    CONSOLE_INDEX_PATHS,
+    PAGE_CSP,
+    connect_payload,
+    console_asset,
+    console_page,
+)
 from .google import SIGN_IN_TTL, GoogleSignIn, SignInError
 
 if TYPE_CHECKING:
@@ -214,43 +224,60 @@ _SECURITY_HEADERS = {
 # A form POST from a `no-referrer` page carries `Origin: null`, which the
 # same-origin check of a browser-only form route refuses. Pages holding such a
 # form use `same-origin` instead: it still sends no referrer to any other site.
-_FORM_PAGE_HEADERS = {"Referrer-Policy": "same-origin"}
+_FORM_PAGE_HEADERS = {"Referrer-Policy": "same-origin", "Content-Security-Policy": PAGE_CSP}
 
-_PAGE = (
-    '<!doctype html><html lang="en"><head><meta charset="utf-8">'
-    '<meta name="viewport" content="width=device-width, initial-scale=1">'
-    "<title>{title}</title></head><body><h1>{title}</h1><p>{message}</p>{link}</body></html>"
-)
 
-_APPROVE_PAGE = (
-    '<!doctype html><html lang="en"><head><meta charset="utf-8">'
-    '<meta name="viewport" content="width=device-width, initial-scale=1">'
-    "<title>Approve CLI sign-in</title></head><body>"
-    "<h1>Approve CLI sign-in</h1>"
-    "<p>A Nest command line asks to sign in as you.</p>"
-    "<p>Code: <strong>{code}</strong></p>"
-    "<p>Client: {client}</p>"
-    "<p>It will be able to:</p><ul>{scopes}</ul>"
-    "<p>Approve only if you started <code>nest login</code> yourself just now and your "
-    "terminal shows this same code. Nest will never ask you for your NCHC password "
-    "or one-time code here.</p>"
-    '<form method="post" action="{action}">'
+def _frame(title: str, body: str, *, root: str = "") -> str:
+    """
+    A `str.format` template of one of the listener's own pages: the Console's
+    stylesheet and mark around a card holding `title` (a `{title}` field or text
+    without braces) and `body`. No script and no inline style, for `PAGE_CSP`.
+    """
+    return (
+        f'<!doctype html><html lang="en"{root}><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        f"<title>{title} · Nest</title>"
+        f'<link rel="stylesheet" href="{CONSOLE_PATH}/console.css"></head>'
+        '<body class="page"><header class="page-bar">'
+        f'<a class="brand" href="{CONSOLE_PATH}">'
+        f'<img class="brand-mark" src="{CONSOLE_PATH}/nest-mark.svg" alt="" width="28" height="28">'
+        '<span class="brand-name">Nest</span></a></header>'
+        '<main class="page-main"><div class="card page-card">'
+        f"<h1>{title}</h1>{body}</div>"
+        '<p class="page-foot">Nest never asks for your HPC password or one-time code.</p>'
+        "</main></body></html>"
+    )
+
+
+_PAGE = _frame("{title}", '<p class="lead">{message}</p>{link}')
+
+_APPROVE_PAGE = _frame(
+    "Approve CLI sign-in",
+    '<p class="lead">A Nest command line asks to sign in as you.</p>'
+    '<div class="code-check"><span class="code-check-label">Code</span>'
+    '<strong class="code-check-value">{code}</strong></div>'
+    '<dl class="facts"><dt>Client</dt><dd>{client}</dd></dl>'
+    '<p>It will be able to:</p><ul class="checklist">{scopes}</ul>'
+    '<div class="callout warn"><p>Approve only if you started <code>nest login</code> '
+    "yourself just now and your terminal shows this same code. Nest will never ask you "
+    "for your NCHC password or one-time code here.</p></div>"
+    '<form class="actions-row" method="post" action="{action}">'
     '<input type="hidden" name="code" value="{code}">'
     '<input type="hidden" name="csrf" value="{csrf}">'
-    '<button type="submit" name="decision" value="approve">Approve</button> '
-    '<button type="submit" name="decision" value="deny">Deny</button>'
-    "</form></body></html>"
+    '<button class="btn primary" type="submit" name="decision" value="approve">Approve</button> '
+    '<button class="btn secondary" type="submit" name="decision" value="deny">Deny</button>'
+    "</form>",
 )
 
-_CODE_PAGE = (
-    '<!doctype html><html lang="en"><head><meta charset="utf-8">'
-    '<meta name="viewport" content="width=device-width, initial-scale=1">'
-    "<title>CLI sign-in</title></head><body><h1>CLI sign-in</h1>"
-    "<p>{message}</p>"
-    '<form method="get" action="{action}">'
-    '<label>Code shown in your terminal: <input name="code" autocomplete="off" '
-    'autocapitalize="characters" maxlength="16" required></label> '
-    '<button type="submit">Continue</button></form></body></html>'
+_CODE_PAGE = _frame(
+    "CLI sign-in",
+    '<p class="lead">{message}</p>'
+    '<form class="stack" method="get" action="{action}">'
+    '<div class="field"><label for="cli-code">Code shown in your terminal</label>'
+    '<input id="cli-code" class="mono" name="code" autocomplete="off" '
+    'autocapitalize="characters" maxlength="16" required></div>'
+    '<div class="actions-row"><button class="btn primary" type="submit">Continue</button></div>'
+    "</form>",
 )
 
 
@@ -269,19 +296,19 @@ _INVITATION_SCRIPT = (
 )
 
 _INVITATION_CSP = (
-    "default-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'sha256-"
+    PAGE_CSP
+    + "; script-src 'sha256-"
     + base64.b64encode(hashlib.sha256(_INVITATION_SCRIPT.encode()).digest()).decode()
     + "'"
 )
 
-_INVITATION_PAGE = (
-    '<!doctype html><html lang="en"{done}><head><meta charset="utf-8">'
-    '<meta name="viewport" content="width=device-width, initial-scale=1">'
-    "<title>{title}</title></head><body><h1>{title}</h1>{content}"
-    "<script>"
-    + _INVITATION_SCRIPT.replace("{", "{{").replace("}", "}}")
-    + "</script></body></html>"
+_INVITATION_PAGE = _frame("{title}", "{content}", root="{done}").replace(
+    "</body>",
+    "<script>" + _INVITATION_SCRIPT.replace("{", "{{").replace("}", "}}") + "</script></body>",
 )
+
+_PAGE_HEADERS = {"Content-Security-Policy": PAGE_CSP}
+"""Headers of the listener's own HTML pages, over its security headers."""
 
 
 def _invitation_csrf(access_token: str, token: str) -> str:
@@ -367,10 +394,17 @@ class _Handler(BaseHTTPRequestHandler):
             self._page(status, title, message)
 
     def _page(self, status: int, title: str, message: str, *, retry: bool = False):
-        link = f'<p><a href="{html.escape(LOGIN_PATH)}">Sign in again</a></p>' if retry else ""
+        link = (
+            f'<p class="actions-row"><a class="btn primary" href="{html.escape(LOGIN_PATH)}">'
+            "Sign in again</a></p>"
+            if retry
+            else f'<p class="actions-row"><a class="btn secondary" href="{CONSOLE_PATH}">'
+            "Open the Nest Console</a></p>"
+        )
         self._send(
             status,
             _PAGE.format(title=html.escape(title), message=html.escape(message), link=link),
+            _PAGE_HEADERS,
         )
 
     def _dispatch(self, route):
@@ -651,10 +685,14 @@ class _Handler(BaseHTTPRequestHandler):
         if grant is None:
             self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthenticated"})
             return
+        user = self.app.sign_in.identities.get_user(grant.session.user_id)
         self._json(
             HTTPStatus.OK,
             {
                 "user_id": str(grant.session.user_id),
+                # The signed-in User's own name and address, for the account menu.
+                "display_name": user.display_name if user else None,
+                "email": user.email if user else None,
                 "access_expires_at": grant.access_expires_at.isoformat(),
                 "refresh_expires_at": grant.session.expires_at.isoformat(),
                 "session_expires_at": grant.session.family_expires_at.isoformat(),
@@ -877,11 +915,17 @@ class _Handler(BaseHTTPRequestHandler):
             ),
             # The token is only ever in the fragment, which browsers never put in
             # a referrer.
-            headers={"Content-Security-Policy": _INVITATION_CSP, **_FORM_PAGE_HEADERS},
+            headers={**_FORM_PAGE_HEADERS, "Content-Security-Policy": _INVITATION_CSP},
         )
 
     def _invitation_message(self, status: int, title: str, message: str, *, done: bool = False):
-        self._invitation_send(status, title, f"<p>{html.escape(message)}</p>", done=done)
+        link = (
+            f'<p class="actions-row"><a class="btn primary" href="{CONSOLE_PATH}#/overview">'
+            "Go to the Nest Console</a></p>"
+        )
+        self._invitation_send(
+            status, title, f'<p class="lead">{html.escape(message)}</p>{link}', done=done
+        )
 
     def _invitation_page(self):
         """
@@ -894,19 +938,25 @@ class _Handler(BaseHTTPRequestHandler):
             self._invitation_send(
                 HTTPStatus.OK,
                 "Nest invitation",
-                "<p>Sign in to Nest to see this invitation. Use the Google account of "
-                "the address the invitation was sent to.</p>"
-                f'<p><a href="{login}">Sign in with Google</a></p>',
+                '<p class="lead">Sign in to Nest to see this invitation. Use the Google '
+                "account of the address the invitation was sent to.</p>"
+                f'<p class="actions-row"><a class="btn primary" href="{login}">'
+                "Sign in with Google</a></p>",
             )
             return
         self._invitation_send(
             HTTPStatus.OK,
             "Nest invitation",
-            f'<form method="post" action="{INVITATION_PAGE_PATH}">'
-            '<p><label>Invitation code: <input id="token" name="token" autocomplete="off" '
-            'maxlength="200" required></label></p>'
+            '<p class="lead">Review the invitation before you decide. Opening a link never '
+            "joins a Project by itself.</p>"
+            f'<form class="stack" method="post" action="{INVITATION_PAGE_PATH}">'
+            '<div class="field"><label for="token">Invitation code</label>'
+            '<input id="token" class="mono" name="token" autocomplete="off" '
+            'maxlength="200" required>'
+            '<span class="hint">Filled in from your invitation link.</span></div>'
             '<input type="hidden" name="step" value="review">'
-            '<button type="submit">Review the invitation</button></form>',
+            '<div class="actions-row"><button class="btn primary" type="submit">'
+            "Review the invitation</button></div></form>",
         )
 
     def _invitation_decide(self):
@@ -992,22 +1042,27 @@ class _Handler(BaseHTTPRequestHandler):
             )
             return
         decline = (
-            ' <button type="submit" name="step" value="decline">Decline</button>'
+            ' <button class="btn secondary" type="submit" name="step" value="decline">'
+            "Decline</button>"
             if preview.kind == "email"
             else ""
         )
         self._invitation_send(
             HTTPStatus.OK,
             "Join a Nest Project",
-            f"<p>You are invited to join <strong>{html.escape(preview.project_name)}</strong> "
+            f'<p class="lead">You are invited to join <strong>'
+            f"{html.escape(preview.project_name)}</strong> "
             f"as <strong>{html.escape(preview.role.capitalize())}</strong>.</p>"
-            f"<p>The invitation expires {html.escape(preview.expires_at.isoformat())}.</p>"
-            "<p>Joining gives you this Project role only. It grants no HPC, Slurm or "
-            "Provider account.</p>"
-            f'<form method="post" action="{INVITATION_PAGE_PATH}">'
+            '<dl class="facts">'
+            f"<dt>Project</dt><dd>{html.escape(preview.project_name)}</dd>"
+            f"<dt>Role</dt><dd>{html.escape(preview.role.capitalize())}</dd>"
+            f"<dt>Expires</dt><dd>{html.escape(preview.expires_at.isoformat())}</dd></dl>"
+            '<div class="callout"><p>Joining gives you this Project role only. It grants '
+            "no HPC, Slurm or Provider account.</p></div>"
+            f'<form class="actions-row" method="post" action="{INVITATION_PAGE_PATH}">'
             f'<input type="hidden" name="token" value="{html.escape(token)}">'
             f'<input type="hidden" name="csrf" value="{_invitation_csrf(access, token)}">'
-            '<button type="submit" name="step" value="accept">Accept</button>'
+            '<button class="btn primary" type="submit" name="step" value="accept">Accept</button>'
             f"{decline}</form>",
         )
 
@@ -1249,6 +1304,12 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _api_call(self, method: str, path: str, who: Principal, body: dict):
         """Runs one Projects API route. Authorization happens in the service."""
+        if path == CONNECT_API_PATH or path.startswith(CONNECT_API_PATH + "/"):
+            if path != CONNECT_API_PATH:
+                self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                return
+            self._connect_api(method, who)
+            return
         if path == INVITATIONS_API_PATH or path.startswith(INVITATIONS_API_PATH + "/"):
             self._own_invitations_api(method, path, who, body)
             return
@@ -1316,7 +1377,10 @@ class _Handler(BaseHTTPRequestHandler):
             )
             self._json(HTTPStatus.OK, _project_json(project, None))
         elif action == "members" and method == "GET":
-            members = [_member_json(m) for m in service.members(who, pid)]
+            listed = service.members(who, pid)
+            # Names of the members the caller may already see, so pages need no IDs.
+            names = self.app.sign_in.identities.display_names([m.user_id for m in listed])
+            members = [_member_json(m, names.get(m.user_id)) for m in listed]
             self._json(HTTPStatus.OK, {"members": members})
         elif action == "members":
             member = service.add_member(who, pid, _string(body, "user_id"), _string(body, "role"))
@@ -1334,6 +1398,38 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 service.remove_member(who, pid, uid)
                 self._json(HTTPStatus.OK, {"removed": True})
+
+    def _connect_api(self, method: str, who: Principal):
+        """
+        `GET /api/connect`: the Console's *Connect to Project* answer (G02c).
+
+        The connection profiles are the operator's settings; the eligibility is the
+        Controller's own [`authz.ExecutionAccess.project_eligibility`], evaluated now
+        for this caller, or `evaluated: false` where this listener has no execution
+        access to ask (a Controller without session authentication, or tests).
+        """
+        if not self._route(method, ("GET",)):
+            return
+        access = self.app.eligibility
+        eligibility: list[dict[str, object]] | None = None
+        if access is not None:
+            eligibility = [
+                {
+                    "id": str(p.id),
+                    "name": p.name,
+                    "role": p.role,
+                    "eligible": p.eligible,
+                    "reasons": list(p.reasons),
+                }
+                for p in access.project_eligibility(who)
+            ]
+        else:
+            # Reading the Projects still needs the session's permission to.
+            self.app.projects.list_projects(who)
+        self._json(
+            HTTPStatus.OK,
+            connect_payload(self.app.connect, self.app.origin, eligibility),
+        )
 
     def _platforms_api(self, method: str, path: str, who: Principal):
         """`/api/platforms`: discovery of the caller's authorized HPC Platforms."""
@@ -1618,6 +1714,7 @@ def _is_api(path: str) -> bool:
     return any(
         path == root or path.startswith(root + "/")
         for root in (
+            CONNECT_API_PATH,
             PROJECTS_API_PATH,
             INVITATIONS_API_PATH,
             PLATFORMS_API_PATH,
@@ -1744,9 +1841,10 @@ def _org_member_json(member: OrganizationMembership) -> dict[str, object]:
     }
 
 
-def _member_json(member: Membership) -> dict[str, object]:
+def _member_json(member: Membership, display_name: str | None = None) -> dict[str, object]:
     return {
         "user_id": str(member.user_id),
+        "display_name": display_name,
         "role": member.role,
         "added_by_user_id": _id(member.added_by_user_id),
         "created_at": _iso(member.created_at),
@@ -1875,6 +1973,9 @@ class AuthHTTPServer(ThreadingHTTPServer):
             service. Defaults to one on the Projects service.
         provider_policy ([`authz.ProviderPolicy`], *optional*): The Controller's
             Provider approval source, reported by the default `admin` service.
+        eligibility ([`authz.ExecutionAccess`], *optional*): The Controller's
+            execution access check, which the Console's `/api/connect` asks which
+            Projects may run here and why not. Without it, eligibility is not reported.
     """
 
     daemon_threads = True
@@ -1893,8 +1994,10 @@ class AuthHTTPServer(ThreadingHTTPServer):
         organizations: OrganizationService | None = None,
         admin: AdminService | None = None,
         provider_policy: ProviderPolicy | None = None,
+        eligibility: ExecutionAccess | None = None,
     ):
         self.sign_in = sign_in
+        self.eligibility = eligibility
         self.cli = cli or CLISignIn(sign_in.database, sign_in.sessions)
         config = sign_in.config
         self.callback_path = urlsplit(config.redirect_url).path
@@ -1903,6 +2006,7 @@ class AuthHTTPServer(ThreadingHTTPServer):
         self.refresh_cookie = REFRESH_COOKIE if self.secure else INSECURE_REFRESH_COOKIE
         redirect = urlsplit(config.redirect_url)
         self.origin = f"{redirect.scheme}://{redirect.netloc}"
+        self.connect = getattr(config, "console", None) or ConsoleConnectConfig()
         self.sessions = sign_in.session_store
         self.projects = projects or ProjectService(sign_in.database)
         self.platforms = platforms or PlatformCatalog(sign_in.database, projects=self.projects)
@@ -1965,6 +2069,7 @@ def start_auth_service(
     bootstrap_admin_email: str | None = None,
     email: EmailService | None = None,
     provider_policy: ProviderPolicy | None = None,
+    eligibility: ExecutionAccess | None = None,
 ) -> AuthService:
     """
     Starts the auth listener when Google sign-in is configured.
@@ -1984,6 +2089,8 @@ def start_auth_service(
             invitations are shared by link only without it.
         provider_policy ([`authz.ProviderPolicy`], *optional*): The Controller's
             Provider approval source, reported by the privileged management API.
+        eligibility ([`authz.ExecutionAccess`], *optional*): The Controller's
+            execution access check, for the Console's Project eligibility.
 
     Raises:
         `OSError`: If `NEST_AUTH_HTTP_BIND` cannot be bound.
@@ -2000,6 +2107,7 @@ def start_auth_service(
         cli=cli,
         email=email,
         provider_policy=provider_policy,
+        eligibility=eligibility,
     )
     thread = threading.Thread(target=server.serve_forever, name="nest-auth-http", daemon=True)
     thread.start()

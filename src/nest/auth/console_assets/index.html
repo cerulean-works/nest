@@ -9,16 +9,22 @@
 </head>
 <body>
 <a class="skip" href="#main">Skip to content</a>
-<header class="bar">
-  <span class="brand">Nest Console</span>
-  <nav id="nav" aria-label="Console"></nav>
-  <div id="who" class="who"></div>
+<header class="app-bar">
+  <a class="brand" href="#/overview"><img class="brand-mark" src="/console/nest-mark.svg" alt="" width="28" height="28"><span class="brand-name">Nest</span><span class="brand-sub">Console</span></a>
+  <div id="switcher" class="switcher"></div>
+  <div id="account"></div>
 </header>
-<div id="status" class="status" role="status" aria-live="polite"></div>
-<main id="main" tabindex="-1">
-  <h1>Nest Console</h1>
-  <p class="muted">Loading…</p>
-  <noscript><p>The Nest Console needs JavaScript. The command line (<code>nest</code>) offers the same Project and membership operations.</p></noscript>
-</main>
+<div class="shell" id="shell">
+  <nav id="nav" class="sidenav" aria-label="Console"></nav>
+  <div class="content">
+    <div id="status" class="status" role="status" aria-live="polite"></div>
+    <main id="main" tabindex="-1">
+      <h1>Nest Console</h1>
+      <p class="muted">Loading…</p>
+      <noscript><p>The Nest Console needs JavaScript. The command line (<code>nest</code>) offers the same Project and membership operations.</p></noscript>
+    </main>
+  </div>
+</div>
+<div id="announcer" class="sr-only" aria-live="polite"></div>
 </body>
 </html>

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Nest">
+  <rect width="32" height="32" rx="8" fill="#172a50"/>
+  <path d="M6 17.5c2.6 5.2 6 7.5 10 7.5s7.4-2.3 10-7.5" fill="none" stroke="#8db8e4" stroke-width="2.4" stroke-linecap="round"/>
+  <path d="M9 14.5c1.9 3.3 4.2 4.8 7 4.8s5.1-1.5 7-4.8" fill="none" stroke="#fcfbf6" stroke-width="2.2" stroke-linecap="round"/>
+  <circle cx="16" cy="10.5" r="3.2" fill="#8db8e4"/>
+</svg>

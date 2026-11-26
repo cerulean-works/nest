@@ -16,24 +16,46 @@ says against the admission authority the Controller would use.
 
 import json
 import os
+import re
 import secrets
+import unittest
 import urllib.error
 import urllib.request
 import uuid
 from datetime import UTC, datetime, timedelta
 from importlib.resources import files
-from typing import Any, NoReturn
+from typing import Any, ClassVar, NoReturn, cast
+from unittest import mock
 
+from admin_fixture import owned_project
 from fake_oidc import CLIENT_ID, CLIENT_SECRET, Account, FakeGoogle
 from test_authz import _Base, browser
 from test_google_auth import Browser, free_port
 
 from nest.auth import INSECURE_SESSION_COOKIE, LOGIN_PATH, GoogleSignIn, start_auth_service
-from nest.auth.console import CONSOLE_CSP
-from nest.authz import Action, AllowedProjects, DatabaseProviderApprovals, Principal
+from nest.auth.console import CONSOLE_CSP, PAGE_CSP, connection_profiles
+from nest.authz import (
+    Action,
+    AllowedProjects,
+    DatabaseProviderApprovals,
+    ExecutionAccess,
+    Principal,
+)
 from nest.authz.admin import ProviderPolicy
-from nest.config import ConfigError, load_controller_config
-from nest.db import PlatformStore, ProviderApprovalStore, SessionStore, hash_token
+from nest.config import (
+    HOSTED_AUTH_URL,
+    ConfigError,
+    ConsoleConnectConfig,
+    load_client_config,
+    load_controller_config,
+)
+from nest.db import (
+    PlatformStore,
+    ProviderApprovalStore,
+    SessionStore,
+    SlurmAccountStore,
+    hash_token,
+)
 
 try:
     from playwright.sync_api import Error as PlaywrightError
@@ -53,6 +75,13 @@ class _ConsoleBase(_Base):
     provider_policy: ProviderPolicy | None = None
     """The Provider policy the listener reports to the admin API, as the Controller passes it."""
 
+    console_env: ClassVar[dict[str, str]] = {}
+    """`NEST_CONSOLE_*` settings: the connection profiles the Console offers."""
+
+    def eligibility(self) -> ExecutionAccess | None:
+        """The execution access check the listener asks for eligibility; none by default."""
+        return None
+
     def setUp(self):
         super().setUp()
         self.fake = FakeGoogle()
@@ -66,12 +95,17 @@ class _ConsoleBase(_Base):
                 "NEST_GOOGLE_CLIENT_SECRET": CLIENT_SECRET,
                 "NEST_GOOGLE_REDIRECT_URL": f"{self.base}/auth/google/callback",
                 "NEST_AUTH_HTTP_BIND": f"127.0.0.1:{port}",
+                **self.console_env,
             }
         ).google
         assert config is not None
         sign_in = GoogleSignIn(config, self.db, endpoints=self.fake.endpoints, timeout=5)
         self.http = start_auth_service(
-            config, self.db, sign_in=sign_in, provider_policy=self.provider_policy
+            config,
+            self.db,
+            sign_in=sign_in,
+            provider_policy=self.provider_policy,
+            eligibility=self.eligibility(),
         )
         self.addCleanup(self.http.stop)
         self.sessions = SessionStore(self.db)
@@ -135,10 +169,14 @@ class ConsoleHTTPTests(_ConsoleBase):
         self.assertNotIn("<style", page)
         self.assertNotIn("style=", page)
         self.assertEqual(self.request("GET", "/console/")[0], 200)
-        for name, kind in (("console.js", "text/javascript"), ("console.css", "text/css")):
+        for name, kind in (
+            ("console.js", "text/javascript; charset=utf-8"),
+            ("console.css", "text/css; charset=utf-8"),
+            ("nest-mark.svg", "image/svg+xml"),
+        ):
             status, headers, _ = self.request("GET", f"/console/{name}")
             self.assertEqual(status, 200, name)
-            self.assertEqual(headers["Content-Type"], f"{kind}; charset=utf-8")
+            self.assertEqual(headers["Content-Type"], kind)
             self.assertEqual(headers["Content-Security-Policy"], CONSOLE_CSP)
         for path in ("/console/index.html", "/console/../web.py", "/console/x/console.js"):
             self.assertEqual(self.request("GET", path)[0], 404, path)
@@ -146,12 +184,19 @@ class ConsoleHTTPTests(_ConsoleBase):
         self.assertEqual((status, headers["Allow"]), (405, "GET"))
 
     def test_api_routes_keep_their_strict_csp(self):
-        for path in ("/api/projects", "/auth/session", "/invitations/accept"):
+        for path in ("/api/projects", "/api/connect", "/auth/session"):
             status, headers, _ = self.request("GET", path)
-            self.assertIn(status, (200, 401), path)
-            if path != "/invitations/accept":
-                self.assertEqual(headers["Content-Security-Policy"], API_CSP, path)
-            self.assertNotIn("'self'", headers["Content-Security-Policy"].split("form-action")[0])
+            self.assertEqual(status, 401, path)
+            self.assertEqual(headers["Content-Security-Policy"], API_CSP, path)
+        # The listener's own pages may load the Console's stylesheet and mark, never a
+        # same-origin script: the invitation page allows only its one hashed script.
+        status, headers, page = self.request("GET", "/invitations/accept")
+        self.assertEqual(status, 200)
+        csp = headers["Content-Security-Policy"]
+        self.assertTrue(csp.startswith(PAGE_CSP), csp)
+        self.assertNotIn("script-src 'self'", csp)
+        self.assertIn('href="/console/console.css"', page)
+        self.assertNotIn("style=", page)
 
     def test_console_holds_no_secret_and_inserts_no_html(self):
         user = self.user("someone")
@@ -160,22 +205,36 @@ class ConsoleHTTPTests(_ConsoleBase):
         bundle = page + "".join(
             ASSETS.joinpath(name).read_text() for name in ("console.js", "console.css")
         )
+        # The mark is a plain drawing: no script, link or reference to anything else.
+        mark = ASSETS.joinpath("nest-mark.svg").read_text()
+        self.assertEqual(re.findall(r"https?://[^\"]+", mark), ["http://www.w3.org/2000/svg"])
+        for forbidden in ("<script", "href", "on", "<foreignObject"):
+            self.assertNotRegex(mark, rf"{forbidden}\w*=" if forbidden == "on" else forbidden)
         for secret in (cookie, CLIENT_SECRET, self.url):
             self.assertNotIn(secret, bundle)
         for forbidden in (
-            "NEST_",
             "innerHTML",
             "outerHTML",
             "insertAdjacentHTML",
             "document.write",
             "eval(",
             "new Function",
-            "localStorage",
+            "sessionStorage",
             "document.cookie",
             "http://",
             "https://",
+            "style=",
         ):
             self.assertNotIn(forbidden, bundle, forbidden)
+        # The only environment name the page mentions is the documented override;
+        # every setting it shows comes from the server's answer.
+        self.assertEqual(set(re.findall(r"NEST_[A-Z_]+", bundle)), {"NEST_PROJECT_ID"})
+        # The browser stores one thing: the ID of the Project last chosen, per User.
+        script = ASSETS.joinpath("console.js").read_text()
+        self.assertEqual(
+            re.findall(r"localStorage\.(\w+)\(", script), ["getItem", "setItem", "removeItem"]
+        )
+        self.assertIn("const STORE_PREFIX = 'nest.console.project.';", script)
 
     def test_console_creates_projects_only_through_the_admin_api(self):
         # POST /api/projects is the creator-is-Owner route that G03 restricts; the
@@ -437,8 +496,24 @@ class _BrowserBase(_ConsoleBase):
         self.dialogs: list[str] = []
         self.page.on("dialog", self.accept_dialog)
 
+    def confirm(self, action: str):
+        """Confirms the Console's own dialog with its `action` button."""
+        dialog = self.page.get_by_role("dialog")
+        dialog.wait_for()
+        self.dialogs.append(dialog.inner_text())
+        dialog.get_by_role("button", name=action, exact=True).click()
+        dialog.wait_for(state="detached")
+
+    def dismiss(self):
+        """Cancels the Console's own dialog."""
+        dialog = self.page.get_by_role("dialog")
+        dialog.wait_for()
+        self.dialogs.append(dialog.inner_text())
+        dialog.get_by_role("button", name="Cancel").click()
+        dialog.wait_for(state="detached")
+
     answer = True
-    """How the next `confirm()` dialogs are answered."""
+    """How the next browser `confirm()` dialogs are answered (the Console uses none)."""
 
     def accept_dialog(self, dialog):
         self.dialogs.append(dialog.message)
@@ -455,7 +530,7 @@ class _BrowserBase(_ConsoleBase):
         self.page.get_by_role("heading", name="Sign in to Nest").wait_for()
         self.page.get_by_role("link", name="Sign in with Google").click()
         self.page.wait_for_url(self.base + "/console")
-        self.page.get_by_role("heading", name="Your Projects").wait_for()
+        self.page.get_by_role("heading", name="Overview").wait_for()
         email = (account or self.fake.account).email
         row = self.conn.execute(
             "SELECT user_id FROM user_identities WHERE email = %s", (email,)
@@ -478,20 +553,56 @@ class _BrowserBase(_ConsoleBase):
         return row[0] if row else None
 
 
+class _EligibilityBrowserBase(_BrowserBase):
+    """The Console of a Controller that serves the Platform `nano` with database
+    Provider approvals, so `/api/connect` reports eligibility as the SDK gets it."""
+
+    console_env: ClassVar[dict[str, str]] = {
+        "NEST_CONSOLE_CONTROLLER_ADDRESS": "nest-controller.example.ts.net:50051",
+        "NEST_CONSOLE_CONTROLLER_TLS": "false",
+    }
+
+    def eligibility(self) -> ExecutionAccess | None:
+        self.platforms = PlatformStore(self.db)
+        self.nano = self.platforms.create_platform("nano", "Nano", **OPS)
+        self.platforms.add_login_node(self.nano.id, "login.nano", transport_modes=["A"], **OPS)
+        self.approvals = ProviderApprovalStore(self.db)
+        self.accounts = SlurmAccountStore(self.db)
+        self.accounts.register_account(self.nano.id, "lab-acct", **OPS)
+        return ExecutionAccess(
+            self.db,
+            DatabaseProviderApprovals(self.db),
+            provider_id="nano",
+            platform_id=self.nano.id,
+        )
+
+    def make_ready(self, pid):
+        """Everything a Project needs to run on `nano`, granted by the operator."""
+        self.approvals.approve("nano", pid, **OPS)
+        self.platforms.grant_project(self.nano.id, pid, **OPS)
+        self.accounts.link_project(pid, self.nano.id, "lab-acct", modes=["A"], default=True, **OPS)
+
+
 class ConsoleBrowserTests(_BrowserBase):
     def test_owner_manages_members_and_invitations(self):
         me = self.sign_in()
-        self.page.get_by_text("You are not a member of any Project yet.").wait_for()
+        self.page.get_by_text("You are not in any Project yet").wait_for()
         # The Console offers no Project creation to an ordinary user.
         self.assertEqual(self.page.get_by_role("button", name="Create Project").count(), 0)
         self.assertEqual(self.page.get_by_role("link", name="Administration").count(), 0)
         pid, users = self.team()
         self.service.add_member(browser(users["owner"]), pid, me, "admin")
         self.page.reload()
-        self.page.get_by_role("link", name="shared").click()
-        self.page.get_by_role("heading", name="shared").wait_for()
+        self.page.get_by_role("navigation", name="Console").get_by_role(
+            "link", name="Projects"
+        ).click()
+        self.page.get_by_role("heading", name="Your Projects").wait_for()
+        self.page.get_by_role("link", name="shared", exact=True).click()
+        self.page.get_by_role("heading", name="shared", exact=True).wait_for()
         self.assertTrue(self.page.locator("h1").evaluate("e => e === document.activeElement"))
         self.page.get_by_role("heading", name="Members (5)").wait_for()
+        # Members are shown by name, not only by ID.
+        self.page.locator("#main").get_by_text("Test Researcher").wait_for()
 
         # Add an existing user; a malformed ID is refused by the browser first.
         newcomer = str(self.user("newcomer"))
@@ -502,25 +613,36 @@ class ConsoleBrowserTests(_BrowserBase):
         self.page.get_by_role("button", name="Add member").click()
         self.page.get_by_text("Member added.").wait_for()
         self.page.get_by_role("heading", name="Members (6)").wait_for()
-        # Adding them again reports the server's refusal.
+        # Adding them again reports the server's refusal, keeps the input and
+        # moves focus to the message.
         self.page.get_by_label("User ID").fill(newcomer)
         self.page.get_by_role("button", name="Add member").click()
-        self.page.get_by_text("That user is already a member of this Project.").first.wait_for()
+        error = self.page.locator(".form-error", has_text="already a member")
+        error.wait_for()
+        self.assertTrue(error.evaluate("e => e === document.activeElement"))
+        self.assertEqual(self.page.get_by_label("User ID").input_value(), newcomer)
 
-        # Change their role, then remove them.
-        self.page.get_by_label(f"New role for {newcomer}").select_option("viewer")
-        row = self.page.locator("tr", has=self.page.get_by_text(newcomer))
-        row.get_by_role("button", name="Change role").click()
-        self.page.get_by_text("Role changed.").wait_for()
+        # Change their role, then remove them after confirming.
+        self.page.get_by_label(f"New role for newcomer ({newcomer})").select_option("viewer")
+        self.page.get_by_role("button", name="Change role of newcomer").click()
+        self.page.get_by_text("newcomer is now Viewer.").wait_for()
         self.assertEqual(self.role(pid, newcomer), "viewer")
         # The Owner's row has no controls, for an Admin.
-        owner_row = self.page.locator("tr", has=self.page.get_by_text(str(users["owner"])))
+        owner_row = self.page.locator(f'tr[data-user="{users["owner"]}"]')
         self.assertEqual(owner_row.get_by_role("button").count(), 0)
-        self.page.get_by_role("button", name=f"Remove {newcomer}").click()
+        # Cancelling the confirmation changes nothing.
+        self.page.get_by_role("button", name=f"Remove newcomer ({newcomer})").click()
+        self.page.get_by_role("dialog").get_by_role("button", name="Cancel").click()
+        self.assertEqual(self.role(pid, newcomer), "viewer")
+        self.page.get_by_role("button", name=f"Remove newcomer ({newcomer})").click()
+        self.confirm("Remove member")
+        self.assertIn("loses access to shared", self.dialogs[-1])
         self.page.get_by_text("Member removed.").wait_for()
         self.assertIsNone(self.role(pid, newcomer))
 
         # Invite by email: the link is shown once, then revoke it.
+        self.page.get_by_role("link", name="Invitations", exact=True).last.click()
+        self.page.get_by_role("heading", name="Email invitations").wait_for()
         self.page.get_by_label("Email address").fill("guest@example.org")
         self.page.get_by_label("Email the invitation").uncheck()
         self.page.get_by_role("button", name="Invite", exact=True).click()
@@ -528,6 +650,7 @@ class ConsoleBrowserTests(_BrowserBase):
         link = self.page.get_by_label("Invitation link.").input_value()
         self.assertTrue(link.startswith(self.base + "/invitations/accept#token="), link)
         self.page.get_by_role("button", name="Revoke invitation to guest@example.org").click()
+        self.confirm("Revoke invitation")
         self.page.get_by_text("Invitation revoked.").wait_for()
         self.assertEqual(
             self.conn.execute(
@@ -541,14 +664,18 @@ class ConsoleBrowserTests(_BrowserBase):
         self.page.get_by_role("button", name="Create Invite Link").click()
         self.page.get_by_text("Invite Link created.").wait_for()
         invite_link = self.page.get_by_label("Invite Link.").input_value()
+        self.page.get_by_role("link", name="Activity").click()
         self.page.get_by_role("heading", name="Recent membership changes").wait_for()
-        self.page.screenshot(path=os.path.join(_evidence(), "console-project.png"), full_page=True)
+        self.page.get_by_text("Member removed").first.wait_for()
         self.assert_clean()
 
+        self.page.get_by_label("Account: Test Researcher").click()
         self.page.get_by_role("button", name="Sign out").click()
         self.page.get_by_text("You have signed out.").wait_for()
         joiner = self.sign_in(Account(sub="108000000000000000777", email="joiner@example.org"))
-        self.page.get_by_role("navigation").get_by_role("link", name="Invitations").click()
+        self.page.get_by_role("navigation", name="Console").get_by_role(
+            "link", name="Invitations"
+        ).click()
         self.page.get_by_label("Invitation link").fill(invite_link)
         self.page.get_by_role("button", name="Review invitation").click()
         self.page.get_by_text("as Viewer?").wait_for()
@@ -562,10 +689,15 @@ class ConsoleBrowserTests(_BrowserBase):
         pid, users = self.team()
         self.service.add_member(browser(users["owner"]), pid, me, "viewer")
         self.page.goto(f"{self.base}/console#/projects/{pid}")
-        self.page.get_by_role("heading", name="shared").wait_for()
+        self.page.get_by_role("heading", name="shared", exact=True).wait_for()
         self.page.get_by_text("Only the Project’s Owner and Admins can manage").wait_for()
         for name in ("Add member", "Invite", "Create Invite Link", "Change role", "Remove"):
             self.assertEqual(self.page.get_by_role("button", name=name, exact=True).count(), 0)
+        self.assertEqual(self.page.get_by_role("navigation", name="Project sections").count(), 0)
+        # A direct link to a manager's tab shows the members instead.
+        self.page.goto(f"{self.base}/console#/projects/{pid}/invitations")
+        self.page.get_by_role("heading", name="Members (5)").wait_for()
+        self.assertEqual(self.page.get_by_role("heading", name="Email invitations").count(), 0)
         self.page.get_by_role("button", name="Leave Project").wait_for()
         # The same request the hidden form would send, made from the page itself.
         answer = self.page.evaluate(
@@ -579,8 +711,14 @@ class ConsoleBrowserTests(_BrowserBase):
             [str(pid), str(me)],
         )
         self.assertEqual(answer, [403, {"error": "forbidden", "reason": "role"}])
+        for path in (f"/api/projects/{pid}/invitations", f"/api/projects/{pid}/audit"):
+            status = self.page.evaluate(
+                "async (p) => (await fetch(p, {credentials: 'same-origin'})).status", path
+            )
+            self.assertEqual(status, 403, path)
         # Leaving removes the membership and returns to the (now empty) list.
         self.page.get_by_role("button", name="Leave Project").click()
+        self.confirm("Leave Project")
         self.page.get_by_text("You left the Project.").wait_for()
         self.page.get_by_text("You are not a member of any Project yet.").wait_for()
         self.assertIsNone(self.role(pid, str(me)))
@@ -594,7 +732,7 @@ class ConsoleBrowserTests(_BrowserBase):
         # Removed while the page is open: the next action shows the loss of access.
         self.service.add_member(browser(users["owner"]), pid, me, "admin")
         self.page.reload()
-        self.page.get_by_role("heading", name="shared").wait_for()
+        self.page.get_by_role("heading", name="shared", exact=True).wait_for()
         self.service.remove_member(browser(users["owner"]), pid, me)
         self.page.get_by_label("User ID").fill(str(self.user("late")))
         self.page.get_by_role("button", name="Add member").click()
@@ -604,10 +742,13 @@ class ConsoleBrowserTests(_BrowserBase):
     def test_revoked_session_returns_to_sign_in(self):
         me = self.sign_in()
         self.identities.revoke_user_sessions(me)
-        self.page.get_by_role("navigation").get_by_role("link", name="Invitations").click()
+        self.page.get_by_role("navigation", name="Console").get_by_role(
+            "link", name="Invitations"
+        ).click()
         self.page.get_by_role("heading", name="Sign in to Nest").wait_for()
         self.page.get_by_text("Your session has ended. Sign in again.").wait_for()
         self.assertEqual(self.page.get_by_role("button", name="Sign out").count(), 0)
+        self.assertEqual(self.page.locator("#project-switcher").count(), 0)
 
     def test_expired_access_token_is_refreshed(self):
         self.sign_in()
@@ -615,7 +756,9 @@ class ConsoleBrowserTests(_BrowserBase):
         self.conn.execute(
             "UPDATE session_access_tokens SET created_at = now() - interval '10 min', expires_at = now() - interval '1 s'"
         )
-        self.page.get_by_role("navigation").get_by_role("link", name="Invitations").click()
+        self.page.get_by_role("navigation", name="Console").get_by_role(
+            "link", name="Invitations"
+        ).click()
         self.page.get_by_role("heading", name="Your invitations").wait_for()
         self.page.get_by_text("No pending invitations").wait_for()
         self.assertEqual(
@@ -647,12 +790,18 @@ class _AdminBrowserBase(_BrowserBase):
         self.assertEqual(self.page.get_by_role("link", name="Administration").count(), 0)
         self.identities.grant_platform_role(me, **OPS)
         self.page.reload()
-        self.page.get_by_role("navigation").get_by_role("link", name="Administration").click()
-        self.page.get_by_role("heading", name="User directory").wait_for()
+        self.page.get_by_role("navigation", name="Console").get_by_role(
+            "link", name="Administration"
+        ).click()
+        self.page.get_by_role("heading", name="Administration").wait_for()
+        self.page.get_by_role("heading", name="Projects", exact=True).wait_for()
         return me
 
     def create_project(self, owner, name: str = "lab") -> uuid.UUID:
         """Creates a Project from the Administration page, picking `owner` in the directory."""
+        self.page.get_by_role("link", name="Create a Project").first.click()
+        self.page.get_by_role("heading", name="Choose the Owner").wait_for()
+        self.page.get_by_text("Browse the user directory").click()
         row = self.page.locator("tr", has=self.page.get_by_text(str(owner)))
         row.get_by_role("button", name="as Owner").click()
         self.assertEqual(
@@ -694,6 +843,8 @@ class ConsoleAdminDatabaseModeTests(_AdminBrowserBase):
         for n in range(30):
             self.user(f"user {n:02}")
         me = self.admin_signs_in()
+        self.page.get_by_role("link", name="Users", exact=True).click()
+        self.page.get_by_role("heading", name="User directory").wait_for()
         more = self.page.get_by_role("button", name="Load more users")
         more.wait_for()
         self.identities.revoke_platform_role(me, **OPS)
@@ -721,8 +872,8 @@ class ConsoleAdminDatabaseModeTests(_AdminBrowserBase):
         self.assertEqual(self.page.get_by_text("only records an approval").count(), 0)
         self.assertEqual(self.page.get_by_role("textbox", name="Provider").input_value(), "nano")
 
-        # Every change needs a reason.
-        self.page.get_by_label("Platform (slug or ID)").first.fill("nano")
+        # Every change needs a reason. The Platform is chosen from the catalog.
+        self.page.get_by_label("Platform (slug or ID)").select_option("nano")
         self.page.get_by_role("button", name="Grant Platform").click()
         self.page.get_by_text("Enter a reason first").wait_for()
         self.reason("platform for lab")
@@ -734,11 +885,17 @@ class ConsoleAdminDatabaseModeTests(_AdminBrowserBase):
         self.page.get_by_role("button", name="Approve Provider").click()
         self.page.get_by_text("Approval recorded. It is effective for new submissions").wait_for()
         self.assertEqual(self.dialogs, [])
+        # Every requirement the access page lists is now in place but the account.
+        needs = self.page.locator(".checklist li")
+        self.assertEqual(needs.nth(0).get_attribute("class"), None)
+        self.assertEqual(needs.nth(1).get_attribute("class"), None)
+        self.assertEqual(needs.nth(2).get_attribute("class"), "missing")
         self.assertIn("recorded and effective", self.effect("nano"))
         self.assertTrue(authority.permits(WHO, pid, Action.RUN_SUBMIT, "nano"))
 
         self.reason("offboard lab")
         self.page.get_by_role("button", name="Revoke nano approval").click()
+        self.confirm("Revoke approval")
         self.page.get_by_text("Revocation recorded. New submissions are refused").wait_for()
         self.assertIn("Revoked: recorded and effective", self.effect("nano"))
         self.assertFalse(authority.permits(WHO, pid, Action.RUN_SUBMIT, "nano"))
@@ -747,6 +904,7 @@ class ConsoleAdminDatabaseModeTests(_AdminBrowserBase):
         self.reason("other provider")
         self.page.get_by_role("textbox", name="Provider").fill("other")
         self.page.get_by_role("button", name="Approve Provider").click()
+        self.confirm("Record approval")
         self.page.get_by_text("It does not enable submissions on this Controller").wait_for()
         self.assertIn("will NOT enable submissions", self.dialogs[-1])
         self.assertIn("checks Provider nano, not other", self.dialogs[-1])
@@ -779,15 +937,14 @@ class ConsoleAdminEnvironmentModeTests(_AdminBrowserBase):
 
         # Cancelling the warning records nothing.
         self.reason("try")
-        self.answer = False
         record.click()
-        self.page.wait_for_timeout(300)
+        self.dismiss()
         self.assertIn("will NOT enable submissions", self.dialogs[-1])
         self.assertIn("environment allow-list", self.dialogs[-1])
         self.assertIsNone(self.approvals.get("nano", pid))
 
-        self.answer = True
         record.click()
+        self.confirm("Record approval")
         self.page.get_by_text(
             "Approval recorded. It does not enable submissions on this Controller"
         ).wait_for()
@@ -803,6 +960,7 @@ class ConsoleAdminEnvironmentModeTests(_AdminBrowserBase):
         # A recorded revocation does take effect, even for a listed Project.
         self.reason("offboard")
         self.page.get_by_role("button", name="Revoke nano approval").click()
+        self.confirm("Revoke approval")
         self.page.get_by_text("Revocation recorded. New submissions are refused").wait_for()
         self.assertIn("Revoked: recorded and effective", self.effect("nano"))
         self.assertFalse(listed.permits(WHO, pid, Action.RUN_SUBMIT, "nano"))
@@ -826,7 +984,7 @@ class ConsoleAdminRevocationTests(_AdminBrowserBase):
         # the server and the Console drops its Administration pages.
         self.identities.revoke_platform_role(me, **OPS)
         self.reason("too late")
-        self.page.get_by_label("Platform (slug or ID)").first.fill("nano")
+        self.page.get_by_label("Platform (slug or ID)").select_option("nano")
         self.page.get_by_role("button", name="Grant Platform").click()
         self.page.get_by_role("heading", name="Administration not available").wait_for()
         self.assertEqual(self.page.get_by_role("link", name="Administration").count(), 0)
@@ -855,9 +1013,10 @@ class ConsoleAdminRevocationTests(_AdminBrowserBase):
         # An admin whose sessions are revoked is back at sign-in.
         self.identities.grant_platform_role(me, **OPS)
         self.page.reload()
-        self.page.get_by_role("navigation").get_by_role("link", name="Administration").wait_for()
+        console_nav = self.page.get_by_role("navigation", name="Console")
+        console_nav.get_by_role("link", name="Administration").wait_for()
         self.identities.revoke_user_sessions(me)
-        self.page.get_by_role("navigation").get_by_role("link", name="Administration").click()
+        console_nav.get_by_role("link", name="Administration").click()
         self.page.get_by_text("Your session has ended. Sign in again.").wait_for()
         self.assertEqual(
             self.conn.execute("SELECT count(*) FROM projects WHERE name = 'sneaky'").fetchone(),
@@ -873,3 +1032,425 @@ def _evidence() -> str:
     )
     os.makedirs(path, exist_ok=True)
     return path
+
+
+class ConnectAPITests(_ConsoleBase):
+    """`GET /api/connect` (G02c): operator profiles and server-side eligibility."""
+
+    console_env: ClassVar[dict[str, str]] = {
+        "NEST_CONSOLE_CONTROLLER_ADDRESS": "nest-controller.example.ts.net:50051",
+        "NEST_CONSOLE_CONTROLLER_TLS": "false",
+    }
+
+    def eligibility(self) -> ExecutionAccess | None:
+        self.platforms = PlatformStore(self.db)
+        self.nano = self.platforms.create_platform("nano", "Nano", **OPS)
+        self.approvals = ProviderApprovalStore(self.db)
+        self.accounts = SlurmAccountStore(self.db)
+        self.accounts.register_account(self.nano.id, "secret-acct-name", **OPS)
+        return ExecutionAccess(
+            self.db,
+            DatabaseProviderApprovals(self.db),
+            provider_id="nano",
+            platform_id=self.nano.id,
+        )
+
+    def test_profiles_and_commands_come_from_the_server(self):
+        user = self.user("someone")
+        status, body = self.call("GET", "/api/connect", self.token(user))
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["auth_url"], self.base)
+        self.assertEqual(body["auth_export"], f"export NEST_AUTH_URL={self.base}")
+        self.assertEqual(
+            body["install"], "uv add 'nest @ git+https://github.com/cerulean-works/nest@main'"
+        )
+        [profile] = body["profiles"]
+        self.assertEqual((profile["id"], profile["status"]), ("private", "available"))
+        self.assertEqual(
+            profile["exports"],
+            [
+                f"export NEST_AUTH_URL={self.base}",
+                "export NEST_CONTROLLER_ADDRESS=nest-controller.example.ts.net:50051",
+                "export NEST_CONTROLLER_TLS=false",
+            ],
+        )
+        # The exact settings the panel copies are accepted by the SDK as they are.
+        client = load_client_config(settings_of(profile))
+        self.assertEqual(
+            (client.address, client.tls, client.auth_url),
+            ("nest-controller.example.ts.net:50051", False, self.base),
+        )
+        self.assertEqual(body["eligibility"], {"evaluated": True, "projects": []})
+
+    def test_eligibility_reasons_follow_each_grant_and_never_name_an_account(self):
+        pid, users = self.team()
+        tokens = {role: self.token(user) for role, user in users.items()}
+
+        def reasons(role):
+            status, body = self.call("GET", "/api/connect", tokens[role])
+            self.assertEqual(status, 200, body)
+            self.assertNotIn("secret-acct-name", json.dumps(body))
+            return {p["id"]: (p["eligible"], p["reasons"]) for p in body["eligibility"]["projects"]}
+
+        self.assertEqual(reasons("member")[str(pid)], (False, ["provider", "platform", "account"]))
+        self.assertEqual(reasons("outsider"), {})
+        self.approvals.approve("nano", pid, **OPS)
+        self.platforms.grant_project(self.nano.id, pid, **OPS)
+        self.assertEqual(reasons("member")[str(pid)], (False, ["account"]))
+        self.accounts.link_project(
+            pid, self.nano.id, "secret-acct-name", modes=["A"], default=True, **OPS
+        )
+        self.assertEqual(reasons("member")[str(pid)], (True, []))
+        self.assertEqual(reasons("owner")[str(pid)], (True, []))
+        # Management access and compute eligibility differ: a Viewer may read, not run.
+        self.assertEqual(reasons("viewer")[str(pid)], (False, ["role"]))
+        # A revoked grant shows on the next read, as the SDK's listing would.
+        self.platforms.revoke_project(self.nano.id, pid, **OPS)
+        eligible, missing = reasons("member")[str(pid)]
+        self.assertFalse(eligible)
+        self.assertIn("platform", missing)
+
+    def test_route_is_read_only_authenticated_and_same_origin(self):
+        user = self.user("someone")
+        cookie = self.token(user)
+        self.assertEqual(
+            self.call("GET", "/api/connect", None), (401, {"error": "unauthenticated"})
+        )
+        self.assertEqual(self.call("POST", "/api/connect", cookie, origin=EVIL)[0], 403)
+        status, headers, _ = self.request(
+            "POST",
+            "/api/connect",
+            cookie=cookie,
+            headers={"Origin": self.base, "Sec-Fetch-Site": "same-origin"},
+            body={},
+        )
+        self.assertEqual((status, headers["Allow"]), (405, "GET"))
+        self.assertEqual(self.call("GET", "/api/connect/x", cookie)[0], 404)
+        # A CLI session needs its Projects scope to read eligibility.
+        cli = self.token(user, kind="cli", scope="jobs:run")
+        status, _, _ = self.request(
+            "GET", "/api/connect", headers={"Authorization": f"Bearer {cli}"}
+        )
+        self.assertEqual(status, 200)
+
+    def test_session_names_the_signed_in_user_and_members_have_names(self):
+        pid, users = self.team()
+        cookie = self.token(users["member"])
+        status, body = self.call("GET", "/auth/session", cookie)
+        self.assertEqual((status, body["display_name"]), (200, "member"))
+        _, listed = self.call("GET", f"/api/projects/{pid}/members", cookie)
+        self.assertEqual(
+            {m["role"]: m["display_name"] for m in listed["members"]},
+            {"owner": "owner", "admin": "admin", "member": "member", "viewer": "viewer"},
+        )
+
+
+def settings_of(profile: dict[str, Any]) -> dict[str, str]:
+    """A profile's settings as an environment."""
+    return {name: value for name, value in cast(list[list[str]], profile["settings"])}
+
+
+class ConnectProfileTests(unittest.TestCase):
+    """Which profiles the Console offers, and that each is valid for the SDK."""
+
+    def test_no_settings_offer_no_profile(self):
+        self.assertEqual(connection_profiles(ConsoleConnectConfig(), "https://nest.example"), [])
+
+    def test_hosted_profile_is_a_labelled_pilot_on_the_hosted_origin_only(self):
+        connect = ConsoleConnectConfig(
+            "nest-controller.tail8e5ba1.ts.net:50051", False, hosted_profile="pilot"
+        )
+        private, hosted = connection_profiles(connect, HOSTED_AUTH_URL)
+        self.assertEqual(private["id"], "private")  # the existing Tailnet path first
+        self.assertEqual(
+            (hosted["status"], hosted["exports"]), ("pilot", ["export NEST_PROFILE=hosted"])
+        )
+        for profile in (private, hosted):
+            load_client_config(settings_of(profile))
+        # Another origin is never offered the hosted session's profile.
+        self.assertEqual(
+            [p["id"] for p in connection_profiles(connect, "https://nest.example")], ["private"]
+        )
+        # After H09 the hosted profile is the default and needs no setting.
+        with mock.patch("nest.config.HOSTED_PROFILE_DEFAULT", True):
+            hosted = connection_profiles(connect, HOSTED_AUTH_URL)[1]
+        self.assertEqual((hosted["status"], hosted["exports"]), ("default", []))
+
+    def test_a_custom_address_gets_the_hosted_session_only_when_named_twice_over_tls(self):
+        connect = ConsoleConnectConfig("staging.example.org:443", True)
+        [profile] = connection_profiles(connect, HOSTED_AUTH_URL)
+        self.assertIn(
+            ("NEST_HOSTED_SESSION_ADDRESS", "staging.example.org:443"),
+            settings_of(profile).items(),
+        )
+        load_client_config(settings_of(profile))
+
+
+class ConnectBrowserTests(_EligibilityBrowserBase):
+    """The Connect panel, the Project switcher and eligibility in a real browser."""
+
+    def setUp(self):
+        super().setUp()
+        self.context.grant_permissions(["clipboard-read", "clipboard-write"], origin=self.base)
+
+    def test_connect_panel_copies_safe_commands_for_the_chosen_project(self):
+        me = self.sign_in()
+        owner = self.user("pi")
+        ready = owned_project(self.service, owner, "Shared lab")
+        twin = owned_project(self.service, owner, "Shared lab")
+        hostile = owned_project(self.service, owner, "<img src=x onerror=alert(1)>'; rm -rf ~")
+        for pid, role in ((ready.id, "member"), (twin.id, "member"), (hostile.id, "viewer")):
+            self.service.add_member(browser(owner), pid, me, role)
+        self.make_ready(ready.id)
+        self.page.reload()
+        self.page.get_by_role("heading", name="Overview").wait_for()
+        # The only Project that can run is chosen first; duplicates are told apart.
+        switcher = self.page.get_by_label("Current Project", exact=True)
+        self.assertEqual(switcher.input_value(), str(ready.id))
+        labels = switcher.locator("option").all_inner_texts()
+        self.assertIn(f"Shared lab ({str(ready.id)[:8]}) · Member", labels)
+        self.assertIn(f"Shared lab ({str(twin.id)[:8]}) · Member", labels)
+        # Names are text, never markup.
+        self.assertIn("<img src=x onerror=alert(1)>'; rm -rf ~ · Viewer", labels)
+        self.assertEqual(self.page.locator("#main img").count(), 0)
+
+        self.page.get_by_role("navigation", name="Console").get_by_role(
+            "link", name="Connect"
+        ).click()
+        self.page.get_by_role("heading", name="Connect to a Project").wait_for()
+        self.page.get_by_text("can run on this Controller.").wait_for()
+        block = self.page.locator('[data-command="Select the Project"]')
+        block.get_by_role("button").click()
+        block.get_by_role("button", name="Copy: Select the Project").filter(
+            has_text="Copied"
+        ).wait_for()
+        copied = self.page.evaluate("navigator.clipboard.readText()")
+        self.assertEqual(
+            copied, f"uv run nest projects use {ready.id}\nuv run nest projects current"
+        )
+        settings = self.page.locator('[data-command="Connection settings and sign-in"] pre')
+        self.assertEqual(
+            settings.inner_text().splitlines(),
+            [
+                f"export NEST_AUTH_URL={self.base}",
+                "export NEST_CONTROLLER_ADDRESS=nest-controller.example.ts.net:50051",
+                "export NEST_CONTROLLER_TLS=false",
+                "uv run nest login",
+                "uv run nest auth status --check",
+            ],
+        )
+
+        # A Project that cannot run says why, and offers no select command.
+        self.page.get_by_label("Project", exact=True).select_option(str(hostile.id))
+        self.page.get_by_text("Your role cannot run work").wait_for()
+        self.page.get_by_text("not approved for this Controller").wait_for()
+        self.assertEqual(self.page.locator('[data-command="Select the Project"]').count(), 0)
+        commands = self.page.locator("#connect-steps pre").all_inner_texts()
+        self.assertFalse(any("rm -rf" in c or "onerror" in c for c in commands))
+        self.assertEqual(
+            self.page.get_by_label("Current Project", exact=True).input_value(), str(hostile.id)
+        )
+        self.page.screenshot(path=os.path.join(_evidence(), "console-connect.png"), full_page=True)
+        self.assert_clean()
+
+    def test_switching_remembers_the_project_and_handles_revocation(self):
+        me = self.sign_in()
+        owner = self.user("pi")
+        first = owned_project(self.service, owner, "alpha")
+        second = owned_project(self.service, owner, "beta")
+        for pid in (first.id, second.id):
+            self.service.add_member(browser(owner), pid, me, "member")
+            self.make_ready(pid)
+        self.page.reload()
+        self.page.get_by_label("Current Project", exact=True).select_option(str(second.id))
+        self.page.locator("#main").get_by_text("beta", exact=True).wait_for()
+        # Kept across reloads, in this browser only, as a bare Project ID.
+        self.page.reload()
+        self.page.get_by_role("heading", name="Overview").wait_for()
+        self.assertEqual(
+            self.page.get_by_label("Current Project", exact=True).input_value(), str(second.id)
+        )
+        stored = self.page.evaluate("Object.entries(localStorage)")
+        self.assertEqual(stored, [[f"nest.console.project.{me}", str(second.id)]])
+        # Revoked grant: shown as soon as the page is read again.
+        self.platforms.revoke_project(self.nano.id, second.id, **OPS)
+        self.page.reload()
+        self.page.get_by_text("This Project cannot run work on this Controller yet.").wait_for()
+        self.page.get_by_text("HPC Platform is not granted to the Project").wait_for()
+        # Removed from the remembered Project: another is chosen, and the page says so.
+        self.service.remove_member(browser(owner), second.id, me)
+        self.page.reload()
+        self.page.get_by_text("no longer available to you").wait_for()
+        self.assertEqual(
+            self.page.get_by_label("Current Project", exact=True).input_value(), str(first.id)
+        )
+        self.assert_clean()
+
+    def test_layout_fits_a_phone_and_works_from_the_keyboard(self):
+        me = self.sign_in()
+        owner = self.user("pi")
+        project = owned_project(self.service, owner, "Long Project name " * 4)
+        self.service.add_member(browser(owner), project.id, me, "admin")
+        self.page.set_viewport_size({"width": 360, "height": 740})
+        for route in ("#/overview", "#/connect", "#/projects", f"#/projects/{project.id}"):
+            self.page.goto(f"{self.base}/console{route}")
+            self.page.reload()
+            self.page.locator("#main h1").wait_for()
+            self.page.wait_for_load_state("networkidle")
+            overflow = self.page.evaluate(
+                "document.documentElement.scrollWidth - document.documentElement.clientWidth"
+            )
+            self.assertLessEqual(overflow, 0, route)
+        # The skip link is the first focusable element and moves focus to the content.
+        first = self.page.evaluate(
+            "document.querySelector('a[href], button, input, select, [tabindex]').className"
+        )
+        self.assertEqual(first, "skip")
+        self.page.locator(".skip").focus()
+        self.page.keyboard.press("Enter")
+        self.assertEqual(self.page.evaluate("document.activeElement.id"), "main")
+        self.assertTrue(self.page.url.endswith(f"#/projects/{project.id}"), self.page.url)
+        # A confirmation opens on Cancel, closes on Escape and gives focus back.
+        newcomer = self.user("newcomer")
+        self.service.add_member(browser(owner), project.id, newcomer, "viewer")
+        self.page.reload()
+        remove = self.page.get_by_role("button", name=f"Remove newcomer ({newcomer})")
+        remove.focus()
+        self.page.keyboard.press("Enter")
+        self.page.get_by_role("dialog").wait_for()
+        self.assertEqual(self.page.evaluate("document.activeElement.textContent"), "Cancel")
+        self.page.keyboard.press("Escape")
+        self.page.get_by_role("dialog").wait_for(state="detached")
+        self.assertTrue(remove.evaluate("e => e === document.activeElement"))
+        self.assertEqual(self.role(project.id, newcomer), "viewer")
+        self.page.screenshot(path=os.path.join(_evidence(), "console-mobile.png"), full_page=True)
+        self.assert_clean()
+
+    def test_projects_list_searches_filters_and_pages(self):
+        me = self.sign_in()
+        owner = self.user("pi")
+        for n in range(20):
+            p = owned_project(self.service, owner, f"course {n:02}")
+            self.service.add_member(browser(owner), p.id, me, "viewer" if n % 2 else "member")
+        self.page.goto(f"{self.base}/console#/projects")
+        self.page.get_by_role("heading", name="Your Projects").wait_for()
+        rows = self.page.locator("#project-results tbody tr")
+        self.assertEqual(rows.count(), 15)
+        self.page.get_by_text("1–15 of 20").wait_for()
+        self.page.get_by_role("button", name="Next").click()
+        self.assertEqual(rows.count(), 5)
+        search = self.page.get_by_label("Search Projects")
+        search.fill("course 1")
+        self.assertEqual(rows.count(), 10)
+        self.assertTrue(search.evaluate("e => e === document.activeElement"))
+        self.page.get_by_label("Role", exact=True).select_option("member")
+        self.assertEqual(rows.count(), 5)
+        search.fill("nothing like it")
+        self.page.get_by_text("No Project matches.").wait_for()
+        self.assert_clean()
+
+
+class ConsoleConnectConfigTests(unittest.TestCase):
+    """`NEST_CONSOLE_*`: operator-set, shell-safe, and never a way around the SDK's rules."""
+
+    def load(self, origin="https://nest.example.com", **extra):
+        return load_controller_config(
+            {
+                "NEST_DATABASE_URL": "postgresql://nest@db.example.internal:5432/nest",
+                "NEST_GOOGLE_CLIENT_ID": CLIENT_ID,
+                "NEST_GOOGLE_CLIENT_SECRET": CLIENT_SECRET,
+                "NEST_GOOGLE_REDIRECT_URL": f"{origin}/auth/google/callback",
+                **extra,
+            }
+        ).google
+
+    def problems(self, **extra) -> str:
+        with self.assertRaises(ConfigError) as caught:
+            self.load(**extra)
+        return str(caught.exception)
+
+    def test_defaults_offer_nothing(self):
+        google = self.load()
+        assert google is not None
+        self.assertEqual(google.console, ConsoleConnectConfig())
+        self.assertEqual(google.summary()["console"]["hosted_profile"], "off")
+
+    def test_private_address_needs_an_explicit_transport(self):
+        google = self.load(
+            NEST_CONSOLE_CONTROLLER_ADDRESS="controller.example.org:50051",
+            NEST_CONSOLE_CONTROLLER_TLS="true",
+        )
+        assert google is not None
+        self.assertEqual(google.console.controller_address, "controller.example.org:50051")
+        self.assertIn(
+            "explicit NEST_CONSOLE_CONTROLLER_TLS",
+            self.problems(NEST_CONSOLE_CONTROLLER_ADDRESS="controller.example.org:50051"),
+        )
+        self.assertIn(
+            "needs NEST_CONSOLE_CONTROLLER_ADDRESS",
+            self.problems(NEST_CONSOLE_CONTROLLER_TLS="false"),
+        )
+
+    def test_values_that_could_inject_into_a_shell_are_refused(self):
+        for address in (
+            "host;rm -rf ~:50051",
+            "$(id):50051",
+            "host:50051 extra",
+            "host",
+            "host:0",
+            "`x`:1",
+            "https://host:443",
+        ):
+            self.assertIn(
+                "must be the Controller's host:port",
+                self.problems(
+                    NEST_CONSOLE_CONTROLLER_ADDRESS=address, NEST_CONSOLE_CONTROLLER_TLS="true"
+                ),
+                address,
+            )
+        self.assertIn(
+            "NEST_CONSOLE_HOSTED_PROFILE must be one of off, pilot",
+            self.problems(NEST_CONSOLE_HOSTED_PROFILE="on"),
+        )
+
+    def test_hosted_rules_match_the_sdk(self):
+        # The hosted profile is offered only by the hosted sign-in origin.
+        self.assertIn(
+            "this Nest signs in at https://nest.example.com",
+            self.problems(NEST_CONSOLE_HOSTED_PROFILE="pilot"),
+        )
+        google = self.load(origin=HOSTED_AUTH_URL, NEST_CONSOLE_HOSTED_PROFILE="pilot")
+        assert google is not None
+        self.assertEqual(google.console.hosted_profile, "pilot")
+        # The gateway is the hosted profile, not a private address.
+        self.assertIn(
+            "names the hosted public gateway",
+            self.problems(
+                NEST_CONSOLE_CONTROLLER_ADDRESS="grpc.nest.cerulean.works:443",
+                NEST_CONSOLE_CONTROLLER_TLS="true",
+            ),
+        )
+        # The hosted session never goes in plaintext to a non-hosted address...
+        self.assertIn(
+            "only over TLS",
+            self.problems(
+                origin=HOSTED_AUTH_URL,
+                NEST_CONSOLE_CONTROLLER_ADDRESS="staging.example.org:50051",
+                NEST_CONSOLE_CONTROLLER_TLS="false",
+            ),
+        )
+        # ...but the existing Tailnet path stays available.
+        google = self.load(
+            origin=HOSTED_AUTH_URL,
+            NEST_CONSOLE_CONTROLLER_ADDRESS="nest-controller.tail8e5ba1.ts.net:50051",
+            NEST_CONSOLE_CONTROLLER_TLS="false",
+        )
+        assert google is not None
+        self.assertFalse(google.console.controller_tls)
+
+    def test_settings_need_google_sign_in(self):
+        with self.assertRaises(ConfigError) as caught:
+            load_controller_config({"NEST_CONSOLE_HOSTED_PROFILE": "pilot"})
+        self.assertIn(
+            "NEST_CONSOLE_HOSTED_PROFILE needs NEST_GOOGLE_CLIENT_ID", str(caught.exception)
+        )

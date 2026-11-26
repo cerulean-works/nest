@@ -54,6 +54,7 @@ logger = get_logger("nest.authz.execution")
 
 __all__ = [
     "AUTHORIZATION_METADATA",
+    "ELIGIBILITY_REASONS",
     "MAX_ELIGIBLE_PROJECTS",
     "PROJECT_METADATA",
     "AllowedProjects",
@@ -61,6 +62,7 @@ __all__ = [
     "EligibleProject",
     "ExecutionAccess",
     "JobAccess",
+    "ProjectEligibility",
     "ProjectRequiredError",
     "UnauthenticatedError",
 ]
@@ -174,6 +176,38 @@ class EligibleProject:
     id: UUID
     name: str
     role: str
+
+
+ELIGIBILITY_REASONS = ("controller", "role", "provider", "platform", "account")
+"""Why a Project is not eligible on this Controller, in the order they are checked:
+the Controller serves no Platform, the caller's role may not submit, the Provider
+does not permit the Project, the served Platform is not granted to it, or a
+submission naming no Slurm account would get none."""
+
+
+@dataclass(frozen=True)
+class ProjectEligibility:
+    """
+    One of the caller's Projects and whether this Controller would accept a
+    submission from it now (G02c), for the Management Console.
+
+    Attributes:
+        id (`UUID`): The Project.
+        name (`str`): Its display name (not unique).
+        role (`str`): The caller's role in it.
+        reasons (`tuple[str, ...]`): Every unmet requirement, from
+            [`authz.ELIGIBILITY_REASONS`]; empty when eligible. Never an account name.
+    """
+
+    id: UUID
+    name: str
+    role: str
+    reasons: tuple[str, ...] = ()
+
+    @property
+    def eligible(self) -> bool:
+        """Whether nothing is missing."""
+        return not self.reasons
 
 
 @dataclass(frozen=True)
@@ -386,21 +420,70 @@ class ExecutionAccess:
         if self.platform_id is None:
             return eligible
         for project, role in self.platforms.projects.list_projects(principal):
-            if not decide(principal, role, Action.RUN_SUBMIT):
-                continue
-            if not self.authorizer.providers.permits(
-                principal, project.id, Action.RUN_SUBMIT, self.provider_id
-            ):
-                continue
-            granted, _ = self.platforms.store.project_platforms(principal.user_id, project.id)
-            if not any(p.id == self.platform_id for p in granted):
-                continue
-            if not self._default_account_resolves(project.id):
+            if self._unmet(principal, project.id, role, first_only=True):
                 continue
             eligible.append(EligibleProject(project.id, project.name, role))
             if len(eligible) >= MAX_ELIGIBLE_PROJECTS:
                 break
         return eligible
+
+    def project_eligibility(self, principal: Principal) -> list[ProjectEligibility]:
+        """
+        Every one of the caller's Projects, each with what it still needs to be
+        eligible here (G02c): the same checks as
+        [`authz.ExecutionAccess.eligible_projects`], all of them reported, so the
+        Console can say what to ask for. Reads only, records nothing, and names no
+        Slurm account. Advice, exactly like the listing: every submission is
+        authorized again from scratch.
+
+        Returns:
+            `list[ProjectEligibility]`: At most [`authz.MAX_ELIGIBLE_PROJECTS`], in
+                the order the Projects were created.
+
+        Raises:
+            [`authz.AccessDeniedError`]: If the session may not read Projects.
+            [`db.DatabaseError`]: If the database cannot answer (fail closed).
+        """
+        answer: list[ProjectEligibility] = []
+        for project, role in self.platforms.projects.list_projects(principal):
+            reasons = self._unmet(principal, project.id, role, first_only=False)
+            answer.append(ProjectEligibility(project.id, project.name, role, reasons))
+            if len(answer) >= MAX_ELIGIBLE_PROJECTS:
+                break
+        return answer
+
+    def _unmet(
+        self, principal: Principal, project_id: UUID, role: str, *, first_only: bool
+    ) -> tuple[str, ...]:
+        """The [`authz.ELIGIBILITY_REASONS`] a Project fails, or only the first."""
+        if self.platform_id is None:
+            return ("controller",)
+        unmet: list[str] = []
+        checks = (
+            ("role", lambda: bool(decide(principal, role, Action.RUN_SUBMIT))),
+            (
+                "provider",
+                lambda: self.authorizer.providers.permits(
+                    principal, project_id, Action.RUN_SUBMIT, self.provider_id
+                ),
+            ),
+            (
+                "platform",
+                lambda: any(
+                    p.id == self.platform_id
+                    for p in self.platforms.store.project_platforms(principal.user_id, project_id)[
+                        0
+                    ]
+                ),
+            ),
+            ("account", lambda: self._default_account_resolves(project_id)),
+        )
+        for reason, check in checks:
+            if not check():
+                unmet.append(reason)
+                if first_only:
+                    break
+        return tuple(unmet)
 
     def _default_account_resolves(self, project_id: UUID) -> bool:
         """Whether a Mode A submission naming no account would get one (E07)."""

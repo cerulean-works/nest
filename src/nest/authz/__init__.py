@@ -22,11 +22,13 @@ from .accounts import (
 )
 from .admin import AdminService, DirectoryUser, Page, ProjectAccess, ProviderPolicy
 from .execution import (
+    ELIGIBILITY_REASONS,
     MAX_ELIGIBLE_PROJECTS,
     AllowedProjects,
     DatabaseProviderApprovals,
     EligibleProject,
     ExecutionAccess,
+    ProjectEligibility,
     ProjectRequiredError,
     UnauthenticatedError,
 )
@@ -80,6 +82,7 @@ __all__ = [
     "CLI_ACTION_SCOPES",
     "DEFAULT_INVITATION_TTL",
     "DEFAULT_LINK_MAX_USES",
+    "ELIGIBILITY_REASONS",
     "MAX_ELIGIBLE_PROJECTS",
     "ORGANIZATION_READ_ACTIONS",
     "PLATFORM_SCOPES",
@@ -116,6 +119,7 @@ __all__ = [
     "PlatformSummary",
     "Principal",
     "ProjectAccess",
+    "ProjectEligibility",
     "ProjectPlatforms",
     "ProjectRequiredError",
     "ProjectService",

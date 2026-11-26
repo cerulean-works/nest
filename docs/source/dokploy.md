@@ -73,6 +73,10 @@ NEST_GOOGLE_CLIENT_SECRET='GOCSPX-...'
 NEST_GOOGLE_REDIRECT_URL='https://nest.example.com/auth/google/callback'
 NEST_BOOTSTRAP_ADMIN_GOOGLE_EMAIL='admin@example.com'
 # NEST_AUTH_HTTP_BIND defaults to 0.0.0.0:8080 in this file once a client ID is set.
+# Optional: what the Console's "Connect to Project" page tells users to set
+# (see "Environment variables"). Leave NEST_CONSOLE_HOSTED_PROFILE unset (off).
+# NEST_CONSOLE_CONTROLLER_ADDRESS='nest-controller.example.ts.net:50051'
+# NEST_CONSOLE_CONTROLLER_TLS='false'
 
 # --- Execution -----------------------------------------------------------------
 NEST_EXECUTOR='slurm'

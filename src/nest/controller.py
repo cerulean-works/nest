@@ -1526,6 +1526,8 @@ def main():
                 if config.auth == "session"
                 else None
             ),
+            # The Console reports the same eligibility the SDK's Project selection gets.
+            eligibility=access,
         )
         logger.info(
             "Controller listening address=%s executor=%s slurm_configured=%s tls=%s auth=%s "
