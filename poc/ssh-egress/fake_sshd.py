@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ipaddress
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
@@ -41,7 +42,7 @@ class FakeSshd:
     _server: asyncio.Server | None = None
 
     async def start(self, host: str = "127.0.0.1", port: int = 0) -> int:
-        if host not in {"127.0.0.1", "::1", "localhost"}:
+        if host != "localhost" and not ipaddress.ip_address(host).is_loopback:
             raise ValueError("The fixture listens on loopback only")
         self._server = await asyncio.start_server(self.handler or self._handle, host, port)
         return self._server.sockets[0].getsockname()[1]

@@ -1,30 +1,35 @@
 #!/usr/bin/env python3
 """
-No-job D03 egress smoke: can this host reach an approved login node's SSH port?
+No-job D03 egress smoke: can the Controller reach an approved login node's SSH port?
 
-Run it **on the Controller host** (so it uses the Controller's egress path and source
-IP) and only after the Platform operator approved the check. It:
+Run it **in the Controller's own network namespace** (for a Docker deployment, a
+disposable container sharing the Controller container's network; for a native
+Controller, on its host) and only after the Platform operator approved the check.
+Output from anywhere else is never acceptance evidence. It:
 
 1. resolves the login node once and requires every address to be public, not on the
    Tailnet, and one the operator recorded (`--approved-address`, required live);
-2. opens one TCP connection to a validated address literal, with Tailscale not used;
-3. reads the server's SSH identification line (RFC 4253 section 4.2), then closes.
-   It **sends no bytes at all**: no client banner, no username, no authentication;
-4. with `--keyscan`, runs `ssh-keyscan` (key exchange only, no authentication)
-   against that same validated address literal, or with `--keyscan-file` reads
-   its saved output, requires every key to have been observed at a validated
-   address and port, and compares the keys with the independently obtained
-   `--pin` fingerprints.
+2. for **each** validated address separately: opens one TCP connection to the
+   literal, fails if the chosen source address is on the Tailnet, and reads the
+   server's SSH identification line (RFC 4253 section 4.2), then closes. It **sends
+   no bytes at all**: no client banner, no username, no authentication;
+3. with `--keyscan`, runs `ssh-keyscan` (key exchange only, no authentication)
+   against each of those literals and requires a `--pin` to match a key observed
+   at *that* address. `--keyscan-file` reads operator-supplied output instead; it
+   is reported as a historical observation and never makes a run acceptance-eligible.
 
 It never logs in, never runs a command, never submits a Slurm job and reads no
-credential. Output is one JSON object per check plus a summary. `evidence` is
-`synthetic` with `--fixture` (loopback fixtures allowed) and `live` otherwise.
-Exits 1 if any check fails.
+credential. Output is one JSON object per check plus a summary that records where
+it ran (`--context`, hostname, network namespace, probe checksum) and whether the
+run is `acceptance_eligible`. `evidence` is `synthetic` with `--fixture` (loopback
+fixtures allowed) and `live` otherwise. Exits 1 if any check fails. A key or banner
+proves only what answered at an address, never anyone's HPC identity.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import ipaddress
 import json
 import socket
@@ -37,6 +42,8 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from egress_policy import (
+    TAILSCALE_CGNAT,
+    TAILSCALE_ULA,
     DestinationRejected,
     IPAddress,
     ScannedKey,
@@ -131,6 +138,35 @@ def run_keyscan(command: str, address: IPAddress, port: int, timeout: float) -> 
     return result.stdout
 
 
+def keys_at(keys: Sequence[ScannedKey], address: IPAddress, port: int) -> list[ScannedKey]:
+    """The scanned keys whose host column names exactly `address` on `port`."""
+    found = []
+    for key in keys:
+        for text, key_port in keyscan_hosts(key.host, port):
+            try:
+                if ipaddress.ip_address(text) == address and key_port == port:
+                    found.append(key)
+                    break
+            except ValueError:
+                continue
+    return found
+
+
+def network_context() -> dict[str, Any]:
+    """Where the probe ran, so a reviewer can match it to the Controller's namespace."""
+    context: dict[str, Any] = {"hostname": socket.gethostname()}
+    try:
+        context["net_namespace"] = Path("/proc/self/ns/net").readlink().as_posix()
+    except OSError:
+        context["net_namespace"] = None
+    context["probe_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    return context
+
+
+ACCEPTANCE_CONTEXTS = frozenset({"controller-namespace", "native-host"})
+"""Contexts whose output can count as Controller egress evidence (see the runbook)."""
+
+
 def run(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, resolver=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     parser.add_argument("--host", required=True, help="approved login-node name or address")
@@ -138,12 +174,19 @@ def run(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, resolver
     parser.add_argument("--allowed-port", type=int, action="append", help="default: 22 only")
     parser.add_argument("--approved-address", action="append", help="operator-approved IP")
     parser.add_argument("--pin", action="append", default=[], help="independent SHA256: pin")
+    parser.add_argument(
+        "--context",
+        choices=["controller-namespace", "native-host", "other"],
+        help="where this runs; required live (see the runbook)",
+    )
     scan = parser.add_mutually_exclusive_group()
     scan.add_argument(
-        "--keyscan", action="store_true", help="run ssh-keyscan against the validated address"
+        "--keyscan", action="store_true", help="run ssh-keyscan against each validated address"
     )
     scan.add_argument(
-        "--keyscan-file", type=Path, help="ssh-keyscan output for the validated address literal"
+        "--keyscan-file",
+        type=Path,
+        help="operator-supplied ssh-keyscan output (historical; never acceptance evidence)",
     )
     parser.add_argument("--keyscan-command", default="ssh-keyscan", help=argparse.SUPPRESS)
     parser.add_argument("--timeout", type=float, default=10.0)
@@ -151,7 +194,9 @@ def run(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, resolver
     args = parser.parse_args(argv)
     resolver = resolver or system_resolver
     evidence = "synthetic" if args.fixture else "live"
+    context = "fixture" if args.fixture else args.context
     failures = 0
+    tested: list[str] = []
 
     def report(check: str, ok: bool, **fields: Any) -> None:
         nonlocal failures
@@ -159,11 +204,40 @@ def run(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, resolver
         record = {"check": check, "ok": ok, "evidence": evidence, **fields}
         print(json.dumps(record, sort_keys=True), file=out, flush=True)
 
+    def summary(*, scanned: bool) -> int:
+        blockers = []
+        if evidence != "live":
+            blockers.append("synthetic run")
+        if context not in ACCEPTANCE_CONTEXTS:
+            blockers.append("not run in the Controller's network namespace")
+        if not scanned:
+            blockers.append("no built-in --keyscan against every tested address")
+        if failures:
+            blockers.append("a check failed")
+        record = {
+            "summary": True,
+            "ok": failures == 0,
+            "failures": failures,
+            "evidence": evidence,
+            "context": context,
+            "network": network_context(),
+            "addresses_tested": tested,
+            "acceptance_eligible": not blockers,
+            "acceptance_blockers": blockers,
+            "started_at": started,
+            "slurm_jobs_submitted": 0,
+            "logins_attempted": 0,
+        }
+        print(json.dumps(record, sort_keys=True), file=out, flush=True)
+        return 0 if failures == 0 else 1
+
     started = datetime.now(UTC).isoformat(timespec="seconds")
     try:
         pins = [normalize_pin(p) for p in args.pin]
         if not args.fixture and not args.approved_address:
             raise ValueError("a live run needs the operator-approved --approved-address set")
+        if not args.fixture and context is None:
+            raise ValueError("a live run needs --context (where the probe runs)")
         port = validate_port(args.port, args.allowed_port or {22})
         addresses = resolve_once(
             args.host,
@@ -174,77 +248,114 @@ def run(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, resolver
         )
     except DestinationRejected as error:
         report("destination", False, reason=error.reason, detail=str(error))
-        return _summary(out, started, evidence, failures)
+        return summary(scanned=False)
     except ValueError as error:
         report("arguments", False, detail=str(error))
-        return _summary(out, started, evidence, failures)
+        return summary(scanned=False)
     report("destination", True, addresses=[str(a) for a in addresses], port=port)
 
-    target = addresses[0]
+    file_keys: list[ScannedKey] | None = None
+    if args.keyscan_file is not None:
+        try:
+            file_keys = parse_keyscan(args.keyscan_file.read_text())
+            check_observed_at(file_keys, addresses, port)
+        except (OSError, ValueError) as error:
+            report("host_key", False, source="operator_file", detail=str(error))
+            file_keys = []
+
+    # Every validated address is tested on its own; nothing is aggregated across them.
+    for target in addresses:
+        tested.append(str(target))
+        probe_address(report, target, port, args.timeout)
+        if args.keyscan:
+            try:
+                text = run_keyscan(args.keyscan_command, target, port, args.timeout)
+                keys = parse_keyscan(text)
+                check_observed_at(keys, [target], port)
+            except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+                report(
+                    "host_key",
+                    False,
+                    address=str(target),
+                    source="probe_keyscan",
+                    detail=str(error) or type(error).__name__,
+                )
+                continue
+            report_host_key(report, keys, target, port, pins, source="probe_keyscan")
+        elif file_keys:
+            report_host_key(
+                report, keys_at(file_keys, target, port), target, port, pins, source="operator_file"
+            )
+    return summary(scanned=args.keyscan)
+
+
+def probe_address(report, target: IPAddress, port: int, timeout: float) -> None:
     begin = time.monotonic()
-    deadline = begin + args.timeout
+    deadline = begin + timeout
     try:
-        with socket.create_connection((str(target), port), timeout=args.timeout) as sock:
-            local = sock.getsockname()[0]
+        with socket.create_connection((str(target), port), timeout=timeout) as sock:
+            local = ipaddress.ip_address(sock.getsockname()[0].split("%", 1)[0])
+            on_tailnet = local in TAILSCALE_CGNAT or local in TAILSCALE_ULA
             report(
                 "tcp_connect",
-                True,
+                not on_tailnet,
                 address=str(target),
-                local_address=local,
+                local_address=str(local),
                 connect_ms=round((time.monotonic() - begin) * 1000, 1),
+                **({"reason": "tailnet_source"} if on_tailnet else {}),
             )
             try:
                 ident = read_identification(sock, deadline)
             except (OSError, ValueError) as error:
-                report("ssh_identification", False, detail=str(error) or type(error).__name__)
+                report(
+                    "ssh_identification",
+                    False,
+                    address=str(target),
+                    detail=str(error) or type(error).__name__,
+                )
             else:
                 report(
                     "ssh_identification",
                     ident.startswith(("SSH-2.0-", "SSH-1.99-")),
+                    address=str(target),
                     identification=ident[:255],
                     bytes_sent=0,
                 )
     except OSError as error:
         report("tcp_connect", False, address=str(target), detail=type(error).__name__)
 
-    if args.keyscan or args.keyscan_file is not None:
-        try:
-            if args.keyscan:
-                text = run_keyscan(args.keyscan_command, target, port, args.timeout)
-            else:
-                text = args.keyscan_file.read_text()
-            keys = parse_keyscan(text)
-            observed_at = check_observed_at(keys, addresses, port)
-        except (OSError, ValueError, subprocess.TimeoutExpired) as error:
-            report("host_key", False, detail=str(error) or type(error).__name__)
-        else:
-            if not pins:
-                report("host_key", False, detail="no independent --pin to compare with")
-            else:
-                matched, unpinned = match_pins(keys, pins)
-                report(
-                    "host_key",
-                    bool(matched),
-                    matched=matched,
-                    unpinned_observed=unpinned,
-                    observed_at=observed_at,
-                    note="observation from this path; trust comes only from the pin",
-                )
-    return _summary(out, started, evidence, failures)
 
-
-def _summary(out: TextIO, started: str, evidence: str, failures: int) -> int:
-    record = {
-        "summary": True,
-        "ok": failures == 0,
-        "failures": failures,
-        "evidence": evidence,
-        "started_at": started,
-        "slurm_jobs_submitted": 0,
-        "logins_attempted": 0,
-    }
-    print(json.dumps(record, sort_keys=True), file=out, flush=True)
-    return 0 if failures == 0 else 1
+def report_host_key(
+    report,
+    keys: Sequence[ScannedKey],
+    target: IPAddress,
+    port: int,
+    pins: Sequence[str],
+    *,
+    source: str,
+) -> None:
+    """One `host_key` record for one address: a pin must match a key seen *there*."""
+    fields: dict[str, Any] = {"address": str(target), "source": source}
+    if source == "operator_file":
+        fields["note"] = "historical observation supplied by the operator, not current evidence"
+    else:
+        fields["note"] = "observed by this run at this address; trust comes only from the pin"
+    if not pins:
+        report("host_key", False, detail="no independent --pin to compare with", **fields)
+        return
+    if not keys:
+        report("host_key", False, detail="no key observed at this address", **fields)
+        return
+    matched, unpinned = match_pins(keys, pins)
+    shown = f"[{target}]" if target.version == 6 else str(target)
+    report(
+        "host_key",
+        bool(matched),
+        matched=matched,
+        unpinned_observed=unpinned,
+        observed_at=[f"{shown}:{port}"],
+        **fields,
+    )
 
 
 if __name__ == "__main__":

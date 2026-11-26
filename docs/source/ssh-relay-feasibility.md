@@ -50,7 +50,7 @@ Every claim about D03 is one of three kinds, and they are reported separately.
 | --- | --- | --- |
 | **Implementation** | Code and documents exist and are reviewed | The probe, the reference relay model, the draft `relay.proto`, this page |
 | **Synthetic** | Checks passed against local, disposable fixtures | The fixture tests below; the probe with `--fixture` (all output marked `"evidence": "synthetic"`) |
-| **Live** | An authorized operator ran a check against the real Platform from the Controller host | **None.** The steps are listed under [Operator smoke steps](#operator-smoke-steps-no-job) and nothing there is claimed as passed |
+| **Live** | An authorized operator ran a check against the real Platform from the Controller's own network namespace | **None.** The steps are listed under [Operator smoke steps](#operator-smoke-steps-no-job) and nothing there is claimed as passed |
 
 Live evidence, once collected, is attached to the D03 Issue with the approval
 record below. A green CI run is synthetic evidence only.
@@ -76,21 +76,84 @@ reachability smoke against a real host.
 
 ## Operator smoke steps (no job)
 
-These are for an authorized operator, run **on the Controller host** (so the
-check uses the Controller's real egress path and source address), after the
-approval above. They read only public information. They never log in, never
-send a username or password, never run a command on the login node and never
-submit a Slurm job. They change no firewall, route, DNS or Controller setting.
+These are for an authorized operator, after the approval above. They read only
+public information. They never log in, never send a username or password, never
+run a command on the login node and never submit a Slurm job. They change no
+firewall, route, DNS or Controller setting.
 
-Before you start, confirm Mode A's Tailnet is not the route. If the Controller
-uses Tailscale, check that the login node's addresses are not routed through
-`tailscale0`:
+### Run them in the Controller's network namespace
+
+The evidence must come from the network namespace the Controller process itself
+uses. DNS, routes, firewall and NAT rules and source-address selection can differ
+between a host and a container on it, so output from the wrong place proves
+nothing about the Controller.
+
+- **Docker or Dokploy deployment.** `compose.dokploy.yaml` puts the Controller on
+  Docker bridge networks (`tailnet` and the internal `grpc-origin`), next to a
+  separate Tailscale service. Its outbound traffic leaves through the bridge and
+  is then NATed and routed by the host. A run directly on the host does **not**
+  exercise the Controller's namespace. Use the disposable container below with
+  `--context controller-namespace`. Host-only output is recorded as
+  `--context other` and never counts as acceptance evidence.
+- **Native Controller** (the process runs directly on the host). Run on that host
+  with `--context native-host`.
+
+The probe's summary records the `--context`, the hostname, the network namespace
+(`net:[inode]`) and the probe file's SHA-256. It reports `acceptance_eligible` and,
+when that is false, why: a synthetic run, the wrong context, no built-in
+`--keyscan` of every tested address, or a failed check.
+
+**Docker: a disposable probe container sharing the Controller's network.** Use
+the Controller's own image (it has Python and `ssh-keyscan`). Mount only the
+probe directory, read-only, and pass no environment, secrets or other volumes.
+Nothing is changed in the Controller container.
 
 ```bash
-ip route get <login-node-public-ip>      # must not say "dev tailscale0"
+CID=$(docker ps -q --filter label=com.docker.compose.service=controller)
+IMAGE=$(docker inspect -f '{{.Image}}' "$CID")
+docker run --rm --network "container:$CID" --user 65534:65534 --read-only \
+  --cap-drop ALL --security-opt no-new-privileges --entrypoint python3 \
+  -v "$PWD/poc/ssh-egress:/probe:ro" "$IMAGE" -B -E -s /probe/egress_probe.py \
+  --context controller-namespace --host ln01.nano4.example \
+  --approved-address <approved-ip> [--approved-address <approved-ipv6>] \
+  --pin SHA256:<fingerprint-from-the-operator> --keyscan
 ```
 
-**1. Rehearse against the local fixture** (synthetic; needs only Python):
+**Routes from that namespace** (read-only; run on the host). The probe already
+fails `tcp_connect` with `tailnet_source` if the chosen source address is on the
+Tailnet, but a public destination address alone does not exclude a VPN, subnet
+router or exit-node route, so check the route for every approved address, both
+inside the namespace and for the traffic the host forwards from it:
+
+```bash
+PID=$(docker inspect -f '{{.State.Pid}}' "$CID")
+sudo readlink "/proc/$PID/ns/net"                  # must equal the probe's net_namespace
+sudo nsenter -t "$PID" -n ip route get <approved-ip>      # default route via the bridge
+sudo nsenter -t "$PID" -n ip -6 route get <approved-ipv6>  # if IPv6 is approved
+# How the host routes what it forwards from that container (policy rules included):
+SRC=$(sudo nsenter -t "$PID" -n ip -4 route get <approved-ip> | grep -o 'src [^ ]*' | cut -d' ' -f2)
+BRIDGE=$(ip -o route get "$SRC" | grep -o 'dev [^ ]*' | cut -d' ' -f2)
+ip route get <approved-ip> from "$SRC" iif "$BRIDGE"  # must not use tailscale0, wg* or tun*
+```
+
+For a native Controller, run `ip route get <approved-ip>` (and `ip -6 route get`
+for each approved IPv6 address) on the host. Neither may name `tailscale0`, a
+WireGuard or VPN interface, or an exit node.
+
+**Record the revision and place.** With the probe output, save
+`git rev-parse HEAD` of the checkout you ran from, `$CID` and `$IMAGE` (Docker), and
+the route output. These go with the approval record.
+
+**Public source address.** The probe sees only its local address (a bridge
+address in Docker). Confirm the public source address against the approved
+source IP policy from your provider's console, and ask the Platform operator to
+confirm from their own logs that the connections at the summary's `started_at`
+came from that address. Do not use a third-party "what is my IP" service.
+
+### Steps
+
+**1. Rehearse against the local fixture** (synthetic; needs Python 3.12 or later and
+nothing else, so `uv run python` in this repository works too):
 
 ```bash
 cd poc/ssh-egress
@@ -99,52 +162,43 @@ python3 egress_probe.py --host 127.0.0.1 --port 2222 --allowed-port 2222 --fixtu
 kill %1
 ```
 
-**2. Reachability and SSH identification** (live):
+**2. Reachability, SSH identification and host keys** (live), using the command
+above for your deployment type. The probe:
 
-```bash
-python3 egress_probe.py --host ln01.nano4.example \
-  --approved-address <approved-ip> [--approved-address <approved-ipv6>]
-```
+- resolves the name once and fails unless every address is public, not on the
+  Tailnet (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`), and in the approved set. A
+  live run without `--approved-address` or `--context` is refused before any
+  lookup;
+- tests **every** validated address separately. For each one it opens one TCP
+  connection to the literal, checks that the source address is not on the
+  Tailnet, reads the server's `SSH-2.0-...` identification line (bounded by
+  `--timeout` and 8 KiB) and closes. It sends **zero bytes**: no client banner,
+  so no key exchange and no authentication;
+- with `--keyscan`, runs `ssh-keyscan` itself, without a shell, against each
+  **address literal it tested**, never the name. A separate DNS lookup (for
+  example through Tailscale split DNS or MagicDNS) could reach the node over the
+  Tailnet. `ssh-keyscan` performs only key exchange and never authenticates.
+  Each address gets its own `host_key` record, which passes only if a `--pin` you
+  got from the operator matches a key observed **at that address**.
 
-The probe resolves the name once and fails unless every address is public, not
-on the Tailnet (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`), and in the approved set.
-A live run without `--approved-address` is refused before any lookup: the result
-would not show that the approved endpoint was reached. The probe connects to one
-validated address on port 22, reads the server's `SSH-2.0-...` identification
-line and closes. The read is bounded by `--timeout` and by 8 KiB in total. It
-sends **zero bytes**: no client banner, so no key exchange and no authentication.
-Its `local_address` is the host's interface address. Your public egress address
-still has to be confirmed against the source IP item, from your provider's
-console, not from a third-party "what is my IP" service.
+A key observed over the same path is never trusted on its own, and `host_key`
+fails if no `--pin` is given. A matching key proves only which server answered at
+an address, never anyone's HPC identity.
 
-**3. Host-key observation at the validated address, compared with the
-independent pin** (live; needs OpenSSH's `ssh-keyscan` on the Controller host):
+`--keyscan-file` accepts operator-supplied `ssh-keyscan` output instead, for
+example when a scan has to be repeated later. Its lines must name tested address
+literals on the probed port (a name, another address or port, or a hashed host
+fails with `keyscan_host_mismatch`), and each address is still checked only
+against its own keys. The output is reported as `source: operator_file`, a
+historical observation, and the run is never `acceptance_eligible`. Prefer
+`--keyscan`.
 
-```bash
-python3 egress_probe.py --host ln01.nano4.example --approved-address <approved-ip> \
-  --pin SHA256:<fingerprint-from-the-operator> --keyscan
-```
-
-With `--keyscan` the probe runs `ssh-keyscan` itself, without a shell, against
-the **address literal it validated**, not the name. A second, separate DNS lookup
-(for example through Tailscale split DNS or MagicDNS) could reach the login node
-over the Tailnet, which is the path D03 must exclude. `ssh-keyscan` performs only
-key exchange and never authenticates. The `host_key` check passes only if:
-
-- every scanned key was observed at a validated address and port (reported as
-  `observed_at`), and
-- an observed key matches a `--pin` you got from the operator.
-
-A key observed over the same path is never trusted on its own, and the check
-fails if no `--pin` is given. If `ssh-keyscan` has to run separately, scan each
-approved literal (`ssh-keyscan -p 22 -t ed25519,ecdsa,rsa <approved-ip>`, without
-`-H`) and pass the output with `--keyscan-file`. Lines for a name, another
-address, another port or a hashed host fail with `keyscan_host_mismatch`.
-
-**4. Attach the output.** Save the JSON lines from steps 2 and 3 with the
-approval record. The summary line always has `slurm_jobs_submitted: 0` and
-`logins_attempted: 0`, and every record has `"evidence": "live"`. Delete any
-saved keyscan file.
+**3. Attach the output.** Save every JSON line, the route output, the revision
+and place records above and the operator's source-address confirmation with the
+approval record. The summary always has `slurm_jobs_submitted: 0` and
+`logins_attempted: 0`. For acceptance it must show `evidence: live`,
+`context: controller-namespace` (or `native-host`), `acceptance_eligible: true`,
+and every approved address in `addresses_tested`. Delete any saved keyscan file.
 
 Not part of this package, and not to be done without separate approval: an
 interactive `ssh` login (even to check `whoami`), any Slurm command, a relay
@@ -197,13 +251,15 @@ stdout carries SSH bytes only, and diagnostics go to stderr.
 | Bounded size and time | Frame size cap, total-bytes cap, connect timeout, idle timeout and maximum duration | `test_size_limits`, `test_idle_and_total_timeouts` |
 | Backpressure | Each direction has at most one frame in flight. A slow side stops reads on the other, so memory per stream is bounded at about twice the frame size | `test_backpressure_bounds_in_flight_data` |
 | EOF and half-close | Client `half_close` becomes TCP FIN, and the login node's FIN becomes server `half_close`. The call ends when both directions have closed | `test_opaque_bytes_round_trip_with_half_close` |
-| Cancel and failure | Client cancellation closes the socket, releases the slot and records `cancelled`. Connect failures and resets end the call with `connect_failed` or `upstream_error` | `test_cancellation_closes_socket_and_releases`, `test_connect_failure`, `test_upstream_reset_is_reported` |
+| Bounded setup | One `connect_timeout_s` covers resolution and connect. Resolution runs off the event loop, so a stalled lookup cannot block other streams. A production relay also needs a resolver with its own enforced timeout, because an abandoned lookup is not interrupted | `test_stalled_resolver_is_bounded_and_does_not_block_the_loop` |
+| Cancel and failure | Client cancellation closes the socket, releases the slot and records `cancelled`. Connect failures, resets and write or drain errors end the call with `connect_failed` or `upstream_error` | `test_cancellation_closes_socket_and_releases`, `test_connect_failure`, `test_upstream_reset_is_reported`, `test_upstream_write_errors_are_upstream_error` |
+| Bounded cleanup | Close is graceful for at most `close_timeout_s`, then the socket is aborted. Slot release and the final audit run in a nested `finally`, so they happen even if closing stalls, fails or is itself cancelled | `test_stalled_close_is_aborted_and_still_releases`, `test_cancellation_during_cleanup_still_releases_and_audits` |
 | Audit | `relay.connected` and `relay.closed` events, plus every denial. Each records the actor, Project, Platform, attempt, node, address, port, outcome, byte counts and duration, with authority `user_owned` and transport `direct_public_tcp`. Never payload | `test_audit_never_contains_payload` |
 
 The reference limits in `RelayLimits` (64 streams in total, 4 per user, 2 per user
-and Platform, 10 opens a minute, 32 KiB frames, 1 GiB, 10 s connect, 15 min idle,
-8 h total) are placeholders for the tests. They are not proposed production
-values.
+and Platform, 10 opens a minute, 32 KiB frames, 1 GiB, 10 s to resolve and
+connect, 5 s to close, 15 min idle, 8 h total) are placeholders for the tests.
+They are not proposed production values.
 
 ### What a working relay does not prove
 

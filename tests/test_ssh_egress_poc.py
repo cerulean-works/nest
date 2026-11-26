@@ -146,6 +146,37 @@ class FixtureServer:
         self.loop.close()
 
 
+OTHER_BLOB = base64.b64encode(b"\x00\x00\x00\x0bssh-ed25519" + bytes(range(32, 64))).decode()
+
+
+class TwoAddressFixture:
+    """Fixtures on 127.0.0.1 and 127.0.0.2 sharing one port: two 'addresses' of a node."""
+
+    def __enter__(self):
+        for _ in range(20):
+            self.first = FixtureServer()
+            self.first.__enter__()
+            port = self.first.port
+            self.second = FixtureServer()
+            self.second.thread.start()
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self.second.server.start("127.0.0.2", port), self.second.loop
+                ).result(5)
+            except OSError:
+                self.second.loop.call_soon_threadsafe(self.second.loop.stop)
+                self.second.thread.join(5)
+                self.first.__exit__()
+                continue
+            self.second.port = port
+            return self.first, port
+        raise RuntimeError("no shared port free on 127.0.0.1 and 127.0.0.2")
+
+    def __exit__(self, *exc):
+        self.second.__exit__()
+        self.first.__exit__()
+
+
 def probe(*args, resolver=None):
     out = io.StringIO()
     code = egress_probe.run(list(args), out=out, resolver=resolver)
@@ -182,6 +213,7 @@ class EgressProbeTests(unittest.TestCase):
             code, records = probe(
                 "--host", "127.0.0.1", "--port", str(fixture.port),
                 "--allowed-port", str(fixture.port), "--approved-address", "127.0.0.1",
+                "--context", "controller-namespace",
             )  # fmt: skip
             self.assertEqual(fixture.server.connections, 0)
         self.assertEqual(code, 1)
@@ -191,18 +223,20 @@ class EgressProbeTests(unittest.TestCase):
     def test_tailnet_resolution_and_unapproved_port_are_refused(self):
         code, records = probe(
             "--host", "ln.example", "--approved-address", "100.101.102.103",
+            "--context", "controller-namespace",
             resolver=lambda h, p: ["100.101.102.103"],
         )  # fmt: skip
         self.assertEqual((code, records[0]["reason"]), (1, "tailnet_address"))
         code, records = probe(
-            "--host", PUBLIC_V4, "--port", "2222", "--approved-address", PUBLIC_V4
-        )
+            "--host", PUBLIC_V4, "--port", "2222", "--approved-address", PUBLIC_V4,
+            "--context", "controller-namespace",
+        )  # fmt: skip
         self.assertEqual((code, records[0]["reason"]), (1, "port_not_allowlisted"))
 
     def test_resolution_outside_approved_addresses_is_refused(self):
         code, records = probe(
             "--host", "ln.example", "--approved-address", PUBLIC_V4,
-            resolver=lambda h, p: ["9.9.9.9"],
+            "--context", "controller-namespace", resolver=lambda h, p: ["9.9.9.9"],
         )  # fmt: skip
         self.assertEqual((code, records[0]["reason"]), (1, "address_not_approved"))
 
@@ -371,6 +405,95 @@ class EgressProbeTests(unittest.TestCase):
         self.assertIn(ident["detail"], {"no identification line before --timeout", "timed out"})
         self.assertLess(elapsed, 2)
 
+    def test_live_run_requires_a_context(self):
+        code, records = probe(
+            "--host", "ln.example", "--approved-address", PUBLIC_V4,
+            resolver=lambda h, p: [PUBLIC_V4],
+        )  # fmt: skip
+        self.assertEqual((code, records[0]["check"]), (1, "arguments"))
+        self.assertIn("--context", records[0]["detail"])
+
+    def test_every_address_is_tested_and_keys_bind_to_their_own_address(self):
+        # Approved A and B: B's key is pinned, A's is not. Before, a pinned key for B
+        # made the whole run pass even though only A was probed.
+        with TwoAddressFixture() as (_, port), tempfile.TemporaryDirectory() as tmp:
+            scan = Path(tmp) / "scan.txt"
+            scan.write_text(
+                f"[127.0.0.1]:{port} ssh-ed25519 {OTHER_BLOB}\n"
+                f"[127.0.0.2]:{port} ssh-ed25519 {PIN_BLOB}\n"
+            )
+            code, records = probe(
+                "--host", "ln.example", "--port", str(port), "--allowed-port", str(port),
+                "--fixture", "--pin", PIN, "--keyscan-file", str(scan),
+                resolver=lambda h, p: ["127.0.0.1", "127.0.0.2"],
+            )  # fmt: skip
+        by = {(r.get("check"), r.get("address")): r for r in records}
+        self.assertEqual(code, 1)
+        self.assertTrue(by["tcp_connect", "127.0.0.1"]["ok"])
+        self.assertTrue(by["tcp_connect", "127.0.0.2"]["ok"])
+        self.assertFalse(by["host_key", "127.0.0.1"]["ok"])
+        self.assertTrue(by["host_key", "127.0.0.2"]["ok"])
+        self.assertEqual(records[-1]["addresses_tested"], ["127.0.0.1", "127.0.0.2"])
+
+    def test_builtin_keyscan_is_per_exact_target(self):
+        with TwoAddressFixture() as (_, port), tempfile.TemporaryDirectory() as tmp:
+            calls = Path(tmp) / "calls.txt"
+            fake = Path(tmp) / "fake-keyscan"
+            fake.write_text(
+                f"#!{sys.executable}\n"
+                "import sys\n"
+                f"open({str(calls)!r}, 'a').write(sys.argv[-1] + '\\n')\n"
+                "port, host = sys.argv[2], sys.argv[-1]\n"
+                f"blob = {PIN_BLOB!r} if host == '127.0.0.2' else {OTHER_BLOB!r}\n"
+                "print(f'[{host}]:{port} ssh-ed25519 {blob}')\n"
+            )
+            fake.chmod(0o700)
+            code, records = probe(
+                "--host", "ln.example", "--port", str(port), "--allowed-port", str(port),
+                "--fixture", "--pin", PIN, "--keyscan", "--keyscan-command", str(fake),
+                resolver=lambda h, p: ["127.0.0.1", "127.0.0.2"],
+            )  # fmt: skip
+            scanned = calls.read_text().split()
+        by = {(r.get("check"), r.get("address")): r for r in records}
+        self.assertEqual(scanned, ["127.0.0.1", "127.0.0.2"])
+        self.assertEqual(code, 1)
+        self.assertFalse(by["host_key", "127.0.0.1"]["ok"])
+        self.assertTrue(by["host_key", "127.0.0.2"]["ok"])
+        self.assertEqual(by["host_key", "127.0.0.2"]["source"], "probe_keyscan")
+
+    def test_imported_keyscan_is_historical_and_never_acceptance_evidence(self):
+        with FixtureServer() as fixture, tempfile.TemporaryDirectory() as tmp:
+            scan = Path(tmp) / "scan.txt"
+            scan.write_text(f"[127.0.0.1]:{fixture.port} ssh-ed25519 {PIN_BLOB}\n")
+            code, records = probe(
+                "--host", "127.0.0.1", "--port", str(fixture.port),
+                "--allowed-port", str(fixture.port), "--fixture",
+                "--pin", PIN, "--keyscan-file", str(scan),
+            )  # fmt: skip
+        key = {r.get("check"): r for r in records}["host_key"]
+        self.assertEqual(code, 0)
+        self.assertEqual(key["source"], "operator_file")
+        self.assertIn("historical", key["note"])
+        summary = records[-1]
+        self.assertFalse(summary["acceptance_eligible"])
+        self.assertIn(
+            "no built-in --keyscan against every tested address", summary["acceptance_blockers"]
+        )
+
+    def test_summary_records_where_it_ran(self):
+        with FixtureServer() as fixture:
+            code, records = probe(
+                "--host", "127.0.0.1", "--port", str(fixture.port),
+                "--allowed-port", str(fixture.port), "--fixture",
+            )  # fmt: skip
+        summary = records[-1]
+        self.assertEqual(code, 0)
+        self.assertEqual(summary["context"], "fixture")
+        self.assertIn("net_namespace", summary["network"])
+        self.assertRegex(summary["network"]["probe_sha256"], r"^[0-9a-f]{64}$")
+        self.assertIn("synthetic run", summary["acceptance_blockers"])
+        self.assertFalse(summary["acceptance_eligible"])
+
 
 class Client:
     """A fake gRPC client side: queued frames in, collected frames out."""
@@ -398,6 +521,43 @@ class Client:
             self.received += chunk
 
 
+class Writer:
+    """Wraps a real StreamWriter to inject a stalled close or a failing drain."""
+
+    def __init__(self, real, *, hang_close=False, drain_error=None):
+        self.real = real
+        self.hang_close = hang_close
+        self.drain_error = drain_error
+        self.aborted = False
+        self.transport = self
+
+    def abort(self):
+        self.aborted = True
+        self.real.transport.abort()
+
+    def write(self, data):
+        self.real.write(data)
+
+    async def drain(self):
+        if self.drain_error is not None:
+            raise self.drain_error
+        await self.real.drain()
+
+    def can_write_eof(self):
+        return self.real.can_write_eof()
+
+    def write_eof(self):
+        self.real.write_eof()
+
+    def close(self):
+        self.real.close()
+
+    async def wait_closed(self):
+        if self.hang_close:
+            await asyncio.Event().wait()
+        await self.real.wait_closed()
+
+
 class RelayContractTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.sshd = fake_sshd.FakeSshd()
@@ -406,6 +566,7 @@ class RelayContractTests(unittest.IsolatedAsyncioTestCase):
         self.resolved: list[str] = []
         self.connected: list[tuple[str, int]] = []
         self.allowed = {("alice", PLATFORM)}
+        self.writer: Writer | None = None
 
     async def asyncTearDown(self):
         await self.sshd.close()
@@ -638,6 +799,93 @@ class RelayContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(
             caught.exception.outcome, {rc.Outcome.UPSTREAM_ERROR, rc.Outcome.IDLE_TIMEOUT}
         )
+
+    async def test_stalled_resolver_is_bounded_and_does_not_block_the_loop(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def stalled(host, port):
+            release.wait(10)
+            return [PUBLIC_V4]
+
+        ticks = 0
+
+        async def ticker():
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0.01)
+
+        tick = asyncio.create_task(ticker())
+        model = self.model(limits=rc.RelayLimits(connect_timeout_s=0.3))
+        model.resolver = stalled
+        client = Client([])
+        started = time.monotonic()
+        with self.assertRaises(rc.RelayError) as caught:
+            await model.open(rc.Principal("alice"), self.first(), client.frames(), client.send)
+        tick.cancel()
+        self.assertEqual(caught.exception.outcome, rc.Outcome.CONNECT_FAILED)
+        self.assertIn("resolve_timeout", str(caught.exception))
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertGreater(ticks, 10)  # other work kept running during the stall
+        self.assertEqual((model.admission.total, self.connected), (0, []))
+        self.assertEqual(self.events[-1].event, "relay.closed")
+
+    def wrapped(self, **options):
+        async def connector(address, port):
+            self.connected.append((str(address), port))
+            reader, writer = await asyncio.open_connection("127.0.0.1", self.port)
+            self.writer = Writer(writer, **options)
+            return reader, self.writer
+
+        return connector
+
+    async def test_stalled_close_is_aborted_and_still_releases(self):
+        model = self.model(
+            connector=self.wrapped(hang_close=True),
+            limits=rc.RelayLimits(close_timeout_s=0.2),
+        )
+        client = Client([b"bye"])
+        started = time.monotonic()
+        event = await model.open(rc.Principal("alice"), self.first(), client.frames(), client.send)
+        self.assertLess(time.monotonic() - started, 2)
+        assert self.writer is not None
+        self.assertTrue(self.writer.aborted)
+        self.assertEqual(event.outcome, rc.Outcome.CLOSED)
+        self.assertEqual(model.admission.total, 0)
+        self.assertEqual(self.events[-1].event, "relay.closed")
+
+    async def test_cancellation_during_cleanup_still_releases_and_audits(self):
+        model = self.model(
+            connector=self.wrapped(hang_close=True),
+            limits=rc.RelayLimits(close_timeout_s=30),
+        )
+        client = Client([], hold_open=True)
+        task = asyncio.create_task(
+            model.open(rc.Principal("alice"), self.first(), client.frames(), client.send)
+        )
+        while not any(e.event == "relay.connected" for e in self.events):
+            await asyncio.sleep(0.01)
+        task.cancel()  # ends the pump; cleanup then hangs in the close
+        await asyncio.sleep(0.1)
+        self.assertFalse(task.done())
+        task.cancel()  # a second cancellation, during cleanup
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        assert self.writer is not None
+        self.assertTrue(self.writer.aborted)
+        self.assertEqual(model.admission.total, 0)
+        last = self.events[-1]
+        self.assertEqual((last.event, last.outcome), ("relay.closed", rc.Outcome.CANCELLED))
+        self.assertEqual(last.detail, "cancelled during cleanup")
+
+    async def test_upstream_write_errors_are_upstream_error(self):
+        model = self.model(connector=self.wrapped(drain_error=ConnectionResetError()))
+        client = Client([b"data"], hold_open=True)
+        with self.assertRaises(rc.RelayError) as caught:
+            await model.open(rc.Principal("alice"), self.first(), client.frames(), client.send)
+        self.assertEqual(caught.exception.outcome, rc.Outcome.UPSTREAM_ERROR)
+        self.assertEqual(model.admission.total, 0)
 
     async def _reset(self, reader, writer):
         sock = writer.get_extra_info("socket")

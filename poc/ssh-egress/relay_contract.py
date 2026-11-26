@@ -25,7 +25,6 @@ TCP reachability proves nothing about who the user is on the HPC system.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import time
 import uuid
 from collections import defaultdict, deque
@@ -137,7 +136,8 @@ class RelayLimits:
     max_opens_per_minute_per_user: int = 10
     max_frame_bytes: int = 32 * 1024
     max_total_bytes: int = 1 << 30
-    connect_timeout_s: float = 10.0
+    connect_timeout_s: float = 10.0  # resolution and connect together
+    close_timeout_s: float = 5.0  # graceful close, then abort
     idle_timeout_s: float = 900.0
     max_duration_s: float = 8 * 3600.0
 
@@ -294,20 +294,31 @@ class RelayModel:
             event.node_id = node.node_id
             try:
                 port = validate_port(node.port, self.allowed_ports)
-                addresses = resolve_once(
-                    node.host,
-                    port,
-                    self.resolver,
-                    approved=node.approved_addresses,
-                    allow_loopback=self.allow_loopback,
-                )
             except DestinationRejected as error:
                 raise RelayError(Outcome.DESTINATION_REJECTED, error.reason) from None
-            event.address, event.port = str(addresses[0]), port
+            # One bound covers resolution and connect. The resolver runs off the event
+            # loop so a stalled lookup cannot block other streams; a production relay
+            # should use a resolver with its own enforced timeout as well, because the
+            # abandoned lookup thread is not interrupted.
             try:
                 async with asyncio.timeout(self.limits.connect_timeout_s):
+                    try:
+                        addresses = await asyncio.to_thread(
+                            resolve_once,
+                            node.host,
+                            port,
+                            self.resolver,
+                            approved=node.approved_addresses,
+                            allow_loopback=self.allow_loopback,
+                        )
+                    except DestinationRejected as error:
+                        raise RelayError(Outcome.DESTINATION_REJECTED, error.reason) from None
+                    event.address, event.port = str(addresses[0]), port
                     reader, writer = await self.connector(addresses[0], port)
-            except (OSError, TimeoutError) as error:
+            except TimeoutError:
+                phase = "connect_timeout" if event.address else "resolve_timeout"
+                raise RelayError(Outcome.CONNECT_FAILED, phase) from None
+            except OSError as error:
                 raise RelayError(Outcome.CONNECT_FAILED, type(error).__name__) from None
             self._emit(event, "relay.connected", started)
             counters = _Counters()
@@ -327,14 +338,33 @@ class RelayModel:
             event.outcome = Outcome.CANCELLED
             raise
         finally:
-            if writer is not None:
-                writer.close()
-                with contextlib.suppress(Exception):
-                    await writer.wait_closed()
-            if admitted is not None:
-                self.admission.release(*admitted)
-            self._emit(event, "relay.closed", started)
+            # Release and the final audit run even if closing fails, stalls or is
+            # itself cancelled.
+            try:
+                if writer is not None:
+                    try:
+                        await self._close(writer)
+                    except asyncio.CancelledError:
+                        event.outcome = Outcome.CANCELLED
+                        event.detail = "cancelled during cleanup"
+                        raise
+            finally:
+                if admitted is not None:
+                    self.admission.release(*admitted)
+                self._emit(event, "relay.closed", started)
         return event
+
+    async def _close(self, writer: asyncio.StreamWriter) -> None:
+        """Close gracefully within `close_timeout_s`, otherwise abort the socket."""
+        writer.close()
+        try:
+            async with asyncio.timeout(self.limits.close_timeout_s):
+                await writer.wait_closed()
+        except asyncio.CancelledError:
+            writer.transport.abort()
+            raise
+        except TimeoutError, OSError:  # stalled or reset: drop the connection
+            writer.transport.abort()
 
     def _emit(self, event: AuditEvent, name: str, started: float) -> None:
         event.event = name
@@ -361,21 +391,24 @@ class RelayModel:
             counters.last_activity = time.monotonic()
 
         async def upstream() -> None:
-            async for frame in client_frames:
-                if len(frame) > limits.max_frame_bytes:
-                    raise RelayError(Outcome.FRAME_TOO_LARGE)
-                account(len(frame), True)
-                writer.write(frame)
-                await writer.drain()  # backpressure: next frame waits for the socket
-            if writer.can_write_eof():
-                writer.write_eof()  # client half-close -> TCP FIN
+            try:
+                async for frame in client_frames:
+                    if len(frame) > limits.max_frame_bytes:
+                        raise RelayError(Outcome.FRAME_TOO_LARGE)
+                    account(len(frame), True)
+                    writer.write(frame)
+                    await writer.drain()  # backpressure: next frame waits for the socket
+                if writer.can_write_eof():
+                    writer.write_eof()  # client half-close -> TCP FIN
+            except OSError as error:  # includes ConnectionError from write or drain
+                raise RelayError(Outcome.UPSTREAM_ERROR, type(error).__name__) from None
 
         async def downstream() -> None:
             try:
                 while chunk := await reader.read(limits.max_frame_bytes):
                     account(len(chunk), False)
                     await send(chunk)  # backpressure: next read waits for the client
-            except ConnectionError as error:
+            except OSError as error:
                 raise RelayError(Outcome.UPSTREAM_ERROR, type(error).__name__) from None
             await send(None)  # TCP FIN -> server half-close
 
