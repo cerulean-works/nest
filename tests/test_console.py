@@ -1326,6 +1326,34 @@ class ConnectBrowserTests(_EligibilityBrowserBase):
         self.page.screenshot(path=os.path.join(_evidence(), "console-mobile.png"), full_page=True)
         self.assert_clean()
 
+    def test_without_a_profile_only_install_and_sign_in_are_offered(self):
+        server = self.http.server
+        assert server is not None
+        server.connect = ConsoleConnectConfig()  # the operator published no profile
+        me = self.sign_in()
+        owner = self.user("pi")
+        project = owned_project(self.service, owner, "lab")
+        self.service.add_member(browser(owner), project.id, me, "member")
+        self.make_ready(project.id)
+        self.page.goto(f"{self.base}/console#/connect")
+        self.page.reload()
+        self.page.get_by_text("has not published connection settings").first.wait_for()
+        commands = [
+            c.get_attribute("data-command") for c in self.page.locator("[data-command]").all()
+        ]
+        self.assertEqual(commands, ["Install Nest", "Connection settings and sign-in"])
+        settings = self.page.locator('[data-command="Connection settings and sign-in"] pre')
+        self.assertEqual(
+            settings.inner_text().splitlines(),
+            [
+                f"export NEST_AUTH_URL={self.base}",
+                "uv run nest login",
+                "uv run nest auth status --check",
+            ],
+        )
+        self.page.locator("#connect-needs-controller").wait_for()
+        self.assert_clean()
+
     def test_projects_list_searches_filters_and_pages(self):
         me = self.sign_in()
         owner = self.user("pi")

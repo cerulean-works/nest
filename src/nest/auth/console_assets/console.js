@@ -888,13 +888,26 @@
           codeBlock('Install Nest', [info.install]),
         ),
         h('li', {},
-          h('h3', { text: 'Connect and sign in (each new terminal)' }),
-          h('p', { class: 'muted small', text: profile && profile.transport === 'private-network'
-            ? 'These settings name the Controller on your private network. Connect your device to that network first.'
-            : 'These settings name the Controller and the Nest you sign in to. Sign-in opens a browser approval page; no password is typed in the terminal.' }),
+          h('h3', { text: profile ? 'Connect and sign in (each new terminal)' : 'Sign in (each new terminal)' }),
+          h('p', { class: 'muted small', text: !profile
+            ? 'This names the Nest you sign in to. Sign-in opens a browser approval page; no password is typed in the terminal.'
+            : profile.transport === 'private-network'
+              ? 'These settings name the Controller on your private network. Connect your device to that network first.'
+              : 'These settings name the Controller and the Nest you sign in to. Sign-in opens a browser approval page; no password is typed in the terminal.' }),
           codeBlock('Connection settings and sign-in', [...exports, ...info.setup.map((s) => s.command)]),
         ),
       ];
+      if (!profile) {
+        // Without the Controller's settings, commands that contact it would fail.
+        items.push(
+          h('li', { id: 'connect-needs-controller' },
+            h('h3', { text: 'Select the Project and run' }),
+            callout('warn', h('p', { text: 'Selecting a Project and running functions need the Controller’s connection settings, which the operator has not published here. Ask them for the Controller address and transport, then use: uv run nest projects select' })),
+          ),
+        );
+        steps.replaceChildren(card(cardHead('Set up your computer', 'steps-h'), h('ol', { class: 'steps' }, items)));
+        return;
+      }
       if (pid && e && (e.eligible || !e.known)) {
         items.push(
           h('li', {},

@@ -77,8 +77,11 @@ run in. Like the SDK's listing, the answer is advice; every call is authorized a
 | Hosted gateway, *Pilot* | `NEST_CONSOLE_HOSTED_PROFILE=pilot` on the hosted sign-in origin | `NEST_PROFILE=hosted` |
 | Hosted gateway, default | Only after H09 switches `HOSTED_PROFILE_DEFAULT` on | None |
 
-With no setting, the page still shows how to install and sign in, and says that the
-operator has not published connection settings. The server builds every command,
+With no setting, the page shows only how to install and sign in, says that the
+operator has not published connection settings, and offers no Project selection or
+run commands, which could not reach the Controller. A deployment whose users should
+get working commands from the page sets `NEST_CONSOLE_CONTROLLER_ADDRESS` and
+`NEST_CONSOLE_CONTROLLER_TLS`. The server builds every command,
 quoting each value for a POSIX shell, from settings that were validated at startup
 (a plain `host:port`, nothing else free-form); the browser adds only a Project ID it
 checked is a UUID. No Project name, token, key or password is ever part of a
