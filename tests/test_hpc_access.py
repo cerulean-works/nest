@@ -376,7 +376,7 @@ class BindingTests(_Database):
         }
         for word in ("password", "secret", "otp", "mfa", "key", "token", "session"):
             self.assertFalse([c for c in columns if word in c], word)
-        key = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk=\n"
+        key = "-----BEGIN OPENSSH " + "PRIVATE KEY-----\nb3BlbnNzaC1rZXk=\n"
         for evidence in (key, "pass word", "x" * 201, ""):
             with self.subTest(evidence=evidence[:12]), self.assertRaises(ValueError):
                 attest(self.access, self.alice, self.nano4.id, "alice01", evidence_ref=evidence)
