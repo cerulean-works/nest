@@ -1,0 +1,695 @@
+{
+  "apiVersion": 1,
+  "groups": [
+    {
+      "orgId": 1,
+      "name": "nest-hosted-pilot",
+      "folder": "Nest",
+      "interval": "1m",
+      "rules": [
+        {
+          "uid": "nest-public-probe-failed",
+          "title": "NestPublicProbeFailed",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 900,
+                "to": 0
+              },
+              "datasourceUid": "PROMETHEUS_DATASOURCE_UID",
+              "model": {
+                "refId": "A",
+                "expr": "count(max(nest_public_probe_success) == 0) or vector(0)",
+                "instant": true,
+                "range": false,
+                "intervalMs": 60000,
+                "maxDataPoints": 43200
+              }
+            },
+            {
+              "refId": "C",
+              "relativeTimeRange": {
+                "from": 0,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "refId": "C",
+                "type": "threshold",
+                "expression": "A",
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "type": "gt",
+                      "params": [
+                        0
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "noDataState": "Alerting",
+          "execErrState": "Error",
+          "for": "1m",
+          "labels": {
+            "service": "nest",
+            "severity": "critical"
+          },
+          "annotations": {
+            "summary": "The daily public gRPC probe failed",
+            "description": "The credential-free verify-public-grpc.py run failed at least one check (TLS, name, ALPN, unauthenticated refusal, path refusal or origin exposure).",
+            "runbook_url": "https://github.com/cerulean-works/nest/blob/main/docs/source/monitoring.md#public-probe"
+          },
+          "isPaused": false,
+          "notification_settings": {
+            "receiver": "nest-pilot"
+          }
+        },
+        {
+          "uid": "nest-public-probe-stale",
+          "title": "NestPublicProbeStale",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 900,
+                "to": 0
+              },
+              "datasourceUid": "PROMETHEUS_DATASOURCE_UID",
+              "model": {
+                "refId": "A",
+                "expr": "count(time() - max(nest_public_probe_last_success_timestamp_seconds) > 93600) or vector(0)",
+                "instant": true,
+                "range": false,
+                "intervalMs": 60000,
+                "maxDataPoints": 43200
+              }
+            },
+            {
+              "refId": "C",
+              "relativeTimeRange": {
+                "from": 0,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "refId": "C",
+                "type": "threshold",
+                "expression": "A",
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "type": "gt",
+                      "params": [
+                        0
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "noDataState": "Alerting",
+          "execErrState": "Error",
+          "for": "10m",
+          "labels": {
+            "service": "nest",
+            "severity": "warning"
+          },
+          "annotations": {
+            "summary": "The public gRPC probe has not passed for over 26 hours",
+            "description": "No passing credential-free probe in 26 hours: the daily timer is not running, or every run since has failed.",
+            "runbook_url": "https://github.com/cerulean-works/nest/blob/main/docs/source/monitoring.md#public-probe"
+          },
+          "isPaused": false,
+          "notification_settings": {
+            "receiver": "nest-pilot"
+          }
+        },
+        {
+          "uid": "nest-certificate-expiring-soon",
+          "title": "NestCertificateExpiringSoon",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 900,
+                "to": 0
+              },
+              "datasourceUid": "PROMETHEUS_DATASOURCE_UID",
+              "model": {
+                "refId": "A",
+                "expr": "count(min(nest_public_tls_certificate_days_left) < 14) or vector(0)",
+                "instant": true,
+                "range": false,
+                "intervalMs": 60000,
+                "maxDataPoints": 43200
+              }
+            },
+            {
+              "refId": "C",
+              "relativeTimeRange": {
+                "from": 0,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "refId": "C",
+                "type": "threshold",
+                "expression": "A",
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "type": "gt",
+                      "params": [
+                        0
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "noDataState": "Alerting",
+          "execErrState": "Error",
+          "for": "1m",
+          "labels": {
+            "service": "nest",
+            "severity": "warning"
+          },
+          "annotations": {
+            "summary": "The public gRPC certificate expires in under 14 days",
+            "description": "Renewal normally happens 30 days before expiry; check the grpc-certificates container and its last renewal.",
+            "runbook_url": "https://github.com/cerulean-works/nest/blob/main/docs/source/monitoring.md#public-probe"
+          },
+          "isPaused": false,
+          "notification_settings": {
+            "receiver": "nest-pilot"
+          }
+        },
+        {
+          "uid": "nest-gateway-resource-exhausted-high",
+          "title": "NestGatewayResourceExhaustedHigh",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 900,
+                "to": 0
+              },
+              "datasourceUid": "PROMETHEUS_DATASOURCE_UID",
+              "model": {
+                "refId": "A",
+                "expr": "count((sum(increase(nest_gateway_resource_exhausted_total[15m])) / sum(increase(nest_gateway_requests_total[15m])) > 0.2) and on() (sum(increase(nest_gateway_requests_total[15m])) >= 20)) or vector(0)",
+                "instant": true,
+                "range": false,
+                "intervalMs": 60000,
+                "maxDataPoints": 43200
+              }
+            },
+            {
+              "refId": "C",
+              "relativeTimeRange": {
+                "from": 0,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "refId": "C",
+                "type": "threshold",
+                "expression": "A",
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "type": "gt",
+                      "params": [
+                        0
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "noDataState": "Alerting",
+          "execErrState": "Error",
+          "for": "10m",
+          "labels": {
+            "service": "nest",
+            "severity": "warning"
+          },
+          "annotations": {
+            "summary": "Over 20% of gateway requests are RESOURCE_EXHAUSTED",
+            "description": "Sustained for 10 minutes over at least 20 requests in 15 minutes. nest_gateway_resource_exhausted_total tells the gateway's rate limit from the Controller's quotas.",
+            "runbook_url": "https://github.com/cerulean-works/nest/blob/main/docs/source/monitoring.md#gateway"
+          },
+          "isPaused": false,
+          "notification_settings": {
+            "receiver": "nest-pilot"
+          }
+        },
+        {
+          "uid": "nest-gateway-upstream-failures",
+          "title": "NestGatewayUpstreamFailures",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 900,
+                "to": 0
+              },
+              "datasourceUid": "PROMETHEUS_DATASOURCE_UID",
+              "model": {
+                "refId": "A",
+                "expr": "count(sum(increase(nest_gateway_response_flags_total{flag=~\"UH|UF\"}[15m])) >= 3) or vector(0)",
+                "instant": true,
+                "range": false,
+                "intervalMs": 60000,
+                "maxDataPoints": 43200
+              }
+            },
+            {
+              "refId": "C",
+              "relativeTimeRange": {
+                "from": 0,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "refId": "C",
+                "type": "threshold",
+                "expression": "A",
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "type": "gt",
+                      "params": [
+                        0
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "noDataState": "Alerting",
+          "execErrState": "Error",
+          "for": "5m",
+          "labels": {
+            "service": "nest",
+            "severity": "critical"
+          },
+          "annotations": {
+            "summary": "The gateway cannot reach the Controller (UH/UF)",
+            "description": "Envoy logged at least 3 requests with no healthy upstream or an upstream connection failure in 15 minutes; run nest-deploy-doctor.py gateway-runtime.",
+            "runbook_url": "https://github.com/cerulean-works/nest/blob/main/docs/source/monitoring.md#gateway"
+          },
+          "isPaused": false,
+          "notification_settings": {
+            "receiver": "nest-pilot"
+          }
+        },
+        {
+          "uid": "nest-gateway-access-log-unparsed",
+          "title": "NestGatewayAccessLogUnparsed",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 900,
+                "to": 0
+              },
+              "datasourceUid": "PROMETHEUS_DATASOURCE_UID",
+              "model": {
+                "refId": "A",
+                "expr": "count(sum(increase(nest_gateway_access_log_unparsed_total[1h])) > 0) or vector(0)",
+                "instant": true,
+                "range": false,
+                "intervalMs": 60000,
+                "maxDataPoints": 43200
+              }
+            },
+            {
+              "refId": "C",
+              "relativeTimeRange": {
+                "from": 0,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "refId": "C",
+                "type": "threshold",
+                "expression": "A",
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "type": "gt",
+                      "params": [
+                        0
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "noDataState": "Alerting",
+          "execErrState": "Error",
+          "for": "0m",
+          "labels": {
+            "service": "nest",
+            "severity": "warning"
+          },
+          "annotations": {
+            "summary": "The gateway access log no longer matches the monitor's format",
+            "description": "Gateway counters may be incomplete: the Envoy access-log format changed without scripts/nest-monitor.py.",
+            "runbook_url": "https://github.com/cerulean-works/nest/blob/main/docs/source/monitoring.md#gateway"
+          },
+          "isPaused": false,
+          "notification_settings": {
+            "receiver": "nest-pilot"
+          }
+        },
+        {
+          "uid": "nest-controller-rpc-refused",
+          "title": "NestControllerRpcRefused",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 900,
+                "to": 0
+              },
+              "datasourceUid": "PROMETHEUS_DATASOURCE_UID",
+              "model": {
+                "refId": "A",
+                "expr": "count(sum(increase(nest_controller_rpc_refused_total[15m])) >= 1) or vector(0)",
+                "instant": true,
+                "range": false,
+                "intervalMs": 60000,
+                "maxDataPoints": 43200
+              }
+            },
+            {
+              "refId": "C",
+              "relativeTimeRange": {
+                "from": 0,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "refId": "C",
+                "type": "threshold",
+                "expression": "A",
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "type": "gt",
+                      "params": [
+                        0
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "noDataState": "Alerting",
+          "execErrState": "Error",
+          "for": "0m",
+          "labels": {
+            "service": "nest",
+            "severity": "warning"
+          },
+          "annotations": {
+            "summary": "The Controller refused calls from outside its allowed peers",
+            "description": "A call reached the Controller from an address outside NEST_GRPC_ALLOWED_PEERS: a network path that bypasses the gateway, or a changed gateway address.",
+            "runbook_url": "https://github.com/cerulean-works/nest/blob/main/docs/source/monitoring.md#controller"
+          },
+          "isPaused": false,
+          "notification_settings": {
+            "receiver": "nest-pilot"
+          }
+        },
+        {
+          "uid": "nest-controller-rate-limited-sustained",
+          "title": "NestControllerRateLimitedSustained",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 900,
+                "to": 0
+              },
+              "datasourceUid": "PROMETHEUS_DATASOURCE_UID",
+              "model": {
+                "refId": "A",
+                "expr": "count(sum(increase(nest_controller_rpc_rate_limited_total[15m])) >= 10) or vector(0)",
+                "instant": true,
+                "range": false,
+                "intervalMs": 60000,
+                "maxDataPoints": 43200
+              }
+            },
+            {
+              "refId": "C",
+              "relativeTimeRange": {
+                "from": 0,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "refId": "C",
+                "type": "threshold",
+                "expression": "A",
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "type": "gt",
+                      "params": [
+                        0
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "noDataState": "Alerting",
+          "execErrState": "Error",
+          "for": "10m",
+          "labels": {
+            "service": "nest",
+            "severity": "warning"
+          },
+          "annotations": {
+            "summary": "The Controller is rate-limiting calls persistently",
+            "description": "At least 10 per-User or per-address rate-limit warnings in 15 minutes, for 10 minutes. A single quota rejection is expected and does not alert.",
+            "runbook_url": "https://github.com/cerulean-works/nest/blob/main/docs/source/monitoring.md#controller"
+          },
+          "isPaused": false,
+          "notification_settings": {
+            "receiver": "nest-pilot"
+          }
+        },
+        {
+          "uid": "nest-migration-not-completed",
+          "title": "NestMigrationNotCompleted",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 900,
+                "to": 0
+              },
+              "datasourceUid": "PROMETHEUS_DATASOURCE_UID",
+              "model": {
+                "refId": "A",
+                "expr": "count(max(nest_migration_status{status!=\"completed\"}) == 1 and on() (time() - max(nest_migration_deploy_timestamp_seconds) > 900)) or vector(0)",
+                "instant": true,
+                "range": false,
+                "intervalMs": 60000,
+                "maxDataPoints": 43200
+              }
+            },
+            {
+              "refId": "C",
+              "relativeTimeRange": {
+                "from": 0,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "refId": "C",
+                "type": "threshold",
+                "expression": "A",
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "type": "gt",
+                      "params": [
+                        0
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "noDataState": "Alerting",
+          "execErrState": "Error",
+          "for": "5m",
+          "labels": {
+            "service": "nest",
+            "severity": "critical"
+          },
+          "annotations": {
+            "summary": "The deployment's migration is not known to have completed",
+            "description": "15 minutes after the Controller container was created, the migration is failed, stuck, still running, absent, stale or unknown. Run nest-deploy-doctor.py migrate-status; do not remove containers or volumes to clear this.",
+            "runbook_url": "https://github.com/cerulean-works/nest/blob/main/docs/source/monitoring.md#migration-status"
+          },
+          "isPaused": false,
+          "notification_settings": {
+            "receiver": "nest-pilot"
+          }
+        },
+        {
+          "uid": "nest-monitor-collector-failing",
+          "title": "NestMonitorCollectorFailing",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 900,
+                "to": 0
+              },
+              "datasourceUid": "PROMETHEUS_DATASOURCE_UID",
+              "model": {
+                "refId": "A",
+                "expr": "count(time() - max by (collector) (nest_monitor_last_success_timestamp_seconds{collector=~\"gateway|controller|migration\"}) > 900) or vector(0)",
+                "instant": true,
+                "range": false,
+                "intervalMs": 60000,
+                "maxDataPoints": 43200
+              }
+            },
+            {
+              "refId": "C",
+              "relativeTimeRange": {
+                "from": 0,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "refId": "C",
+                "type": "threshold",
+                "expression": "A",
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "type": "gt",
+                      "params": [
+                        0
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "noDataState": "Alerting",
+          "execErrState": "Error",
+          "for": "5m",
+          "labels": {
+            "service": "nest",
+            "severity": "warning"
+          },
+          "annotations": {
+            "summary": "A Nest monitoring collector has not succeeded for 15 minutes",
+            "description": "Its signals are stale: the container it reads is missing or not running, or Docker cannot be queried. See the collector's journal.",
+            "runbook_url": "https://github.com/cerulean-works/nest/blob/main/docs/source/monitoring.md#collectors"
+          },
+          "isPaused": false,
+          "notification_settings": {
+            "receiver": "nest-pilot"
+          }
+        },
+        {
+          "uid": "nest-monitor-collector-missing",
+          "title": "NestMonitorCollectorMissing",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 900,
+                "to": 0
+              },
+              "datasourceUid": "PROMETHEUS_DATASOURCE_UID",
+              "model": {
+                "refId": "A",
+                "expr": "count((count(nest_monitor_last_run_timestamp_seconds{collector=~\"probe|gateway|controller|migration\"}) < 4) or absent(nest_monitor_last_run_timestamp_seconds{collector=~\"probe|gateway|controller|migration\"})) or vector(0)",
+                "instant": true,
+                "range": false,
+                "intervalMs": 60000,
+                "maxDataPoints": 43200
+              }
+            },
+            {
+              "refId": "C",
+              "relativeTimeRange": {
+                "from": 0,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "refId": "C",
+                "type": "threshold",
+                "expression": "A",
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "type": "gt",
+                      "params": [
+                        0
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "noDataState": "Alerting",
+          "execErrState": "Error",
+          "for": "30m",
+          "labels": {
+            "service": "nest",
+            "severity": "warning"
+          },
+          "annotations": {
+            "summary": "Nest monitoring series are missing",
+            "description": "At least one collector's text file is not being scraped: the timer never ran, the textfile directory is not mounted, or the scrape job is down.",
+            "runbook_url": "https://github.com/cerulean-works/nest/blob/main/docs/source/monitoring.md#collectors"
+          },
+          "isPaused": false,
+          "notification_settings": {
+            "receiver": "nest-pilot"
+          }
+        }
+      ]
+    }
+  ]
+}
