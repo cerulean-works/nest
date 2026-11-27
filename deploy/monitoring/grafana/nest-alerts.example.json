@@ -21,7 +21,7 @@
               "datasourceUid": "PROMETHEUS_DATASOURCE_UID",
               "model": {
                 "refId": "A",
-                "expr": "count(max(nest_public_probe_success) == 0) or vector(0)",
+                "expr": "count(max(nest_public_probe_success{job=\"nest\"}) == 0) or vector(0)",
                 "instant": true,
                 "range": false,
                 "intervalMs": 60000,
@@ -83,7 +83,7 @@
               "datasourceUid": "PROMETHEUS_DATASOURCE_UID",
               "model": {
                 "refId": "A",
-                "expr": "count(time() - max(nest_public_probe_last_success_timestamp_seconds) > 93600) or vector(0)",
+                "expr": "count(time() - max(nest_public_probe_last_success_timestamp_seconds{job=\"nest\"}) > 93600) or vector(0)",
                 "instant": true,
                 "range": false,
                 "intervalMs": 60000,
@@ -145,7 +145,7 @@
               "datasourceUid": "PROMETHEUS_DATASOURCE_UID",
               "model": {
                 "refId": "A",
-                "expr": "count(min(nest_public_tls_certificate_days_left) < 14) or vector(0)",
+                "expr": "count(min(nest_public_tls_certificate_days_left{job=\"nest\"}) < 14) or vector(0)",
                 "instant": true,
                 "range": false,
                 "intervalMs": 60000,
@@ -207,7 +207,7 @@
               "datasourceUid": "PROMETHEUS_DATASOURCE_UID",
               "model": {
                 "refId": "A",
-                "expr": "count((sum(increase(nest_gateway_resource_exhausted_total[15m])) / sum(increase(nest_gateway_requests_total[15m])) > 0.2) and on() (sum(increase(nest_gateway_requests_total[15m])) >= 20)) or vector(0)",
+                "expr": "count((sum(increase(nest_gateway_resource_exhausted_total{job=\"nest\"}[15m])) / sum(increase(nest_gateway_requests_total{job=\"nest\"}[15m])) > 0.2) and on() (sum(increase(nest_gateway_requests_total{job=\"nest\"}[15m])) >= 20)) or vector(0)",
                 "instant": true,
                 "range": false,
                 "intervalMs": 60000,
@@ -269,7 +269,7 @@
               "datasourceUid": "PROMETHEUS_DATASOURCE_UID",
               "model": {
                 "refId": "A",
-                "expr": "count(sum(increase(nest_gateway_response_flags_total{flag=~\"UH|UF\"}[15m])) >= 3) or vector(0)",
+                "expr": "count(sum(increase(nest_gateway_response_flags_total{job=\"nest\",flag=~\"UH|UF\"}[15m])) >= 3) or vector(0)",
                 "instant": true,
                 "range": false,
                 "intervalMs": 60000,
@@ -331,7 +331,7 @@
               "datasourceUid": "PROMETHEUS_DATASOURCE_UID",
               "model": {
                 "refId": "A",
-                "expr": "count(sum(increase(nest_gateway_access_log_unparsed_total[1h])) > 0) or vector(0)",
+                "expr": "count(sum(increase(nest_gateway_access_log_unparsed_total{job=\"nest\"}[1h])) > 0) or vector(0)",
                 "instant": true,
                 "range": false,
                 "intervalMs": 60000,
@@ -393,7 +393,7 @@
               "datasourceUid": "PROMETHEUS_DATASOURCE_UID",
               "model": {
                 "refId": "A",
-                "expr": "count(sum(increase(nest_controller_rpc_refused_total[15m])) >= 1) or vector(0)",
+                "expr": "count(sum(increase(nest_controller_rpc_refused_total{job=\"nest\"}[15m])) >= 1) or vector(0)",
                 "instant": true,
                 "range": false,
                 "intervalMs": 60000,
@@ -455,7 +455,7 @@
               "datasourceUid": "PROMETHEUS_DATASOURCE_UID",
               "model": {
                 "refId": "A",
-                "expr": "count(sum(increase(nest_controller_rpc_rate_limited_total[15m])) >= 10) or vector(0)",
+                "expr": "count(sum(increase(nest_controller_rpc_rate_limited_total{job=\"nest\"}[15m])) >= 10) or vector(0)",
                 "instant": true,
                 "range": false,
                 "intervalMs": 60000,
@@ -517,7 +517,7 @@
               "datasourceUid": "PROMETHEUS_DATASOURCE_UID",
               "model": {
                 "refId": "A",
-                "expr": "count(max(nest_migration_status{status!=\"completed\"}) == 1 and on() (time() - max(nest_migration_deploy_timestamp_seconds) > 900)) or vector(0)",
+                "expr": "count(max(nest_migration_status{job=\"nest\",status!=\"completed\"}) == 1 and on() (time() - max(nest_migration_deploy_timestamp_seconds{job=\"nest\"}) > 900)) or vector(0)",
                 "instant": true,
                 "range": false,
                 "intervalMs": 60000,
@@ -579,7 +579,7 @@
               "datasourceUid": "PROMETHEUS_DATASOURCE_UID",
               "model": {
                 "refId": "A",
-                "expr": "count(time() - max by (collector) (nest_monitor_last_success_timestamp_seconds{collector=~\"gateway|controller|migration\"}) > 900) or vector(0)",
+                "expr": "count(time() - max by (collector) (nest_monitor_last_success_timestamp_seconds{job=\"nest\",collector=~\"gateway|controller|migration\"}) > 900) or vector(0)",
                 "instant": true,
                 "range": false,
                 "intervalMs": 60000,
@@ -641,7 +641,7 @@
               "datasourceUid": "PROMETHEUS_DATASOURCE_UID",
               "model": {
                 "refId": "A",
-                "expr": "count((count(nest_monitor_last_run_timestamp_seconds{collector=~\"probe|gateway|controller|migration\"}) < 4) or absent(nest_monitor_last_run_timestamp_seconds{collector=~\"probe|gateway|controller|migration\"})) or vector(0)",
+                "expr": "count((count(nest_monitor_last_run_timestamp_seconds{job=\"nest\",collector=~\"probe|gateway|controller|migration\"}) < 4) or absent(nest_monitor_last_run_timestamp_seconds{job=\"nest\",collector=~\"probe|gateway|controller|migration\"})) or vector(0)",
                 "instant": true,
                 "range": false,
                 "intervalMs": 60000,

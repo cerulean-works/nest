@@ -19,8 +19,11 @@ provisions every rule paused, to check the queries before anything can notify. E
 rule's query is the Prometheus expression wrapped as `count(EXPR) or vector(0)`, so
 a healthy deployment answers 0 (not "no data") and the condition is "above 0".
 
-Every expression reads only the `nest_*` series of scripts/nest-monitor.py, so the
-rules hold no address, token or ID and match no other job. Annotations are fixed
+Every expression reads only the `nest_*` series of scripts/nest-monitor.py, and each
+selector is limited to the Nest scrape job (`--job`, default `nest`): once
+node_exporter reads the textfile directory, its existing job serves the same series,
+and counting both would double every count and hide a missing collector. The rules
+hold no address, token or ID. Annotations are fixed
 text without templates: a notification carries the rule name, never a log line.
 """
 
@@ -191,6 +194,26 @@ RULES = (
 )
 
 
+DEFAULT_JOB = "nest"
+_JOB = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+_SELECTOR = re.compile(r"\b(nest_[a-z_]+)(\{)?")
+
+
+def scoped(expr: str, job: str = DEFAULT_JOB) -> str:
+    """`expr` with every `nest_*` selector limited to the `nest` scrape job. With the
+    textfile directory enabled, the existing node_exporter job serves the same files,
+    so unscoped selectors would see each series twice (doubling counts and hiding a
+    missing collector)."""
+    if not _JOB.match(job):
+        raise ValueError("the job name has 1-64 letters, digits, '_', '.', ':' or '-'")
+
+    def add(match: re.Match) -> str:
+        name, brace = match.group(1), match.group(2)
+        return f'{name}{{job="{job}",' if brace else f'{name}{{job="{job}"}}'
+
+    return _SELECTOR.sub(add, expr)
+
+
 def _labels(rule: Rule) -> dict[str, str]:
     return {"service": "nest", "severity": rule.severity}
 
@@ -203,7 +226,7 @@ def _annotations(rule: Rule) -> dict[str, str]:
     }
 
 
-def prometheus() -> str:
+def prometheus(job: str = DEFAULT_JOB) -> str:
     # JSON strings are valid YAML double-quoted scalars.
     q = json.dumps
     lines = [
@@ -216,7 +239,7 @@ def prometheus() -> str:
     for rule in RULES:
         lines += [
             f"      - alert: {rule.name}",
-            f"        expr: {q(rule.expr)}",
+            f"        expr: {q(scoped(rule.expr, job))}",
             f"        for: {rule.duration}",
             "        labels:",
             *(f"          {k}: {q(v)}" for k, v in _labels(rule).items()),
@@ -229,7 +252,9 @@ def prometheus() -> str:
 _UID = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 
 
-def grafana(datasource_uid: str, contact_point: str, paused: bool = False) -> dict:
+def grafana(
+    datasource_uid: str, contact_point: str, paused: bool = False, job: str = DEFAULT_JOB
+) -> dict:
     if not _UID.match(datasource_uid):
         raise ValueError("the data source UID has 1-40 letters, digits, '-' or '_'")
     if not contact_point.strip() or any(ord(c) < 32 or c in "${}" for c in contact_point):
@@ -248,7 +273,7 @@ def grafana(datasource_uid: str, contact_point: str, paused: bool = False) -> di
                         "datasourceUid": datasource_uid,
                         "model": {
                             "refId": "A",
-                            "expr": f"count({rule.expr}) or vector(0)",
+                            "expr": f"count({scoped(rule.expr, job)}) or vector(0)",
                             "instant": True,
                             "range": False,
                             "intervalMs": 60000,
@@ -289,21 +314,24 @@ def grafana(datasource_uid: str, contact_point: str, paused: bool = False) -> di
 def main(argv: list[str] | None = None) -> int:
     top = argparse.ArgumentParser(description=__doc__.split("\n\n")[0].strip())
     commands = top.add_subparsers(dest="command", required=True)
-    commands.add_parser("prometheus")
-    render = commands.add_parser("grafana")
+    job = argparse.ArgumentParser(add_help=False)
+    job.add_argument(
+        "--job", default=DEFAULT_JOB, help="the Nest scrape job's name (default: %(default)s)"
+    )
+    commands.add_parser("prometheus", parents=[job])
+    render = commands.add_parser("grafana", parents=[job])
     render.add_argument("--datasource-uid", required=True)
     render.add_argument("--contact-point", required=True)
     render.add_argument(
         "--paused", action="store_true", help="provision the rules paused (a first rollout)"
     )
     args = top.parse_args(argv)
-    if args.command == "prometheus":
-        sys.stdout.write(prometheus())
-        return 0
     try:
-        sys.stdout.write(
-            json.dumps(grafana(args.datasource_uid, args.contact_point, args.paused), indent=2)
-        )
+        if args.command == "prometheus":
+            sys.stdout.write(prometheus(args.job))
+            return 0
+        provisioned = grafana(args.datasource_uid, args.contact_point, args.paused, args.job)
+        sys.stdout.write(json.dumps(provisioned, indent=2))
     except ValueError as error:
         print(f"refused: {error}", file=sys.stderr)
         return 2

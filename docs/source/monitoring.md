@@ -108,7 +108,7 @@ This needs no log store; Loki is not assumed.
 | `failed` | it exited non-zero |
 | `stuck` | a `migrate` container never started (see [recovery](deployment-recovery)) |
 | `in_progress` | running, waiting for PostgreSQL, or just created |
-| `stale` | the newest `migrate` container was created over 10 minutes before the Controller container: it belongs to an earlier deploy |
+| `stale` | the newest `migrate` container last finished (or started) over 10 minutes before the Controller container was created: it belongs to an earlier deploy. A deploy that recreates only the Controller starts the existing `migrate` container again; it then counts by when it ran, not when it was created |
 | `absent` | no `migrate` container, and no completion recorded for this Controller container |
 | `unknown` | Docker could not be queried, or there is no Controller container |
 
@@ -266,9 +266,14 @@ checkout.
    `deploy/monitoring/prometheus/nest-scrape.yml.example`. It asks node_exporter for
    its textfile collector only and keeps only `nest_*` and the textfile collector's
    error and mtime series. Check the result with `promtool check config` before the
-   reload.
-3. In Prometheus, check that the series arrive (`nest_monitor_collector_success`,
-   four collectors, all 1) and that `node_textfile_scrape_error` is 0.
+   reload. Once the directory is enabled, the existing node_exporter job serves the
+   same `nest_*` series too; every rule and dashboard query selects `job="nest"`, so
+   that copy is never counted. If the job gets another name, render the rules with
+   `--job <name>`. Optionally drop the copy from the node_exporter job with
+   `metric_relabel_configs: [{source_labels: [__name__], regex: "nest_.*", action: drop}]`.
+3. In Prometheus, check that the series arrive
+   (`nest_monitor_collector_success{job="nest"}`: four collectors, all 1) and that
+   `node_textfile_scrape_error` is 0.
 
 ## Provision the alerts
 
@@ -291,6 +296,15 @@ checkout.
 4. With the rules paused, open each rule's query and check that it answers 0. Then
    render again without `--paused` and deploy that.
 
+   On a deployment whose `migrate` container is already gone (the staging baseline
+   of #114), the migration status is `absent` and `NestMigrationNotCompleted`'s
+   query answers 1: that is correct, since no completion was ever observed for the
+   running Controller container. Unpause every other rule, and keep only that one
+   paused (edit the rendered file's `isPaused` for its UID, `nest-migration-not-completed`)
+   until the next approved deploy, after which `migrate-status` and the collector
+   show `completed`; then unpause it and tick the migration item under
+   [Live acceptance](#live-acceptance-r10).
+
 Prometheus can evaluate the same rules instead (`rule_files:` with
 `nest-alerts.rules.yml`), but Prometheus has no Alertmanager here, so Grafana-managed
 rules are the delivery path.
@@ -301,17 +315,20 @@ condition "above 0", so a healthy deployment answers 0, not "no data". No data
 
 ### Dashboard queries
 
+Every query selects `job="nest"`: the existing node_exporter job serves the same
+series from the textfile directory, and counting both doubles them.
+
 | Panel | Query |
 | --- | --- |
-| Certificate days left | `nest_public_tls_certificate_days_left` |
-| Hours since a passing probe | `(time() - nest_public_probe_last_success_timestamp_seconds) / 3600` |
-| Requests per minute by code | `sum by (code) (rate(nest_gateway_requests_total[5m])) * 60` |
-| `RESOURCE_EXHAUSTED` share | `sum(increase(nest_gateway_resource_exhausted_total[15m])) / sum(increase(nest_gateway_requests_total[15m]))` |
-| Rejections by source | `sum by (source) (increase(nest_gateway_resource_exhausted_total[15m]))` |
-| Response flags | `sum by (flag) (increase(nest_gateway_response_flags_total[15m]))` |
-| Controller warnings | `sum(increase(nest_controller_rpc_refused_total[15m]))`, `sum by (scope) (increase(nest_controller_rpc_rate_limited_total[15m]))` |
-| Migration status | `nest_migration_status == 1` |
-| Collector health | `nest_monitor_collector_success`, `time() - nest_monitor_last_success_timestamp_seconds` |
+| Certificate days left | `nest_public_tls_certificate_days_left{job="nest"}` |
+| Hours since a passing probe | `(time() - nest_public_probe_last_success_timestamp_seconds{job="nest"}) / 3600` |
+| Requests per minute by code | `sum by (code) (rate(nest_gateway_requests_total{job="nest"}[5m])) * 60` |
+| `RESOURCE_EXHAUSTED` share | `sum(increase(nest_gateway_resource_exhausted_total{job="nest"}[15m])) / sum(increase(nest_gateway_requests_total{job="nest"}[15m]))` |
+| Rejections by source | `sum by (source) (increase(nest_gateway_resource_exhausted_total{job="nest"}[15m]))` |
+| Response flags | `sum by (flag) (increase(nest_gateway_response_flags_total{job="nest"}[15m]))` |
+| Controller warnings | `sum(increase(nest_controller_rpc_refused_total{job="nest"}[15m]))`, `sum by (scope) (increase(nest_controller_rpc_rate_limited_total{job="nest"}[15m]))` |
+| Migration status | `nest_migration_status{job="nest"} == 1` |
+| Collector health | `nest_monitor_collector_success{job="nest"}`, `time() - nest_monitor_last_success_timestamp_seconds{job="nest"}` |
 
 ## Test the alerts safely
 

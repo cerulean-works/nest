@@ -15,7 +15,14 @@
 # `collect[]=textfile` asks node_exporter for its textfile collector only, and the
 # relabel keeps only Nest's series and the textfile collector's own error/mtime
 # series, so this job adds no copy of the host metrics the node_exporter job
-# already scrapes.
+# already scrapes. The node_exporter job, which scrapes without `collect[]`, also
+# serves the nest_* series once the directory is enabled: the rules and dashboard
+# queries select job="nest" (render them with --job if this job is renamed), so that
+# copy is never counted. Dropping it there is optional:
+#   metric_relabel_configs:
+#     - source_labels: [__name__]
+#       regex: "nest_.*"
+#       action: drop
 - job_name: nest
   scrape_interval: 60s
   scrape_timeout: 10s

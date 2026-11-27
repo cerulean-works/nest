@@ -581,6 +581,36 @@ class MigrationTests(_Dirs):
         _, status, _, _ = self.run_migration(FakeDocker(deployment), now=NOW + 120)
         self.assertEqual(status, "absent")
 
+    def test_a_restarted_migrate_container_is_judged_by_when_it_ran(self):
+        # A deploy that changes only Controller settings recreates the Controller and
+        # starts the existing migrate container again: its creation time is old.
+        restarted = container(
+            "migrate",
+            status="exited",
+            created=NOW - 86400,
+            started=iso(NOW - 1795),
+            finished=iso(NOW - 1780),
+            name="app-migrate-1",
+        )
+        deployment = self.deployment([restarted], controller_created=NOW - 1800)
+        _, status, samples, out = self.run_migration(FakeDocker(deployment))
+        self.assertEqual(status, "completed", out)
+        self.assertEqual(value(samples, "nest_migration_finished_timestamp_seconds"), NOW - 1780)
+        # The same old container, not run again since the earlier deploy, is stale.
+        old = container(
+            "migrate",
+            status="exited",
+            created=NOW - 86400,
+            started=iso(NOW - 86395),
+            finished=iso(NOW - 86380),
+            name="app-migrate-1",
+        )
+        for path in self.state.iterdir():
+            path.unlink()
+        deployment = self.deployment([old], controller_created=NOW - 1800)
+        _, status, _, out = self.run_migration(FakeDocker(deployment))
+        self.assertEqual(status, "stale", out)
+
     def test_evidence_is_not_recorded_from_a_stale_container(self):
         deployment = self.deployment([self.completed(created=NOW - 86400)])
         self.run_migration(FakeDocker(deployment))
@@ -762,6 +792,21 @@ class AlertRuleTests(unittest.TestCase):
             self.assertNotIn("vllm", rule.expr)
             self.assertNotIn("{{", rule.summary + rule.description)
 
+    def test_every_selector_is_limited_to_the_nest_job(self):
+        grafana = alerts.grafana("u", "c")["groups"][0]["rules"]
+        expressions = [alerts.scoped(r.expr) for r in alerts.RULES]
+        expressions += [r["data"][0]["model"]["expr"] for r in grafana]
+        for expr in expressions:
+            selectors = re.findall(r"nest_[a-z_]+(\{[^}]*\}|)", expr)
+            self.assertTrue(selectors, expr)
+            for found in selectors:
+                self.assertTrue(found.startswith('{job="nest"'), expr)
+        self.assertIn(alerts.scoped(alerts.RULES[0].expr), alerts.prometheus().replace('\\"', '"'))
+        self.assertIn('job=\\"monitoring-nest\\"', alerts.prometheus("monitoring-nest"))
+        for bad in ("", 'a"b', "a}b", "a b"):
+            with self.assertRaises(ValueError):
+                alerts.scoped("nest_x", bad)
+
     def test_grafana_rules_route_only_to_the_named_contact_point(self):
         provisioned = alerts.grafana("prom-uid", "nest-pilot")
         text = json.dumps(provisioned)
@@ -790,9 +835,19 @@ PROMTOOL = os.environ.get("NEST_TEST_PROMTOOL", "").strip() or shutil.which("pro
 PROMTOOL_REQUIRED = os.environ.get("NEST_TEST_PROMTOOL_REQUIRED", "").strip() == "1"
 
 
-def _series(name, values, **labels):
-    text = ",".join(f'{k}="{v}"' for k, v in labels.items())
-    return {"series": f"{name}{{{text}}}" if text else name, "values": values}
+def _series(name, values, job="nest", **labels):
+    """One synthetic series, scraped by the `nest` job unless `job` says otherwise."""
+    text = ",".join(f'{k}="{v}"' for k, v in {"job": job, **labels}.items())
+    return {"series": f"{name}{{{text}}}", "values": values}
+
+
+def _twice(series):
+    """`series` plus the copy the existing node_exporter job scrapes from the same
+    textfile directory."""
+    copies = [
+        {**s, "series": s["series"].replace('job="nest"', 'job="node_exporter"')} for s in series
+    ]
+    return [*series, *copies]
 
 
 def _alert(name, eval_time, firing, **labels):
@@ -811,7 +866,7 @@ def _alert(name, eval_time, firing, **labels):
 def _grafana_query(name, eval_time, expected):
     rule = next(r for r in alerts.RULES if r.name == name)
     return {
-        "expr": f"count({rule.expr}) or vector(0)",
+        "expr": f"count({alerts.scoped(rule.expr)}) or vector(0)",
         "eval_time": eval_time,
         "exp_samples": [{"labels": "{}", "value": expected}],
     }
@@ -1008,8 +1063,44 @@ def promtool_cases():
         ),
         _test(
             [_series("nest_public_probe_success", "1x60")],
+            [_alert("NestMonitorCollectorMissing", "40m", True, job="nest")],
+            [_grafana_query("NestMonitorCollectorMissing", "40m", 1)],
+        ),
+        # The documented topology: node_exporter's own job scrapes the same files.
+        # Counts and the missing-collector check still see one copy.
+        _test(
+            _twice(collectors),
+            [
+                _alert("NestMonitorCollectorMissing", "50m", False),
+                _alert("NestMonitorCollectorFailing", "50m", False),
+            ],
+            [_grafana_query("NestMonitorCollectorMissing", "50m", 0)],
+        ),
+        _test(
+            _twice(collectors[1:]),
             [_alert("NestMonitorCollectorMissing", "40m", True)],
             [_grafana_query("NestMonitorCollectorMissing", "40m", 1)],
+        ),
+        _test(
+            _twice([_series(flags, "0x20 2x40", flag="UH"), _series(flags, "0x60", flag="UF")]),
+            [_alert("NestGatewayUpstreamFailures", "30m", False)],
+        ),
+        _test(
+            _twice([_series(flags, "0x20 3x40", flag="UF"), _series(flags, "0x60", flag="UH")]),
+            [_alert("NestGatewayUpstreamFailures", "30m", True)],
+        ),
+        _test(
+            _twice([_series("nest_controller_rpc_rate_limited_total", "0+0.4x60", scope="user")]),
+            [_alert("NestControllerRateLimitedSustained", "40m", False)],
+        ),
+        _test(
+            _twice(
+                [
+                    _series(req, "0+0.8x60", route="service", code="RESOURCE_EXHAUSTED"),
+                    _series(exhausted, "0+0.8x60", source="controller"),
+                ]
+            ),
+            [_alert("NestGatewayResourceExhaustedHigh", "40m", False)],
         ),
     ]
 

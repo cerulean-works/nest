@@ -28,6 +28,7 @@ import socket
 import ssl
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -528,6 +529,7 @@ def _load_monitor():
     spec = importlib.util.spec_from_file_location("nest_monitor_gateway", MONITOR)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # dataclasses look their module up
     spec.loader.exec_module(module)
     return module
 

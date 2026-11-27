@@ -98,8 +98,9 @@ GATEWAY_SERVICE = "grpc-gateway"
 CONTROLLER_SERVICE = "controller"
 DEFAULT_MAX_LINES = 200_000
 DEFAULT_PROBE_TIMEOUT = 120.0
-# A migrate container created this long before the Controller container belongs to
-# an earlier deploy: Compose creates both within seconds in one `up`.
+# A migrate container that last finished this long before the Controller container
+# was created belongs to an earlier deploy: one `up` creates the Controller and runs
+# the migration within minutes of each other.
 DEFAULT_STALE_TOLERANCE = 600.0
 
 # --- Prometheus text output -------------------------------------------------------
@@ -614,13 +615,16 @@ def classify_migration(
         return Migration("in_progress", newest.state, deployed), evidence
     if newest.state != "completed":
         return Migration("unknown", f"migrate container state {newest.state}", deployed), evidence
-    created = doctor.parse_time(newest.created) or 0.0
-    if created < deployed - tolerance:
+    # When it last ran, not when it was created: a deploy that recreates only the
+    # Controller starts the existing migrate container again, keeping its old
+    # creation time (the doctor's `wait-migrate --since` judges by finish time too).
+    ran = finished or doctor.parse_time(newest.started) or doctor.parse_time(newest.created) or 0.0
+    if ran < deployed - tolerance:
         return (
             Migration(
                 "stale",
-                "the newest migrate container is older than the Controller container: "
-                "it belongs to an earlier deploy",
+                "the newest migrate container last finished before the Controller "
+                "container was created: it belongs to an earlier deploy",
                 deployed,
                 finished,
             ),
