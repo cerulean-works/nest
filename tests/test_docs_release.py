@@ -154,7 +154,12 @@ class TagInstallTests(unittest.TestCase):
         # label, whatever the page, so a new page cannot quietly hand Release users a
         # moving `main` (#118). examples/hosted_remote.py and the Console's install
         # copy are code, tracked by release gate G6 (see ReleaseGateTests).
-        main_install = re.compile(r"cerulean-works/nest(?:\.git)?@main\b")
+        # Commands, and prose such as "install it from `main`".
+        main_install = re.compile(
+            r"cerulean-works/nest(?:\.git)?@main\b"
+            r"|install\w*[^.\n]{0,40}\bfrom (?:the )?`main`",
+            re.IGNORECASE,
+        )
         for page in [README, *sorted(DOCS.rglob("*.md"))]:
             for part in markdown_sections(page.read_text()):
                 for found in main_install.finditer(part):
@@ -198,6 +203,8 @@ class ReleaseGateTests(unittest.TestCase):
         "hosted-connection",
         "INSTALL_COMMAND",
         "examples/hosted_remote.py",
+        "/api/connect",
+        "tail8e5ba1",
     )
 
     def notes(self) -> str:
@@ -221,6 +228,28 @@ class ReleaseGateTests(unittest.TestCase):
         notes = self.notes()
         self.assertNotIn("not part of this release", notes)
         self.assertNotIn("open the public gateway as part of this release", notes)
+
+    def test_the_console_install_command_is_the_release_pin_or_gated(self):
+        # One constant serves both deployments. Until it is deployment-aware, a `@main`
+        # value is allowed only while a blocking gate names the Release value it needs.
+        from nest.auth.console import INSTALL_COMMAND
+
+        release = f"cerulean-works/nest@v{package_version()}"
+        if release in INSTALL_COMMAND:
+            return
+        self.assertIn("cerulean-works/nest@main", INSTALL_COMMAND)
+        gates = section(self.notes(), "## Release status: BLOCKED")
+        (g6,) = [line for line in gates.splitlines() if line.startswith("| G6 |")]
+        self.assertIn("INSTALL_COMMAND", g6)
+        self.assertIn(f"`@v{package_version()}` on the Release deployment", g6)
+
+    def test_the_checklist_prepares_release_first_installs(self):
+        step = section(RELEASING.read_text(), "## Release-prep checklist")
+        step = step[step.index("2. **Merges") : step.index("3. **Checks")]
+        self.assertNotIn("Early Access path", step)
+        self.assertNotIn("if the tagged docs should install", step)
+        self.assertIn("release first", step)
+        self.assertIn("INSTALL_COMMAND", step)
 
     def test_the_checklist_gates_the_tag(self):
         checklist = section(RELEASING.read_text(), "## Release-prep checklist")

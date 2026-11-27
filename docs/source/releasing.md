@@ -103,13 +103,19 @@ order below follows from that.
    - the Early Access paragraph in `README.md`. The README release badge reads the
      newest GitHub pre-release by itself: it shows `v0.1.0a4` until the new tag is
      published, then the new tag, with no edit;
-   - [Install Nest](installation): the release-pinned command for the target,
-     `uv add "nest @ git+https://github.com/cerulean-works/nest@<target-tag>"`, as
-     the supported release install; the *Releases and `@main`* section; and the
-     example `uv.lock` entry and upgrade output that show the version string;
-   - the [Quickstart](quickstart) install step, if the tagged docs should install
-     the release rather than `main`, and this page's *Current state* table;
-   - `@main` stays documented as the development and Early Access path.
+   - every user-facing install, release first: [Install Nest](installation), the
+     [Quickstart](quickstart), [Connect to Cerulean-hosted Nest](hosted-connection),
+     the docs landing page and the README. Each first says to check that the
+     target is listed on the Releases page, then gives the pinned command
+     `uv add "nest @ git+https://github.com/cerulean-works/nest@<target-tag>"` as
+     the ordinary install (see [How `main` and tagged docs differ](#how-main-and-tagged-docs-differ)),
+     with the example `uv.lock` entry and upgrade output that show the version
+     string;
+   - `@main` only as a separately labeled *development build*, for the Main
+     deployment or while the target is unpublished;
+   - the Console's install command (`nest.auth.console.INSTALL_COMMAND`), which a
+     Release deployment must serve as the release pin (see the gates below);
+   - this page's *Current state* table.
 3. **Checks `main` at the commit to tag:** all `main` push workflows succeeded on
    that exact commit (Tests, Code Quality, Controller container, HPC runtime
    image, Docs), and the HPC runtime image's `sha-<commit>` tag is published.
@@ -137,16 +143,23 @@ all of these:
 - production TLS and the gateway at `grpc.nest.cerulean.works:443` are verified
   against system roots;
 - a clean client with **no `NEST_*` settings and no Tailnet** passes on the
-  production endpoint: `nest login` at the new origin, automatic selection of the
+  production endpoint: the Release Console shows the install command for the
+  `v0.1.0a5` tag, then `nest login` at the new origin, automatic selection of the
   sole eligible Project, `42` locally and remotely, the matching audit records,
   and no unauthorized work;
 - H09 is explicitly approved (#90), including the reviewed switch of
   `nest.config.HOSTED_PROFILE_DEFAULT`;
 - the release docs are re-checked after #96, so that the tagged Quickstart,
-  Install and [Connect to Cerulean-hosted Nest](hosted-connection) pages describe
-  the zero-env hosted path as the canonical path, and the Console's install copy
-  (`nest.auth.console.INSTALL_COMMAND`) and `examples/hosted_remote.py` no longer
-  offer `@main` to Release users;
+  Install, [Connect to Cerulean-hosted Nest](hosted-connection) and landing pages
+  describe the zero-env hosted path as the canonical path; the Tailnet connection
+  block (`nest-controller.tail8e5ba1.ts.net`, today the Main/staging application)
+  is paired with the release pin only if it reaches a Release Controller; and
+  `examples/hosted_remote.py` no longer offers `@main` to Release users;
+- the Console's install command (`nest.auth.console.INSTALL_COMMAND`, served by
+  `GET /api/connect`) pins the `v0.1.0a5` tag on the Release deployment and
+  `@main` on the Main deployment. One constant cannot be right for both, so this needs a
+  deployment-configured or version-derived ref, a code change tracked in #96 or
+  #118;
 - Main and Release run as independent deployments on the shared host (#118),
   reviewed and verified by the operator: distinct edge gateway aliases and
   Traefik router, service and transport names, separate routes and certificates
