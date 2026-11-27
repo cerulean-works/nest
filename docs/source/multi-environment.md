@@ -273,17 +273,31 @@ uv run nest login        # a Main session, stored for that origin
 
 ## Monitoring
 
-The monitoring for both deployments comes from #114 (PR #115). Until it can tell
-the deployments apart, run its collectors for one deployment only, Release once
-it serves users. Then two deployments can never overwrite each other's
-`nest_<collector>.prom` files in one textfile directory. Monitoring both needs:
+The R10 collectors and alerts ([Monitor the hosted pilot](monitoring)) identify one
+deployment unless they are given `--environment`. For two deployments on one host:
 
-- one textfile directory, state directory and systemd instance per deployment;
-- a bounded `environment` label (`main` or `release`) on every series and in every
-  alert;
-- a probe per public name, with its own trust root.
+- Run one set of collector units per deployment, each with its own
+  `--project <appName>`, `--environment main` or `--environment release`, and its
+  own `--state-dir` (for example `/var/lib/nest-monitor-release`). Copy the units
+  under new names, such as `nest-monitor-release.service`, with their own
+  environment file. Every series then carries `environment="<name>"`, and the
+  files are named `nest_<name>_<collector>.prom`, so the two deployments share
+  one textfile directory without overwriting each other.
+- Run one probe per public name, each with its own trust root (`--ca-file` for a
+  staging certificate, `--system-roots` for a production one) and its own
+  `--environment`.
+- Render the rules once per deployment:
+  `nest_alerts.py grafana --environment release ...`, and the same for
+  `prometheus`. Each set is limited to `job="nest",environment="<name>"`, and has
+  its own group, rule UIDs and titles and an `environment` label, so a Main alert
+  never fires for Release and Main's series never satisfy a Release rule. The same
+  `nest` scrape job serves both.
+- An environment name is 1 to 8 lower-case letters or digits. Without
+  `--environment`, the output is exactly the single-deployment output. Re-render
+  and re-provision when moving an existing single deployment to a named one, and
+  delete its old unnamed rules only after the named ones work.
 
-That is coordinated on PR #115. This page does not change the monitoring stack.
+No monitoring infrastructure is changed by this page.
 
 ## Verify
 
@@ -319,6 +333,7 @@ unchanged.
 | Per-deployment aliases and `--instance` routes: right gateway, Controller and certificate for each name, PROXY v2 attribution, unknown name refused, no cross-origin path, no host ports; Traefik pre-v3.5 and v3.5+ | part 2 | synthetic, real containers |
 | Main recreated, rolled back and unrouted while Release serves every handshake; Release containers, route and database untouched; Main's data survives | part 3 | synthetic, real containers |
 | Negative preflights: subnet, alias, name, Tailnet hostname, workdir; service-name alias refused | part 4; `tests/test_multi_environment.py` | synthetic |
+| Monitoring: per-environment files, state, labels and rules; default output unchanged | `tests/test_multi_environment.py` | synthetic |
 | Single-deployment output unchanged | `tests/test_multi_environment.py` | synthetic |
 | Dokploy trigger semantics, DNS, Tunnel routes, OAuth sign-in on both origins, certificates, data migration, Tailnet enrollment, HPC smoke | **PENDING**: operator only | live |
 

@@ -13,7 +13,11 @@ checkout. It reuses scripts/nest-deploy-doctor.py, which must sit next to it.
 
 Each collector writes one Prometheus text file, `nest_<collector>.prom`, atomically
 into `--textfile-dir` (node_exporter's textfile collector reads it; nothing listens
-on a port), and keeps its cursor and counters in `--state-dir`.
+on a port), and keeps its cursor and counters in `--state-dir`. With several
+deployments on one host (#118), `--environment NAME` (such as `main` or `release`)
+adds `environment="NAME"` to every series and names the files
+`nest_NAME_<collector>.prom`, so each deployment's files stand side by side; without
+it nothing changes.
 
 probe
     Runs the credential-free public verifier against the gateway: no session is read
@@ -108,6 +112,9 @@ DEFAULT_STALE_TOLERANCE = 600.0
 _NAME = re.compile(r"^[a-zA-Z_:][a-zA-Z0-9_:]*$")
 # Label values are only ever taken from the fixed lists below; this is a second fence.
 _LABEL_VALUE = re.compile(r"^[A-Za-z0-9_.:-]{0,64}$")
+# `--environment`: one deployment's short name when several share a host (#118), the
+# same rule as deploy/monitoring/nest_alerts.py.
+ENVIRONMENT = re.compile(r"^[a-z][a-z0-9]{0,7}$")
 
 
 class Metrics:
@@ -130,13 +137,19 @@ class Metrics:
     def names(self) -> set[str]:
         return set(self._families)
 
-    def render(self) -> str:
+    def render(self, environment: str | None = None) -> str:
+        """The text format; with `environment`, every sample also carries
+        `environment="<it>"` (one deployment of several on a host, #118)."""
+        if environment is not None and not ENVIRONMENT.match(environment):
+            raise ValueError("bad environment")
+        extra = (("environment", environment),) if environment else ()
         lines = []
         for name in sorted(self._families):
             kind, help_text, samples = self._families[name]
             lines.append(f"# HELP {name} {help_text}")
             lines.append(f"# TYPE {name} {kind}")
-            for labels, value in sorted(samples):
+            for own, value in sorted(samples):
+                labels = tuple(sorted(own + extra))
                 text = ",".join(f'{k}="{v}"' for k, v in labels)
                 number = repr(value) if value != int(value) else str(int(value))
                 lines.append(f"{name}{{{text}}} {number}" if text else f"{name} {number}")
@@ -157,24 +170,35 @@ def _atomic_write(path: Path, text: str, mode: int) -> None:
         raise
 
 
-def write_textfile(directory: Path, collector: str, metrics: Metrics) -> Path:
-    # node_exporter reads only *.prom and skips the dot-prefixed temporary file.
-    path = directory / f"nest_{collector}.prom"
-    _atomic_write(path, metrics.render(), 0o644)
+def _stem(collector: str, environment: str | None) -> str:
+    return f"{environment}_{collector}" if environment else collector
+
+
+def write_textfile(
+    directory: Path, collector: str, metrics: Metrics, environment: str | None = None
+) -> Path:
+    # node_exporter reads only *.prom and skips the dot-prefixed temporary file. Each
+    # deployment's files have their own names, so two never overwrite each other.
+    path = directory / f"nest_{_stem(collector, environment)}.prom"
+    _atomic_write(path, metrics.render(environment), 0o644)
     return path
 
 
-def load_state(directory: Path, collector: str) -> dict:
+def load_state(directory: Path, collector: str, environment: str | None = None) -> dict:
+    stem = _stem(collector, environment).replace("_", "-")
     try:
-        data = json.loads((directory / f"nest-monitor-{collector}.json").read_text())
+        data = json.loads((directory / f"nest-monitor-{stem}.json").read_text())
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
 
 
-def save_state(directory: Path, collector: str, state: dict) -> None:
+def save_state(
+    directory: Path, collector: str, state: dict, environment: str | None = None
+) -> None:
     text = json.dumps(state, sort_keys=True)
-    _atomic_write(directory / f"nest-monitor-{collector}.json", text, 0o600)
+    stem = _stem(collector, environment).replace("_", "-")
+    _atomic_write(directory / f"nest-monitor-{stem}.json", text, 0o600)
 
 
 # --- docker log reading -------------------------------------------------------------
@@ -821,8 +845,9 @@ def finish(name: str, outcome: Outcome, args, state: dict, now: float) -> int:
         1 if outcome.ok else 0,
         collector=name,
     )
-    write_textfile(Path(args.textfile_dir), name, metrics)
-    save_state(Path(args.state_dir), name, state)
+    environment = getattr(args, "environment", None)
+    write_textfile(Path(args.textfile_dir), name, metrics, environment)
+    save_state(Path(args.state_dir), name, state, environment)
     print(outcome.summary, flush=True)
     return 0 if outcome.ok else 1
 
@@ -835,6 +860,10 @@ def parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--textfile-dir", required=True, help="node_exporter textfile directory")
     common.add_argument("--state-dir", required=True, help="this collector's private state")
+    common.add_argument(
+        "--environment",
+        help="this deployment's short name when several share the host (#118), such as main",
+    )
     docker_args = argparse.ArgumentParser(add_help=False)
     docker_args.add_argument("--project", required=True, help="the Compose project (Dokploy app)")
     docker_args.add_argument("--max-lines", type=int, default=DEFAULT_MAX_LINES)
@@ -875,6 +904,9 @@ def main(
         print("refused: the monitor runs only the credential-free checks", file=sys.stderr)
         return 2
     args = parser().parse_args(raw)
+    if args.environment is not None and not ENVIRONMENT.match(args.environment):
+        print("refused: --environment is 1-8 lower-case letters or digits", file=sys.stderr)
+        return 2
     docker = docker or doctor.Docker()
     now = clock()
     state_dir = Path(args.state_dir)
@@ -885,7 +917,7 @@ def main(
         if args.ca_file and not os.path.isfile(args.ca_file):
             print(f"refused: --ca-file {args.ca_file} is not a file", file=sys.stderr)
             return 2
-        state = load_state(state_dir, "probe")
+        state = load_state(state_dir, "probe", args.environment)
         outcome = collect_probe(
             args, state, runner, now, os.environ if environ is None else environ
         )
@@ -896,7 +928,7 @@ def main(
     names = ("gateway", "controller", "migration") if args.command == "collect" else (args.command,)
     code = 0
     for name in names:
-        state = load_state(state_dir, name)
+        state = load_state(state_dir, name, args.environment)
         if name == "migration":
             outcome = collect_migration(args, docker, state)
         else:

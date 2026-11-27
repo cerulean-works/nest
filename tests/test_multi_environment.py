@@ -731,6 +731,107 @@ class EdgeAliasRuntimeTests(unittest.TestCase):
         self.assertEqual(result.status, "FAIL")
 
 
+def _load(name: str, path: Path):
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class MonitoringEnvironmentTests(unittest.TestCase):
+    """#114's collectors and alerts with `--environment` (#118): each deployment's
+    text files, state and rules stand side by side and never read the other's."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.monitor = _load("nest_monitor", ROOT / "scripts" / "nest-monitor.py")
+        cls.alerts = _load("nest_alerts", ROOT / "deploy" / "monitoring" / "nest_alerts.py")
+
+    def metrics(self):
+        metrics = self.monitor.Metrics()
+        metrics.add(
+            "nest_gateway_requests_total", "counter", "Requests.", 3, route="service", code="0"
+        )
+        metrics.add("nest_monitor_collector_success", "gauge", "OK.", 1)
+        return metrics
+
+    def test_default_output_is_unchanged(self):
+        text = self.metrics().render()
+        self.assertNotIn("environment", text)
+        committed = (
+            ROOT / "deploy" / "monitoring" / "prometheus" / "nest-alerts.rules.yml"
+        ).read_text()
+        self.assertEqual(self.alerts.prometheus(), committed)
+
+    def test_each_environment_has_its_own_files_and_label(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            for name in ("main", "release"):
+                self.monitor.write_textfile(path, "gateway", self.metrics(), name)
+                self.monitor.save_state(path, "gateway", {"cursor": name}, name)
+            self.monitor.write_textfile(path, "gateway", self.metrics())
+            self.assertEqual(
+                sorted(p.name for p in path.glob("*.prom")),
+                ["nest_gateway.prom", "nest_main_gateway.prom", "nest_release_gateway.prom"],
+            )
+            release = (path / "nest_release_gateway.prom").read_text()
+            self.assertIn(
+                'nest_gateway_requests_total{code="0",environment="release",route="service"} 3',
+                release,
+            )
+            self.assertIn('nest_monitor_collector_success{environment="release"} 1', release)
+            self.assertNotIn("main", release)
+            for name in ("main", "release"):
+                self.assertEqual(self.monitor.load_state(path, "gateway", name), {"cursor": name})
+
+    def test_unbounded_environment_names_are_refused(self):
+        for bad in ("Main", "a-b", "a_b", "release01x", "", 'a"b'):
+            with self.subTest(bad):
+                with self.assertRaises(ValueError):
+                    self.metrics().render(bad)
+                with self.assertRaises(ValueError):
+                    self.alerts.prometheus(environment=bad)
+        with tempfile.TemporaryDirectory() as directory:
+            code = self.monitor.main(
+                [
+                    "gateway",
+                    "--project",
+                    "p",
+                    "--textfile-dir",
+                    directory,
+                    "--state-dir",
+                    directory,
+                    "--environment",
+                    "Release",
+                ]
+            )
+        self.assertEqual(code, 2)
+
+    def test_rules_are_scoped_to_one_environment(self):
+        for name in ("main", "release"):
+            rules = self.alerts.prometheus(environment=name).replace('\\"', '"')
+            selectors = re.findall(r"nest_[a-z_]+(\{[^}]*\})", rules)
+            self.assertTrue(selectors)
+            for found in selectors:
+                self.assertTrue(found.startswith(f'{{job="nest",environment="{name}"'), found)
+            self.assertIn(f"name: nest-hosted-pilot-{name}", rules)
+        main = self.alerts.grafana("u", "c", environment="main")["groups"][0]
+        release = self.alerts.grafana("u", "c", environment="release")["groups"][0]
+        default = self.alerts.grafana("u", "c")["groups"][0]
+        uids = [r["uid"] for g in (main, release, default) for r in g["rules"]]
+        self.assertEqual(len(uids), len(set(uids)))
+        self.assertTrue(all(len(uid) <= 40 for uid in uids))
+        self.assertEqual({main["name"], release["name"], default["name"]}.__len__(), 3)
+        for rule in release["rules"]:
+            self.assertEqual(rule["labels"]["environment"], "release")
+            self.assertIn('environment="release"', rule["data"][0]["model"]["expr"])
+            self.assertTrue(rule["title"].endswith("(release)"))
+
+
 class MainClientConfigTests(unittest.TestCase):
     """The settings a Main developer uses (docs/source/multi-environment.md): an
     explicit endpoint with verified TLS and Main's own sign-in origin. The SDK never
