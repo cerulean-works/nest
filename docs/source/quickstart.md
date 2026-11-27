@@ -7,8 +7,9 @@ a Nest Project. Operators who run a Controller start at the
 
 > [!NOTE]
 > Nest is in **Early Access**. You install it from the `main` branch, and the API
-> may change before 1.0. See [Install Nest](installation) for versions and
-> updates.
+> may change before 1.0. These docs describe version `0.1.0a5`. To pin the
+> `v0.1.0a5` release instead, first check that it is published; see
+> [Releases and `@main`](installation#releases-and-main).
 
 ## Before you start
 
@@ -70,7 +71,10 @@ uv add "nest @ git+https://github.com/cerulean-works/nest@main"
 ```
 
 `uv.lock` now pins the commit of `main` you installed. Run every command below
-from this directory with `uv run`.
+from this directory with `uv run`. Once `v0.1.0a5` is listed on the
+[Releases page](https://github.com/cerulean-works/nest/releases), you can install
+`@v0.1.0a5` instead of `@main`; before that, the tag does not exist
+([details](installation#releases-and-main)).
 
 ## 2. Log in
 
@@ -144,8 +148,16 @@ The first `42` was computed on your machine, the second on the cluster:
   Python process.
 - `.remote()` sends it to the Controller, which checks your session, your
   Project role and the operator's approvals, runs it as a Slurm job on your
-  Project's HPC Platform with one CPU (`cpu=1`) and no GPU, and returns the
-  result. It waits for the job, up to 900 seconds by default (`NEST_RPC_TIMEOUT`).
+  Project's HPC Platform with one CPU (`cpu=1`), and returns the result. It waits
+  for the job, up to 900 seconds by default (`NEST_RPC_TIMEOUT`).
+- No GPU was requested, so the function **sees** no GPU (`CUDA_VISIBLE_DEVICES=""`,
+  no NVIDIA passthrough). That is not the same as allocating none: the default
+  worker script asks Slurm for one GPU (`#SBATCH --gpus-per-node=1`), so the job
+  normally still **holds** one. Nest's admission reserves that GPU and counts it
+  against the Project's GPU limit, and the cluster's own accounting may charge it.
+  See
+  [Run functions on GPUs](gpus#limitations) and
+  [What is reserved](admission-limits#what-is-reserved).
 
 The same program, with its dependency declared inline, is
 [`examples/hosted_remote.py`](https://github.com/cerulean-works/nest/blob/main/examples/hosted_remote.py).

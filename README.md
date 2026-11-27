@@ -16,10 +16,15 @@ cluster.
 ## Early Access
 
 Nest is in Early Access. Install it from `main` (below); the API is experimental
-and may change before 1.0. The published pre-release tags (newest: `v0.1.0a4`)
-predate sign-in and do not work with the authenticated Controller, and the package
-still reports version `0.1.0a1`, so compare commits rather than version strings.
-See [Release status and checklist](docs/source/releasing.md).
+and may change before 1.0. The package version is `0.1.0a5`, the version of the
+next planned pre-release, `v0.1.0a5`. That pre-release is the first to include
+sign-in. It exists only once it is listed on the
+[Releases page](https://github.com/cerulean-works/nest/releases); until then,
+`@v0.1.0a5` installs nothing. The older tags (`v0.1.0a1` to `v0.1.0a4`) predate
+sign-in, so the authenticated Controller refuses them, and every commit of `main`
+reports the same version, so compare commits rather than version strings. See
+[Install Nest](docs/source/installation.md#releases-and-main) and
+[Release status and checklist](docs/source/releasing.md).
 
 ## Quickstart
 

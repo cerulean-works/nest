@@ -28,7 +28,7 @@ nest = { git = "https://github.com/cerulean-works/nest", rev = "main" }
 # uv.lock
 [[package]]
 name = "nest"
-version = "0.1.0a1"
+version = "0.1.0a5"
 source = { git = "https://github.com/cerulean-works/nest?rev=main#<commit>" }
 ```
 
@@ -44,12 +44,44 @@ To pin a specific commit, replace `@main` with `@<commit>`.
 ### Releases and `@main`
 
 Installing from `main` is the development and Early Access path, and the one the
-[Quickstart](quickstart) uses. The existing release tags (`v0.1.0a1` to `v0.1.0a4`)
-predate sign-in: an SDK installed from one of them has no `nest` command and sends
-no session, so an authenticated Controller refuses it. The release-prep pull
-request for the next tag adds its pinned command (`@<tag>`) here before the tag is
-pushed, so that the tag's own docs show it. See
-[Release status and checklist](releasing).
+[Quickstart](quickstart) uses. It always exists and gets every fix first.
+
+**Release `v0.1.0a5`.** These docs describe Nest `0.1.0a5`, the first
+pre-release that includes sign-in. Check that `v0.1.0a5` is listed on the
+[Releases page](https://github.com/cerulean-works/nest/releases) first: until it
+is published there, it is only *planned*, and the command below fails because the
+tag does not exist. Once it is listed, pin it with:
+
+```bash
+uv add "nest @ git+https://github.com/cerulean-works/nest@v0.1.0a5"
+```
+
+```toml
+# pyproject.toml
+[tool.uv.sources]
+nest = { git = "https://github.com/cerulean-works/nest", rev = "v0.1.0a5" }
+```
+
+```toml
+# uv.lock
+[[package]]
+name = "nest"
+version = "0.1.0a5"
+source = { git = "https://github.com/cerulean-works/nest?rev=v0.1.0a5#<commit>" }
+```
+
+With pip: `pip install "git+https://github.com/cerulean-works/nest.git@v0.1.0a5"`.
+A tag never moves, so `uv lock --upgrade-package nest` keeps a tag pin on the same
+commit. To move to a later release, change `@v0.1.0a5` in `pyproject.toml`, or
+switch back to `@main`. The release still has to be compatible with the
+Controller you call: keep the SDK at or after the commit the Controller was
+deployed from (see [below](#sdk-controller-and-hpc-runtime-versions)). Use `@main`
+if the operator has deployed a Controller newer than the release.
+
+**Older tags.** `v0.1.0a1` to `v0.1.0a4` predate sign-in: an SDK installed from one
+of them has no `nest` command and sends no session, so an authenticated
+Controller refuses it. They also all report version `0.1.0a1`. Do not use them
+with a shared Controller. See [Release status and checklist](releasing).
 
 ### Install with pip
 
@@ -74,11 +106,11 @@ uv sync
 ```
 
 ```text
-Updated nest v0.1.0a1 (2b2b5f19) -> v0.1.0a1 (cd756014)
+Updated nest v0.1.0a5 (2b2b5f19) -> v0.1.0a5 (cd756014)
 ```
 
 The version string changes only when a maintainer bumps it, so many commits of
-`main` report the same version (`0.1.0a1` in the example). Compare commits, not
+`main` report the same version (`0.1.0a5` in the example). Compare commits, not
 versions. Show the commit your environment runs:
 
 ```bash
