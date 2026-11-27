@@ -83,6 +83,8 @@ guide:
         title: Run the public gRPC gateway pilot (H08)
       - local: hosted-rollout
         title: Hosted gRPC rollout runbook and evidence (H09)
+      - local: monitoring
+        title: Monitor the hosted pilot (R10)
       - local: public-api-security
         title: Public API security and abuse controls (H07)
       - local: public-grpc-transport

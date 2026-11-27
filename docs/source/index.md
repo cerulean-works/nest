@@ -16,8 +16,10 @@ def compute(x):
 print(compute.remote(21))  # 42, computed by a Slurm job
 ```
 
-Nest is in **Early Access**: install it from `main`, and expect API changes before
-1.0. See [Install Nest](installation) for versions.
+Nest is in **Early Access**: install the release `v0.1.0a5` once it is listed on
+the [Releases page](https://github.com/cerulean-works/nest/releases), and expect
+API changes before 1.0. See [Install Nest](installation) for the release, the
+development build and versions.
 
 ## Quickstart
 

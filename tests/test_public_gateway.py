@@ -28,6 +28,7 @@ import socket
 import ssl
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -513,12 +514,22 @@ class EdgeProxy:
 
 
 VERIFIER = ROOT / "scripts" / "verify-public-grpc.py"
+MONITOR = ROOT / "scripts" / "nest-monitor.py"
 
 
 def _load_verifier():
     spec = importlib.util.spec_from_file_location("verify_public_grpc", VERIFIER)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_monitor():
+    spec = importlib.util.spec_from_file_location("nest_monitor_gateway", MONITOR)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # dataclasses look their module up
     spec.loader.exec_module(module)
     return module
 
@@ -669,6 +680,7 @@ class EnvoyGatewayTests(_Base):
         controller_port = server.add_insecure_port("127.0.0.1:0")
         server.start()
         self.addCleanup(server.stop, None)
+        self.server = server
 
         self.edge_address = _edge_bind_address()
         listen, admin = _free_port(), _free_port()
@@ -920,3 +932,63 @@ class EnvoyGatewayTests(_Base):
         self.assertEqual(by_name["signed_in_projects"]["eligible_projects"], 1)
         self.assertEqual(by_name["remote_execution"]["result"], "nest-public-grpc-ok")
         self.assertNotIn(self.token_member, out.getvalue())
+
+    @unittest.skipUnless(MONITOR.is_file(), "requires the repository's scripts/")
+    def test_monitor_counts_the_real_access_log(self):
+        """#114: the monitor's parser against what this Envoy actually writes."""
+        monitor = _load_monitor()
+        stub = self.gateway_stub()
+        with self.assertRaises(grpc.RpcError):
+            stub.ListEligibleProjects(execution_pb2.ListEligibleProjectsRequest(), timeout=30)
+        channel = grpc.secure_channel(
+            f"localhost:{self.edge.port}", grpc.ssl_channel_credentials(self.ca.pem)
+        )
+        self.addCleanup(channel.close)
+        with self.assertRaises(grpc.RpcError):
+            channel.unary_unary("/grpc.health.v1.Health/Check")(b"", timeout=30)
+        self.guard.users.capacity = 1.0
+        self.guard.users.per_second = 0.01
+        codes = []
+        for _ in range(3):
+            try:
+                stub.ListEligibleProjects(
+                    execution_pb2.ListEligibleProjectsRequest(),
+                    timeout=30,
+                    metadata=self.metadata(),
+                )
+                codes.append(grpc.StatusCode.OK)
+            except grpc.RpcError as exc:
+                codes.append(cast(grpc.Call, exc).code())
+        self.assertIn(grpc.StatusCode.RESOURCE_EXHAUSTED, codes)
+        self.server.stop(None).wait(10)
+        with self.assertRaises(grpc.RpcError) as caught:
+            stub.ListEligibleProjects(execution_pb2.ListEligibleProjectsRequest(), timeout=30)
+        self.assertEqual(cast(grpc.Call, caught.exception).code(), grpc.StatusCode.UNAVAILABLE)
+
+        deadline = time.monotonic() + 10
+        while True:
+            lines = self.log.read_text().splitlines()
+            access = [line for line in lines if monitor.looks_like_access_line(line)]
+            if len(access) >= 6 or time.monotonic() > deadline:
+                break
+            time.sleep(0.2)
+        counters: dict = {}
+        monitor.count_gateway(lines, counters)
+        requests = counters.get("requests", {})
+        detail = json.dumps(counters) + "\n" + "\n".join(access)
+        self.assertEqual(counters.get("unparsed", 0), 0, detail)
+        self.assertEqual(sum(requests.values()), len(access), detail)
+        self.assertGreaterEqual(len(access), 6, detail)
+        self.assertGreaterEqual(requests.get("service/UNAUTHENTICATED", 0), 1, detail)
+        self.assertGreaterEqual(requests.get("service/OK", 0), 1, detail)
+        self.assertGreaterEqual(
+            sum(v for k, v in requests.items() if k.startswith("other/")), 1, detail
+        )
+        self.assertEqual(
+            counters.get("resource_exhausted"),
+            {"controller": codes.count(grpc.StatusCode.RESOURCE_EXHAUSTED)},
+            detail,
+        )
+        flags = counters.get("flags", {})
+        self.assertGreaterEqual(flags.get("UF", 0) + flags.get("UH", 0), 1, detail)
+        self.assertNotIn("other", flags, detail)

@@ -1,6 +1,6 @@
 [project]
 name = "nest"
-version = "0.1.0a1"
+version = "0.1.0a5"
 description = "A Python SDK for remote function execution on HPC clusters"
 readme = "README.md"
 license = "Apache-2.0"
@@ -38,6 +38,8 @@ dev = [
 target-version = "py314"
 line-length = 100
 extend-exclude = ["src/nest/proto/*_pb2*"]
+# Run on the Docker host with its own Python (3.9 or later), not Nest's.
+per-file-target-version = { "scripts/nest-monitor.py" = "py39", "deploy/monitoring/*.py" = "py39" }
 
 [tool.ruff.lint]
 ignore = []

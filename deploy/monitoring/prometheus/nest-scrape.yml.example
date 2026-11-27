@@ -1,0 +1,38 @@
+# A separate `nest` scrape job for the monitoring stack's prometheus.yml (#114, R10).
+#
+# The monitoring stack is a separately owned deployment: propose this change there,
+# reviewed, rather than editing its live checkout. Add the job under
+# `scrape_configs:`. It does not touch the vllm job or its file_sd targets.
+#
+# Nest's collectors (scripts/nest-monitor.py) write text files that the existing
+# node_exporter serves through its textfile collector, so no new exporter, port or
+# network is needed. node_exporter must run with
+#   --collector.textfile.directory=/textfile
+# and a read-only bind mount of the host's textfile directory, for example
+#   /var/lib/node_exporter/textfile/nest:/textfile:ro
+# (see docs/source/monitoring.md#expose-the-text-files).
+#
+# `collect[]=textfile` asks node_exporter for its textfile collector only, and the
+# relabel keeps only Nest's series and the textfile collector's own error/mtime
+# series, so this job adds no copy of the host metrics the node_exporter job
+# already scrapes. The node_exporter job, which scrapes without `collect[]`, also
+# serves the nest_* series once the directory is enabled: the rules and dashboard
+# queries select job="nest" (render them with --job if this job is renamed), so that
+# copy is never counted. Dropping it there is optional:
+#   metric_relabel_configs:
+#     - source_labels: [__name__]
+#       regex: "nest_.*"
+#       action: drop
+- job_name: nest
+  scrape_interval: 60s
+  scrape_timeout: 10s
+  metrics_path: /metrics
+  params:
+    "collect[]": [textfile]
+  static_configs:
+    # The node_exporter target exactly as the existing node_exporter job names it.
+    - targets: ["node_exporter:9100"]
+  metric_relabel_configs:
+    - source_labels: [__name__]
+      regex: "nest_.*|node_textfile_scrape_error|node_textfile_mtime_seconds"
+      action: keep
