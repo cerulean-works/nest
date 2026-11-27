@@ -117,7 +117,10 @@ after it finished (a cleanup, a prune, a deploy that drops the `migrate` profile
 Each time the collector sees a completed, current one, it records the `migrate`
 container, its finish time and the Controller container's ID. While that Controller
 container is the running one (restarts keep its ID), the recorded evidence keeps the
-status `completed`, with `nest_migration_evidence_recorded 1`. A new deploy recreates
+status `completed`, with `nest_migration_evidence_recorded 1`. Evidence belongs to
+the latest observed attempt only: once a newer `migrate` container is seen failed,
+stuck, running or stale, the earlier completion is dropped, so removing that
+container afterwards shows `absent`, never the old success. A new deploy recreates
 the Controller, so the old evidence stops counting, and the status is `absent` or
 `stale` until the new migration is seen. So that evidence is captured, keep the
 collector timer running, and right after each deploy run:

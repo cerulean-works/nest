@@ -605,16 +605,20 @@ def classify_migration(
             ),
             evidence,
         )
+    # A migrate container is observed: it is the latest attempt, and only its own
+    # outcome counts. Evidence recorded for an earlier attempt is dropped unless this
+    # one completed, so a later failed (or stuck, running, stale) attempt that is then
+    # removed can never fall back to the earlier success.
     if any(s.state == "stuck-created" for s in states):
-        return Migration("stuck", "a migrate container never started", deployed), evidence
+        return Migration("stuck", "a migrate container never started", deployed), {}
     newest = states[-1]
     finished = doctor.parse_time(newest.finished) or 0.0
     if newest.state == "failed":
-        return Migration("failed", f"exited {newest.exit_code}", deployed, finished), evidence
+        return Migration("failed", f"exited {newest.exit_code}", deployed, finished), {}
     if newest.state in ("running", "pending", "waiting-dependency"):
-        return Migration("in_progress", newest.state, deployed), evidence
+        return Migration("in_progress", newest.state, deployed), {}
     if newest.state != "completed":
-        return Migration("unknown", f"migrate container state {newest.state}", deployed), evidence
+        return Migration("unknown", f"migrate container state {newest.state}", deployed), {}
     # When it last ran, not when it was created: a deploy that recreates only the
     # Controller starts the existing migrate container again, keeping its old
     # creation time (the doctor's `wait-migrate --since` judges by finish time too).
@@ -628,7 +632,7 @@ def classify_migration(
                 deployed,
                 finished,
             ),
-            evidence,
+            {},
         )
     kept = {"controller": controller_id, "migrate": newest.id, "finished": finished}
     return Migration("completed", "nest-db upgrade finished", deployed, finished), kept

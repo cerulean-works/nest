@@ -581,6 +581,43 @@ class MigrationTests(_Dirs):
         _, status, _, _ = self.run_migration(FakeDocker(deployment), now=NOW + 120)
         self.assertEqual(status, "absent")
 
+    def test_a_newer_unsuccessful_attempt_supersedes_recorded_evidence(self):
+        # completed -> a newer attempt that did not complete -> its container removed,
+        # all with the same Controller container: never `completed` again.
+        later = {
+            "failed": container(
+                "migrate", status="exited", exit_code=1, created=NOW - 60, finished=iso(NOW - 30)
+            ),
+            "stuck": container(
+                "migrate", status="created", started=NEVER, created=NOW - 3000, running=False
+            ),
+            "in_progress": container("migrate", status="running", created=NOW - 60),
+            "stale": self.completed(created=NOW - 86400),
+        }
+        for status, attempt in later.items():
+            with self.subTest(status):
+                for path in self.state.iterdir():
+                    path.unlink()
+                deployment = self.deployment([self.completed()])
+                controller = deployment["controller"]
+                _, found, _, out = self.run_migration(FakeDocker(deployment))
+                self.assertEqual(found, "completed", out)
+                deployment = {"controller": controller, "migrate": [attempt], "postgres": []}
+                _, found, _, out = self.run_migration(FakeDocker(deployment), now=NOW + 60)
+                self.assertEqual(found, status, out)
+                deployment["migrate"] = []  # the attempt's container is then removed
+                _, found, samples, out = self.run_migration(FakeDocker(deployment), now=NOW + 120)
+                self.assertEqual(found, "absent", out)
+                self.assertEqual(value(samples, "nest_migration_evidence_recorded"), 0)
+
+    def test_unreadable_docker_keeps_recorded_evidence(self):
+        deployment = self.deployment([self.completed()])
+        self.run_migration(FakeDocker(deployment))
+        self.run_migration(FakeDocker(broken=True), now=NOW + 60)  # nothing observed
+        deployment["migrate"] = []
+        _, found, _, out = self.run_migration(FakeDocker(deployment), now=NOW + 120)
+        self.assertEqual(found, "completed", out)
+
     def test_a_restarted_migrate_container_is_judged_by_when_it_ran(self):
         # A deploy that changes only Controller settings recreates the Controller and
         # starts the existing migrate container again: its creation time is old.
