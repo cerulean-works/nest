@@ -1,0 +1,28 @@
+# Collects the gateway, Controller and migration signals once (R10).
+# Runs as a dedicated user in the `docker` group: it uses only `docker ps`,
+# `docker container inspect` and `docker logs` (see docs/source/monitoring.md#privileges).
+[Unit]
+Description=Nest monitoring collectors (gateway, controller, migration)
+After=docker.service
+Wants=docker.service
+
+[Service]
+# The textfile directory is shared with the other collector unit: group nest-textfile,
+# mode 2775 (docs/source/monitoring.md#install-the-collectors).
+Type=oneshot
+User=nest-monitor
+Group=nest-monitor
+SupplementaryGroups=docker nest-textfile
+EnvironmentFile=/etc/nest-monitor/nest-monitor.env
+StateDirectory=nest-monitor
+ExecStart=/usr/bin/python3 /opt/nest-monitor/scripts/nest-monitor.py collect \
+    --project ${NEST_MONITOR_PROJECT} \
+    --textfile-dir /var/lib/node_exporter/textfile/nest \
+    --state-dir /var/lib/nest-monitor
+TimeoutStartSec=120
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/nest-monitor /var/lib/node_exporter/textfile/nest
+UMask=0022

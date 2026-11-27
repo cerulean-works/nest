@@ -1,0 +1,32 @@
+# The daily credential-free public probe (R10). Needs no Docker access, so it runs
+# as a user outside the `docker` group. It reads no Nest session and runs nothing.
+[Unit]
+Description=Nest credential-free public gRPC probe
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# The textfile directory is shared with the other collector unit: group nest-textfile,
+# mode 2775 (docs/source/monitoring.md#install-the-collectors).
+Type=oneshot
+User=nest-monitor-probe
+Group=nest-monitor-probe
+SupplementaryGroups=nest-textfile
+EnvironmentFile=/etc/nest-monitor/nest-monitor.env
+StateDirectory=nest-monitor-probe
+CacheDirectory=nest-monitor-probe
+Environment=UV_CACHE_DIR=/var/cache/nest-monitor-probe/uv
+Environment=UV_PROJECT_ENVIRONMENT=/var/cache/nest-monitor-probe/venv
+WorkingDirectory=/opt/nest-monitor
+ExecStart=/usr/bin/python3 /opt/nest-monitor/scripts/nest-monitor.py probe \
+    ${NEST_MONITOR_PROBE_ADDRESS} --ca-file ${NEST_MONITOR_PROBE_CA_FILE} \
+    --runner "/usr/local/bin/uv run --frozen python" \
+    --textfile-dir /var/lib/node_exporter/textfile/nest \
+    --state-dir /var/lib/nest-monitor-probe
+TimeoutStartSec=300
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/nest-monitor-probe /var/cache/nest-monitor-probe /var/lib/node_exporter/textfile/nest
+UMask=0022

@@ -84,6 +84,19 @@ jobs:
             echo "NEST_TEST_ENVOY=$RUNNER_TEMP/envoy"
             echo "NEST_TEST_ENVOY_REQUIRED=1"
           } >> "$GITHUB_ENV"
+      # The alert rules of deploy/monitoring (tests/test_monitoring.py) are checked and
+      # unit-tested with the promtool of the Prometheus version the staging monitoring
+      # stack runs; the image is never started.
+      - name: Extract promtool for the monitoring rule tests
+        run: |
+          docker create --name prometheus-binary prom/prometheus:v3.13.2
+          docker cp prometheus-binary:/bin/promtool "$RUNNER_TEMP/promtool"
+          docker rm prometheus-binary
+          "$RUNNER_TEMP/promtool" --version
+          {
+            echo "NEST_TEST_PROMTOOL=$RUNNER_TEMP/promtool"
+            echo "NEST_TEST_PROMTOOL_REQUIRED=1"
+          } >> "$GITHUB_ENV"
       - name: Install Chromium for the real-browser tests
         run: uv run --frozen playwright install --with-deps chromium
       # Eight pytest-xdist workers: the suite mostly waits on subprocesses, servers and

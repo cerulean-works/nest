@@ -341,12 +341,20 @@ afterwards.
 
 ### R10. Monitoring
 
-Before production, set up alerts for:
+Before production, alerts must exist and be delivered for:
 
-- `days_left` under 14 (a daily `verify-public-grpc.py` run without credentials);
+- `days_left` under 14, from a daily `verify-public-grpc.py` run without credentials;
 - a rising share of `RESOURCE_EXHAUSTED`, or `UH`/`UF` flags, in Envoy's access log;
 - the Controller's `RPC refused` and `RPC rate-limited` warnings;
 - `migrate-status` other than `completed` after a deploy.
+
+[Monitor the hosted pilot](monitoring) has the collectors
+(`scripts/nest-monitor.py`), the separate `nest` scrape job, the Grafana-managed
+rules routed to one operator-approved contact point, safe drills and rollback. It
+changes neither the vLLM job nor the default contact point, and needs a reviewed
+change in the separately owned monitoring stack. R10 is **PENDING** until the
+checklist in [Live acceptance (R10)](monitoring#live-acceptance-r10) is recorded:
+the repository implementation and its CI tests are synthetic evidence only.
 
 ## Production activation (after approval only)
 
