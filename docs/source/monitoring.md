@@ -10,6 +10,11 @@ discovery, changes the default contact point, or turns on H09.
 [end of this page](#live-acceptance-r10) are **PENDING** until the operator records
 evidence. A merged pull request or green CI does not complete R10.
 
+**One deployment per host.** The collector file names, state directories, units,
+`job="nest"` selector and Grafana rule UIDs identify a single deployment. Do not
+install these examples twice to watch Main and Release side by side: per-environment
+identities and alert evaluation are tracked in #118.
+
 ## How it fits together
 
 ```text
