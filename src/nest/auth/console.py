@@ -82,8 +82,12 @@ approval, invitations): the Console's stylesheet and mark, and no script at all
 INSTALL_COMMAND = shlex.join(
     ["uv", "add", "nest @ git+https://github.com/cerulean-works/nest@main"]
 )
-"""The one-time install step the Console shows: Nest from its repository, as in
-*Install Nest*."""
+"""The one-time install step the Console shows: the development build (`@main`).
+
+This matches the Main deployment only. *Install Nest* gives the release pin as the
+ordinary install, and a Release deployment must serve that pin instead; that is a
+blocking pre-tag gate (G6 in `docs/release-notes/`), to be implemented with #96 or
+#118. Until then this value is unchanged."""
 
 _SETUP_COMMANDS = (
     ("Sign in", "uv run nest login"),

@@ -1,6 +1,6 @@
 [project]
 name = "nest"
-version = "0.1.0a1"
+version = "0.1.0a5"
 description = "A Python SDK for remote function execution on HPC clusters"
 readme = "README.md"
 license = "Apache-2.0"

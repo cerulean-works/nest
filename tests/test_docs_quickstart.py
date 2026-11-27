@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -81,13 +82,14 @@ class QuickstartTests(unittest.TestCase):
         self.assertNotIn("gpu", quickstart_main())
 
     def test_install_starts_a_fresh_uv_project(self):
+        version = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
         install = blocks(section(QUICKSTART.read_text(), "## 1. Install"), "bash")[0]
         self.assertEqual(
             install.split("\n")[:3],
             [
                 "uv init --python 3.14 hello-nest",
                 "cd hello-nest",
-                'uv add "nest @ git+https://github.com/cerulean-works/nest@main"',
+                f'uv add "nest @ git+https://github.com/cerulean-works/nest@v{version}"',
             ],
         )
 
