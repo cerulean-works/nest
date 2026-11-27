@@ -40,7 +40,12 @@ preflight
     (`--traefik-dynamic-dir`, default /etc/dokploy/traefik/dynamic), read-only:
     a TCP router, service or transport name defined in two files, or one SNI name
     in two routers, fails, and this deployment's route must dial exactly
-    `NEST_GRPC_EDGE_ALIAS`:8443. HPC values and the database URL are never printed.
+    `NEST_GRPC_EDGE_ALIAS`:8443. `route_change` fails when the settings would change
+    the running gateway's alias or name while an installed route file still depends
+    on the current one, unless `--retire-route FILE` records that it is being
+    retired. HPC values and the database URL are never printed; a platforms file
+    (`NEST_PLATFORMS_ENV_FILE`, default ./platforms.env next to `--env-file`) and the
+    Platform variables an `env_file` gives other Controllers are compared too.
 
 migrate-status
     Lists this project's `migrate` containers and classifies each: `completed`,
@@ -765,9 +770,48 @@ def _platform_targets(text: str) -> list[tuple[str, frozenset, str, str]]:
     return targets
 
 
+PLATFORM_KEY = re.compile(r"NEST_PLATFORM_[A-Z0-9_]+?_(LOGIN_NODES|ACCOUNT|WORKDIR)")
+
+
+def platform_lines(container: dict) -> str:
+    """The `NEST_PLATFORM_<ID>_LOGIN_NODES/ACCOUNT/WORKDIR` variables in a container's
+    environment, as platforms.env lines. Compose's `env_file` (`./platforms.env`, or
+    `NEST_PLATFORMS_ENV_FILE`) puts a file's Platforms there as plain variables."""
+    lines = []
+    for item in (container.get("Config") or {}).get("Env") or []:
+        key, _, value = item.partition("=")
+        if PLATFORM_KEY.fullmatch(key):
+            lines.append(f"{key}={value}")
+    return "\n".join(lines)
+
+
+def platforms_file_lines(env_file: str | None, values: dict[str, str]) -> str | None:
+    """This deployment's platforms file, which Compose loads with `env_file`: the
+    matching lines only, never printed. `None` when there is none to read (the file
+    is optional), and `""` when it names none."""
+    import os
+
+    if not env_file:
+        return None
+    name = values.get("NEST_PLATFORMS_ENV_FILE") or "./platforms.env"
+    path = name if os.path.isabs(name) else os.path.join(os.path.dirname(env_file) or ".", name)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+    except OSError:
+        return None
+    lines = []
+    for raw in text.splitlines():
+        key, _, value = raw.strip().removeprefix("export ").partition("=")
+        if PLATFORM_KEY.fullmatch(key.strip()):
+            lines.append(f"{key.strip()}={value.strip()}")
+    return "\n".join(lines)
+
+
 def hpc_targets(values: dict[str, str]) -> list[tuple[str, frozenset, str, str]]:
     """Every HPC target a Controller's settings name: the legacy single cluster and
-    each inline Platform. A platforms file (NEST_PLATFORMS_ENV_FILE) is not read."""
+    each Platform in `NEST_PLATFORMS_ENV` (inline, or the lines of a platforms file
+    joined into it by the caller)."""
     targets = []
     host_text = values.get("NEST_SLURM_LOGIN_NODES") or values.get("NEST_SLURM_HOST", "")
     if values.get("NEST_SLURM_WORKDIR") or values.get("NEST_SLURM_ACCOUNT"):
@@ -830,7 +874,12 @@ def database_host_check(
 
 
 def check_isolation(
-    values: dict[str, str], project: str, docker: Docker, networks: list[dict], public_grpc: bool
+    values: dict[str, str],
+    project: str,
+    docker: Docker,
+    networks: list[dict],
+    public_grpc: bool,
+    env_file: str | None = None,
 ) -> list[Check]:
     """Compares this deployment's identity with every other Nest deployment on the
     host, running or stopped: the Compose project, the gateway's edge alias and public
@@ -958,17 +1007,43 @@ def check_isolation(
     else:
         checks.append(Check("tailnet_hostname", "PASS", f"no other deployment uses {hostname}"))
 
-    ours = hpc_targets(values)
-    if not ours:
-        detail = "no NEST_SLURM_* or inline NEST_PLATFORMS_ENV target to compare"
-        if values.get("NEST_PLATFORMS_ENV_FILE"):
-            detail += "; NEST_PLATFORMS_ENV_FILE is not read: compare its workdirs by hand"
-        checks.append(Check("hpc_workdir", "SKIP", detail))
+    from_file = platforms_file_lines(env_file, values)
+    if from_file is None and values.get("NEST_PLATFORMS_ENV_FILE"):
+        checks.append(
+            Check(
+                "hpc_workdir",
+                "FAIL",
+                "NEST_PLATFORMS_ENV_FILE names a file this tool cannot read; run preflight "
+                "from the checkout, next to the .env, so its Platforms are compared",
+            )
+        )
         return checks
-    shared_dirs, shared_accounts = [], []
+    own = dict(values)
+    own["NEST_PLATFORMS_ENV"] = "\n".join(
+        filter(None, [values.get("NEST_PLATFORMS_ENV", ""), from_file or ""])
+    )
+    ours = hpc_targets(own)
+    if not ours:
+        checks.append(
+            Check(
+                "hpc_workdir",
+                "SKIP",
+                "no NEST_SLURM_*, NEST_PLATFORMS_ENV or platforms file target to compare",
+            )
+        )
+        return checks
+    shared_dirs, shared_accounts, unknown = [], [], []
     for controller in others("controller"):
-        theirs = hpc_targets(container_env(controller, HPC_SETTINGS))
+        settings_of = container_env(controller, HPC_SETTINGS)
+        settings_of["NEST_PLATFORMS_ENV"] = "\n".join(
+            filter(None, [settings_of.get("NEST_PLATFORMS_ENV", ""), platform_lines(controller)])
+        )
+        theirs = hpc_targets(settings_of)
         label = f"{_project(controller)}{'' if _running(controller) else ' (stopped)'}"
+        if not theirs:
+            # A Controller whose targets cannot be read is never assumed isolated.
+            unknown.append(label)
+            continue
         for name, hosts, account, workdir in ours:
             for other_name, other_hosts, other_account, other_workdir in theirs:
                 if not _same_cluster(hosts, other_hosts):
@@ -986,6 +1061,16 @@ def check_isolation(
                 + "; ".join(sorted({d for _, d in shared_dirs}))
                 + ". Jobs, results and worker state would mix; give each deployment its own "
                 "workdir on the cluster",
+            )
+        )
+    elif unknown:
+        checks.append(
+            Check(
+                "hpc_workdir",
+                "WARN",
+                "cannot read the HPC targets of "
+                + ", ".join(sorted(set(unknown)))
+                + "; compare their workdirs and accounts with this deployment's by hand",
             )
         )
     else:
@@ -1007,6 +1092,10 @@ def check_isolation(
                 + "Split the operator-approved allocation between them "
                 "(docs/source/multi-environment.md, HPC capacity)",
             )
+        )
+    elif unknown:
+        checks.append(
+            Check("hpc_account", "WARN", "not compared with " + ", ".join(sorted(set(unknown))))
         )
     else:
         checks.append(Check("hpc_account", "PASS", "no other deployment shares the Slurm account"))
@@ -1171,6 +1260,82 @@ def check_routes(values: dict[str, str], directory: str, public_grpc: bool) -> l
     return checks
 
 
+def check_route_change(
+    values: dict[str, str],
+    project: str,
+    docker: Docker,
+    directory: str,
+    retire: Sequence[str] = (),
+) -> Check | None:
+    """Whether deploying these settings would orphan an installed route: this project's
+    gateway as it runs now answers to an alias and serves a name, and a route file
+    that dials that alias or routes that name stops working when either changes
+    (Phase 2 of docs/source/multi-environment.md). Files named in `retire` are the
+    operator's recorded decision to retire them (#118, decision 5) and only warn."""
+    import os
+
+    running = [c for c in docker.containers(project, "grpc-gateway") if _running(c)]
+    if not running:
+        return None
+    edge_network = values.get("NEST_GRPC_EDGE_NETWORK", DEFAULT_EDGE_NETWORK)
+    current_alias = _edge_alias_of(running[0], edge_network)
+    current_host = (
+        container_env(running[0], ("NEST_GRPC_PUBLIC_HOST",))
+        .get("NEST_GRPC_PUBLIC_HOST", DEFAULT_PUBLIC_HOST)
+        .lower()
+    )
+    alias = values.get("NEST_GRPC_EDGE_ALIAS", DEFAULT_EDGE_ALIAS)
+    host = values.get("NEST_GRPC_PUBLIC_HOST", DEFAULT_PUBLIC_HOST).lower()
+    if alias == current_alias and host == current_host:
+        return Check("route_change", "PASS", "the gateway keeps its alias and name")
+    try:
+        names = sorted(n for n in os.listdir(directory) if n.endswith((".yml", ".yaml")))
+    except OSError:
+        return Check(
+            "route_change",
+            "FAIL",
+            f"these settings change the gateway's alias ({current_alias} -> {alias}) or name "
+            f"({current_host} -> {host}), and {directory} cannot be read to see which "
+            "route files that breaks",
+        )
+    broken = []
+    for name in names:
+        try:
+            with open(os.path.join(directory, name), encoding="utf-8") as handle:
+                routes = parse_tcp_routes(handle.read())
+        except OSError:
+            continue
+        except UnicodeDecodeError:
+            continue
+        targets = {
+            a.rpartition(":")[0] for item in routes["services"].values() for a in item["addresses"]
+        }
+        hosts = {h for item in routes["routers"].values() for h in item["hosts"]}
+        if (alias != current_alias and current_alias in targets) or (
+            host != current_host and current_host in hosts
+        ):
+            broken.append(name)
+    if not broken:
+        return Check(
+            "route_change",
+            "PASS",
+            f"no installed route depends on the current alias {current_alias} or name {current_host}",
+        )
+    blocking = [n for n in broken if n not in retire]
+    detail = (
+        f"deploying changes the gateway's alias ({current_alias} -> {alias}) or name "
+        f"({current_host} -> {host}), which stops {', '.join(broken)} from routing"
+    )
+    if blocking:
+        return Check(
+            "route_change",
+            "FAIL",
+            detail + ". Keep the current values (Phase 1), or, once retiring that route is "
+            "the recorded decision, pass --retire-route for it (docs/source/multi-environment.md)",
+        )
+    return Check("route_change", "WARN", detail + "; retiring it as recorded")
+
+
 def host_routes(run: Runner) -> list[dict] | None:
     if not shutil.which("ip") and run is run_command:
         return None
@@ -1198,8 +1363,14 @@ def preflight(args, docker: Docker, environ: dict[str, str]) -> int:
         checks.append(
             Check("public_grpc", "SKIP", "profile public-grpc is off; gateway settings not checked")
         )
-    checks += check_isolation(values, args.project, docker, networks, public_grpc)
+    checks += check_isolation(values, args.project, docker, networks, public_grpc, args.env_file)
     checks += check_routes(values, args.traefik_dynamic_dir, public_grpc)
+    if public_grpc:
+        change = check_route_change(
+            values, args.project, docker, args.traefik_dynamic_dir, args.retire_route or ()
+        )
+        if change is not None:
+            checks.append(change)
     emit(checks, args.json)
     return 1 if any(c.status == "FAIL" for c in checks) else 0
 
@@ -1218,7 +1389,7 @@ def parse_time(value: str) -> float | None:
         text = match.group(1) + fraction + match.group(3)
     moment = datetime.datetime.fromisoformat(text)
     if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=datetime.timezone.utc)  # noqa: UP017 (Python 3.9+)
+        moment = moment.replace(tzinfo=datetime.timezone.utc)
     return moment.timestamp()
 
 
@@ -1996,6 +2167,12 @@ def parser() -> argparse.ArgumentParser:
         "--traefik-dynamic-dir",
         default=DEFAULT_TRAEFIK_DYNAMIC_DIR,
         help="Traefik's file-provider directory, read for route collisions",
+    )
+    check.add_argument(
+        "--retire-route",
+        action="append",
+        metavar="FILE",
+        help="a route file in that directory whose retirement is a recorded decision",
     )
     status = commands.add_parser(
         "migrate-status", parents=[common, age], help="classify migrate containers"

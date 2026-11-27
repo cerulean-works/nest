@@ -273,7 +273,11 @@ class ComposeAliasTests(unittest.TestCase):
         gateway = default["services"]["grpc-gateway"]
         self.assertEqual(gateway["networks"]["edge"]["aliases"], ["nest-grpc-gateway"])
         self.assertEqual(gateway["environment"]["NEST_GRPC_EDGE_ALIAS"], "nest-grpc-gateway")
-        main = config({"P": "nest-main", **read_env(ENVIRONMENTS / "main.env.example")})
+        main_env = {
+            **read_env(ENVIRONMENTS / "main.env.example"),
+            **read_phase2(ENVIRONMENTS / "main.env.example"),
+        }
+        main = config({"P": "nest-main", **main_env})
         release = config({"P": "nest-release", **read_env(ENVIRONMENTS / "release.env.example")})
         for resolved, alias, subnet in (
             (main, "nest-grpc-gateway-main", "10.253.250.0/28"),
@@ -292,8 +296,21 @@ class ComposeAliasTests(unittest.TestCase):
             self.assertNotEqual(main["volumes"][key]["name"], release["volumes"][key]["name"])
 
 
+def read_phase2(path: Path) -> dict[str, str]:
+    """The commented-out Phase 2 values of main.env.example."""
+    text = path.read_text()
+    block = text[text.index("PHASE 2 ONLY") :]
+    values = {}
+    for line in block.splitlines():
+        match = re.match(r"^# (NEST_[A-Z0-9_]+)='([^']*)'$", line)
+        if match:
+            values[match.group(1)] = match.group(2)
+    return values
+
+
 class TemplateTests(unittest.TestCase):
     MAIN = read_env(ENVIRONMENTS / "main.env.example")
+    MAIN_PHASE2 = read_phase2(ENVIRONMENTS / "main.env.example")
     RELEASE = read_env(ENVIRONMENTS / "release.env.example")
 
     def test_identities_differ(self):
@@ -312,12 +329,32 @@ class TemplateTests(unittest.TestCase):
                 self.assertIn(key, self.MAIN)
                 self.assertIn(key, self.RELEASE)
                 self.assertNotEqual(self.MAIN[key], self.RELEASE[key])
+                if key in self.MAIN_PHASE2:
+                    self.assertNotEqual(self.MAIN_PHASE2[key], self.RELEASE[key])
         main = ipaddress.IPv4Network(self.MAIN["NEST_GRPC_ORIGIN_SUBNET"])
         release = ipaddress.IPv4Network(self.RELEASE["NEST_GRPC_ORIGIN_SUBNET"])
         self.assertFalse(main.overlaps(release))
 
+    def test_main_template_is_phase_1(self):
+        """Review of #119: following main.env.example on today's staging application
+        changes neither its alias nor its name nor its origin; Main's new values are
+        only in the commented Phase 2 block."""
+        self.assertEqual(self.MAIN["NEST_GRPC_EDGE_ALIAS"], doctor.DEFAULT_EDGE_ALIAS)
+        for key in ("NEST_GRPC_PUBLIC_HOST", "NEST_GOOGLE_REDIRECT_URL", "NEST_PUBLIC_URL"):
+            self.assertRegex(self.MAIN[key], r"^<existing [^>]+>$", key)
+        self.assertEqual(
+            self.MAIN_PHASE2,
+            {
+                "NEST_GRPC_PUBLIC_HOST": "grpc.main.nest.cerulean.works",
+                "NEST_GRPC_EDGE_ALIAS": "nest-grpc-gateway-main",
+                "NEST_GOOGLE_REDIRECT_URL": "https://main.nest.cerulean.works/auth/google/callback",
+                "NEST_PUBLIC_URL": "https://main.nest.cerulean.works",
+            },
+        )
+
     def test_each_template_is_internally_consistent(self):
-        for name, env in (("main", self.MAIN), ("release", self.RELEASE)):
+        main_target = {**self.MAIN, **self.MAIN_PHASE2}
+        for name, env in (("main", main_target), ("release", self.RELEASE)):
             with self.subTest(name):
                 subnet = ipaddress.IPv4Network(env["NEST_GRPC_ORIGIN_SUBNET"])
                 gateway = ipaddress.IPv4Address(env["NEST_GRPC_GATEWAY_ADDRESS"])
@@ -336,9 +373,7 @@ class TemplateTests(unittest.TestCase):
                 origin = env["NEST_PUBLIC_URL"]
                 self.assertTrue(env["NEST_GOOGLE_REDIRECT_URL"].startswith(origin + "/"))
                 self.assertTrue(origin.startswith("https://"))
-        self.assertEqual(self.MAIN["NEST_PUBLIC_URL"], "https://main.nest.cerulean.works")
         self.assertEqual(self.RELEASE["NEST_PUBLIC_URL"], "https://nest.cerulean.works")
-        self.assertEqual(self.MAIN["NEST_GRPC_PUBLIC_HOST"], "grpc.main.nest.cerulean.works")
         self.assertEqual(self.RELEASE["NEST_GRPC_PUBLIC_HOST"], "grpc.nest.cerulean.works")
 
     def test_no_credential_values(self):
@@ -350,9 +385,11 @@ class TemplateTests(unittest.TestCase):
                         self.assertRegex(value, r"^<[^>]+>$")
 
     def test_route_commands_match_the_aliases(self):
-        for name, path in (("main", "main.env.example"), ("release", "release.env.example")):
+        for name, path, env in (
+            ("main", "main.env.example", {**self.MAIN, **self.MAIN_PHASE2}),
+            ("release", "release.env.example", self.RELEASE),
+        ):
             text = (ENVIRONMENTS / path).read_text()
-            env = read_env(ENVIRONMENTS / path)
             with self.subTest(name):
                 self.assertIn(f"--instance {name}", text)
                 result = render(env["NEST_GRPC_PUBLIC_HOST"], "v3.6.2", "--instance", name)
@@ -497,7 +534,14 @@ def main_deployment(
 
 class IsolationPreflightTests(unittest.TestCase):
     def preflight(
-        self, containers, env=None, *, extra_networks=(), routes_dir=None, project="release"
+        self,
+        containers,
+        env=None,
+        *,
+        extra_networks=(),
+        routes_dir=None,
+        project="release",
+        extra=(),
     ):
         env = dict(RELEASE_ENV if env is None else env)
         edge = edge_network(*[c for c in containers if EDGE in c["NetworkSettings"]["Networks"]])
@@ -505,7 +549,14 @@ class IsolationPreflightTests(unittest.TestCase):
         out = io.StringIO()
         with tempfile.TemporaryDirectory() as empty, redirect_stdout(out):
             code = doctor.main(
-                ["preflight", "--project", project, "--traefik-dynamic-dir", routes_dir or empty],
+                [
+                    "preflight",
+                    "--project",
+                    project,
+                    "--traefik-dynamic-dir",
+                    routes_dir or empty,
+                    *extra,
+                ],
                 docker=doctor.Docker(run=fake),
                 environ=env,
             )
@@ -622,6 +673,69 @@ class IsolationPreflightTests(unittest.TestCase):
         self.assertEqual(checks["hpc_account"][0], "WARN")
         self.assertIn("NEST_LIMIT_ACTIVE_PER_PLATFORM is unset", checks["hpc_account"][1])
 
+    def test_platforms_file_of_another_deployment_is_compared(self):
+        """Review of #119: Compose's env_file puts a platforms.env file's Platforms into
+        the container as plain variables; they must be compared, not ignored."""
+        file_style = {
+            "NEST_PLATFORMS": "lab",
+            "NEST_PLATFORM_LAB_LOGIN_NODES": "login.hpc.example",
+            "NEST_PLATFORM_LAB_ACCOUNT": "acct-not-printed",
+            "NEST_PLATFORM_LAB_WORKDIR": "/home/svc/nest-release",
+        }
+        _, checks = self.preflight(main_deployment(controller_env=file_style))
+        self.assertEqual(checks["hpc_workdir"][0], "FAIL", checks["hpc_workdir"][1])
+        self.assertIn("LAB = main LAB", checks["hpc_workdir"][1])
+        self.assertEqual(checks["hpc_account"][0], "WARN")
+
+    def test_unreadable_targets_of_another_deployment_never_pass(self):
+        _, checks = self.preflight(main_deployment(controller_env={"NEST_DATABASE_PASSWORD": "x"}))
+        self.assertEqual(checks["hpc_workdir"][0], "WARN")
+        self.assertIn("cannot read the HPC targets of main", checks["hpc_workdir"][1])
+        self.assertEqual(checks["hpc_account"][0], "WARN")
+
+    def test_own_platforms_file_is_compared(self):
+        env = {**RELEASE_ENV, "NEST_PLATFORMS_ENV": ""}
+        with tempfile.TemporaryDirectory() as checkout:
+            env_file = Path(checkout) / ".env"
+            env_file.write_text("".join(f"{k}='{v}'\n" for k, v in env.items() if v))
+            (Path(checkout) / "platforms.env").write_text(
+                "NEST_PLATFORMS=lab\n"
+                "NEST_PLATFORM_LAB_LOGIN_NODES=login.hpc.example\n"
+                "NEST_PLATFORM_LAB_ACCOUNT=acct-not-printed\n"
+                "NEST_PLATFORM_LAB_WORKDIR=/home/svc/nest-main\n"
+            )
+            _, checks = self.preflight_file(main_deployment(), env_file)
+            self.assertEqual(checks["hpc_workdir"][0], "FAIL", checks["hpc_workdir"][1])
+            env_file.write_text(env_file.read_text() + "NEST_PLATFORMS_ENV_FILE='./missing.env'\n")
+            _, checks = self.preflight_file(main_deployment(), env_file)
+            self.assertEqual(checks["hpc_workdir"][0], "FAIL")
+            self.assertIn("cannot read", checks["hpc_workdir"][1])
+
+    def preflight_file(self, containers, env_file):
+        edge = edge_network(*[c for c in containers if EDGE in c["NetworkSettings"]["Networks"]])
+        fake = FakeDocker(containers, [edge])
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as empty, redirect_stdout(out):
+            code = doctor.main(
+                [
+                    "preflight",
+                    "--project",
+                    "release",
+                    "--env-file",
+                    str(env_file),
+                    "--traefik-dynamic-dir",
+                    empty,
+                ],
+                docker=doctor.Docker(run=fake),
+                environ={},
+            )
+        text = out.getvalue()
+        for secret in ("hunter2-not-printed", "acct-not-printed", "/home/svc"):
+            self.assertNotIn(secret, text)
+        return code, {
+            line.split()[1].rstrip(":"): (line.split()[0], line) for line in text.splitlines()
+        }
+
     def test_shared_project_name_fails(self):
         """Two checkouts deploying under one Compose project share everything."""
         mine = container("release-controller-1", "release", "controller", workdir="/a")
@@ -686,6 +800,57 @@ class IsolationPreflightTests(unittest.TestCase):
             )
             _, checks = self.preflight(main_deployment(), routes_dir=directory)
             self.assertEqual(checks["route_sni"][0], "FAIL")
+
+    def test_changing_alias_or_name_under_an_installed_route_fails(self):
+        """Review of #119: Main's Phase 2 values on today's staging application would
+        orphan its installed staging route; preflight must refuse, not WARN."""
+        staging = container(
+            "release-grpc-gateway-1",
+            "release",
+            "grpc-gateway",
+            env={
+                "NEST_GRPC_EDGE_ALIAS": "nest-grpc-gateway",
+                "NEST_GRPC_PUBLIC_HOST": "grpc.staging.example.org",
+            },
+            edge_aliases=["grpc-gateway", "nest-grpc-gateway"],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "nest-grpc.yml").write_text(
+                render("grpc.staging.example.org", "v3.6.2").stdout
+            )
+            phase2 = {
+                **RELEASE_ENV,
+                "NEST_GRPC_EDGE_ALIAS": "nest-grpc-gateway-release",
+                "NEST_GRPC_PUBLIC_HOST": "grpc.nest.example.org",
+            }
+            code, checks = self.preflight(
+                [staging, *main_deployment()], phase2, routes_dir=directory
+            )
+            self.assertEqual(code, 1)
+            self.assertEqual(checks["route_change"][0], "FAIL", checks["route_change"][1])
+            self.assertIn("nest-grpc.yml", checks["route_change"][1])
+            # Only the name changes: still refused.
+            name_only = {**phase2, "NEST_GRPC_EDGE_ALIAS": "nest-grpc-gateway"}
+            _, checks = self.preflight(
+                [staging, *main_deployment()], name_only, routes_dir=directory
+            )
+            self.assertEqual(checks["route_change"][0], "FAIL")
+            # Phase 1: the current values.
+            phase1 = {
+                **phase2,
+                "NEST_GRPC_EDGE_ALIAS": "nest-grpc-gateway",
+                "NEST_GRPC_PUBLIC_HOST": "grpc.staging.example.org",
+            }
+            _, checks = self.preflight([staging, *main_deployment()], phase1, routes_dir=directory)
+            self.assertEqual(checks["route_change"][0], "PASS")
+            # A recorded retirement of that file is a warning.
+            _, checks = self.preflight(
+                [staging, *main_deployment()],
+                phase2,
+                routes_dir=directory,
+                extra=["--retire-route", "nest-grpc.yml"],
+            )
+            self.assertEqual(checks["route_change"][0], "WARN")
 
     def test_unreadable_route_directory_is_skipped_not_passed(self):
         _, checks = self.preflight(main_deployment(), routes_dir="/nonexistent/traefik/dynamic")
@@ -901,3 +1066,114 @@ class MainClientConfigTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --- Option B/C: copying Main's database into Release (review of #119) ---------------
+
+try:
+    from postgres_fixture import connect as _pg_connect
+    from test_executions import _Base as _RegistryBase
+except ImportError:  # the Controller image has no psycopg test fixtures
+    _RegistryBase = None
+
+if _RegistryBase is not None:
+
+    class ReleaseCopyScriptTests(_RegistryBase):
+        """deploy/environments/release-copy-{check,revoke}.sql on a restored copy that
+        still holds Main's live attempt, invitations, sessions and service trust."""
+
+        CHECK = (ENVIRONMENTS / "release-copy-check.sql").read_text()
+        REVOKE = (ENVIRONMENTS / "release-copy-revoke.sql").read_text()
+
+        def seed_main_credentials(self):
+            token = lambda: os.urandom(32)
+            with _pg_connect(self.url) as conn:
+                conn.execute(
+                    "INSERT INTO project_invite_links (project_id, role, created_by_user_id, "
+                    "token_hash, expires_at, max_uses) VALUES (%s, 'member', %s, %s, "
+                    "now() + interval '7 days', 5)",
+                    (self.project, self.owner, token()),
+                )
+                conn.execute(
+                    "INSERT INTO project_email_invitations (project_id, invited_email_normalized, "
+                    "role, invited_by_user_id, token_hash, expires_at) VALUES "
+                    "(%s, 'dev@example.org', 'member', %s, %s, now() + interval '7 days')",
+                    (self.project, self.owner, token()),
+                )
+                family = uuid.uuid4()
+                conn.execute(
+                    "INSERT INTO user_sessions (user_id, kind, token_hash, expires_at, family_id, "
+                    "family_expires_at) VALUES (%s, 'cli', %s, now() + interval '1 day', %s, "
+                    "now() + interval '30 days')",
+                    (self.owner, token(), family),
+                )
+            from nest.db import ServicePrincipalStore
+
+            services = ServicePrincipalStore(self.db)
+            principal = services.create_principal("ci-main", operator="ops", reason="test")
+            services.add_trust_policy(
+                principal.id,
+                audience="nest-main",
+                repository="example/app",
+                repository_id="1",
+                repository_owner_id="2",
+                refs=["refs/heads/main"],
+                workflows=[".github/workflows/ci.yml"],
+                operator="ops",
+                reason="test",
+            )
+            services.grant(
+                principal.id,
+                project_id=self.project,
+                capabilities=["project.read"],
+                operator="ops",
+                reason="test",
+            )
+
+        def remaining(self) -> dict[str, int]:
+            with _pg_connect(self.url) as conn:
+                rows = conn.execute(self.CHECK.split("$$;", 1)[1]).fetchall()
+            return {row[0]: row[1] for row in rows}
+
+        def run_check(self):
+            with _pg_connect(self.url) as conn:
+                conn.execute(self.CHECK.split("$$;", 1)[0] + "$$;")
+
+        def test_live_work_from_main_blocks_the_copy(self):
+            import psycopg
+
+            execution, _ = self.register()
+            attempt = self.begin(execution.execution_id)
+            self.assertEqual(attempt.status, "submitting")
+            with self.assertRaises(psycopg.errors.RaiseException) as caught:
+                self.run_check()
+            self.assertIn("1 live attempt(s)", str(caught.exception))
+            # Quiesced: the attempt ended on Main before the dump.
+            self.registry.finish_attempt(attempt.id, "failed", error_kind="ssh_unreachable")
+            self.run_check()
+
+        def test_revoke_leaves_nothing_from_main_usable(self):
+            self.seed_main_credentials()
+            before = self.remaining()
+            seeded = set(before) - {"service sessions unrevoked"}
+            self.assertTrue(all(before[item] >= 1 for item in seeded), before)
+            with _pg_connect(self.url) as conn:
+                conn.execute("SELECT set_config('nest.revoker', %s, false)", (str(self.owner),))
+                conn.execute("SELECT set_config('nest.operator', 'ops-test', false)")
+                conn.execute(self.REVOKE)
+                audited = conn.execute(
+                    "SELECT count(*) FROM security_audit_events "
+                    "WHERE actor_operator = 'ops-test' AND interface = 'database'"
+                ).fetchone()[0]
+            self.assertGreaterEqual(audited, 3)
+            self.assertEqual(set(self.remaining().values()), {0}, self.remaining())
+            self.run_check()
+
+        def test_revoke_needs_the_revoker(self):
+            import psycopg
+
+            self.seed_main_credentials()
+            with _pg_connect(self.url) as conn, self.assertRaises(psycopg.Error):
+                conn.execute(self.REVOKE)
+            # One transaction: nothing was revoked.
+            self.assertGreaterEqual(self.remaining()["user sessions unrevoked"], 1)

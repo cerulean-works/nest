@@ -188,13 +188,22 @@ staging route until the maintainer decides otherwise (decision 5).
 
 1. **Phase 1, no change to Main.** Create Release as above with alias
    `nest-grpc-gateway-release` and origin subnet `10.253.251.0/28`. Main keeps the
-   default alias `nest-grpc-gateway`, its `10.253.250.0/28` subnet and its existing
-   staging route. The two aliases already differ, and `preflight` checks both.
-2. **Phase 2, Main's new names (when approved).** Set Main's
-   `NEST_GRPC_PUBLIC_HOST=grpc.main.nest.cerulean.works` and
-   `NEST_GRPC_EDGE_ALIAS=nest-grpc-gateway-main`, and set `NEST_GOOGLE_REDIRECT_URL`
-   and `NEST_PUBLIC_URL` to the Main origin. Render and install
-   `nest-grpc-main.yml` with `--instance main`. Then redeploy Main. Its
+   default alias `nest-grpc-gateway`, its `10.253.250.0/28` subnet, its current
+   gRPC name and sign-in origin, and its existing staging route. The two aliases
+   already differ, and `preflight` checks both. `main.env.example` is this phase:
+   its Main values are commented out under *PHASE 2 ONLY*. `preflight`'s
+   `route_change` fails if Main's settings would change the running gateway's alias
+   or name while an installed route still depends on it.
+2. **Phase 2, Main's new names (when approved).** First verify the
+   `main.nest.cerulean.works` Tunnel route, its Google callback and the DNS-only
+   `grpc.main` record. Render and install `nest-grpc-main.yml` with
+   `--instance main`. Then set the *PHASE 2 ONLY* values of `main.env.example`:
+   `NEST_GRPC_PUBLIC_HOST=grpc.main.nest.cerulean.works`,
+   `NEST_GRPC_EDGE_ALIAS=nest-grpc-gateway-main`, and `NEST_GOOGLE_REDIRECT_URL` and
+   `NEST_PUBLIC_URL` on the Main origin. `preflight` now fails on `route_change`,
+   because the staging route `nest-grpc.yml` depends on the old alias and name. Pass
+   `--retire-route nest-grpc.yml` only once retiring the staging name is the recorded
+   decision, and the check turns into a warning. Then redeploy Main. Its
    certificate service requests the new name, and the gateway starts serving it.
    From then on the gateway no longer serves the old staging name.
 3. Verify Main (`preflight`, `gateway-runtime`, external checks with the staging
@@ -213,13 +222,74 @@ then.
 | Option | What it means | Trade-offs |
 | --- | --- | --- |
 | A. Fresh | A new, empty database, migrated by `nest-db upgrade`. The bootstrap admin signs in, then Projects, memberships, Platform grants and Slurm account links are recreated for the approved cohort. | No inherited state or test data. Users and Projects are recreated by hand, and existing CLI sessions are not valid on Release. |
-| B. Copy | `pg_dump` from Main at a recorded time, then `pg_restore` into Release's new volume before Release first starts. Then revoke every session in the copy (`nest-db sessions revoke --user-id` for each User, see [Sign in with Google](authentication)), and review Projects, invitations and grants. | Keeps Projects and users, but also copies Main's test data, and the two copies diverge from then on. The dump holds personal data and must be handled as a secret. |
+| B. Copy | Quiesce Main, `pg_dump` it, restore into Release's own volume before Release's Controller first serves, then run the two check and revoke scripts below. | Keeps Projects and users, but also copies Main's test data, and the two copies diverge from then on. The dump holds personal data and must be handled as a secret. |
 | C. Move | As B, but Main is then reset to a new database. | Main loses its history. It needs a Main backup and an explicit decision, and is rarely worth it. |
 
 Whichever option you pick, the schema must match the Release tag's minimum: the
 `migrate` profile runs `nest-db upgrade`, and `nest-db verify` checks the result.
 The rollback for B or C is the backup taken first. Restore it only into the
 application it came from.
+
+### Copy procedure (options B and C)
+
+A live Main database holds more than Projects and users. It also holds:
+
+- execution attempts in flight, with Main's Slurm job IDs and the admission
+  reservations they hold. Release's recovery would query Slurm for jobs it does
+  not own, look for their outcomes in its own workdir, fail them after the grace
+  period, and count their reservations against its limits until then;
+- invite links and email invitations, whose bearer tokens were issued to Main's
+  developer audience;
+- user and service sessions, service principals, workload trust policies and
+  grants.
+
+None of that may carry over. In order, with `dc` the Compose command of each
+application (`docker compose -p <appName> -f compose.dokploy.yaml`, from its
+checkout):
+
+1. **Quiesce Main.** Tell Main's users to stop submitting. Wait until
+   `dc exec controller nest-db execution list` prints no attempt (reconcile any
+   `unknown` one with `nest-db execution reconcile`). Then stop Main's Controller,
+   `dc stop controller`, so nothing new starts, and dump from Main's own PostgreSQL:
+   `dc exec -T postgres pg_dump -U nest -Fc nest > main-<time>.dump`. Keep the file
+   private and delete it when done. Start Main's Controller again.
+2. **Restore into Release, offline.** Deploy Release once, on its own new volume,
+   then `dc stop controller` on Release. Restore into an empty database, as in
+   [Back up and restore](database#back-up-and-restore). Replacing Release's
+   just-created database is safe only because Release has never served:
+
+   ```bash
+   dc exec -T postgres psql -v ON_ERROR_STOP=1 -U nest -d postgres \
+     -c 'DROP DATABASE nest' -c 'CREATE DATABASE nest OWNER nest'
+   dc exec -T postgres pg_restore -U nest --no-owner --role=nest --exit-on-error -d nest < main-<time>.dump
+   dc run --rm migrate          # nest-db upgrade to the Release tag's schema
+   ```
+3. **Check:** `dc exec -T postgres psql -v ON_ERROR_STOP=1 -U nest -d nest < deploy/environments/release-copy-check.sql`.
+   It fails while the copy holds a live attempt or a held reservation; then go back
+   to step 1. Otherwise it prints how many invite links, invitations, sessions and
+   service principals, policies and grants remain usable.
+4. **Revoke what Main issued:**
+
+   ```bash
+   dc exec -T postgres psql -v ON_ERROR_STOP=1 -U nest -d nest \
+     -c "SET nest.revoker = '<Release platform admin User ID>'" \
+     -c "SET nest.operator = '<your name>'" < deploy/environments/release-copy-revoke.sql
+   ```
+
+   It runs in one transaction and revokes every invite link, pending invitation,
+   user and service session, and every service principal, trust policy and grant.
+   The database's audit triggers record the operator and a fixed reason. Run step 3
+   again: every count must be 0. Record the run in #118.
+5. Start Release's Controller (`dc start controller`). Recreate on Release only the
+   service principals the operator re-approves for it, with Release's own
+   `NEST_WORKLOAD_OIDC_AUDIENCE` (`nest-db service-principal create`, `trust`,
+   `grant`), and invite users again as needed. Review Project memberships, Platform
+   grants and Slurm account links for Release's cohort.
+
+`tests/test_multi_environment.py` runs both scripts against PostgreSQL. A copy with
+a live attempt fails the check. After revocation nothing from Main remains usable,
+and the changes are in the security audit log. A missing `nest.revoker` or
+`nest.operator` changes nothing.
 
 ## HPC capacity
 
@@ -233,8 +303,11 @@ admits up to its own limits, so the cluster sees the sum. Two deployments with
    `jobs/` inputs, outputs and worker state. Use distinct paths such as
    `<cluster path>/nest-main` and `<cluster path>/nest-release` on every Platform.
    `preflight` fails when another deployment on the host uses the same workdir on
-   the same login hosts. It does not read a `NEST_PLATFORMS_ENV_FILE`, so compare
-   those by hand.
+   the same login hosts. It reads this deployment's platforms file
+   (`NEST_PLATFORMS_ENV_FILE`, default `./platforms.env` next to `--env-file`) and the
+   Platform variables that file gives other Controllers. When another
+   deployment's targets cannot be read, it warns and never passes; compare those by
+   hand.
 2. **Account and quota.** Prefer separate Slurm accounts, or QoS limits set by the
    cluster administrator (`GrpTRES`, `GrpJobs`), which Slurm itself enforces across
    both deployments. If one account is shared, the operator approves a split, and
@@ -333,6 +406,8 @@ unchanged.
 | Per-deployment aliases and `--instance` routes: right gateway, Controller and certificate for each name, PROXY v2 attribution, unknown name refused, no cross-origin path, no host ports; Traefik pre-v3.5 and v3.5+ | part 2 | synthetic, real containers |
 | Main recreated, rolled back and unrouted while Release serves every handshake; Release containers, route and database untouched; Main's data survives | part 3 | synthetic, real containers |
 | Negative preflights: subnet, alias, name, Tailnet hostname, workdir; service-name alias refused | part 4; `tests/test_multi_environment.py` | synthetic |
+| Platforms files compared; a route orphaned by a changed alias or name refused; Main template is Phase 1 | `tests/test_multi_environment.py` | synthetic |
+| Copy scripts: a live attempt blocks the copy; nothing Main issued stays usable; changes audited | `tests/test_multi_environment.py` (PostgreSQL) | synthetic, real PostgreSQL |
 | Monitoring: per-environment files, state, labels and rules; default output unchanged | `tests/test_multi_environment.py` | synthetic |
 | Single-deployment output unchanged | `tests/test_multi_environment.py` | synthetic |
 | Dokploy trigger semantics, DNS, Tunnel routes, OAuth sign-in on both origins, certificates, data migration, Tailnet enrollment, HPC smoke | **PENDING**: operator only | live |

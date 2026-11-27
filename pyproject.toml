@@ -39,7 +39,7 @@ target-version = "py314"
 line-length = 100
 extend-exclude = ["src/nest/proto/*_pb2*"]
 # Run on the Docker host with its own Python (3.9 or later), not Nest's.
-per-file-target-version = { "scripts/nest-monitor.py" = "py39", "deploy/monitoring/*.py" = "py39" }
+per-file-target-version = { "scripts/nest-monitor.py" = "py39", "scripts/nest-deploy-doctor.py" = "py39", "deploy/monitoring/*.py" = "py39" }
 
 [tool.ruff.lint]
 ignore = []
