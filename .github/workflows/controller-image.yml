@@ -58,6 +58,9 @@ jobs:
           - group: public-grpc-networks
             title: Test the public gRPC gateway on a Dokploy-like multi-network host (#109)
             script: bash tests/smoke_public_grpc_networks.sh
+          - group: two-environments
+            title: Test Main and Release side by side behind one real Traefik (#118)
+            script: bash tests/smoke_two_environments.sh
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build the Controller image with Compose

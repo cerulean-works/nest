@@ -39,6 +39,8 @@ guide:
         title: Deploy on Dokploy from environment variables
       - local: deployment-recovery
         title: Preflight and recover a Dokploy deployment
+      - local: multi-environment
+        title: Run Main and Release side by side on one Dokploy host
       - local: docker-compose
         title: Deploy with Docker Compose
       - local: tailscale-shared

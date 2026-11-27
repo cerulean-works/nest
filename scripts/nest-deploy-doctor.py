@@ -27,6 +27,21 @@ preflight
     Traefik passthrough file matches the installed Traefik. It never creates, changes
     or deletes anything.
 
+    Several deployments on one host (#118): it also compares this deployment with
+    every other Nest deployment there, running or stopped. One Compose project name
+    must not come from two checkouts. With `public-grpc`, `NEST_GRPC_EDGE_ALIAS`
+    must be a valid alias that no other container on the edge network answers to,
+    and `NEST_GRPC_PUBLIC_HOST` one that no other gateway serves. A short database
+    host name must not name another project's container on the edge network.
+    `NEST_TAILSCALE_HOSTNAME` must differ from other deployments, and so must each
+    HPC workdir on the same cluster; a shared Slurm account is a warning, because
+    each deployment's admission limits apply only to itself. A running conflict
+    fails, a stopped one warns. It then reads Traefik's dynamic directory
+    (`--traefik-dynamic-dir`, default /etc/dokploy/traefik/dynamic), read-only:
+    a TCP router, service or transport name defined in two files, or one SNI name
+    in two routers, fails, and this deployment's route must dial exactly
+    `NEST_GRPC_EDGE_ALIAS`:8443. HPC values and the database URL are never printed.
+
 migrate-status
     Lists this project's `migrate` containers and classifies each: `completed`,
     `failed` (non-zero exit), `running`, `waiting-dependency` (not started because
@@ -67,7 +82,8 @@ gateway-runtime
     this checks what the running containers actually do (#109). It requires
     exactly one running gateway and one running Controller, and checks:
     `NEST_GRPC_UPSTREAM` names the grpc-origin-only alias, not the generic
-    `controller` name. That name is a DNS name of the Controller on grpc-origin and on
+    `controller` name. The gateway answers to its `NEST_GRPC_EDGE_ALIAS` on the
+    edge network, and no other container there does (#118). That name is a DNS name of the Controller on grpc-origin and on
     no other network. Inside the gateway it resolves (getent) to exactly the
     Controller's grpc-origin address. The Controller's `NEST_GRPC_TRUSTED_PROXIES` is
     the gateway's grpc-origin /32, and neither it nor `NEST_GRPC_ALLOWED_PEERS` admits
@@ -110,6 +126,35 @@ MAX_LOG_LINES = 200
 DEFAULT_MIN_AGE = 300.0
 DEFAULT_SETTLE = 10.0
 
+DEFAULT_EDGE_ALIAS = "nest-grpc-gateway"
+DEFAULT_PUBLIC_HOST = "grpc.nest.cerulean.works"
+DEFAULT_TAILSCALE_HOSTNAME = "nest-controller"
+DEFAULT_TRAEFIK_DYNAMIC_DIR = "/etc/dokploy/traefik/dynamic"
+# Compose service names of compose.dokploy.yaml: Docker gives each one as a DNS name
+# on every network the service joins, so on a shared edge network they resolve to
+# every deployment's container and can never identify one of them (#109, #118).
+SERVICE_NAMES = (
+    "controller",
+    "migrate",
+    "postgres",
+    "tailscale",
+    "grpc-gateway",
+    "grpc-certificates",
+    "controller-grpc-origin",
+)
+EDGE_ALIAS_PATTERN = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
+HPC_SETTINGS = (
+    "NEST_SLURM_HOST",
+    "NEST_SLURM_LOGIN_NODES",
+    "NEST_SLURM_ACCOUNT",
+    "NEST_SLURM_WORKDIR",
+    "NEST_PLATFORMS_ENV",
+    "NEST_PLATFORMS_ENV_FILE",
+    "NEST_LIMIT_ACTIVE_PER_PLATFORM",
+    # Only its host name is used; the URL itself may hold a password.
+    "NEST_DATABASE_URL",
+)
+
 # Settings read from the environment file. Only the network ones are printed.
 SETTINGS = (
     "COMPOSE_PROFILES",
@@ -119,7 +164,12 @@ SETTINGS = (
     "NEST_GRPC_ALLOWED_PEERS",
     "NEST_GRPC_EDGE_PROXY",
     "NEST_GRPC_EDGE_NETWORK",
+    "NEST_GRPC_EDGE_ALIAS",
+    "NEST_GRPC_PUBLIC_HOST",
+    "NEST_TAILSCALE_HOSTNAME",
     "NEST_PUBLIC_PILOT",
+    # HPC targets, compared with other deployments on this host and never printed.
+    *HPC_SETTINGS,
 )
 
 Runner = Callable[[Sequence[str]], "Result"]
@@ -203,6 +253,28 @@ class Docker:
     def logs(self, container_id: str, lines: int) -> str:
         result = self.run(["docker", "logs", "--tail", str(lines), container_id])
         return (result.stdout + result.stderr).rstrip()
+
+    def service_containers(self, service: str) -> list[dict]:
+        """Every container, of any Compose project and in any state, of `service`."""
+        ids = self._ok(
+            [
+                "docker",
+                "ps",
+                "--all",
+                "--quiet",
+                "--no-trunc",
+                "--filter",
+                f"label=com.docker.compose.service={service}",
+            ]
+        ).split()
+        if not ids:
+            return []
+        return json.loads(self._ok(["docker", "container", "inspect", *ids]))
+
+    def inspect(self, ids: Sequence[str]) -> list[dict]:
+        if not ids:
+            return []
+        return json.loads(self._ok(["docker", "container", "inspect", *ids]))
 
     def project_containers(self, project: str) -> list[dict]:
         ids = self._ok(
@@ -420,6 +492,11 @@ def check_origin(
                             f"{name} exists with {existing}; Compose will recreate it with {subnet}, restarting the Controller",
                         )
                     )
+            elif name.endswith("_grpc-origin"):
+                collisions.append(
+                    f"{name} ({existing}), the origin network of deployment "
+                    f"{name[: -len('_grpc-origin')]}; every deployment needs its own subnet"
+                )
             else:
                 collisions.append(f"{name} ({existing})")
     if collisions:
@@ -627,6 +704,473 @@ def traefik_file_check(image: str) -> Check:
     )
 
 
+# --- Several deployments on one host (#118) -----------------------------------------
+
+
+def _project(container: dict) -> str:
+    return ((container.get("Config") or {}).get("Labels") or {}).get(
+        "com.docker.compose.project", ""
+    )
+
+
+def _running(container: dict) -> bool:
+    return (container.get("State") or {}).get("Status") == "running"
+
+
+def _edge_alias_of(container: dict, edge_network: str | None) -> str:
+    """The edge alias a gateway container uses: its `NEST_GRPC_EDGE_ALIAS`, or for a
+    gateway from before that setting, the alias it has on the edge network, or the
+    one compose.dokploy.yaml always gave it."""
+    alias = container_env(container, ("NEST_GRPC_EDGE_ALIAS",)).get("NEST_GRPC_EDGE_ALIAS", "")
+    if alias:
+        return alias
+    for name, attachment in _attachments(container).items():
+        if edge_network is None or name == edge_network:
+            for candidate in attachment.get("Aliases") or []:
+                # Docker also lists the service name and the short container ID.
+                if candidate not in SERVICE_NAMES and not container.get("Id", "").startswith(
+                    candidate
+                ):
+                    return candidate
+    return DEFAULT_EDGE_ALIAS
+
+
+def edge_alias_problem(alias: str) -> str | None:
+    """Why `alias` cannot name one gateway on a shared edge network, or None."""
+    if not EDGE_ALIAS_PATTERN.fullmatch(alias):
+        return f"NEST_GRPC_EDGE_ALIAS {alias!r} must be a lower-case DNS label"
+    if alias in SERVICE_NAMES:
+        return (
+            f"NEST_GRPC_EDGE_ALIAS {alias!r} is a Compose service name, which resolves to "
+            "every deployment's container on the edge network"
+        )
+    return None
+
+
+def _platform_targets(text: str) -> list[tuple[str, frozenset, str, str]]:
+    """(platform, login hosts, account, workdir) of each HPC Platform in the lines of a
+    platforms.env value (real or `\\n`-escaped newlines)."""
+    fields: dict[str, dict[str, str]] = {}
+    for line in text.replace("\\n", "\n").splitlines():
+        key, _, value = line.strip().partition("=")
+        match = re.fullmatch(r"NEST_PLATFORM_([A-Z0-9_]+?)_(LOGIN_NODES|ACCOUNT|WORKDIR)", key)
+        if match:
+            fields.setdefault(match.group(1), {})[match.group(2)] = value.strip().strip("'\"")
+    targets = []
+    for platform, item in sorted(fields.items()):
+        hosts = frozenset(
+            h.strip().lower() for h in item.get("LOGIN_NODES", "").split(",") if h.strip()
+        )
+        targets.append((platform, hosts, item.get("ACCOUNT", ""), item.get("WORKDIR", "")))
+    return targets
+
+
+def hpc_targets(values: dict[str, str]) -> list[tuple[str, frozenset, str, str]]:
+    """Every HPC target a Controller's settings name: the legacy single cluster and
+    each inline Platform. A platforms file (NEST_PLATFORMS_ENV_FILE) is not read."""
+    targets = []
+    host_text = values.get("NEST_SLURM_LOGIN_NODES") or values.get("NEST_SLURM_HOST", "")
+    if values.get("NEST_SLURM_WORKDIR") or values.get("NEST_SLURM_ACCOUNT"):
+        hosts = frozenset(h.strip().lower() for h in host_text.split(",") if h.strip())
+        targets.append(
+            (
+                "NEST_SLURM",
+                hosts,
+                values.get("NEST_SLURM_ACCOUNT", ""),
+                values.get("NEST_SLURM_WORKDIR", ""),
+            )
+        )
+    targets += _platform_targets(values.get("NEST_PLATFORMS_ENV", ""))
+    return targets
+
+
+def _same_cluster(a: frozenset, b: frozenset) -> bool:
+    # Unknown login hosts count as the same cluster: never assume isolation.
+    return not a or not b or bool(a & b)
+
+
+def database_host_check(
+    values: dict[str, str], project: str, docker: Docker, networks: list[dict], edge_network: str
+) -> Check:
+    """The Controller joins the shared edge network too (Dokploy attaches it for the
+    Web Domain), so a short database host name such as `postgres` must not name any
+    other project's container there: the Controller could reach another deployment's
+    database. Only the host name is printed, never the URL."""
+    import urllib.parse
+
+    url = values.get("NEST_DATABASE_URL", "")
+    if not url:
+        return Check("database_host", "SKIP", "NEST_DATABASE_URL is unset")
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return Check("database_host", "FAIL", "NEST_DATABASE_URL does not parse (not printed)")
+    if not host or "." in host or ":" in host:
+        return Check(
+            "database_host", "PASS", "NEST_DATABASE_URL names a host outside this host's Docker DNS"
+        )
+    edge = next((n for n in networks if n.get("Name") == edge_network), None)
+    ids = [i for i in ((edge or {}).get("Containers") or {}) if not i.startswith("ep-")]
+    holders = [
+        f"{c.get('Name', '?').lstrip('/')} ({_project(c) or 'no project'})"
+        for c in docker.inspect(ids)
+        if _project(c) != project and host in _dns_names(_attachments(c).get(edge_network) or {})
+    ]
+    if holders:
+        return Check(
+            "database_host",
+            "FAIL",
+            f"the database host {host} also names {', '.join(sorted(holders))} on "
+            f"{edge_network}, which the Controller joins; that container could answer for this "
+            "deployment's database. Take it off the edge network or rename it",
+        )
+    return Check(
+        "database_host", "PASS", f"{host} names no other project's container on {edge_network}"
+    )
+
+
+def check_isolation(
+    values: dict[str, str], project: str, docker: Docker, networks: list[dict], public_grpc: bool
+) -> list[Check]:
+    """Compares this deployment's identity with every other Nest deployment on the
+    host, running or stopped: the Compose project, the gateway's edge alias and public
+    name, the Tailnet hostname and the HPC workdirs and accounts. Read-only."""
+    checks: list[Check] = []
+    own = docker.project_containers(project)
+    directories = sorted(
+        {
+            ((c.get("Config") or {}).get("Labels") or {}).get(
+                "com.docker.compose.project.working_dir", ""
+            )
+            for c in own
+        }
+        - {""}
+    )
+    if len(directories) > 1:
+        checks.append(
+            Check(
+                "project_identity",
+                "FAIL",
+                f"Compose project {project} has containers from {len(directories)} checkouts: "
+                "two deployments share one project name, and with it every network, volume "
+                "and database. Give each its own Dokploy application (appName)",
+            )
+        )
+    elif project == "nest":
+        checks.append(
+            Check(
+                "project_identity",
+                "WARN",
+                "project `nest` is compose.dokploy.yaml's default name; a second deployment "
+                "started without -p would share it. Dokploy uses each application's appName",
+            )
+        )
+    else:
+        checks.append(Check("project_identity", "PASS", f"project {project} has one checkout"))
+
+    def others(service: str) -> list[dict]:
+        return [c for c in docker.service_containers(service) if _project(c) not in ("", project)]
+
+    def verdict(found: list[dict]) -> str:
+        return "FAIL" if any(_running(c) for c in found) else "WARN"
+
+    def projects(found: list[dict]) -> str:
+        return ", ".join(
+            sorted(f"{_project(c)}{'' if _running(c) else ' (stopped)'}" for c in found)
+        )
+
+    edge_network = values.get("NEST_GRPC_EDGE_NETWORK", DEFAULT_EDGE_NETWORK)
+    gateways = others("grpc-gateway")
+    if public_grpc:
+        alias = values.get("NEST_GRPC_EDGE_ALIAS", DEFAULT_EDGE_ALIAS)
+        problem = edge_alias_problem(alias)
+        same = [c for c in gateways if _edge_alias_of(c, edge_network) == alias]
+        # Any other container that answers to the name on the edge network.
+        edge = next((n for n in networks if n.get("Name") == edge_network), None)
+        strangers = []
+        if edge is not None:
+            ids = [i for i in (edge.get("Containers") or {}) if not i.startswith("ep-")]
+            known = {c.get("Id") for c in same}
+            for container in docker.inspect(ids):
+                if _project(container) == project or container.get("Id") in known:
+                    continue
+                attachment = _attachments(container).get(edge_network) or {}
+                if alias in _dns_names(attachment):
+                    strangers.append(container.get("Name", "?").lstrip("/"))
+        if problem:
+            checks.append(Check("edge_alias", "FAIL", problem))
+        elif same or strangers:
+            holders = ", ".join(filter(None, [projects(same), ", ".join(strangers)]))
+            checks.append(
+                Check(
+                    "edge_alias",
+                    "FAIL" if strangers else verdict(same),
+                    f"{alias} on {edge_network} is also the gateway alias of {holders}: Traefik "
+                    "would reach either gateway. Set a unique NEST_GRPC_EDGE_ALIAS for this "
+                    "deployment and render its route with --instance (docs/source/multi-environment.md)",
+                )
+            )
+        else:
+            checks.append(
+                Check(
+                    "edge_alias", "PASS", f"{alias} is used by no other container on {edge_network}"
+                )
+            )
+
+        host = values.get("NEST_GRPC_PUBLIC_HOST", DEFAULT_PUBLIC_HOST).lower()
+        same = [
+            c
+            for c in gateways
+            if container_env(c, ("NEST_GRPC_PUBLIC_HOST",))
+            .get("NEST_GRPC_PUBLIC_HOST", DEFAULT_PUBLIC_HOST)
+            .lower()
+            == host
+        ]
+        if same:
+            checks.append(
+                Check(
+                    "public_host",
+                    verdict(same),
+                    f"{host} is also served by the gateway of {projects(same)}; each deployment "
+                    "needs its own NEST_GRPC_PUBLIC_HOST, route and certificate",
+                )
+            )
+        else:
+            checks.append(Check("public_host", "PASS", f"no other gateway serves {host}"))
+
+    checks.append(database_host_check(values, project, docker, networks, edge_network))
+
+    hostname = values.get("NEST_TAILSCALE_HOSTNAME", DEFAULT_TAILSCALE_HOSTNAME).lower()
+    same = [
+        c
+        for c in others("tailscale")
+        if container_env(c, ("TS_HOSTNAME",)).get("TS_HOSTNAME", "").lower() == hostname
+    ]
+    if same:
+        checks.append(
+            Check(
+                "tailnet_hostname",
+                verdict(same),
+                f"Tailscale hostname {hostname} is also used by {projects(same)}; the second "
+                "node gets a suffixed MagicDNS name, so set a distinct NEST_TAILSCALE_HOSTNAME",
+            )
+        )
+    else:
+        checks.append(Check("tailnet_hostname", "PASS", f"no other deployment uses {hostname}"))
+
+    ours = hpc_targets(values)
+    if not ours:
+        detail = "no NEST_SLURM_* or inline NEST_PLATFORMS_ENV target to compare"
+        if values.get("NEST_PLATFORMS_ENV_FILE"):
+            detail += "; NEST_PLATFORMS_ENV_FILE is not read: compare its workdirs by hand"
+        checks.append(Check("hpc_workdir", "SKIP", detail))
+        return checks
+    shared_dirs, shared_accounts = [], []
+    for controller in others("controller"):
+        theirs = hpc_targets(container_env(controller, HPC_SETTINGS))
+        label = f"{_project(controller)}{'' if _running(controller) else ' (stopped)'}"
+        for name, hosts, account, workdir in ours:
+            for other_name, other_hosts, other_account, other_workdir in theirs:
+                if not _same_cluster(hosts, other_hosts):
+                    continue
+                if workdir and workdir.rstrip("/") == other_workdir.rstrip("/"):
+                    shared_dirs.append((controller, f"{name} = {label} {other_name}"))
+                if account and account == other_account:
+                    shared_accounts.append(f"{name} = {label} {other_name}")
+    if shared_dirs:
+        checks.append(
+            Check(
+                "hpc_workdir",
+                verdict([c for c, _ in shared_dirs]),
+                "the HPC workdir (not printed) is shared with another deployment: "
+                + "; ".join(sorted({d for _, d in shared_dirs}))
+                + ". Jobs, results and worker state would mix; give each deployment its own "
+                "workdir on the cluster",
+            )
+        )
+    else:
+        checks.append(
+            Check(
+                "hpc_workdir", "PASS", "no other deployment on this host uses the same HPC workdir"
+            )
+        )
+    if shared_accounts:
+        limit = values.get("NEST_LIMIT_ACTIVE_PER_PLATFORM", "")
+        checks.append(
+            Check(
+                "hpc_account",
+                "WARN",
+                "the Slurm account (not printed) is shared with another deployment: "
+                + "; ".join(sorted(set(shared_accounts)))
+                + ". Each deployment admits work on its own ledger, so their limits add up; "
+                + ("NEST_LIMIT_ACTIVE_PER_PLATFORM is unset here. " if not limit else "")
+                + "Split the operator-approved allocation between them "
+                "(docs/source/multi-environment.md, HPC capacity)",
+            )
+        )
+    else:
+        checks.append(Check("hpc_account", "PASS", "no other deployment shares the Slurm account"))
+    return checks
+
+
+# The few lines of a Traefik dynamic file that matter here, at the indentation
+# render.sh writes (and Traefik's documentation uses): two spaces per level.
+ROUTE_SECTION = re.compile(r"^  (routers|services|serversTransports):\s*$")
+ROUTE_NAME = re.compile(r"^    ([A-Za-z0-9_.@-]+):\s*$")
+ROUTE_RULE = re.compile(r"HostSNI\(([^)]*)\)")
+ROUTE_ADDRESS = re.compile(r"^\s*-\s*address:\s*[\"']?([^\"'\s]+)[\"']?\s*$")
+
+
+def parse_tcp_routes(text: str) -> dict[str, dict]:
+    """Names, HostSNI names and server addresses of the `tcp:` section of a Traefik
+    YAML dynamic file. Other sections (http, tls) are ignored."""
+    found: dict[str, dict] = {"routers": {}, "services": {}, "serversTransports": {}}
+    in_tcp, section, name = False, None, None
+    for line in text.splitlines():
+        stripped = line.split("#", 1)[0].rstrip() if "`" not in line else line.rstrip()
+        if not stripped.strip():
+            continue
+        if not line.startswith(" "):
+            in_tcp, section, name = stripped == "tcp:", None, None
+            continue
+        if not in_tcp:
+            continue
+        match = ROUTE_SECTION.match(stripped)
+        if match:
+            section, name = match.group(1), None
+            continue
+        if section is None:
+            continue
+        match = ROUTE_NAME.match(stripped)
+        if match:
+            name = match.group(1)
+            found[section][name] = {"hosts": [], "addresses": []}
+            continue
+        if name is None:
+            continue
+        rule = ROUTE_RULE.search(stripped)
+        if rule and "rule:" in stripped:
+            hosts = re.findall(r"`([^`]*)`", rule.group(1))
+            found[section][name]["hosts"] += [h.lower() for h in hosts]
+        address = ROUTE_ADDRESS.match(stripped)
+        if address:
+            found[section][name]["addresses"].append(address.group(1))
+    return found
+
+
+def check_routes(values: dict[str, str], directory: str, public_grpc: bool) -> list[Check]:
+    """Reads Traefik's dynamic configuration directory (read-only) for the collisions
+    that break a second deployment's gRPC route: a router, service or transport name
+    defined in two files (Traefik keeps one, so a name goes unrouted), one SNI name in two
+    routers, and this deployment's route dialling anything but its own edge alias."""
+    import os
+
+    try:
+        names = sorted(n for n in os.listdir(directory) if n.endswith((".yml", ".yaml")))
+    except OSError as error:
+        return [
+            Check(
+                "traefik_routes",
+                "SKIP",
+                f"cannot read {directory} ({error.strerror}); pass --traefik-dynamic-dir, or "
+                "check the route files by hand (docs/source/multi-environment.md)",
+            )
+        ]
+    files: dict[str, dict] = {}
+    for name in names:
+        try:
+            with open(os.path.join(directory, name), encoding="utf-8") as handle:
+                files[name] = parse_tcp_routes(handle.read())
+        except (OSError, UnicodeDecodeError) as error:
+            return [Check("traefik_routes", "FAIL", f"cannot read {name}: {error}")]
+    checks: list[Check] = []
+    duplicates = []
+    for section in ("routers", "services", "serversTransports"):
+        defined: dict[str, list[str]] = {}
+        for file, routes in files.items():
+            for name in routes[section]:
+                defined.setdefault(name, []).append(file)
+        duplicates += [
+            f"{section[:-1]} {n} in {', '.join(f)}"
+            for n, f in sorted(defined.items())
+            if len(f) > 1
+        ]
+    if duplicates:
+        checks.append(
+            Check(
+                "route_names",
+                "FAIL",
+                "defined in more than one file, so Traefik's file provider keeps only one "
+                "definition and the other deployment's name is not routed: "
+                + "; ".join(duplicates)
+                + ". Render each deployment's file with its own --instance",
+            )
+        )
+    else:
+        checks.append(
+            Check("route_names", "PASS", f"no TCP name repeats across {len(files)} files")
+        )
+    owners: dict[str, list[str]] = {}
+    for file, routes in files.items():
+        for router, item in routes["routers"].items():
+            for host in item["hosts"]:
+                owners.setdefault(host, []).append(f"{file}:{router}")
+    repeated = [f"{h} in {', '.join(o)}" for h, o in sorted(owners.items()) if len(o) > 1]
+    if repeated:
+        checks.append(
+            Check(
+                "route_sni",
+                "FAIL",
+                "one SNI name in several routers: "
+                + "; ".join(repeated)
+                + ". Keep one route per name",
+            )
+        )
+    else:
+        checks.append(Check("route_sni", "PASS", "every HostSNI name has one router"))
+    if not public_grpc:
+        return checks
+
+    host = values.get("NEST_GRPC_PUBLIC_HOST", DEFAULT_PUBLIC_HOST).lower()
+    alias = values.get("NEST_GRPC_EDGE_ALIAS", DEFAULT_EDGE_ALIAS)
+    mine = [
+        (file, router, item)
+        for file, routes in files.items()
+        for router, item in routes["routers"].items()
+        if host in item["hosts"]
+    ]
+    if not mine:
+        checks.append(
+            Check(
+                "route_target",
+                "WARN",
+                f"no route for {host} in {directory} yet; install the one render.sh prints",
+            )
+        )
+        return checks
+    problems = []
+    for file, _router, _item in mine:
+        addresses = [a for item in files[file]["services"].values() for a in item["addresses"]]
+        for address in addresses or ["(none)"]:
+            target, _, port = address.rpartition(":")
+            if target != alias or port != "8443":
+                problems.append(f"{file} dials {address}, not {alias}:8443")
+    if problems:
+        checks.append(
+            Check(
+                "route_target",
+                "FAIL",
+                "; ".join(problems)
+                + ". Render this deployment's route with --edge-alias set to its NEST_GRPC_EDGE_ALIAS",
+            )
+        )
+    else:
+        checks.append(
+            Check("route_target", "PASS", f"{mine[0][0]} routes {host} to {alias}:8443 only")
+        )
+    return checks
+
+
 def host_routes(run: Runner) -> list[dict] | None:
     if not shutil.which("ip") and run is run_command:
         return None
@@ -647,12 +1191,15 @@ def preflight(args, docker: Docker, environ: dict[str, str]) -> int:
     profiles = {p.strip() for p in values.get("COMPOSE_PROFILES", "").split(",") if p.strip()}
     networks = docker.networks()
     checks += check_origin(values, args.project, networks, host_routes(docker.run))
-    if "public-grpc" in profiles:
+    public_grpc = "public-grpc" in profiles
+    if public_grpc:
         checks += check_gateway(values, args.project, networks, docker, args.traefik_container)
     else:
         checks.append(
             Check("public_grpc", "SKIP", "profile public-grpc is off; gateway settings not checked")
         )
+    checks += check_isolation(values, args.project, docker, networks, public_grpc)
+    checks += check_routes(values, args.traefik_dynamic_dir, public_grpc)
     emit(checks, args.json)
     return 1 if any(c.status == "FAIL" for c in checks) else 0
 
@@ -1217,6 +1764,51 @@ def private_path(
     )
 
 
+def edge_alias_runtime(docker: Docker, gateway: dict, origin_name: str) -> Check:
+    """The running gateway answers to its NEST_GRPC_EDGE_ALIAS on the edge network,
+    and no other container there does, so Traefik's route reaches this gateway only
+    (#118)."""
+    alias = container_env(gateway, ("NEST_GRPC_EDGE_ALIAS",)).get(
+        "NEST_GRPC_EDGE_ALIAS", DEFAULT_EDGE_ALIAS
+    )
+    problem = edge_alias_problem(alias)
+    if problem:
+        return Check("edge_alias", "FAIL", problem)
+    edges = [n for n in _attachments(gateway) if n != origin_name]
+    if len(edges) != 1:
+        return Check(
+            "edge_alias",
+            "FAIL",
+            f"the gateway joins {', '.join(edges) or 'no network'} besides {origin_name}; "
+            "expected exactly the edge network",
+        )
+    edge = edges[0]
+    if alias not in _dns_names(_attachments(gateway)[edge]):
+        return Check(
+            "edge_alias",
+            "FAIL",
+            f"the gateway does not answer to NEST_GRPC_EDGE_ALIAS {alias} on {edge}; redeploy "
+            "it from the current compose.dokploy.yaml",
+        )
+    network = next((n for n in docker.networks() if n.get("Name") == edge), None)
+    ids = [i for i in ((network or {}).get("Containers") or {}) if not i.startswith("ep-")]
+    others = []
+    for container in docker.inspect(ids):
+        if container.get("Id") == gateway.get("Id"):
+            continue
+        if alias in _dns_names(_attachments(container).get(edge) or {}):
+            others.append(container.get("Name", "?").lstrip("/"))
+    if others:
+        return Check(
+            "edge_alias",
+            "FAIL",
+            f"{alias} on {edge} also names {', '.join(sorted(others))}, so Traefik's route "
+            "resolves to more than one gateway; give each deployment a unique "
+            "NEST_GRPC_EDGE_ALIAS (docs/source/multi-environment.md)",
+        )
+    return Check("edge_alias", "PASS", f"{alias} names only this gateway on {edge}")
+
+
 def gateway_runtime(args, docker: Docker, sleep: Callable[[float], None] | None = None) -> int:
     sleep = sleep or time.sleep
     checks: list[Check] = []
@@ -1318,6 +1910,8 @@ def gateway_runtime(args, docker: Docker, sleep: Callable[[float], None] | None 
             )
         )
 
+    checks.append(edge_alias_runtime(docker, gateway, origin_name))
+
     controller_env = container_env(controller, RUNTIME_ENV)
     gateway_cidr = ipaddress.IPv4Network(f"{gateway_origin}/32")
     origin_ip = ipaddress.IPv4Address(gateway_origin)
@@ -1398,6 +1992,11 @@ def parser() -> argparse.ArgumentParser:
     )
     check.add_argument("--env-file", help="the deployment's .env (read literally)")
     check.add_argument("--traefik-container", default=DEFAULT_TRAEFIK_CONTAINER)
+    check.add_argument(
+        "--traefik-dynamic-dir",
+        default=DEFAULT_TRAEFIK_DYNAMIC_DIR,
+        help="Traefik's file-provider directory, read for route collisions",
+    )
     status = commands.add_parser(
         "migrate-status", parents=[common, age], help="classify migrate containers"
     )

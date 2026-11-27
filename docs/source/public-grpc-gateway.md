@@ -57,12 +57,14 @@ Controller :50051 (NEST_PUBLIC_PILOT=true; publishes no port)
 | `deploy/public-grpc/renew-certificate.sh` | Obtains and renews the certificate with lego (DNS-01 through Cloudflare) and installs it by rename |
 | `deploy/public-grpc/traefik/nest-grpc.yml` | The Traefik TCP passthrough router for Traefik v2.x to v3.4 (`proxyProtocol` on the load balancer), for `/etc/dokploy/traefik/dynamic/` |
 | `deploy/public-grpc/traefik/nest-grpc.servers-transport.yml` | The same router for Traefik v3.5 and later (`proxyProtocol` on a TCP `serversTransport`) |
-| `deploy/public-grpc/traefik/render.sh` | Prints the right one of the two for a name and a Traefik version |
+| `deploy/public-grpc/traefik/render.sh` | Prints the right one of the two for a name and a Traefik version; `--instance ID` gives one deployment's file its own router, service, transport and target alias (`--edge-alias`) |
+| `deploy/environments/main.env.example`, `release.env.example` | The settings that keep two deployments on one host apart ([Run Main and Release side by side](multi-environment)) |
 | `deploy/public-grpc/staging.env.example` | Every staging setting, with placeholders, for the Dokploy Environment panel |
 | `scripts/nest-deploy-doctor.py` | `preflight`: before a deploy, checks the origin subnet against Docker networks and host routes and checks the gateway settings against the running Traefik and Tailnet bridge (see [Preflight and recover a Dokploy deployment](deployment-recovery)). `gateway-runtime`: after a deploy, checks what the running gateway resolves and which address the Controller actually sees (see [The upstream name and the private path](#the-upstream-name-and-the-private-path)) |
 | `compose.dokploy.yaml` profiles `public-grpc` and `public-grpc-acme` | The `grpc-gateway` (Envoy `v1.36.2`) and `grpc-certificates` (lego) services, the internal `grpc-origin` network, and the external edge network |
 | `scripts/verify-public-grpc.py` | The live validation checks below |
 | `tests/check_traefik_passthrough.sh` | Runs a Traefik image with the rendered route and checks that it delivers a PROXY v2 header on SNI passthrough |
+| `tests/smoke_two_environments.sh` | Two deployments on one edge network with one real Traefik: reproduces the shared-alias collision, then checks per-deployment routing, certificates, attribution, and redeploy and rollback of one without disturbing the other |
 | `tests/smoke_public_grpc_networks.sh` | Rebuilds the Dokploy staging topology (Controller and gateway on both the edge network and grpc-origin) and runs real gRPC through Envoy and the origin guard with the old and the current configuration |
 
 ## Deploy to staging
@@ -177,6 +179,12 @@ performs them.
    sh deploy/public-grpc/traefik/render.sh grpc.staging.<domain> "v$version" \
      > /etc/dokploy/traefik/dynamic/nest-grpc.yml
    ```
+
+   This is the single-deployment form. When a second Nest deployment shares the
+   host and Traefik (Main next to Release, #118), give each its own
+   `NEST_GRPC_EDGE_ALIAS` and its own file from `render.sh NAME VERSION --instance ID`,
+   and never overwrite another deployment's file: see
+   [Run Main and Release side by side](multi-environment).
 
    Traefik reloads the file by itself; no other router changes. Do not use a
    Dokploy HTTP Domain for this name: it would terminate TLS in Traefik and bypass
