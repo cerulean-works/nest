@@ -38,6 +38,14 @@ def section(text: str, heading: str) -> str:
     return text[start : start + following.start()] if following else text[start:]
 
 
+FENCE = re.compile(r"```(\w*)\n(.*?)```", re.DOTALL)
+
+
+def blocks(text: str, language: str) -> list[str]:
+    """Every fenced code block of `language` in `text`."""
+    return [body for lang, body in FENCE.findall(text) if lang == language]
+
+
 def markdown_sections(text: str) -> list[str]:
     """`text` split at Markdown headings, ignoring `#` lines inside code fences."""
     parts, current, fenced = [], [], False
@@ -68,17 +76,20 @@ class ReleaseVersionTests(unittest.TestCase):
         self.assertRegex(package_version(), r"^\d+\.\d+\.\d+a\d+$")
 
     def test_installation_pins_the_tag_of_this_version(self):
-        releases = section(INSTALLATION.read_text(), "### Releases and `@main`")
+        text = INSTALLATION.read_text()
+        install = section(text, "## Install with uv")
         tag = f"v{package_version()}"
-        self.assertIn(f'uv add "nest @ git+https://github.com/cerulean-works/nest@{tag}"', releases)
-        self.assertIn(
-            f'pip install "git+https://github.com/cerulean-works/nest.git@{tag}"', releases
-        )
-        self.assertIn(f'rev = "{tag}"', releases)
-        self.assertIn(f'version = "{package_version()}"', releases)
+        self.assertIn(f'uv add "nest @ git+https://github.com/cerulean-works/nest@{tag}"', install)
+        self.assertIn(f'rev = "{tag}"', install)
+        self.assertIn(f'version = "{package_version()}"', install)
         # The condition comes before the command, so nobody runs it without reading it.
-        self.assertLess(releases.index(RELEASES_PAGE), releases.index(f"nest@{tag}"))
-        self.assertIn("planned", releases)
+        self.assertLess(install.index(RELEASES_PAGE), install.index(f"nest@{tag}"))
+        self.assertIn("planned", install)
+        pip = section(text, "### Install with pip")
+        self.assertLess(
+            pip.index(RELEASES_PAGE),
+            pip.index(f'pip install "git+https://github.com/cerulean-works/nest.git@{tag}"'),
+        )
 
     def test_example_lock_entries_show_the_package_version(self):
         text = INSTALLATION.read_text()
@@ -125,10 +136,37 @@ class TagInstallTests(unittest.TestCase):
                         f"{page.name}: {tag} is offered before saying how to check it exists",
                     )
 
-    def test_the_quickstart_still_installs_main(self):
-        install = section(QUICKSTART.read_text(), "## 1. Install")
-        self.assertIn('uv add "nest @ git+https://github.com/cerulean-works/nest@main"', install)
-        self.assertNotIn(f'nest@v{package_version()}"', install)
+    def assert_release_first_then_labeled_main(self, install: str):
+        # The immutable tagged docs must give readers the released SDK (#118: a later
+        # `main` can be incompatible with the Release deployment). `@main` is only a
+        # separately labeled development fallback, after the release command.
+        release = f'uv add "nest @ git+https://github.com/cerulean-works/nest@v{package_version()}"'
+        main = 'uv add "nest @ git+https://github.com/cerulean-works/nest@main"'
+        self.assertIn(release, blocks(install, "bash")[0])
+        self.assertLess(install.index(release), install.index(main))
+        fallback = install[install.index(release) + len(release) : install.index(main)]
+        self.assertIn("Main deployment", fallback)
+        self.assertRegex(fallback, r"(?i)not listed yet|not published")
+        self.assertIn("incompatible", install[install.index(main) :] + fallback)
+
+    def test_the_quickstart_installs_the_release_first(self):
+        self.assert_release_first_then_labeled_main(
+            section(QUICKSTART.read_text(), "## 1. Install")
+        )
+
+    def test_the_readme_installs_the_release_first(self):
+        readme = section(README.read_text(), "## Quickstart")
+        install = readme[readme.index("**1. Install**") : readme.index("**2. Log in**")]
+        self.assert_release_first_then_labeled_main(install)
+
+    def test_the_install_page_offers_main_only_as_the_development_build(self):
+        text = INSTALLATION.read_text()
+        main = 'uv add "nest @ git+https://github.com/cerulean-works/nest@main"'
+        self.assertNotIn(main, section(text, "## Install with uv").split("### ", 1)[0])
+        releases = section(text, "### Releases and `@main`")
+        self.assertIn(main, releases)
+        self.assertIn("Development build", releases[: releases.index(main)])
+        self.assertIn("Main deployment", releases)
 
 
 @requires_docs
@@ -142,6 +180,8 @@ class ReleaseGateTests(unittest.TestCase):
         "#96",
         "H09",
         "staging or canary",
+        "#118",
+        "main.nest.cerulean.works",
     )
 
     def notes(self) -> str:

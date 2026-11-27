@@ -7,54 +7,21 @@ it from the GitHub repository. The recommended way is to add it to a
 
 ## Install with uv
 
-In a new or existing uv project:
+These docs describe the release `v0.1.0a5`, the first pre-release that includes
+sign-in. **First check** that `v0.1.0a5` is listed on the
+[Releases page](https://github.com/cerulean-works/nest/releases): until it is
+published there, it is only *planned*, the tag does not exist and the command
+below fails; see [Releases and `@main`](#releases-and-main) for what to install
+until then. In a new or existing uv project:
 
 ```bash
 uv init --python 3.14 my-project   # only for a new project
 cd my-project
-uv add "nest @ git+https://github.com/cerulean-works/nest@main"
+uv add "nest @ git+https://github.com/cerulean-works/nest@v0.1.0a5"
 ```
 
 `uv add` records the dependency in `pyproject.toml` and the resolved commit in
 `uv.lock`:
-
-```toml
-# pyproject.toml
-[tool.uv.sources]
-nest = { git = "https://github.com/cerulean-works/nest", rev = "main" }
-```
-
-```toml
-# uv.lock
-[[package]]
-name = "nest"
-version = "0.1.0a5"
-source = { git = "https://github.com/cerulean-works/nest?rev=main#<commit>" }
-```
-
-Run Nest and its `nest` command through the project environment:
-
-```bash
-uv run nest --help
-uv run python main.py
-```
-
-To pin a specific commit, replace `@main` with `@<commit>`.
-
-### Releases and `@main`
-
-Installing from `main` is the development and Early Access path, and the one the
-[Quickstart](quickstart) uses. It always exists and gets every fix first.
-
-**Release `v0.1.0a5`.** These docs describe Nest `0.1.0a5`, the first
-pre-release that includes sign-in. Check that `v0.1.0a5` is listed on the
-[Releases page](https://github.com/cerulean-works/nest/releases) first: until it
-is published there, it is only *planned*, and the command below fails because the
-tag does not exist. Once it is listed, pin it with:
-
-```bash
-uv add "nest @ git+https://github.com/cerulean-works/nest@v0.1.0a5"
-```
 
 ```toml
 # pyproject.toml
@@ -70,13 +37,51 @@ version = "0.1.0a5"
 source = { git = "https://github.com/cerulean-works/nest?rev=v0.1.0a5#<commit>" }
 ```
 
-With pip: `pip install "git+https://github.com/cerulean-works/nest.git@v0.1.0a5"`.
+Run Nest and its `nest` command through the project environment:
+
+```bash
+uv run nest --help
+uv run python main.py
+```
+
 A tag never moves, so `uv lock --upgrade-package nest` keeps a tag pin on the same
-commit. To move to a later release, change `@v0.1.0a5` in `pyproject.toml`, or
-switch back to `@main`. The release still has to be compatible with the
-Controller you call: keep the SDK at or after the commit the Controller was
-deployed from (see [below](#sdk-controller-and-hpc-runtime-versions)). Use `@main`
-if the operator has deployed a Controller newer than the release.
+commit. To move to a later release, change `@v0.1.0a5` in `pyproject.toml`. The
+release still has to be compatible with the Controller you call: keep the SDK at
+or after the commit the Controller was deployed from (see
+[below](#sdk-controller-and-hpc-runtime-versions)).
+
+### Releases and `@main`
+
+**Release `v0.1.0a5`** (above) is what an ordinary user of the Release deployment
+installs, once it is listed on the
+[Releases page](https://github.com/cerulean-works/nest/releases).
+
+**Development build (`@main`).** `main` always exists and gets every fix first,
+but it moves with every merge. It is for developers and operators of the Main
+deployment, and the only install while `v0.1.0a5` is not published:
+
+```bash
+uv add "nest @ git+https://github.com/cerulean-works/nest@main"
+```
+
+```toml
+# pyproject.toml
+[tool.uv.sources]
+nest = { git = "https://github.com/cerulean-works/nest", rev = "main" }
+```
+
+```toml
+# uv.lock
+[[package]]
+name = "nest"
+version = "0.1.0a5"
+source = { git = "https://github.com/cerulean-works/nest?rev=main#<commit>" }
+```
+
+An SDK from `@main` can be newer than, and incompatible with, the Controller of
+the Release deployment, so do not use it there once the release is published.
+Choosing the Main deployment's endpoint stays an explicit setting. To pin a
+specific commit, replace `@main` with `@<commit>`.
 
 **Older tags.** `v0.1.0a1` to `v0.1.0a4` predate sign-in: an SDK installed from one
 of them has no `nest` command and sends no session, so an authenticated
@@ -85,17 +90,21 @@ with a shared Controller. See [Release status and checklist](releasing).
 
 ### Install with pip
 
-Without uv, install into a Python 3.14 virtual environment:
+Without uv, install into a Python 3.14 virtual environment, again once
+`v0.1.0a5` is listed on the [Releases page](https://github.com/cerulean-works/nest/releases):
 
 ```bash
-pip install "git+https://github.com/cerulean-works/nest.git@main"
+pip install "git+https://github.com/cerulean-works/nest.git@v0.1.0a5"
 ```
 
-`pip install --upgrade --force-reinstall "git+https://github.com/cerulean-works/nest.git@main"`
+The development build is `pip install "git+https://github.com/cerulean-works/nest.git@main"`,
+and `pip install --upgrade --force-reinstall "git+https://github.com/cerulean-works/nest.git@main"`
 updates it.
 
 ## Update the SDK
 
+With a release pin, update by changing the tag in `pyproject.toml` (see
+[Install with uv](#install-with-uv)). With the development build,
 `rev = "main"` names a branch, but `uv.lock` pins the commit that `main` pointed
 to when the lock was last resolved. `uv sync` and `uv run` keep installing that
 commit, however much `main` has moved since. Refresh the pin explicitly:

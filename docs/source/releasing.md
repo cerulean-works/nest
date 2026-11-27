@@ -26,12 +26,12 @@ initiative.
 | `main` relative to `v0.1.0a4` | Every change from pull request #12 on is unreleased, including the `nest` command, sign-in and sessions, Projects and Project selection, PostgreSQL, the Console, the Execution Registry and the public gateway pilot |
 | Documentation | `main` is published at [docs.cerulean.works/nest/main/guide/](https://docs.cerulean.works/nest/main/guide/). A `v*` tag publishes its own version of the docs |
 
-**Consequence for users:** install from `main`, as the [Quickstart](quickstart)
-does. The existing tags predate session authentication: an SDK installed from
-`v0.1.0a4` has no `nest` command and sends no session, so an authenticated
-Controller refuses its calls with `UNAUTHENTICATED`. [Install Nest](installation#releases-and-main)
-already shows the pinned command for `v0.1.0a5`, which the tagged docs need, and
-says to use it only once the tag is listed on the Releases page.
+**Consequence for users:** the [Quickstart](quickstart) and
+[Install Nest](installation) install the release `v0.1.0a5`, once it is listed on
+the Releases page. Until then the only install is the development build from
+`main`, labeled as such. The existing tags predate session authentication: an SDK
+installed from `v0.1.0a4` has no `nest` command and sends no session, so an
+authenticated Controller refuses its calls with `UNAUTHENTICATED`.
 
 ## How `main` and tagged docs differ
 
@@ -44,10 +44,15 @@ and the `main` docs at the same commit have the same text. The release-prep pull
 request therefore writes the release install so that it is true both before and
 after the tag:
 
-- The [Quickstart](quickstart) installs `@main`, which always exists. It mentions
-  the release pin only together with "once it is listed on the Releases page".
-- [Install Nest](installation#releases-and-main) shows the pinned `@v0.1.0a5`
-  command, the `uv.lock` entry it produces, and the condition to check first.
+- The [Quickstart](quickstart) and [Install Nest](installation) first say to
+  check that the tag is listed on the
+  [Releases page](https://github.com/cerulean-works/nest/releases), then give the
+  pinned `@v0.1.0a5` command as the ordinary install. A reader of the tag's immutable
+  docs therefore gets the released SDK, never a later, possibly incompatible
+  `main`.
+- The development build (`@main`) follows in a separately labeled fallback: only
+  while the tag is not published, or for the Main deployment. Choosing the Main
+  deployment's endpoint stays an explicit setting.
 - Values known only after the merge (the final `main` commit and the HPC
   runtime image digest) are not written into `docs/source`. They go into the
   GitHub Release text, drafted in
@@ -73,7 +78,7 @@ wording, which stays true.
 | --- | --- |
 | `Docs` (`.github/workflows/docs.yml`) | Builds and publishes a separate docs version for the tag |
 | `HPC runtime image` (`.github/workflows/hpc-runtime-image.yml`) | Adds the tag to the digest `main` already published for that commit; fails if the commit is not on `main` or its `sha-` image is missing (see [Published images](runtime-image#published-images)) |
-| Dokploy (configured outside this repository) | The operator's Compose deployment that follows tags. Treat the tag as a production rollout decision |
+| Dokploy (configured outside this repository) | The Release application, if the operator configured it to follow tags. Under #118 it is a separate Compose application from the Main deployment, which follows `main`. Verify the actual trigger behavior; treat the tag as a production rollout decision |
 | `Tests` (`.github/workflows/tests.yml`) | Runs the test suite again on the tagged commit |
 | `Controller container`, `Code Quality` | Not triggered by tags; they run on `main` and pull requests |
 
@@ -138,7 +143,15 @@ all of these:
 - H09 is explicitly approved (#90), including the reviewed switch of
   `nest.config.HOSTED_PROFILE_DEFAULT`;
 - the release docs are re-checked after #96, so that the tagged Quickstart and
-  Install pages describe the zero-env hosted path as the canonical path.
+  Install pages describe the zero-env hosted path as the canonical path;
+- Main and Release run as independent deployments on the shared host (#118),
+  reviewed and verified by the operator: distinct edge gateway aliases and
+  Traefik router, service and transport names, separate routes and certificates
+  (`main.nest.cerulean.works` and `grpc.main.nest.cerulean.works` versus
+  `nest.cerulean.works` and `grpc.nest.cerulean.works`), credentials, PostgreSQL
+  databases and volumes, Tailnet identity, and HPC workdirs and runtime state; an
+  operator-approved aggregate capacity policy if both use the same HPC account;
+  and a redeploy of one that leaves the other's routes and state untouched.
 
 **The tag.**
 

@@ -6,10 +6,10 @@ a Nest Project. Operators who run a Controller start at the
 [Operator guide](index#operator-guide) instead.
 
 > [!NOTE]
-> Nest is in **Early Access**. You install it from the `main` branch, and the API
-> may change before 1.0. These docs describe version `0.1.0a5`. To pin the
-> `v0.1.0a5` release instead, first check that it is published; see
-> [Releases and `@main`](installation#releases-and-main).
+> Nest is in **Early Access**, and the API may change before 1.0. These docs
+> describe the release `v0.1.0a5`, which step 1 installs once it is published.
+> See [Releases and `@main`](installation#releases-and-main) for the development
+> build and for updates.
 
 ## Before you start
 
@@ -62,19 +62,31 @@ Internet. [Why these settings are explicit](configuration#why-the-hosted-control
 
 ## 1. Install
 
-Create a project and add Nest to it:
+These docs describe the release `v0.1.0a5`. **First check** that `v0.1.0a5` is
+listed on the [Releases page](https://github.com/cerulean-works/nest/releases), then create a project and add that release:
 
 ```bash
 uv init --python 3.14 hello-nest
 cd hello-nest
+uv add "nest @ git+https://github.com/cerulean-works/nest@v0.1.0a5"
+```
+
+`uv.lock` now pins the release's commit, which a tag never changes. Run every
+command below from this directory with `uv run`.
+
+**Development build (`@main`), only if `v0.1.0a5` is not listed yet, or if you
+develop against the Main deployment.** Until the release is published, its tag
+does not exist and the command above fails. Developers and operators install the
+development build instead:
+
+```bash
 uv add "nest @ git+https://github.com/cerulean-works/nest@main"
 ```
 
-`uv.lock` now pins the commit of `main` you installed. Run every command below
-from this directory with `uv run`. Once `v0.1.0a5` is listed on the
-[Releases page](https://github.com/cerulean-works/nest/releases), you can install
-`@v0.1.0a5` instead of `@main`; before that, the tag does not exist
-([details](installation#releases-and-main)).
+`@main` moves with every merge, and an SDK built from it can be newer than, and
+incompatible with, the Controller of the Release deployment. Once `v0.1.0a5` is
+published, ordinary users install the release. See
+[Releases and `@main`](installation#releases-and-main).
 
 ## 2. Log in
 
@@ -159,7 +171,8 @@ The first `42` was computed on your machine, the second on the cluster:
   [Run functions on GPUs](gpus#limitations) and
   [What is reserved](admission-limits#what-is-reserved).
 
-The same program, with its dependency declared inline, is
+The same program, with its dependency declared inline on the development build
+(`@main`), is
 [`examples/hosted_remote.py`](https://github.com/cerulean-works/nest/blob/main/examples/hosted_remote.py).
 
 ## Several Projects, or none

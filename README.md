@@ -15,12 +15,11 @@ cluster.
 
 ## Early Access
 
-Nest is in Early Access. Install it from `main` (below); the API is experimental
-and may change before 1.0. The package version is `0.1.0a5`, the version of the
-next planned pre-release, `v0.1.0a5`. That pre-release is the first to include
-sign-in. It exists only once it is listed on the
-[Releases page](https://github.com/cerulean-works/nest/releases); until then,
-`@v0.1.0a5` installs nothing. The older tags (`v0.1.0a1` to `v0.1.0a4`) predate
+Nest is in Early Access, and the API is experimental and may change before 1.0.
+The package version is `0.1.0a5`, the version of the planned pre-release
+`v0.1.0a5`, the first that includes sign-in. Install that release (below) once it
+is listed on the [Releases page](https://github.com/cerulean-works/nest/releases); until then, `@v0.1.0a5` installs nothing,
+and only the development build from `main` exists. The older tags (`v0.1.0a1` to `v0.1.0a4`) predate
 sign-in, so the authenticated Controller refuses them, and every commit of `main`
 reports the same version, so compare commits rather than version strings. See
 [Install Nest](docs/source/installation.md#releases-and-main) and
@@ -48,13 +47,19 @@ The public gateway (no Tailscale) is an operator-run staging pilot until the H09
 production sign-off, not a default; for your own Nest or local development, see
 the [full Quickstart](docs/source/quickstart.md).
 
-**1. Install**
+**1. Install** the release, after checking that `v0.1.0a5` is listed on the
+[Releases page](https://github.com/cerulean-works/nest/releases):
 
 ```bash
 uv init --python 3.14 hello-nest
 cd hello-nest
-uv add "nest @ git+https://github.com/cerulean-works/nest@main"
+uv add "nest @ git+https://github.com/cerulean-works/nest@v0.1.0a5"
 ```
+
+Not listed yet, or developing against the Main deployment? Install the
+development build instead, `uv add "nest @ git+https://github.com/cerulean-works/nest@main"`; it can be newer than, and incompatible with,
+the Release deployment. See
+[Releases and `@main`](docs/source/installation.md#releases-and-main).
 
 **2. Log in** by approving the CLI in a browser, then check your Project:
 
