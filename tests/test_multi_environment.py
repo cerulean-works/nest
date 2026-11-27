@@ -1107,6 +1107,12 @@ if _RegistryBase is not None:
                     "now() + interval '30 days')",
                     (self.owner, token(), family),
                 )
+                conn.execute(
+                    "INSERT INTO email_outbox (message_key, kind, recipient, subject, body_text, "
+                    "message_id, max_attempts) VALUES ('invitation:main-1', 'invitation', "
+                    "'dev@example.org', 'Join p', 'https://main.example/invite/secret', "
+                    "'<main-1@example.org>', 5)"
+                )
             from nest.db import ServicePrincipalStore
 
             services = ServicePrincipalStore(self.db)
@@ -1156,6 +1162,7 @@ if _RegistryBase is not None:
             self.seed_main_credentials()
             before = self.remaining()
             seeded = set(before) - {"service sessions unrevoked"}
+            self.assertEqual(before["emails unsent"], 1)
             self.assertTrue(all(before[item] >= 1 for item in seeded), before)
             with _pg_connect(self.url) as conn:
                 conn.execute("SELECT set_config('nest.revoker', %s, false)", (str(self.owner),))
@@ -1168,6 +1175,41 @@ if _RegistryBase is not None:
             self.assertGreaterEqual(audited, 3)
             self.assertEqual(set(self.remaining().values()), {0}, self.remaining())
             self.run_check()
+
+        def test_the_runbook_command_line_revokes(self):
+            """Review of #119: step 4's exact psql invocation, with `-f -` reading the
+            script from standard input after the two `-c` settings."""
+            psql = shutil.which("psql")
+            if psql is None:
+                self.skipTest("needs the psql client")
+            doc = (ROOT / "docs" / "source" / "multi-environment.md").read_text()
+            block = doc[doc.index("4. **Revoke what Main issued:**") :]
+            block = block[
+                block.index("```bash") + len("```bash") : block.index(
+                    "```", block.index("```bash") + 7
+                )
+            ]
+            command = " ".join(
+                line.strip().rstrip("\\").strip() for line in block.strip().splitlines()
+            )
+            prefix = "dc exec -T postgres psql -v ON_ERROR_STOP=1 -U nest -d nest "
+            self.assertTrue(command.startswith(prefix), command)
+            rest = command[len(prefix) :]
+            self.assertIn(" -f - < deploy/environments/release-copy-revoke.sql", rest)
+            rest = rest.replace("<Release platform admin User ID>", str(self.owner))
+            rest = rest.replace("<your name>", "ops-test")
+            self.seed_main_credentials()
+            result = subprocess.run(
+                f"{psql} -v ON_ERROR_STOP=1 -d '{self.url}' {rest}",
+                shell=True,
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=60,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(set(self.remaining().values()), {0}, self.remaining())
 
         def test_revoke_needs_the_revoker(self):
             import psycopg

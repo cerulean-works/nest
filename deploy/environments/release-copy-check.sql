@@ -40,4 +40,6 @@ SELECT 'service principals active', count(*) FROM service_principals WHERE statu
 UNION ALL
 SELECT 'workload trust policies active', count(*) FROM workload_trust_policies WHERE status = 'active'
 UNION ALL
-SELECT 'service grants active', count(*) FROM service_principal_grants WHERE status = 'active';
+SELECT 'service grants active', count(*) FROM service_principal_grants WHERE status = 'active'
+UNION ALL
+SELECT 'emails unsent', count(*) FROM email_outbox WHERE status <> 'sent';

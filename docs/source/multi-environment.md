@@ -239,7 +239,7 @@ A live Main database holds more than Projects and users. It also holds:
   not own, look for their outcomes in its own workdir, fail them after the grace
   period, and count their reservations against its limits until then;
 - invite links and email invitations, whose bearer tokens were issued to Main's
-  developer audience;
+  developer audience, and queued emails that Release's worker would send;
 - user and service sessions, service principals, workload trust policies and
   grants.
 
@@ -273,22 +273,27 @@ checkout):
    ```bash
    dc exec -T postgres psql -v ON_ERROR_STOP=1 -U nest -d nest \
      -c "SET nest.revoker = '<Release platform admin User ID>'" \
-     -c "SET nest.operator = '<your name>'" < deploy/environments/release-copy-revoke.sql
+     -c "SET nest.operator = '<your name>'" -f - < deploy/environments/release-copy-revoke.sql
    ```
 
-   It runs in one transaction and revokes every invite link, pending invitation,
-   user and service session, and every service principal, trust policy and grant.
-   The database's audit triggers record the operator and a fixed reason. Run step 3
-   again: every count must be 0. Record the run in #118.
+   Keep the `-f -`: with `-c` alone psql never reads standard input, runs only the
+   two `SET` commands, and still exits 0. The script runs in one transaction. It
+   revokes every invite link, pending invitation, user and service session, and
+   every service principal, trust policy and grant. It also deletes every unsent
+   email copied from Main's outbox, so Release never sends Main's queued messages.
+   The database's audit triggers record the operator and a fixed reason. The
+   script ends by checking that nothing from Main is left usable, and rolls back
+   if anything is. Run step 3 again: every count must be 0. Record the run in #118.
 5. Start Release's Controller (`dc start controller`). Recreate on Release only the
    service principals the operator re-approves for it, with Release's own
    `NEST_WORKLOAD_OIDC_AUDIENCE` (`nest-db service-principal create`, `trust`,
    `grant`), and invite users again as needed. Review Project memberships, Platform
    grants and Slurm account links for Release's cohort.
 
-`tests/test_multi_environment.py` runs both scripts against PostgreSQL. A copy with
-a live attempt fails the check. After revocation nothing from Main remains usable,
-and the changes are in the security audit log. A missing `nest.revoker` or
+`tests/test_multi_environment.py` runs both scripts against PostgreSQL, and runs
+step 4's exact `psql` command line when `psql` is installed. A copy with a live
+attempt fails the check. After revocation nothing from Main remains usable, and
+the changes are in the security audit log. A missing `nest.revoker` or
 `nest.operator` changes nothing.
 
 ## HPC capacity
