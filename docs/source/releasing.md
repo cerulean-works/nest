@@ -142,8 +142,11 @@ all of these:
   and no unauthorized work;
 - H09 is explicitly approved (#90), including the reviewed switch of
   `nest.config.HOSTED_PROFILE_DEFAULT`;
-- the release docs are re-checked after #96, so that the tagged Quickstart and
-  Install pages describe the zero-env hosted path as the canonical path;
+- the release docs are re-checked after #96, so that the tagged Quickstart,
+  Install and [Connect to Cerulean-hosted Nest](hosted-connection) pages describe
+  the zero-env hosted path as the canonical path, and the Console's install copy
+  (`nest.auth.console.INSTALL_COMMAND`) and `examples/hosted_remote.py` no longer
+  offer `@main` to Release users;
 - Main and Release run as independent deployments on the shared host (#118),
   reviewed and verified by the operator: distinct edge gateway aliases and
   Traefik router, service and transport names, separate routes and certificates

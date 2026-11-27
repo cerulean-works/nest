@@ -26,10 +26,19 @@ It needs no VPN or Tailnet.
 
 ## The flow
 
+Install the release `v0.1.0a5` after checking that it is listed on the
+[Releases page](https://github.com/cerulean-works/nest/releases)
+(see [Install Nest](installation#install-with-uv)):
+
 ```bash
-uv add "nest @ git+https://github.com/cerulean-works/nest@main"   # see Install Nest
+uv add "nest @ git+https://github.com/cerulean-works/nest@v0.1.0a5"
 export NEST_PROFILE=hosted   # not needed once H09 makes the profile the default
 ```
+
+**Development build (`@main`), only for the Main deployment, or if `v0.1.0a5` is
+not listed yet:** `uv add "nest @ git+https://github.com/cerulean-works/nest@main"`.
+It can be newer than, and incompatible with, the Release deployment this profile
+connects to; see [Releases and `@main`](installation#releases-and-main).
 
 ```python
 import nest

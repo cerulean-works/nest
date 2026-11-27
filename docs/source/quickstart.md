@@ -63,7 +63,8 @@ Internet. [Why these settings are explicit](configuration#why-the-hosted-control
 ## 1. Install
 
 These docs describe the release `v0.1.0a5`. **First check** that `v0.1.0a5` is
-listed on the [Releases page](https://github.com/cerulean-works/nest/releases), then create a project and add that release:
+listed on the [Releases page](https://github.com/cerulean-works/nest/releases), then create
+a project and add that release:
 
 ```bash
 uv init --python 3.14 hello-nest

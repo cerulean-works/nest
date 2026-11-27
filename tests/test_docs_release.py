@@ -149,6 +149,19 @@ class TagInstallTests(unittest.TestCase):
         self.assertRegex(fallback, r"(?i)not listed yet|not published")
         self.assertIn("incompatible", install[install.index(main) :] + fallback)
 
+    def test_no_page_offers_an_unlabeled_main_install(self):
+        # Every `@main` install in the docs must sit right after a "development build"
+        # label, whatever the page, so a new page cannot quietly hand Release users a
+        # moving `main` (#118). examples/hosted_remote.py and the Console's install
+        # copy are code, tracked by release gate G6 (see ReleaseGateTests).
+        main_install = re.compile(r"cerulean-works/nest(?:\.git)?@main\b")
+        for page in [README, *sorted(DOCS.rglob("*.md"))]:
+            for part in markdown_sections(page.read_text()):
+                for found in main_install.finditer(part):
+                    with self.subTest(page=page.name, section=part.split("\n", 1)[0]):
+                        before = part[max(0, found.start() - 600) : found.start()]
+                        self.assertIn("development build", before.lower())
+
     def test_the_quickstart_installs_the_release_first(self):
         self.assert_release_first_then_labeled_main(
             section(QUICKSTART.read_text(), "## 1. Install")
@@ -182,6 +195,9 @@ class ReleaseGateTests(unittest.TestCase):
         "staging or canary",
         "#118",
         "main.nest.cerulean.works",
+        "hosted-connection",
+        "INSTALL_COMMAND",
+        "examples/hosted_remote.py",
     )
 
     def notes(self) -> str:
