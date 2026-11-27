@@ -19,6 +19,7 @@ DOCS = ROOT / "docs" / "source"
 INSTALLATION = DOCS / "installation.md"
 QUICKSTART = DOCS / "quickstart.md"
 README = ROOT / "README.md"
+RELEASING = DOCS / "releasing.md"
 WORKER_SCRIPT = ROOT / "scripts" / "worker.sbatch"
 RELEASES_PAGE = "https://github.com/cerulean-works/nest/releases"
 TAG_INSTALL = re.compile(r"cerulean-works/nest(?:\.git)?@(v\d[\w.]*)")
@@ -35,6 +36,20 @@ def section(text: str, heading: str) -> str:
     level = heading.split(" ", 1)[0]
     following = re.search(rf"^{re.escape(level)} ", text[start:], re.MULTILINE)
     return text[start : start + following.start()] if following else text[start:]
+
+
+def markdown_sections(text: str) -> list[str]:
+    """`text` split at Markdown headings, ignoring `#` lines inside code fences."""
+    parts, current, fenced = [], [], False
+    for line in text.splitlines(keepends=True):
+        if line.startswith("```"):
+            fenced = not fenced
+        if not fenced and re.match(r"#{1,6} ", line):
+            parts.append("".join(current))
+            current = []
+        current.append(line)
+    parts.append("".join(current))
+    return parts
 
 
 def user_facing_pages() -> list[Path]:
@@ -93,18 +108,72 @@ class TagInstallTests(unittest.TestCase):
                 with self.subTest(page=page.name):
                     self.assertEqual(found, tag)
 
-    def test_every_tag_install_names_the_published_condition(self):
-        # A page that offers the tag must also say how to tell whether it exists.
+    def test_every_tag_install_names_the_published_condition_first(self):
+        # Within the section that offers the tag, the condition (the Releases page, or
+        # the Install section that names it) comes before the first `@<tag>`.
+        tag = f"@v{package_version()}"
+        conditions = (RELEASES_PAGE, "installation#releases-and-main")
         for page in user_facing_pages():
             text = page.read_text()
-            if TAG_INSTALL.search(text) or f"@v{package_version()}" in text:
-                with self.subTest(page=page.name):
-                    self.assertIn(RELEASES_PAGE, text)
+            for part in markdown_sections(text):
+                if tag not in part:
+                    continue
+                with self.subTest(page=page.name, section=part.split("\n", 1)[0]):
+                    first = part.index(tag)
+                    self.assertTrue(
+                        any(c in part[:first] for c in conditions),
+                        f"{page.name}: {tag} is offered before saying how to check it exists",
+                    )
 
     def test_the_quickstart_still_installs_main(self):
         install = section(QUICKSTART.read_text(), "## 1. Install")
         self.assertIn('uv add "nest @ git+https://github.com/cerulean-works/nest@main"', install)
         self.assertNotIn(f'nest@v{package_version()}"', install)
+
+
+@requires_docs
+class ReleaseGateTests(unittest.TestCase):
+    """The maintainer's a5 decision (#116, #96): the tag waits for these gates."""
+
+    GATES = (
+        "https://nest.cerulean.works",
+        "grpc.nest.cerulean.works:443",
+        "no `NEST_*` settings and no Tailnet",
+        "#96",
+        "H09",
+        "staging or canary",
+    )
+
+    def notes(self) -> str:
+        return (ROOT / "docs" / "release-notes" / f"v{package_version()}.md").read_text()
+
+    def test_draft_notes_are_blocked_on_every_gate(self):
+        notes = self.notes()
+        self.assertIn("## Release status: BLOCKED", notes)
+        gates = section(notes, "## Release status: BLOCKED")
+        for gate in self.GATES:
+            with self.subTest(gate=gate):
+                self.assertIn(gate, gates)
+
+    def test_draft_notes_document_the_legacy_origin(self):
+        legacy = section(self.notes(), "## Legacy sign-in origin")
+        self.assertIn("auth.nest.cerulean.works", legacy)
+        self.assertIn("nest login", legacy)
+        self.assertIn("invitation", legacy)
+
+    def test_draft_notes_do_not_exclude_h09_from_the_release(self):
+        notes = self.notes()
+        self.assertNotIn("not part of this release", notes)
+        self.assertNotIn("open the public gateway as part of this release", notes)
+
+    def test_the_checklist_gates_the_tag(self):
+        checklist = section(RELEASING.read_text(), "## Release-prep checklist")
+        gates = checklist[
+            checklist.index("**Release-specific gates.**") : checklist.index("**The tag.**")
+        ]
+        for gate in self.GATES:
+            with self.subTest(gate=gate):
+                self.assertIn(gate, gates)
 
 
 @requires_docs

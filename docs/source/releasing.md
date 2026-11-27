@@ -20,7 +20,7 @@ initiative.
 | Item | Value |
 | --- | --- |
 | Source package version on `main` | `0.1.0a5`, set by the release-prep pull request for the planned tag `v0.1.0a5` |
-| Planned next tag | `v0.1.0a5`. It is published only once it appears on the [Releases page](https://github.com/cerulean-works/nest/releases); creating it is the maintainer's decision (checklist step 6) |
+| Planned next tag | `v0.1.0a5`. It is published only once it appears on the [Releases page](https://github.com/cerulean-works/nest/releases); creating it is the maintainer's decision (checklist step 6), and it is **blocked** until its [release-specific gates](#release-prep-checklist) have evidence |
 | Newest published release tag | `v0.1.0a4`, a pre-release published 2026-11-12, at commit `492055e` (pull request #11) |
 | Source package version in every tag `v0.1.0a1` to `v0.1.0a4` | `0.1.0a1`: the tags were created without a version bump |
 | `main` relative to `v0.1.0a4` | Every change from pull request #12 on is unreleased, including the `nest` command, sign-in and sessions, Projects and Project selection, PostgreSQL, the Console, the Execution Registry and the public gateway pilot |
@@ -117,6 +117,29 @@ order below follows from that.
    the operator's explicit approval of the rollout. Pushing the tag **is** the
    rollout trigger, so this approval comes before step 6, never after.
 
+**Release-specific gates.** The maintainer can set additional gates for a
+release. They are listed in that release's draft notes in `docs/release-notes/`,
+and each one needs evidence before step 6. While any of them lacks evidence, the
+release is **blocked**, not ready, whatever CI says.
+
+For `v0.1.0a5` (maintainer decision, 2026-11-28, #116 and #96), the tag waits for
+all of these:
+
+- the canonical Console and sign-in origin `https://nest.cerulean.works` (#96) is
+  merged, and the candidate to tag contains it, including its docs;
+- the exact reviewed candidate is verified on a separately approved pre-tag
+  staging or canary deployment. No tag is pushed to bootstrap this;
+- production TLS and the gateway at `grpc.nest.cerulean.works:443` are verified
+  against system roots;
+- a clean client with **no `NEST_*` settings and no Tailnet** passes on the
+  production endpoint: `nest login` at the new origin, automatic selection of the
+  sole eligible Project, `42` locally and remotely, the matching audit records,
+  and no unauthorized work;
+- H09 is explicitly approved (#90), including the reviewed switch of
+  `nest.config.HOSTED_PROFILE_DEFAULT`;
+- the release docs are re-checked after #96, so that the tagged Quickstart and
+  Install pages describe the zero-env hosted path as the canonical path.
+
 **The tag.**
 
 6. **Pushes the tag** on the commit checked in step 3, and publishes the GitHub
@@ -134,6 +157,8 @@ order below follows from that.
    wrong, publish a corrected follow-up tag through the same steps; published tags
    and image tags are not rewritten.
 
-A release does not switch on the hosted profile default
+Pushing a tag does not switch on the hosted profile default
 (`nest.config.HOSTED_PROFILE_DEFAULT`), change DNS or open the public gateway:
 those are separate, reviewed H09 actions in the [rollout runbook](hosted-rollout).
+When a release depends on them, as `v0.1.0a5` does, they are completed and
+verified **before** the tag, as release-specific gates.
