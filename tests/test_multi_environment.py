@@ -324,6 +324,7 @@ class TemplateTests(unittest.TestCase):
             "NEST_PUBLIC_URL",
             "NEST_SLURM_WORKDIR",
             "NEST_GRPC_CLOUDFLARE_DNS_API_TOKEN",
+            "NEST_CONTROLLER_IMAGE",
         ):
             with self.subTest(key):
                 self.assertIn(key, self.MAIN)
@@ -647,11 +648,42 @@ class IsolationPreflightTests(unittest.TestCase):
         self.assertEqual(checks["hpc_workdir"][0], "FAIL")
         self.assertIn("LAB = main LAB", checks["hpc_workdir"][1])
 
-    def test_same_workdir_on_another_cluster_is_not_shared(self):
-        other = RELEASE_ENV["NEST_PLATFORMS_ENV"].replace(
-            "login.hpc.example", "login.other.example"
+    def test_other_login_nodes_do_not_prove_another_cluster(self):
+        """Review of #119 (lkw50197): one Slurm cluster has several login nodes on one
+        filesystem and one accounting database. Main on login01 and Release on login04
+        with the same workdir and account must not PASS."""
+        ours = RELEASE_ENV["NEST_PLATFORMS_ENV"].replace(
+            "login.hpc.example", "login04.cluster.example"
         )
-        _, checks = self.preflight(main_deployment(controller_env={"NEST_PLATFORMS_ENV": other}))
+        theirs = ours.replace("login04.cluster.example", "login01.cluster.example")
+        env = {**RELEASE_ENV, "NEST_PLATFORMS_ENV": ours}
+        _, checks = self.preflight(
+            main_deployment(controller_env={"NEST_PLATFORMS_ENV": theirs}), env
+        )
+        self.assertEqual(checks["hpc_workdir"][0], "FAIL", checks["hpc_workdir"][1])
+        self.assertIn("other login hosts, not proof of another cluster", checks["hpc_workdir"][1])
+        self.assertEqual(checks["hpc_account"][0], "WARN", checks["hpc_account"][1])
+        self.assertNotIn("login0", checks["hpc_workdir"][1] + checks["hpc_account"][1])
+
+    def test_nested_workdirs_overlap(self):
+        nested = RELEASE_ENV["NEST_PLATFORMS_ENV"].replace(
+            "/home/svc/nest-release", "/home/svc/nest-release/main"
+        )
+        _, checks = self.preflight(main_deployment(controller_env={"NEST_PLATFORMS_ENV": nested}))
+        self.assertEqual(checks["hpc_workdir"][0], "FAIL", checks["hpc_workdir"][1])
+        sibling = RELEASE_ENV["NEST_PLATFORMS_ENV"].replace(
+            "/home/svc/nest-release", "/home/svc/nest-release-old"
+        )
+        _, checks = self.preflight(main_deployment(controller_env={"NEST_PLATFORMS_ENV": sibling}))
+        self.assertEqual(checks["hpc_workdir"][0], "PASS", checks["hpc_workdir"][1])
+
+    def test_separate_workdirs_and_accounts_pass(self):
+        separate = (
+            RELEASE_ENV["NEST_PLATFORMS_ENV"]
+            .replace("/home/svc/nest-release", "/home/svc/nest-main")
+            .replace("acct-not-printed", "other-acct-not-printed")
+        )
+        _, checks = self.preflight(main_deployment(controller_env={"NEST_PLATFORMS_ENV": separate}))
         self.assertEqual(checks["hpc_workdir"][0], "PASS")
         self.assertEqual(checks["hpc_account"][0], "PASS")
 
@@ -735,6 +767,53 @@ class IsolationPreflightTests(unittest.TestCase):
         return code, {
             line.split()[1].rstrip(":"): (line.split()[0], line) for line in text.splitlines()
         }
+
+    def test_shared_controller_image_tag_fails(self):
+        """Review of #119 (lkw50197): an image tag is daemon-wide, so two deployments
+        building the same NEST_CONTROLLER_IMAGE replace each other's revision."""
+
+        def with_image(deployment, image, *, migrate_running=True):
+            for c in deployment:
+                if c["Config"]["Labels"]["com.docker.compose.service"] == "controller":
+                    c["Config"]["Image"] = image
+            migrate = container("main-migrate-1", "main", "migrate", running=migrate_running)
+            migrate["Config"]["Image"] = image
+            return [*deployment, migrate]
+
+        env = {**RELEASE_ENV, "NEST_CONTROLLER_IMAGE": "nest-controller:release"}
+        _, checks = self.preflight(with_image(main_deployment(), "nest-controller:release"), env)
+        self.assertEqual(checks["controller_image"][0], "FAIL", checks["controller_image"][1])
+        self.assertIn("is also the image of main", checks["controller_image"][1])
+        # Both on today's default: the same collision.
+        _, checks = self.preflight(
+            with_image(main_deployment(), "nest-controller:local"), dict(RELEASE_ENV)
+        )
+        self.assertEqual(checks["controller_image"][0], "FAIL")
+        # Only a stopped deployment's migrate container has it: a warning.
+        stopped = with_image(
+            main_deployment(running=False), "nest-controller:release", migrate_running=False
+        )
+        _, checks = self.preflight(stopped, env)
+        self.assertEqual(checks["controller_image"][0], "WARN")
+        # Distinct tags, or a digest, pass.
+        _, checks = self.preflight(with_image(main_deployment(), "nest-controller:main"), env)
+        self.assertEqual(checks["controller_image"][0], "PASS")
+        pinned = {**env, "NEST_CONTROLLER_IMAGE": "registry.example/nest@sha256:" + "a" * 64}
+        _, checks = self.preflight(
+            with_image(main_deployment(), pinned["NEST_CONTROLLER_IMAGE"]), pinned
+        )
+        self.assertEqual(checks["controller_image"][0], "PASS")
+
+    def test_controller_and_migration_revision_are_compared(self):
+        controller = container("release-controller-1", "release", "controller")
+        migrate = container("release-migrate-1", "release", "migrate", running=False)
+        controller["Image"] = migrate["Image"] = "sha256:" + "1" * 64
+        _, checks = self.preflight([controller, migrate, *main_deployment()])
+        self.assertEqual(checks["controller_revision"][0], "PASS")
+        migrate["Image"] = "sha256:" + "2" * 64
+        _, checks = self.preflight([controller, migrate, *main_deployment()])
+        self.assertEqual(checks["controller_revision"][0], "WARN")
+        self.assertIn("111111111111", checks["controller_revision"][1])
 
     def test_shared_project_name_fails(self):
         """Two checkouts deploying under one Compose project share everything."""

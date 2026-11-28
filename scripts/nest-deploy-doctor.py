@@ -33,9 +33,11 @@ preflight
     must be a valid alias that no other container on the edge network answers to,
     and `NEST_GRPC_PUBLIC_HOST` one that no other gateway serves. A short database
     host name must not name another project's container on the edge network.
-    `NEST_TAILSCALE_HOSTNAME` must differ from other deployments, and so must each
-    HPC workdir on the same cluster; a shared Slurm account is a warning, because
-    each deployment's admission limits apply only to itself. A running conflict
+    `NEST_TAILSCALE_HOSTNAME` and `NEST_CONTROLLER_IMAGE` (an image tag is
+    daemon-wide) must differ from other deployments, and so must each HPC workdir,
+    which must not be nested in another either, whatever login hosts each names
+    (one cluster has several); a shared Slurm account is a warning, because each
+    deployment's admission limits apply only to itself. A running conflict
     fails, a stopped one warns. It then reads Traefik's dynamic directory
     (`--traefik-dynamic-dir`, default /etc/dokploy/traefik/dynamic), read-only:
     a TCP router, service or transport name defined in two files, or one SNI name
@@ -132,6 +134,7 @@ DEFAULT_MIN_AGE = 300.0
 DEFAULT_SETTLE = 10.0
 
 DEFAULT_EDGE_ALIAS = "nest-grpc-gateway"
+DEFAULT_CONTROLLER_IMAGE = "nest-controller:local"
 DEFAULT_PUBLIC_HOST = "grpc.nest.cerulean.works"
 DEFAULT_TAILSCALE_HOSTNAME = "nest-controller"
 DEFAULT_TRAEFIK_DYNAMIC_DIR = "/etc/dokploy/traefik/dynamic"
@@ -172,6 +175,7 @@ SETTINGS = (
     "NEST_GRPC_EDGE_ALIAS",
     "NEST_GRPC_PUBLIC_HOST",
     "NEST_TAILSCALE_HOSTNAME",
+    "NEST_CONTROLLER_IMAGE",
     "NEST_PUBLIC_PILOT",
     # HPC targets, compared with other deployments on this host and never printed.
     *HPC_SETTINGS,
@@ -828,9 +832,11 @@ def hpc_targets(values: dict[str, str]) -> list[tuple[str, frozenset, str, str]]
     return targets
 
 
-def _same_cluster(a: frozenset, b: frozenset) -> bool:
-    # Unknown login hosts count as the same cluster: never assume isolation.
-    return not a or not b or bool(a & b)
+def _overlapping_paths(a: str, b: str) -> bool:
+    """Whether two workdirs are the same directory or one lies inside the other, by
+    path text: `/w/nest` overlaps `/w/nest/` and `/w/nest/release`."""
+    a, b = a.rstrip("/") or "/", b.rstrip("/") or "/"
+    return a == b or a.startswith(b.rstrip("/") + "/") or b.startswith(a.rstrip("/") + "/")
 
 
 def database_host_check(
@@ -871,6 +877,71 @@ def database_host_check(
     return Check(
         "database_host", "PASS", f"{host} names no other project's container on {edge_network}"
     )
+
+
+def controller_image_checks(values, project, docker, others, verdict, projects) -> list[Check]:
+    """The Controller and migrate image of this deployment is its revision. Both
+    services build `NEST_CONTROLLER_IMAGE` from the deployment's own checkout, but an
+    image tag is daemon-wide, not per Compose project: another deployment building
+    the same tag replaces it, and this deployment's next recreate or migration would
+    run the other revision (review of #119). A digest-pinned reference cannot change.
+    Also reports when this deployment's Controller and its last migration ran
+    different builds."""
+    checks = []
+    image = values.get("NEST_CONTROLLER_IMAGE", DEFAULT_CONTROLLER_IMAGE)
+    if "@sha256:" in image:
+        checks.append(Check("controller_image", "PASS", f"{image} is pinned by digest"))
+    else:
+        same = [
+            c
+            for service in ("controller", "migrate")
+            for c in others(service)
+            if (c.get("Config") or {}).get("Image") == image
+        ]
+        if same:
+            checks.append(
+                Check(
+                    "controller_image",
+                    verdict(same),
+                    f"NEST_CONTROLLER_IMAGE {image} is also the image of "
+                    f"{projects(same)}: a build of either deployment retags it, and the other's "
+                    "next recreate or migration runs that revision. Give each deployment its "
+                    "own tag, such as nest-controller:release (docs/source/multi-environment.md)",
+                )
+            )
+        else:
+            checks.append(
+                Check("controller_image", "PASS", f"no other deployment uses the image {image}")
+            )
+
+    def newest(service: str) -> dict | None:
+        found = docker.containers(project, service)
+        if not found:
+            return None
+        return max(found, key=lambda c: str(c.get("Created", "")))
+
+    controller, migrate = newest("controller"), newest("migrate")
+    if controller is not None and migrate is not None:
+        ours, theirs = controller.get("Image", ""), migrate.get("Image", "")
+        short = lambda image_id: image_id.removeprefix("sha256:")[:12] or "?"
+        if ours == theirs:
+            checks.append(
+                Check(
+                    "controller_revision",
+                    "PASS",
+                    f"the Controller and its last migration ran image {short(ours)}",
+                )
+            )
+        else:
+            checks.append(
+                Check(
+                    "controller_revision",
+                    "WARN",
+                    f"the Controller runs image {short(ours)} but the last migration ran "
+                    f"{short(theirs)}; redeploy so both run this deployment's build",
+                )
+            )
+    return checks
 
 
 def check_isolation(
@@ -988,6 +1059,7 @@ def check_isolation(
             checks.append(Check("public_host", "PASS", f"no other gateway serves {host}"))
 
     checks.append(database_host_check(values, project, docker, networks, edge_network))
+    checks += controller_image_checks(values, project, docker, others, verdict, projects)
 
     hostname = values.get("NEST_TAILSCALE_HOSTNAME", DEFAULT_TAILSCALE_HOSTNAME).lower()
     same = [
@@ -1044,23 +1116,28 @@ def check_isolation(
             # A Controller whose targets cannot be read is never assumed isolated.
             unknown.append(label)
             continue
+        # Login hosts never prove separate clusters: one Slurm cluster often has
+        # several login nodes on one shared filesystem and one accounting database,
+        # so every pair is compared, whatever hosts it names (review of #119).
         for name, hosts, account, workdir in ours:
             for other_name, other_hosts, other_account, other_workdir in theirs:
-                if not _same_cluster(hosts, other_hosts):
-                    continue
-                if workdir and workdir.rstrip("/") == other_workdir.rstrip("/"):
-                    shared_dirs.append((controller, f"{name} = {label} {other_name}"))
+                pair = f"{name} = {label} {other_name}"
+                if hosts and other_hosts and not hosts & other_hosts:
+                    pair += " (other login hosts, not proof of another cluster)"
+                if workdir and other_workdir and _overlapping_paths(workdir, other_workdir):
+                    shared_dirs.append((controller, pair))
                 if account and account == other_account:
-                    shared_accounts.append(f"{name} = {label} {other_name}")
+                    shared_accounts.append(pair)
     if shared_dirs:
         checks.append(
             Check(
                 "hpc_workdir",
                 verdict([c for c, _ in shared_dirs]),
-                "the HPC workdir (not printed) is shared with another deployment: "
+                "the HPC workdir (not printed) is the same as, or nested in, another "
+                "deployment's: "
                 + "; ".join(sorted({d for _, d in shared_dirs}))
                 + ". Jobs, results and worker state would mix; give each deployment its own "
-                "workdir on the cluster",
+                "workdir path, even on login hosts you believe are separate clusters",
             )
         )
     elif unknown:
@@ -1089,8 +1166,9 @@ def check_isolation(
                 + "; ".join(sorted(set(shared_accounts)))
                 + ". Each deployment admits work on its own ledger, so their limits add up; "
                 + ("NEST_LIMIT_ACTIVE_PER_PLATFORM is unset here. " if not limit else "")
-                + "Split the operator-approved allocation between them "
-                "(docs/source/multi-environment.md, HPC capacity)",
+                + "Split the operator-approved allocation between them, or record that "
+                "the accounts belong to separate clusters (docs/source/multi-environment.md, "
+                "HPC capacity)",
             )
         )
     elif unknown:

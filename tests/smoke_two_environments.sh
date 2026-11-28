@@ -23,6 +23,10 @@
 #   4. negative preflights: a colliding origin subnet, edge alias or HPC workdir, and
 #      a gateway alias that is a Compose service name.
 #
+#   3b. Main builds a new revision under its own image tag and is recreated and
+#      migrated with it; Release's Controller and migrate, recreated afterwards,
+#      still run Release's revision (each deployment has its own NEST_CONTROLLER_IMAGE).
+#
 # Needs Docker, openssl and the image in NEST_CONTROLLER_IMAGE. Contacts no real host,
 # DNS name, certificate authority, Tailnet or HPC cluster; every credential is a
 # throwaway fixture. NEST_SMOKE_TRAEFIK_TAGS picks the Traefik images.
@@ -30,7 +34,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 fixture=$(mktemp -d)
-export NEST_CONTROLLER_IMAGE=${NEST_CONTROLLER_IMAGE:-nest-controller:test}
+# The prebuilt Controller image. Each deployment gets its own tag of it, as on the
+# host, where each application builds its own checkout under its own tag (#118).
+base_image=${NEST_CONTROLLER_IMAGE:-nest-controller:test}
+unset NEST_CONTROLLER_IMAGE
 read -r -a traefik_tags <<<"${NEST_SMOKE_TRAEFIK_TAGS:-v3.3 v3.6.2}"
 label=nest-multi-smoke
 edge=nest-multi-smoke-edge
@@ -43,6 +50,7 @@ declare -A project=([main]=nest-main-smoke [release]=nest-release-smoke)
 declare -A subnet=([main]=10.253.250.0/28 [release]=10.253.251.0/28)
 declare -A gateway_ip=([main]=10.253.250.3 [release]=10.253.251.3)
 declare -A host=([main]=grpc.main.smoke.test [release]=grpc.release.smoke.test)
+declare -A image=([main]=nest-controller:multi-smoke-main [release]=nest-controller:multi-smoke-release)
 # One throwaway password per deployment, kept across every rewrite of its .env.
 declare -A password=([main]="smoke-main-$(openssl rand -hex 8)" [release]="smoke-release-$(openssl rand -hex 8)")
 mkdir -p "$dyn"
@@ -67,6 +75,7 @@ cleanup() {
         compose "$name" down --timeout 10 --volumes --remove-orphans >/dev/null 2>&1 || true
     done
     docker network rm "$edge" "$outside" >/dev/null 2>&1 || true
+    docker image rm "${image[main]}" "${image[release]}" >/dev/null 2>&1 || true
     rm -rf "$fixture"
 }
 trap cleanup EXIT
@@ -98,6 +107,7 @@ write_env() { # env alias(empty: the default) allowed_peers [workdir]
     local name=$1 alias=$2 peers=$3 workdir=${4:-/home/svc-nest/nest-$1}
     {
         printf "COMPOSE_PROFILES='local-db,migrate,public-grpc'\n"
+        printf "NEST_CONTROLLER_IMAGE='%s'\n" "${image[$name]}"
         printf "NEST_DATABASE_URL='postgresql://nest@postgres:5432/nest'\n"
         printf "NEST_DATABASE_PASSWORD='%s'\n" "${password[$name]}"
         printf "NEST_DATABASE_REQUIRED='true'\n"
@@ -126,6 +136,16 @@ write_env() { # env alias(empty: the default) allowed_peers [workdir]
     } > "$fixture/$name.env"
     chmod 600 "$fixture/$name.env"
 }
+
+# A revision of the Controller image per deployment: the same code with a label
+# naming the revision, so a container shows which build it runs.
+build_revision() { # env revision
+    printf 'FROM %s\nLABEL org.cerulean-works.nest.smoke-revision=%s\n' "$base_image" "$2" \
+        | docker build --quiet --tag "${image[$1]}" - >/dev/null
+}
+revision_of() { docker inspect --format '{{index .Config.Labels "org.cerulean-works.nest.smoke-revision"}}' "$1"; }
+build_revision main main-1
+build_revision release release-1
 
 declare -A peers alias
 alias=([main]="" [release]="")
@@ -176,7 +196,7 @@ render_routes() { # version mode(default|shared-alias|instance)
 # TLS handshakes from the outside network, through Traefik, for one name.
 handshakes() { # name count
     docker run --rm --network "$outside" -v "$PWD/tests:/tests:ro" -v "$fixture/ca.pem:/ca.pem:ro" \
-        --entrypoint python "$NEST_CONTROLLER_IMAGE" /tests/tls_sni_probe.py "$1:443" "$1" \
+        --entrypoint python "$base_image" /tests/tls_sni_probe.py "$1:443" "$1" \
         --ca-file /ca.pem --count "$2" --timeout 3
 }
 
@@ -210,7 +230,7 @@ render_routes "$first_version" default
 start_traefik "${traefik_tags[0]}"
 sleep 3
 
-resolved=$(docker run --rm --network "$edge" --entrypoint getent "$NEST_CONTROLLER_IMAGE" ahosts nest-grpc-gateway \
+resolved=$(docker run --rm --network "$edge" --entrypoint getent "$base_image" ahosts nest-grpc-gateway \
     | awk '{print $1}' | sort -u | tr '\n' ' ')
 [ "$(wc -w <<<"$resolved")" -eq 2 ] || fail "expected nest-grpc-gateway to name both gateways, got: $resolved"
 echo "PASS: [collision] nest-grpc-gateway on the edge network resolves to both gateways: $resolved"
@@ -263,7 +283,8 @@ check_environment() { # env other tag
     report="$fixture/preflight-$name-$tag.txt"
     preflight "$name" > "$report" || { cat "$report"; fail "[$tag] preflight failed for $name"; }
     for check in edge_alias public_host tailnet_hostname database_host hpc_workdir \
-        route_names route_sni route_target origin_subnet_free trusted_proxies allowed_peers edge_proxy; do
+        route_names route_sni route_target origin_subnet_free trusted_proxies allowed_peers edge_proxy \
+        controller_image; do
         grep -q "^PASS $check: " "$report" || { cat "$report"; fail "[$tag] $check did not pass for $name"; }
     done
     grep -q '^WARN hpc_account: ' "$report" || fail "[$tag] the shared Slurm account was not reported"
@@ -283,7 +304,7 @@ check_environment() { # env other tag
     # The full credential-free verification, and the call reaches this Controller only.
     since=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)
     docker run --rm --network "$outside" -v "$PWD/scripts:/scripts:ro" -v "$fixture/ca.pem:/ca.pem:ro" \
-        --entrypoint python "$NEST_CONTROLLER_IMAGE" /scripts/verify-public-grpc.py "${host[$name]}:443" \
+        --entrypoint python "$base_image" /scripts/verify-public-grpc.py "${host[$name]}:443" \
         --ca-file /ca.pem --timeout 5 \
         --origin "$(container_ip "$name" controller "$edge"):50051" \
         --origin "$(container_ip "$name" grpc-gateway "$edge"):8443" \
@@ -395,6 +416,29 @@ echo "PASS: Release untouched (containers, route, database); Main's data survive
 wait_routed "${host[main]}"
 check_environment main release "after-rollback"
 
+# --- 3b. Main's new build cannot change Release's revision -------------------------
+release_image=$(docker inspect --format '{{.Image}}' "$(container_id release controller)")
+[ "$(revision_of "$(container_id release controller)")" = release-1 ] || fail "Release does not run release-1"
+build_revision main main-2
+compose main up -d --no-build --pull never --no-deps --force-recreate --wait --wait-timeout 90 controller >/dev/null
+compose main run --rm --no-deps --pull never migrate >/dev/null
+[ "$(revision_of "$(container_id main controller)")" = main-2 ] || fail "Main did not take its new build"
+# Release recreated and its migrate container created afterwards, as a later
+# redeploy, restart recovery or migration would: both still Release's build.
+compose release up -d --no-build --pull never --no-deps --force-recreate --wait --wait-timeout 90 controller >/dev/null
+compose release up --no-start --no-build --pull never --no-deps --force-recreate migrate >/dev/null 2>&1
+for service in controller migrate; do
+    id=$(container_id release "$service")
+    [ "$(revision_of "$id")" = release-1 ] || fail "Release's $service runs $(revision_of "$id") after Main's build"
+    [ "$(docker inspect --format '{{.Image}}' "$id")" = "$release_image" ] || fail "Release's $service image changed"
+done
+preflight release > "$fixture/revision.txt" || { cat "$fixture/revision.txt"; fail "preflight failed after Main's build"; }
+grep -q "^PASS controller_revision: the Controller and its last migration ran image " "$fixture/revision.txt" \
+    || { cat "$fixture/revision.txt"; fail "Release's revision not confirmed"; }
+docker rm "$(container_id release migrate)" >/dev/null
+echo "PASS: Main's new build (main-2) left Release's Controller and migrate on release-1"
+wait_routed "${host[release]}"
+
 # --- 4. Negative preflights -----------------------------------------------------------
 cp "$fixture/release.env" "$fixture/release.env.good"
 negative() { # description expected-line sed-expression
@@ -420,6 +464,8 @@ preflight release > "$fixture/negative.txt" || true
 grep -q "^WARN tailnet_hostname: Tailscale hostname nest-controller-main is also used by ${project[main]} (stopped)" \
     "$fixture/negative.txt" || { cat "$fixture/negative.txt"; fail "Main's Tailnet hostname not flagged"; }
 echo "PASS: preflight flags Main's Tailnet hostname (stopped sidecar: WARN)"
+negative "Main's Controller image" "^FAIL controller_image: NEST_CONTROLLER_IMAGE ${image[main]} is also the image of ${project[main]}" \
+    "s|^NEST_CONTROLLER_IMAGE=.*|NEST_CONTROLLER_IMAGE='${image[main]}'|"
 negative "Main's HPC workdir" "^FAIL hpc_workdir: .*LAB = ${project[main]} LAB" \
     "s|nest-release|nest-main|"
 cp "$fixture/release.env.good" "$fixture/release.env"

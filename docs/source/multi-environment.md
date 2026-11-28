@@ -38,6 +38,7 @@ cluster).
 | Resource | Isolated by | What must differ | Checked by |
 | --- | --- | --- | --- |
 | Containers, `tailnet`, `grpc-origin`, `acme` networks | Compose project (appName) | one Dokploy application each; never the default project `nest` twice | `preflight` `project_identity` |
+| Controller and migrate image (the revision) | **not isolated by the project**: an image tag is shared by the whole Docker daemon | `NEST_CONTROLLER_IMAGE`: one tag per application (`nest-controller:main`, `nest-controller:release`), or a digest | `preflight` `controller_image`, `controller_revision` |
 | `grpc-origin` subnet and gateway address | settings | `NEST_GRPC_ORIGIN_SUBNET`, `NEST_GRPC_GATEWAY_ADDRESS`, `NEST_GRPC_TRUSTED_PROXIES`, `NEST_GRPC_ALLOWED_PEERS` | `preflight` `origin_subnet_free` (names the other deployment) |
 | `controller-grpc-origin` (gateway upstream) | it exists only on the project's own `grpc-origin` (#109) | nothing; keep it | `gateway-runtime` `upstream_alias`, `upstream_dns` |
 | Gateway name on the edge network | **`NEST_GRPC_EDGE_ALIAS`** (new, default `nest-grpc-gateway`) | one unique alias per deployment | `preflight` and `gateway-runtime` `edge_alias`; the entrypoint refuses a Compose service name |
@@ -131,6 +132,28 @@ Take a database backup of the existing application before any change
    in `NEST_GRPC_ALLOWED_PEERS`.
 5. Approve the new Tailnet node (tag `tag:nest-controller`), then set
    `NEST_TAILSCALE_AUTHKEY` to `''`.
+
+## Keep each application's revision
+
+Both applications build the Controller image from their own checkout, Main from
+`main` and Release from its tag. The `controller` and `migrate` services use the
+same `NEST_CONTROLLER_IMAGE`, so within one application they always agree. An image
+tag, however, belongs to the whole Docker daemon, not to a Compose project. If both
+applications used the same tag (`nest-controller:local`, the default), Main's next
+build would retag it. Release's next recreate, restart recovery or migration would
+then run Main's revision.
+
+- Set a tag of its own in each application: `NEST_CONTROLLER_IMAGE='nest-controller:main'`
+  and `'nest-controller:release'`, as the templates do. Changing Main's tag is a
+  normal redeploy: it builds the same checkout under the new tag.
+- `preflight`'s `controller_image` fails while another deployment's `controller` or
+  `migrate` container uses the same tag (a warning if that deployment is stopped). A
+  digest-pinned reference (`...@sha256:...`) cannot be retagged and passes.
+- `controller_revision` warns when the Controller and the deployment's last
+  migration ran different images.
+- `tests/smoke_two_environments.sh` checks this. It builds a new revision under
+  Main's tag, then recreates and migrates Main. Release's Controller and migrate,
+  recreated afterwards, still run Release's revision.
 
 ## Route each gRPC name
 
@@ -307,8 +330,11 @@ admits up to its own limits, so the cluster sees the sum. Two deployments with
    into `<workdir>/project`. It also keeps its own `environments/` cache and
    `jobs/` inputs, outputs and worker state. Use distinct paths such as
    `<cluster path>/nest-main` and `<cluster path>/nest-release` on every Platform.
-   `preflight` fails when another deployment on the host uses the same workdir on
-   the same login hosts. It reads this deployment's platforms file
+   `preflight` fails when another deployment on the host uses the same workdir or a
+   nested one, **whatever login hosts each names**. One Slurm cluster often has
+   several login nodes on one shared filesystem, so different login hosts are not
+   taken as proof of separate clusters; give each deployment its own path even if
+   you believe they are. It reads this deployment's platforms file
    (`NEST_PLATFORMS_ENV_FILE`, default `./platforms.env` next to `--env-file`) and the
    Platform variables that file gives other Controllers. When another
    deployment's targets cannot be read, it warns and never passes; compare those by
@@ -319,7 +345,9 @@ admits up to its own limits, so the cluster sees the sum. Two deployments with
    each deployment's `NEST_LIMIT_ACTIVE_PER_PLATFORM`, `..._PER_PROJECT`,
    `..._CPU_PER_PROJECT` and `..._GPU_PER_PROJECT` are set so that Main's plus
    Release's stay within the approved allocation. `preflight` warns about a shared
-   account and names the deployments. It never changes a limit.
+   account name and names the deployments, also when their login hosts differ.
+   Only the operator can confirm that two accounts of the same name belong to
+   separate clusters; record that in #118. It never changes a limit.
 3. **Attribution.** Jobs from both deployments are named `nest-worker`. The working
    directory tells them apart:
    `sacct --format=JobID,JobName,Account,WorkDir%60,AllocTRES%40`. Each deployment's
@@ -412,6 +440,8 @@ unchanged.
 | Main recreated, rolled back and unrouted while Release serves every handshake; Release containers, route and database untouched; Main's data survives | part 3 | synthetic, real containers |
 | Negative preflights: subnet, alias, name, Tailnet hostname, workdir; service-name alias refused | part 4; `tests/test_multi_environment.py` | synthetic |
 | Platforms files compared; a route orphaned by a changed alias or name refused; Main template is Phase 1 | `tests/test_multi_environment.py` | synthetic |
+| Same or nested workdir refused, and a shared account flagged, also on different login hosts | `tests/test_multi_environment.py` | synthetic |
+| One image tag per application: Main's new build leaves Release's Controller and migrate revision unchanged; a shared tag is refused | `tests/smoke_two_environments.sh` part 3b and 4; `tests/test_multi_environment.py` | synthetic, real containers |
 | Copy scripts: a live attempt blocks the copy; nothing Main issued stays usable; changes audited | `tests/test_multi_environment.py` (PostgreSQL) | synthetic, real PostgreSQL |
 | Monitoring: per-environment files, state, labels and rules; default output unchanged | `tests/test_multi_environment.py` | synthetic |
 | Single-deployment output unchanged | `tests/test_multi_environment.py` | synthetic |
