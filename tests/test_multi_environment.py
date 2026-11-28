@@ -665,6 +665,20 @@ class IsolationPreflightTests(unittest.TestCase):
         self.assertEqual(checks["hpc_account"][0], "WARN", checks["hpc_account"][1])
         self.assertNotIn("login0", checks["hpc_workdir"][1] + checks["hpc_account"][1])
 
+    def test_workdir_paths_are_normalized(self):
+        """Review of #119 (P3): the same directory written differently overlaps."""
+        for same in (
+            "/home/svc//nest-release",
+            "/home/svc/./nest-release",
+            "/home/svc/x/../nest-release/",
+        ):
+            with self.subTest(same):
+                self.assertTrue(doctor._overlapping_paths(same, "/home/svc/nest-release"))
+        self.assertFalse(
+            doctor._overlapping_paths("/home/svc/nest-release-old", "/home/svc/nest-release")
+        )
+        self.assertTrue(doctor._overlapping_paths("/", "/home/svc"))
+
     def test_nested_workdirs_overlap(self):
         nested = RELEASE_ENV["NEST_PLATFORMS_ENV"].replace(
             "/home/svc/nest-release", "/home/svc/nest-release/main"

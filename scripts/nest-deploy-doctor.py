@@ -834,9 +834,14 @@ def hpc_targets(values: dict[str, str]) -> list[tuple[str, frozenset, str, str]]
 
 def _overlapping_paths(a: str, b: str) -> bool:
     """Whether two workdirs are the same directory or one lies inside the other, by
-    path text: `/w/nest` overlaps `/w/nest/` and `/w/nest/release`."""
-    a, b = a.rstrip("/") or "/", b.rstrip("/") or "/"
-    return a == b or a.startswith(b.rstrip("/") + "/") or b.startswith(a.rstrip("/") + "/")
+    normalized path text: `/w/nest` overlaps `/w/nest/`, `/w//nest`, `/w/./nest` and
+    `/w/nest/release`. A symbolic link cannot be seen from the text."""
+    import posixpath
+
+    a, b = posixpath.normpath(a), posixpath.normpath(b)
+    if a == b:
+        return True
+    return a.startswith(b.rstrip("/") + "/") or b.startswith(a.rstrip("/") + "/")
 
 
 def database_host_check(
