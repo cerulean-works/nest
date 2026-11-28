@@ -889,13 +889,22 @@ def controller_image_checks(values, project, docker, others, verdict, projects) 
     services build `NEST_CONTROLLER_IMAGE` from the deployment's own checkout, but an
     image tag is daemon-wide, not per Compose project: another deployment building
     the same tag replaces it, and this deployment's next recreate or migration would
-    run the other revision (review of #119). A digest-pinned reference cannot change.
-    Also reports when this deployment's Controller and its last migration ran
+    run the other revision (review of #119). compose.dokploy.yaml builds this image
+    (`build: .`, `pull_policy: build`), so the value must be a tag: Docker cannot tag
+    a build with a digest reference. Also reports when this deployment's Controller and its last migration ran
     different builds."""
     checks = []
     image = values.get("NEST_CONTROLLER_IMAGE", DEFAULT_CONTROLLER_IMAGE)
-    if "@sha256:" in image:
-        checks.append(Check("controller_image", "PASS", f"{image} is pinned by digest"))
+    if "@" in image:
+        checks.append(
+            Check(
+                "controller_image",
+                "FAIL",
+                f"NEST_CONTROLLER_IMAGE {image} is a digest reference, but compose.dokploy.yaml "
+                "builds this image and Docker cannot tag a build with a digest; use a tag of "
+                "this application's own, such as nest-controller:release",
+            )
+        )
     else:
         same = [
             c

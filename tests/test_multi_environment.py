@@ -809,14 +809,17 @@ class IsolationPreflightTests(unittest.TestCase):
         )
         _, checks = self.preflight(stopped, env)
         self.assertEqual(checks["controller_image"][0], "WARN")
-        # Distinct tags, or a digest, pass.
+        # Distinct tags pass.
         _, checks = self.preflight(with_image(main_deployment(), "nest-controller:main"), env)
         self.assertEqual(checks["controller_image"][0], "PASS")
         pinned = {**env, "NEST_CONTROLLER_IMAGE": "registry.example/nest@sha256:" + "a" * 64}
         _, checks = self.preflight(
             with_image(main_deployment(), pinned["NEST_CONTROLLER_IMAGE"]), pinned
         )
-        self.assertEqual(checks["controller_image"][0], "PASS")
+        # Review of #119 (P3): compose.dokploy.yaml builds the image, so a digest
+        # reference cannot be its tag; refused rather than passed.
+        self.assertEqual(checks["controller_image"][0], "FAIL")
+        self.assertIn("cannot tag a build with a digest", checks["controller_image"][1])
 
     def test_controller_and_migration_revision_are_compared(self):
         controller = container("release-controller-1", "release", "controller")

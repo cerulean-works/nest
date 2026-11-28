@@ -38,7 +38,7 @@ cluster).
 | Resource | Isolated by | What must differ | Checked by |
 | --- | --- | --- | --- |
 | Containers, `tailnet`, `grpc-origin`, `acme` networks | Compose project (appName) | one Dokploy application each; never the default project `nest` twice | `preflight` `project_identity` |
-| Controller and migrate image (the revision) | **not isolated by the project**: an image tag is shared by the whole Docker daemon | `NEST_CONTROLLER_IMAGE`: one tag per application (`nest-controller:main`, `nest-controller:release`), or a digest | `preflight` `controller_image`, `controller_revision` |
+| Controller and migrate image (the revision) | **not isolated by the project**: an image tag is shared by the whole Docker daemon | `NEST_CONTROLLER_IMAGE`: one tag per application (`nest-controller:main`, `nest-controller:release`) | `preflight` `controller_image`, `controller_revision` |
 | `grpc-origin` subnet and gateway address | settings | `NEST_GRPC_ORIGIN_SUBNET`, `NEST_GRPC_GATEWAY_ADDRESS`, `NEST_GRPC_TRUSTED_PROXIES`, `NEST_GRPC_ALLOWED_PEERS` | `preflight` `origin_subnet_free` (names the other deployment) |
 | `controller-grpc-origin` (gateway upstream) | it exists only on the project's own `grpc-origin` (#109) | nothing; keep it | `gateway-runtime` `upstream_alias`, `upstream_dns` |
 | Gateway name on the edge network | **`NEST_GRPC_EDGE_ALIAS`** (new, default `nest-grpc-gateway`) | one unique alias per deployment | `preflight` and `gateway-runtime` `edge_alias`; the entrypoint refuses a Compose service name |
@@ -147,8 +147,12 @@ then run Main's revision.
   and `'nest-controller:release'`, as the templates do. Changing Main's tag is a
   normal redeploy: it builds the same checkout under the new tag.
 - `preflight`'s `controller_image` fails while another deployment's `controller` or
-  `migrate` container uses the same tag (a warning if that deployment is stopped). A
-  digest-pinned reference (`...@sha256:...`) cannot be retagged and passes.
+  `migrate` container uses the same tag (a warning if that deployment is stopped).
+  It also fails on a digest reference (`...@sha256:...`): `compose.dokploy.yaml`
+  builds the image (`pull_policy: build`), and Docker cannot tag a build with a
+  digest. Pinning Release to a reviewed digest needs a published Controller image and
+  a Compose definition that pulls it instead of building. Nest has neither today,
+  and adding them is a separate decision.
 - `controller_revision` warns when the Controller and the deployment's last
   migration ran different images.
 - `tests/smoke_two_environments.sh` checks this. It builds a new revision under
