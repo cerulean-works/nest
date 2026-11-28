@@ -338,6 +338,9 @@ services:
       # Required (the entrypoint refuses to start without it): Traefik's address
       # on the edge network as a CIDR, such as 10.0.1.7/32.
       NEST_GRPC_EDGE_PROXY: ${NEST_GRPC_EDGE_PROXY:-}
+      # This gateway's alias on the edge network (see `networks.edge` below), checked
+      # by the entrypoint and by `nest-deploy-doctor.py`; it must be unique there.
+      NEST_GRPC_EDGE_ALIAS: ${NEST_GRPC_EDGE_ALIAS:-nest-grpc-gateway}
       # The grpc-origin-only alias, never the generic `controller` (see above). The
       # entrypoint refuses to start unless it resolves only inside the subnet.
       NEST_GRPC_UPSTREAM: controller-grpc-origin:50051
@@ -369,7 +372,11 @@ services:
         # NEST_GRPC_ORIGIN_SUBNET other than the first, which the bridge uses.
         ipv4_address: ${NEST_GRPC_GATEWAY_ADDRESS:-172.31.250.2}
       edge:
-        aliases: [nest-grpc-gateway]
+        # The one name Traefik's route dials (deploy/public-grpc/traefik/render.sh).
+        # The `grpc-gateway` service name also resolves on this shared network, to
+        # every deployment's gateway, so a route never uses it. Give each deployment
+        # on the same edge network its own alias (#118); the entrypoint validates it.
+        aliases: ["${NEST_GRPC_EDGE_ALIAS:-nest-grpc-gateway}"]
     cap_drop:
       - ALL
     security_opt:

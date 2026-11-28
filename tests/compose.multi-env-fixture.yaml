@@ -1,0 +1,9 @@
+# Test-only override for compose.dokploy.yaml; see tests/smoke_two_environments.sh.
+# As on the Dokploy host (#109, #118), the Controller also joins the shared external
+# edge network, which Dokploy attaches for the Controller's Web Domain. Traefik is
+# not part of either project: the smoke test runs one real Traefik on the edge
+# network for both deployments, as Dokploy does.
+services:
+  controller:
+    networks:
+      edge: {}

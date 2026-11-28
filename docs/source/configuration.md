@@ -528,7 +528,7 @@ These variables configure Compose itself:
 
 | Variable | Default | Behavior |
 | --- | --- | --- |
-| `NEST_CONTROLLER_IMAGE` | `nest-controller:local` | Local tag assigned to the image built from this checkout. |
+| `NEST_CONTROLLER_IMAGE` | `nest-controller:local` | Local tag assigned to the image built from this checkout. Tags are shared by every Compose project on the Docker host, so give each deployment on one host its own (see [Run Main and Release side by side](multi-environment)). |
 | `NEST_CONTROLLER_HOST_IP` | `127.0.0.1` | Host interface for the published gRPC port. Use the host's Tailscale IPv4 address for Tailnet clients. |
 | `NEST_CONTROLLER_PORT` | `50051` | Published host port; the container always listens on port 50051. |
 | `NEST_SSH_DIR` | `./ssh` | Mode A: existing host directory containing the SSH configuration, key, and verified host keys. The container uses a private copy at `/home/nest/.ssh`, so in-container paths such as `/home/nest/.ssh/tls.key` work for the file settings above. |

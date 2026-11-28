@@ -12,6 +12,12 @@
 #                          10.0.1.7/32 (Dokploy's Traefik on dokploy-network). Only
 #                          connections from it are accepted, and only it may send the
 #                          PROXY protocol header that names the client.
+#   NEST_GRPC_EDGE_ALIAS   this gateway's DNS alias on the edge network, which the
+#                          Traefik route dials (default nest-grpc-gateway). Only
+#                          validated here: a lower-case DNS label and never a Compose
+#                          service name, which every deployment on a shared edge
+#                          network has (#118). Uniqueness is checked by
+#                          `nest-deploy-doctor.py preflight` and `gateway-runtime`.
 #   NEST_GRPC_UPSTREAM     Controller host:port on the private network
 #                          (controller-grpc-origin:50051, a name that exists only on
 #                          grpc-origin; the generic `controller` name also resolves on
@@ -74,6 +80,15 @@ echo "$edge_prefix" | grep -Eqx '[0-9]{1,3}' || fail "NEST_GRPC_EDGE_PROXY prefi
 if [ "$edge_prefix" -lt "$min_prefix" ] || [ "$edge_prefix" -gt "$max_prefix" ]; then
     fail "NEST_GRPC_EDGE_PROXY prefix must be /$min_prefix to /$max_prefix (no wide or default route), got /$edge_prefix"
 fi
+
+edge_alias=${NEST_GRPC_EDGE_ALIAS:-nest-grpc-gateway}
+echo "$edge_alias" | grep -Eqx '[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?' \
+    || fail "NEST_GRPC_EDGE_ALIAS must be a lower-case DNS label, got '$edge_alias'"
+case $edge_alias in
+    grpc-gateway | controller | controller-grpc-origin | tailscale | postgres | migrate | grpc-certificates)
+        fail "NEST_GRPC_EDGE_ALIAS $edge_alias is a Compose service name, which resolves to every deployment on the edge network; choose a unique alias such as nest-grpc-gateway-release"
+        ;;
+esac
 
 upstream_host=${upstream%:*}
 upstream_port=${upstream##*:}
@@ -160,7 +175,7 @@ if grep -q '@[A-Z][A-Z_]*@' "$out/envoy.yaml.tmp"; then
     fail "the template has a value this script does not set"
 fi
 mv "$out/envoy.yaml.tmp" "$out/envoy.yaml"
-echo "nest-grpc-gateway: rendered for $host, edge proxy $edge, upstream $upstream" >&2
+echo "nest-grpc-gateway: rendered for $host, edge proxy $edge, edge alias $edge_alias, upstream $upstream" >&2
 
 [ -z "$render_only" ] || exit 0
 [ -z "$origin_subnet" ] || check_upstream_resolution
